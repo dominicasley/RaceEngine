@@ -1,0 +1,12 @@
+[submodule "vendor/di"]
+	path = vendor/di
+	url = https://github.com/boost-experimental/di.git
+[submodule "vendor/spdlog"]
+	path = vendor/spdlog
+	url = git@github.com:gabime/spdlog.git
+[submodule "vendor/glfw"]
+	path = vendor/glfw
+	url = git@github.com:glfw/glfw.git
+[submodule "vendor/glew"]
+	path = vendor/glfw
+	url = https://github.com/nigels-com/glew.git
