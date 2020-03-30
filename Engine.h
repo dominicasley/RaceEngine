@@ -1,6 +1,6 @@
 #pragma once
 
-#include <boost/di.h>
+#include <boost/di.hpp>
 #include "Bootstrapper.h"
 
 namespace di = boost::di;

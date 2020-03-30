@@ -1,7 +1,8 @@
 #pragma once
 
-#include "SigSlot.h"
+#include <vulkan/vulkan.h>
 #include "../Api/VulkanWindowRequiredExtensions.h"
+#include "../../Async/Async.h"
 
 class IWindow
 {
@@ -13,5 +14,5 @@ public:
     virtual bool shouldClose() const = 0;
     virtual bool getKeyPressed(int key) const = 0;
 
-    sigslot::signal<void(int, int)> onWindowResize;
+    Observable<std::tuple<int, int>> windowResize;
 };

@@ -11,6 +11,7 @@ public:
     const unsigned int height;
     const unsigned int bitsPerPixel;
 
+    Texture();
     Texture(std::vector<unsigned char> data, unsigned int width, unsigned int height, unsigned int bitsPerPixel);
 
     static Texture fromFile(const std::string &fileName);

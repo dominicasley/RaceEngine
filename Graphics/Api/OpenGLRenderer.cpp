@@ -1,7 +1,6 @@
 #include "OpenGLRenderer.h"
-#include <glew/glew.h>
+#include <gl/gl3w.h>
 #include <vector>
-#include <tinygltf/tiny_gltf.h>
 #include "Resources/RenderableEntityDesc.h"
 #include "Resources/Mesh.h"
 #include "Resources/Shader.h"
@@ -10,24 +9,25 @@
 #include "../Scene/Light.h"
 #include "../Scene/Camera.h"
 
-OpenGLRenderer::OpenGLRenderer(Logger &logger) : logger(logger)
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tiny_gltf.h>
+
+OpenGLRenderer::OpenGLRenderer(spdlog::logger &logger) : logger(logger)
 {
 }
 
 bool OpenGLRenderer::init()
 {
-    glewExperimental = GL_TRUE;
-    auto err = glewInit();
-
-    if (GLEW_OK != err)
+    if (gl3wInit())
     {
-        logger.error("GLEW initialisation failed {}", glewGetErrorString(err));
+        logger.error("Failed to initialize OpenGL");
         return false;
     }
 
     glClearColor(0.0, 0.0, 0.0, 0);
 
-    glEnable(GL_ALPHA_TEST);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_3D);
     glEnable(GL_TEXTURE_2D);
@@ -130,7 +130,7 @@ void OpenGLRenderer::draw(const Scene *scene)
         setProgramUniform(1, "normalMatrix",
                           glm::transpose(glm::inverse(glm::mat3(camera->getMvMatrix() * entityModelMatrix))));
 
-        glBindVertexArray(entity->getModel()->extras.GetNumberAsInt());
+        glBindVertexArray(static_cast<GLuint>(entity->getModel()->extras.GetNumberAsInt()));
 
         auto model = entity->getModel();
         const auto &tscene = model->scenes[model->defaultScene];
@@ -166,7 +166,7 @@ std::vector<unsigned int> &OpenGLRenderer::bindMesh(std::vector<unsigned int> &v
     {
         if (bufferView.target == 0)
         {
-            logger.warn("bufferView.target is zero");
+            logger.warn("bufferView.target is zero. skipping buffer view.");
             continue;
         }
 
@@ -336,7 +336,7 @@ unsigned int OpenGLRenderer::createTexture(const tinygltf::Texture &texture, tin
     unsigned int textureId;
 
     GLfloat fLargest;
-    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &fLargest);
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &fLargest);
 
     glGenTextures(1, &textureId);
     glBindTexture(GL_TEXTURE_2D, textureId);

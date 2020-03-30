@@ -1,14 +1,11 @@
 #include "ResourceService.h"
 
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-
-#include <tiny_gltf.h>
 #include <utility>
+#include <fstream>
+
 
 ResourceService::ResourceService(
-    Logger& logger,
+    spdlog::logger& logger,
     MemoryStorageService& memoryStorageService,
     BackgroundWorkerService& backgroundWorkerService) :
     logger(logger),

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "Logger.h"
+#include <spdlog/logger.h>
+
 #include "Async/Async.h"
 #include "Graphics/Graphics.h"
 #include "Io/Io.h"
@@ -8,7 +9,7 @@
 class Bootstrapper
 {
 public:
-    Logger& logger;
+    spdlog::logger& logger;
     IWindow& window;
     OpenGLRenderer& renderer;
     ResourceService& resourceService;
@@ -17,7 +18,7 @@ public:
     SceneManager& sceneManager;
 
     Bootstrapper(
-            Logger& logger,
+            spdlog::logger& logger,
             MemoryStorageService& memoryStorageService,
             ResourceService& resourceService,
             IWindow& window,

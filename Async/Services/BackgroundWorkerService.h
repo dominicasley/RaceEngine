@@ -1,20 +1,20 @@
 #pragma once
 
-#include <Logger.h>
 #include <vector>
 #include <memory>
 #include <future>
+#include <spdlog/logger.h>
 
 #include "../Models/IAsyncTask.h"
 #include "../Models/AsyncTask.h"
 
 class BackgroundWorkerService
 {
-    Logger& logger;
+    spdlog::logger& logger;
     static std::vector<std::shared_ptr<ITask>> tasks;
 
 public:
-    BackgroundWorkerService(Logger& logger);
+    BackgroundWorkerService(spdlog::logger& logger);
 
     template <class T>
     static std::shared_ptr<AsyncTask<T>> registerTask(std::future<T> future)

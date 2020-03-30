@@ -1,10 +1,12 @@
-#include "Logger.h"
+#include <spdlog/async.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/basic_file_sink.h>
+
 #include "Engine.h"
-#include "Bootstrapper.h"
 
 Engine::Engine() :
         app(di::make_injector(
-                di::bind<Logger>
+                di::bind<spdlog::logger>
                         .to(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
                 di::bind<IWindow>
                         .in(di::singleton)

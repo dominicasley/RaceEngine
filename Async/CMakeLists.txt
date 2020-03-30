@@ -7,6 +7,4 @@ add_library (Async
         Services/BackgroundWorkerService.h
         Operators/ForkJoin.h Models/AsyncTask.h Models/ITask.h)
 
-target_include_directories(Async PUBLIC "../../Middleware/")
-target_link_directories(Async PRIVATE "../../Middleware/spdlog/lib")
 target_link_libraries(Async PRIVATE spdlog)

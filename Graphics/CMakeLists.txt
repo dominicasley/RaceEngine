@@ -36,23 +36,17 @@ add_library (Graphics
         "System/GlfwWindow.cpp"
         "System/GlfwWindow.h"
         "System/IWindow.h"
-        "Api/VulkanWindowRequiredExtensions.h")
+        "Api/VulkanWindowRequiredExtensions.h"
+        )
 
 target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
-target_include_directories(Graphics PUBLIC "../../Middleware/glfw/include/")
-target_include_directories(Graphics PUBLIC "../../Middleware/glm")
-target_include_directories(Graphics PUBLIC "../../Middleware/FreeImage")
-target_include_directories(Graphics PUBLIC "../../Middleware/tinygltf")
-target_include_directories(Graphics PUBLIC "../../Middleware/")
 target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
-target_link_directories(Graphics PUBLIC "../../Middleware/glfw/lib-vc2019/")
-target_link_directories(Graphics PUBLIC "../../Middleware/FreeImage")
-target_link_directories(Graphics PRIVATE "../../Middleware/spdlog/lib")
-target_link_directories(Graphics PUBLIC "../../Middleware/glew/lib")
-target_link_libraries(Graphics PRIVATE opengl32)
-target_link_libraries(Graphics PRIVATE FreeImage)
-target_link_libraries(Graphics PRIVATE glew32)
-target_link_libraries(Graphics PRIVATE spdlog)
-target_link_libraries(Graphics PRIVATE dwmapi)
+
+target_link_libraries(Graphics PUBLIC opengl32)
+target_link_libraries(Graphics PUBLIC spdlog)
+target_link_libraries(Graphics PUBLIC glm)
+target_link_libraries(Graphics PUBLIC gl3w)
+target_link_libraries(Graphics PUBLIC glfw)
+target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 
 # TODO: Add tests and install targets if needed.

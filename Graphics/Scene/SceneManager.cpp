@@ -4,7 +4,7 @@
 
 #include "SceneManager.h"
 
-SceneManager::SceneManager(Logger& logger) : logger(logger)
+SceneManager::SceneManager(spdlog::logger& logger) : logger(logger)
 {
 
 }

@@ -1,7 +1,6 @@
 #pragma once
 
-#include <Logger.h>
-#include <SigSlot.h>
+#include <spdlog/logger.h>
 #include <map>
 #include <string>
 #include <future>
@@ -12,13 +11,13 @@
 class ResourceService
 {
 private:
-    Logger& logger;
+    spdlog::logger& logger;
     MemoryStorageService& memoryStorageService;
     BackgroundWorkerService& backgroundWorkerService;
 
 public:
     explicit ResourceService(
-        Logger& logger,
+        spdlog::logger& logger,
         MemoryStorageService& memoryStorageService,
         BackgroundWorkerService& backgroundWorkerService);
     [[nodiscard]] tinygltf::Model* loadModel(std::string filePath);

@@ -1,13 +1,12 @@
 #pragma once
 
-#include <Logger.h>
+#include <spdlog/logger.h>
 #include <map>
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <tiny_gltf.h>
-
 
 typedef std::pair<unsigned int, std::string> UniformKey;
 typedef std::map<UniformKey, unsigned int> UniformPool;
@@ -26,7 +25,7 @@ class OpenGLRenderer
 {
 private:
     UniformPool uniformPool;
-    Logger& logger;
+    spdlog::logger& logger;
 
 private:
     std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos,
@@ -35,7 +34,7 @@ private:
     void bindModelNodes(std::vector<unsigned int>& vbos, tinygltf::Model* model, tinygltf::Node& node);
 
 public:
-    explicit OpenGLRenderer(Logger& logger);
+    explicit OpenGLRenderer(spdlog::logger& logger);
 
     bool init();
 

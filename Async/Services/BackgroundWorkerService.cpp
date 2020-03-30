@@ -3,7 +3,7 @@
 
 std::vector<std::shared_ptr<ITask>> BackgroundWorkerService::tasks;
 
-BackgroundWorkerService::BackgroundWorkerService(Logger& logger) : logger(logger)
+BackgroundWorkerService::BackgroundWorkerService(spdlog::logger& logger) : logger(logger)
 {
 }
 

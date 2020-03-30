@@ -2,7 +2,7 @@
 #include "GlfwWindow.h"
 #include <Dwmapi.h>
 
-GLFWWindow::GLFWWindow(Logger& logger) : logger(logger)
+GLFWWindow::GLFWWindow(spdlog::logger& logger) : logger(logger)
 {
     if (!glfwInit())
     {
@@ -88,7 +88,7 @@ void GLFWWindow::makeContextCurrent()
 void GLFWWindow::windowResized(GLFWwindow *window, int width, int height)
 {
     auto caller = reinterpret_cast<GLFWWindow*>(glfwGetWindowUserPointer(window));
-    caller->onWindowResize(width, height);
+    caller->windowResize.next(std::make_tuple(width, height));
 }
 
 bool GLFWWindow::getKeyPressed(int key) const

@@ -6,7 +6,7 @@
 #include <mutex>
 #include <thread>
 
-MemoryStorageService::MemoryStorageService(Logger& logger)
+MemoryStorageService::MemoryStorageService(spdlog::logger& logger) : logger(logger)
 {
 
 }

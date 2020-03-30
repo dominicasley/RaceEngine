@@ -4,18 +4,19 @@
 
 #pragma once
 
+#include <spdlog/spdlog.h>
 #include <map>
-#include <Logger.h>
+
 #include "Scene.h"
 
 class SceneManager
 {
 private:
-    Logger& logger;
+    spdlog::logger& logger;
     std::map<std::string, std::unique_ptr<Scene>> scenes;
 
 public:
-    explicit SceneManager(Logger& logger);
+    explicit SceneManager(spdlog::logger& logger);
 
     [[nodiscard]] const std::map<std::string, std::unique_ptr<Scene>>& getScenes();
     [[nodiscard]] Scene* getScene(const std::string& name);

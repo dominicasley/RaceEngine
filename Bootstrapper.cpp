@@ -7,7 +7,7 @@
 #include <utility>
 
 Bootstrapper::Bootstrapper(
-    Logger& logger,
+    spdlog::logger& logger,
     MemoryStorageService& memoryStorageService,
     ResourceService& resourceService,
     IWindow& window,
@@ -24,7 +24,8 @@ Bootstrapper::Bootstrapper(
 {
     renderer.init();
 
-    window.onWindowResize.connect([&, this](int width, int height) {
+    window.windowResize.subscribe([&, this](auto size) {
+        const auto& [width, height] = size;
         logger.info("Window Resized: {}px x {}px", width, height);
         renderer.setViewport(width, height);
 
