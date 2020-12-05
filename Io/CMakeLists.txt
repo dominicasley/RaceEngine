@@ -4,7 +4,8 @@ add_library (Io
         "Services/MemoryStorageService.cpp"
         "Services/MemoryStorageService.h"
         "Services/ResourceService.cpp"
-        "Services/ResourceService.h")
+        "Services/ResourceService.h"
+        Utility/AccessorUtility.h)
 
 
 target_include_directories(Io PUBLIC "../Async/")

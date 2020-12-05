@@ -14,12 +14,11 @@ ResourceService::ResourceService(
 {
 }
 
-tinygltf::Model *ResourceService::loadModel(std::string filePath)
+tinygltf::Model* ResourceService::loadModel(std::string filePath)
 {
     if (memoryStorageService.modelExists(filePath))
     {
         logger.info("Model {} already loaded in memory", filePath);
-
         return memoryStorageService.getModel(filePath);
     }
 
@@ -42,7 +41,6 @@ tinygltf::Model *ResourceService::loadModel(std::string filePath)
     else
     {
         logger.error("Unknown extension {} when loading model with path {}", fileExtension, filePath);
-
         return nullptr;
     }
 
@@ -53,6 +51,7 @@ tinygltf::Model *ResourceService::loadModel(std::string filePath)
     else
     {
         logger.error("Failed to load model: {}", filePath);
+        return nullptr;
     }
 
     if (!warning.empty())
@@ -86,7 +85,8 @@ const Observable<tinygltf::Model*>& ResourceService::loadModelAsync(std::string 
 {
     logger.info("Loading model: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(std::async(std::launch::async, &ResourceService::loadModel, this, filePath))
+    return BackgroundWorkerService::registerTask(
+        std::async(std::launch::async, &ResourceService::loadModel, this, filePath))
         ->asObservable();
 }
 
@@ -94,6 +94,7 @@ const Observable<std::string>& ResourceService::loadTextFileAsync(std::string fi
 {
     logger.info("Loading file: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(std::async(std::launch::async, &ResourceService::loadTextFile, this, filePath))
+    return BackgroundWorkerService::registerTask(
+        std::async(std::launch::async, &ResourceService::loadTextFile, this, filePath))
         ->asObservable();
 }

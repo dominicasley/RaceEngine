@@ -4,43 +4,55 @@
 
 #include "Engine.h"
 
-Engine::Engine() :
-        app(di::make_injector(
-                di::bind<spdlog::logger>
-                        .to(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
-                di::bind<IWindow>
-                        .in(di::singleton)
-                        .to<GLFWWindow>(),
-                di::bind<VulkanRenderer>
-                        .in(di::singleton)
-                        .to<VulkanRenderer>(),
-                di::bind<OpenGLRenderer>
-                        .in(di::singleton)
-                        .to<OpenGLRenderer>(),
-                di::bind<BackgroundWorkerService>
-                        .in(di::singleton)
-                        .to<BackgroundWorkerService>(),
-                di::bind<MemoryStorageService>
-                        .in(di::singleton)
-                        .to<MemoryStorageService>(),
-                di::bind<ResourceService>
-                        .to<ResourceService>(),
-                di::bind<SceneManager>
-                        .in(di::singleton)
-                        .to<SceneManager>()).create<Bootstrapper>()),
-        window(app.window),
-        renderer(app.renderer),
-        resourceService(app.resourceService),
-        memoryStorageService(app.memoryStorageService),
-        backgroundWorkerService(app.backgroundWorkerService),
-        sceneManager(app.sceneManager) {
+Engine::Engine() : app(di::make_injector(
+    di::bind<spdlog::logger>
+        .to(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
+    di::bind<IWindow>
+        .in(di::singleton)
+        .to<GLFWWindow>(),
+    di::bind<VulkanRenderer>
+        .in(di::singleton)
+        .to<VulkanRenderer>(),
+    di::bind<OpenGLRenderer>
+        .in(di::singleton)
+        .to<OpenGLRenderer>(),
+    di::bind<BackgroundWorkerService>
+        .in(di::singleton)
+        .to<BackgroundWorkerService>(),
+    di::bind<MemoryStorageService>
+        .in(di::singleton)
+        .to<MemoryStorageService>(),
+    di::bind<ResourceService>
+        .to<ResourceService>(),
+    di::bind<RenderableEntityService>
+        .to<RenderableEntityService>(),
+    di::bind<AnimationService>
+        .to<AnimationService>(),
+    di::bind<SceneService>
+        .to<SceneService>(),
+    di::bind<SceneManagerService>
+        .in(di::singleton)
+        .to<SceneManagerService>()).create<Bootstrapper>()),
+                   window(app.window),
+                   renderer(app.renderer),
+                   resource(app.resourceService),
+                   memoryStorage(app.memoryStorageService),
+                   backgroundWorker(app.backgroundWorkerService),
+                   sceneManager(app.sceneManager),
+                   scene(app.sceneService),
+                   entity(app.renderableEntityService),
+                   camera(app.cameraService)
+{
+
 }
 
-bool Engine::running() const {
+bool Engine::running() const
+{
     return !app.window.shouldClose();
 }
 
-void Engine::step() {
+void Engine::step()
+{
     app.step();
     app.draw();
 }

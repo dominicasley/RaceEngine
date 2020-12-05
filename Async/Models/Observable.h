@@ -5,6 +5,7 @@
 #include <future>
 #include <iostream>
 #include <utility>
+#include <spdlog/spdlog.h>
 #include "IAsyncTask.h"
 
 template <class T>

@@ -1,22 +1,17 @@
-//
-// Created by Dominic on 2/01/2020.
-//
-
 #pragma once
 
 #include <spdlog/spdlog.h>
 #include <map>
+#include "../Models/Scene/Scene.h"
 
-#include "Scene.h"
-
-class SceneManager
+class SceneManagerService
 {
 private:
     spdlog::logger& logger;
     std::map<std::string, std::unique_ptr<Scene>> scenes;
 
 public:
-    explicit SceneManager(spdlog::logger& logger);
+    explicit SceneManagerService(spdlog::logger& logger);
 
     [[nodiscard]] const std::map<std::string, std::unique_ptr<Scene>>& getScenes();
     [[nodiscard]] Scene* getScene(const std::string& name);

@@ -20,8 +20,6 @@ public:
 
     template<class... Ts>
     constexpr static std::tuple<Ts...> join(const Observable<Ts>& ... observables) {
-        return std::apply([&](auto& ...e) {
-            return std::make_tuple(e.await()...);
-        }, std::make_tuple(observables...));
+        return std::make_tuple(observables.await()...);
     }
 };

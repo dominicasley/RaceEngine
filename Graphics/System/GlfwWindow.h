@@ -8,21 +8,33 @@
 #include <spdlog/logger.h>
 
 #include "IWindow.h"
+#include "WindowState.h"
 
 class GLFWWindow : public IWindow
 {
 private:
+    mutable double _delta;
+    mutable double _frameTime;
+    mutable double _avgFrameRate;
+    mutable int _frameCount;
+
+    WindowState windowState;
     spdlog::logger& logger;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
+    static void cursorPositionChanged(GLFWwindow* window, double x, double y);
 
 public:
     explicit GLFWWindow(spdlog::logger& logger);
     ~GLFWWindow();
-    [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
-    [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     void makeContextCurrent() override;
     void swapBuffers() const override;
+    void setMousePosition(int x, int y) override ;
+    [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
+    [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
-    [[nodiscard]] bool getKeyPressed(int key) const override;
+    [[nodiscard]] bool keyPressed(int key) const override;
+    [[nodiscard]] const WindowState& state() const override;
+    [[nodiscard]] std::tuple<double, double> mousePosition() override;
+    [[nodiscard]] float delta() const override;
 };

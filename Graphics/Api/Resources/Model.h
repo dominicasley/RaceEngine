@@ -3,7 +3,7 @@
 #include <map>
 #include <memory>
 #include "Mesh.h"
-#include "Skeleton.h"
+#include "../../Models/Scene/Skeleton.h"
 #include "Animation.h"
 
 class Model

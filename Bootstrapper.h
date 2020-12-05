@@ -15,16 +15,22 @@ public:
     ResourceService& resourceService;
     MemoryStorageService& memoryStorageService;
     BackgroundWorkerService& backgroundWorkerService;
-    SceneManager& sceneManager;
+    SceneManagerService& sceneManager;
+    SceneService& sceneService;
+    RenderableEntityService& renderableEntityService;
+    CameraService& cameraService;
 
     Bootstrapper(
-            spdlog::logger& logger,
-            MemoryStorageService& memoryStorageService,
-            ResourceService& resourceService,
-            IWindow& window,
-            OpenGLRenderer& renderer,
-            BackgroundWorkerService& backgroundWorkerService,
-            SceneManager& sceneManager);
+        spdlog::logger& logger,
+        MemoryStorageService& memoryStorageService,
+        ResourceService& resourceService,
+        IWindow& window,
+        OpenGLRenderer& renderer,
+        BackgroundWorkerService& backgroundWorkerService,
+        SceneManagerService& sceneManager,
+        SceneService& sceneService,
+        RenderableEntityService& renderableEntityService,
+        CameraService& cameraService);
 
     void step();
     void draw();

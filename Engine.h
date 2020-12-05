@@ -5,17 +5,21 @@
 
 namespace di = boost::di;
 
-class Engine {
+class Engine
+{
 private:
     Bootstrapper app;
 
 public:
     IWindow& window;
     OpenGLRenderer& renderer;
-    ResourceService& resourceService;
-    MemoryStorageService& memoryStorageService;
-    BackgroundWorkerService& backgroundWorkerService;
-    SceneManager& sceneManager;
+    ResourceService& resource;
+    MemoryStorageService& memoryStorage;
+    BackgroundWorkerService& backgroundWorker;
+    SceneManagerService& sceneManager;
+    SceneService& scene;
+    RenderableEntityService& entity;
+    CameraService& camera;
 
     Engine();
     [[nodiscard]] bool running() const;

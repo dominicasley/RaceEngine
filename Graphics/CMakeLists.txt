@@ -5,39 +5,43 @@ cmake_minimum_required (VERSION 3.8)
 
 # Add source to this project's executable.
 add_library (Graphics
-        "Api/VulkanRenderer.cpp"
-        "Api/VulkanRenderer.h"
-        "Api/OpenGLRenderer.cpp"
-        "Api/OpenGLRenderer.h"
-        "Api/Resources/Animation.h"
-        "Api/Resources/Material.cpp"
-        "Api/Resources/Material.h"
-        "Api/Resources/Mesh.h"
-        "Api/Resources/Model.cpp"
-        "Api/Resources/Model.h"
-        "Api/Resources/RenderableEntityDesc.h"
-        "Api/Resources/Shader.h"
-        "Api/Resources/Skeleton.cpp"
-        "Api/Resources/Skeleton.h"
-        "Api/Resources/Texture.cpp"
-        "Api/Resources/Texture.h"
-        "Api/Resources/Uniform.h"
-        "Api/Resources/UniformDataType.h"
-        "Scene/Camera.cpp"
-        "Scene/Camera.h"
-        "Scene/RenderableEntity.cpp"
-        "Scene/RenderableEntity.h"
-        "Scene/Light.cpp"
-        "Scene/Light.h"
-        "Scene/Scene.cpp"
-        "Scene/Scene.h"
-        "Scene/SceneManager.cpp"
-        "Scene/SceneManager.h"
-        "System/GlfwWindow.cpp"
-        "System/GlfwWindow.h"
-        "System/IWindow.h"
-        "Api/VulkanWindowRequiredExtensions.h"
-        )
+        Api/VulkanRenderer.cpp
+        Api/VulkanRenderer.h
+        Api/OpenGLRenderer.cpp
+        Api/OpenGLRenderer.h
+        Api/Resources/Animation.h
+        Api/Resources/Material.cpp
+        Api/Resources/Material.h
+        Api/Resources/Mesh.h
+        Api/Resources/Model.cpp
+        Api/Resources/Model.h
+        Api/Resources/RenderableEntityDesc.h
+        Api/Resources/Shader.h
+        Models/Scene/Skeleton.h
+        Api/Resources/Texture.cpp
+        Api/Resources/Texture.h
+        Api/Resources/Uniform.h
+        Api/Resources/UniformDataType.h
+        Models/Scene/Camera.h
+        Models/Scene/RenderableEntity.h
+        Models/Scene/Light.h
+        Models/Scene/Scene.h
+        Services/SceneManagerService.cpp
+        Services/SceneManagerService.h
+        System/GlfwWindow.cpp
+        System/GlfwWindow.h
+        System/IWindow.h
+        Api/VulkanWindowRequiredExtensions.h
+        System/WindowState.h
+        Services/RenderableEntityService.cpp
+        Services/RenderableEntityService.h
+        Services/SceneService.cpp
+        Services/SceneService.h
+        Services/CameraService.cpp
+        Services/CameraService.h
+        Models/Scene/Joint.h
+        Services/AnimationService.cpp
+        Services/AnimationService.h)
 
 target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
@@ -47,6 +51,9 @@ target_link_libraries(Graphics PUBLIC spdlog)
 target_link_libraries(Graphics PUBLIC glm)
 target_link_libraries(Graphics PUBLIC gl3w)
 target_link_libraries(Graphics PUBLIC glfw)
+
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
+target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)
+
 
 # TODO: Add tests and install targets if needed.

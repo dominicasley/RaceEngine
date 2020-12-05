@@ -13,14 +13,20 @@ Bootstrapper::Bootstrapper(
     IWindow& window,
     OpenGLRenderer& renderer,
     BackgroundWorkerService& backgroundWorkerService,
-    SceneManager& sceneManager) :
+    SceneManagerService& sceneManager,
+    SceneService& sceneService,
+    RenderableEntityService& renderableEntityService,
+    CameraService& cameraService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
     window(window),
     renderer(renderer),
     backgroundWorkerService(backgroundWorkerService),
-    sceneManager(sceneManager)
+    sceneManager(sceneManager),
+    sceneService(sceneService),
+    renderableEntityService(renderableEntityService),
+    cameraService(cameraService)
 {
     renderer.init();
 
@@ -29,9 +35,9 @@ Bootstrapper::Bootstrapper(
         logger.info("Window Resized: {}px x {}px", width, height);
         renderer.setViewport(width, height);
 
-        for (auto& camera : sceneManager.getScene("game")->getCameras())
+        for (auto& camera : sceneManager.getScene("game")->cameras)
         {
-            camera->setAspectRatio(static_cast<float>(width) / static_cast<float>(height));
+            cameraService.setAspectRatio(*camera, static_cast<float>(width) / static_cast<float>(height));
         }
     });
 }
@@ -43,6 +49,6 @@ void Bootstrapper::step()
 
 void Bootstrapper::draw()
 {
-    renderer.draw(sceneManager.getScene("game"));
+    renderer.draw(*sceneManager.getScene("game"));
     window.swapBuffers();
 }

@@ -26,7 +26,7 @@ public:
         if (future.valid() && future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
         {
             value = future.get();
-            complete = true;
+            this->complete = true;
             observer.next(value);
         }
     }
@@ -37,7 +37,7 @@ public:
 
         if (future.valid()) {
             value = future.get();
-            complete = true;
+            this->complete = true;
             observer.next(value);
         }
 
