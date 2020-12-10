@@ -107,11 +107,11 @@ void OpenGLRenderer::drawMesh(tinygltf::Model* model, tinygltf::Mesh& mesh)
     }
 }
 
-void OpenGLRenderer::drawModelNodes(RenderableEntity& entity, tinygltf::Model* model, tinygltf::Node& node)
+void OpenGLRenderer::drawModelNodes(RenderableEntity* entity, tinygltf::Model* model, tinygltf::Node& node)
 {
     if (node.mesh != -1)
     {
-        const auto joints = renderableEntityService.joints(entity, model, node);
+        const auto joints = renderableEntityService.joints(entity, node);
         setProgramUniform(1, "jointTransformationMatrixes", joints);
         setProgramUniform(1, "animated", !joints.empty());
 
@@ -136,7 +136,7 @@ void OpenGLRenderer::draw(const Scene& scene)
 
     for (auto& entity : scene.entities)
     {
-        const auto entityModelMatrix = renderableEntityService.modelMatrix(*entity);
+        const auto entityModelMatrix = renderableEntityService.modelMatrix(entity.get());
 
 
         setProgramUniform(1, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
@@ -154,7 +154,7 @@ void OpenGLRenderer::draw(const Scene& scene)
 
         for (int node : currentScene.nodes)
         {
-            drawModelNodes(*entity, model, model->nodes[node]);
+            drawModelNodes(entity.get(), model, model->nodes[node]);
         }
     }
 }

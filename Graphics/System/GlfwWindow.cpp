@@ -86,15 +86,16 @@ bool GLFWWindow::shouldClose() const
 
 void GLFWWindow::swapBuffers() const
 {
-    _delta = (glfwGetTime() - _frameTime);
-    _frameTime = glfwGetTime();
+    const auto currentTime = glfwGetTime();
+    _delta = (currentTime - _frameTime);
+    _frameTime = currentTime;
     _frameCount++;
 
-    if (glfwGetTime() - _avgFrameRate > 60)
+    if (currentTime - _avgFrameRate > 60)
     {
         logger.info("Last Frame Time: {}s", _delta);
-        logger.info("Average FPS: {}", _frameCount / 10);
-        _avgFrameRate = glfwGetTime();
+        logger.info("Average FPS: {}", _frameCount / (currentTime - _avgFrameRate));
+        _avgFrameRate = currentTime;
         _frameCount = 0;
     }
 

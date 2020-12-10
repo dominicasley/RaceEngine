@@ -16,11 +16,17 @@ add_subdirectory(vendor/gl3w vendor/gl3w)
 add_subdirectory(vendor/glm vendor/glm)
 add_subdirectory(vendor/glfw vendor/glfw)
 
+set(ozz_build_samples OFF)
+set(ozz_build_howtos OFF)
+set(ozz_build_gltf OFF)
+add_subdirectory(vendor/ozz-animation vendor/ozz-animation)
+
 target_link_libraries(Engine PUBLIC spdlog)
 target_link_libraries(Engine PRIVATE opengl32)
 target_link_libraries(Engine PUBLIC glm)
 target_link_libraries(Engine PRIVATE gl3w)
 target_link_libraries(Engine PUBLIC glfw)
+
 
 target_include_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")

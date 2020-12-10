@@ -47,7 +47,7 @@ public:
     bool init();
     void draw(const Scene&);
     void drawMesh(tinygltf::Model* model, tinygltf::Mesh& mesh);
-    void drawModelNodes(RenderableEntity& entity, tinygltf::Model* model, tinygltf::Node& node);
+    void drawModelNodes(RenderableEntity* entity, tinygltf::Model* model, tinygltf::Node& node);
     void bindMaterial(const Material*);
     void upload(tinygltf::Model* model);
     unsigned int createShaderObject(const Shader&);

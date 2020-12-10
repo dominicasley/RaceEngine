@@ -11,6 +11,6 @@
 
 AnimationService::AnimationService(spdlog::logger& logger)
 {
-    ozz::io::File file("", "rb");
+
 }
 

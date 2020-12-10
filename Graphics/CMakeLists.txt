@@ -51,6 +51,8 @@ target_link_libraries(Graphics PUBLIC spdlog)
 target_link_libraries(Graphics PUBLIC glm)
 target_link_libraries(Graphics PUBLIC gl3w)
 target_link_libraries(Graphics PUBLIC glfw)
+target_link_libraries(Graphics PUBLIC ozz_animation)
+target_link_libraries(Graphics PUBLIC ozz_base)
 
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)
