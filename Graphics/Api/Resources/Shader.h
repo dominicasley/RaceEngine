@@ -2,7 +2,7 @@
 
 #include <string>
 
-class Shader
+struct Shader
 {
 public:
     std::string vertexShaderSource;
@@ -11,7 +11,4 @@ public:
     std::string tessellationEvaluationShaderSource;
     std::string computeShaderSource;
     std::string geometryShaderSource;
-
-    explicit Shader()
-    {};
 };

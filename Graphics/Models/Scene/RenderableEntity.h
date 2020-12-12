@@ -20,11 +20,10 @@
 struct RenderableEntity
 {
     RenderableEntity* parent;
-    tinygltf::Model* model;
+    Model* model;
     ozz::animation::Skeleton* skeleton;
     ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms;
     ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;
-    std::vector<glm::mat4> inverseBindPoseTransforms;
     std::vector<ozz::animation::Animation*> animations;
     glm::mat4 modelMatrix;
     glm::mat4 rotation;

@@ -24,6 +24,8 @@ Engine::Engine() : app(di::make_injector(
         .to<MemoryStorageService>(),
     di::bind<ResourceService>
         .to<ResourceService>(),
+    di::bind<GLTFService>
+        .to<GLTFService>(),
     di::bind<RenderableEntityService>
         .to<RenderableEntityService>(),
     di::bind<AnimationService>

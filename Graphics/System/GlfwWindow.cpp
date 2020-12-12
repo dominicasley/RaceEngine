@@ -91,7 +91,7 @@ void GLFWWindow::swapBuffers() const
     _frameTime = currentTime;
     _frameCount++;
 
-    if (currentTime - _avgFrameRate > 60)
+    if (currentTime - _avgFrameRate > 15)
     {
         logger.info("Last Frame Time: {}s", _delta);
         logger.info("Average FPS: {}", _frameCount / (currentTime - _avgFrameRate));

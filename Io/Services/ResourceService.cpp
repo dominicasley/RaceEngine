@@ -1,6 +1,5 @@
 #include "ResourceService.h"
 
-#include <utility>
 #include <fstream>
 #include <ozz/base/io/archive.h>
 
@@ -8,10 +7,12 @@
 ResourceService::ResourceService(
     spdlog::logger& logger,
     MemoryStorageService& memoryStorageService,
-    BackgroundWorkerService& backgroundWorkerService) :
+    BackgroundWorkerService& backgroundWorkerService,
+    GLTFService& gltfService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
-    backgroundWorkerService(backgroundWorkerService)
+    backgroundWorkerService(backgroundWorkerService),
+    gltfService(gltfService)
 {
 }
 
@@ -29,7 +30,7 @@ std::string ResourceService::loadTextFile(const std::string& filePath)
     return output;
 }
 
-tinygltf::Model* ResourceService::loadModel(const std::string& filePath)
+Model* ResourceService::loadModel(const std::string& filePath)
 {
     if (memoryStorageService.models.exists(filePath))
     {
@@ -37,49 +38,23 @@ tinygltf::Model* ResourceService::loadModel(const std::string& filePath)
         return memoryStorageService.models.get(filePath);
     }
 
-    tinygltf::TinyGLTF gltfLoader;
-
-    bool result;
-    std::string error;
-    std::string warning;
-    tinygltf::Model model;
-
+    std::optional<Model> model;
     auto fileExtension = filePath.substr(filePath.find_last_of('.') + 1);
-    if (fileExtension == "gltf")
+    if (fileExtension == "gltf" || fileExtension == "glb")
     {
-        result = gltfLoader.LoadASCIIFromFile(&model, &error, &warning, filePath);
-    }
-    else if (fileExtension == "glb")
-    {
-        result = gltfLoader.LoadBinaryFromFile(&model, &error, &warning, filePath);
+        model = gltfService.loadModelFromFile(filePath);
     }
     else
     {
-        logger.error("Unknown extension {} when loading model with path {}", fileExtension, filePath);
         return nullptr;
     }
 
-    if (result)
+    if (!model.has_value())
     {
-        logger.info("Loaded model: {}", filePath);
-    }
-    else
-    {
-        logger.error("Failed to load model: {}", filePath);
         return nullptr;
     }
 
-    if (!warning.empty())
-    {
-        logger.warn(warning);
-    }
-
-    if (!error.empty())
-    {
-        logger.error(error);
-    }
-
-    return memoryStorageService.models.add(filePath, model);
+    return memoryStorageService.models.add(filePath, model.value());
 }
 
 ozz::animation::Skeleton* ResourceService::loadSkeleton(const std::string& filePath)
@@ -146,7 +121,7 @@ const Observable<std::string>& ResourceService::loadTextFileAsync(std::string fi
         ->asObservable();
 }
 
-const Observable<tinygltf::Model*>& ResourceService::loadModelAsync(std::string filePath)
+const Observable<Model*>& ResourceService::loadModelAsync(std::string filePath)
 {
     logger.info("Loading model: {}", filePath);
 

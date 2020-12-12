@@ -32,6 +32,6 @@ public:
     void setAnimation(RenderableEntity* entity, const std::string& animationName) const;
     void setAnimation(RenderableEntity* entity, unsigned int animationIndex) const;
 
-    [[nodiscard]] std::vector<glm::mat4> joints(RenderableEntity* entity, tinygltf::Node &node) const;
+    [[nodiscard]] std::vector<glm::mat4> joints(RenderableEntity* entity) const;
     [[nodiscard]] const glm::mat4& modelMatrix(RenderableEntity* entity) const;
 };

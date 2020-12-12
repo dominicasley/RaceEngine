@@ -6,21 +6,17 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <tiny_gltf.h>
 #include "../Services/SceneService.h"
 
 typedef std::pair<unsigned int, std::string> UniformKey;
 typedef std::map<UniformKey, unsigned int> UniformPool;
 
 struct Scene;
-
-class Material;
-
+struct Material;
 struct Mesh;
-
-class Shader;
-
-class Texture;
+struct Model;
+struct Shader;
+struct Texture;
 
 class OpenGLRenderer
 {
@@ -32,10 +28,7 @@ private:
     CameraService& cameraService;
 
 private:
-    std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos,
-                                   tinygltf::Model* model, tinygltf::Mesh& mesh);
-
-    void bindModelNodes(std::vector<unsigned int>& vbos, tinygltf::Model* model, tinygltf::Node& node);
+    std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh);
 
 public:
     explicit OpenGLRenderer(
@@ -46,12 +39,11 @@ public:
 
     bool init();
     void draw(const Scene&);
-    void drawMesh(tinygltf::Model* model, tinygltf::Mesh& mesh);
-    void drawModelNodes(RenderableEntity* entity, tinygltf::Model* model, tinygltf::Node& node);
-    void bindMaterial(const Material*);
-    void upload(tinygltf::Model* model);
+    void drawMesh(const Mesh& mesh);
+    void bindMaterial(const Material* material);
+    void upload(Model* model);
     unsigned int createShaderObject(const Shader&);
-    unsigned int createTexture(const tinygltf::Texture& texture, tinygltf::Image& image);
+    unsigned int createTexture(Texture* texture) const;
     void setViewport(int width, int height);
 
     // OGL SPECIFIC

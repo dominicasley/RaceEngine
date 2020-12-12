@@ -2,18 +2,12 @@
 #include <gl/gl3w.h>
 #include <vector>
 #include "Resources/RenderableEntityDesc.h"
-#include "Resources/Mesh.h"
 #include "Resources/Shader.h"
 #include "../Models/Scene/Scene.h"
 #include "../Models/Scene/RenderableEntity.h"
 #include "../Models/Scene/Light.h"
 #include "../Models/Scene/Camera.h"
-
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-
-#include <tiny_gltf.h>
+#include "../Models/Scene/Model.h"
 
 OpenGLRenderer::OpenGLRenderer(
     spdlog::logger& logger,
@@ -52,75 +46,60 @@ bool OpenGLRenderer::init()
     return true;
 }
 
-void OpenGLRenderer::drawMesh(tinygltf::Model* model, tinygltf::Mesh& mesh)
+void OpenGLRenderer::drawMesh(const Mesh& mesh)
 {
-    for (const auto& primitive : mesh.primitives)
+    for (const auto& primitive : mesh.meshPrimitives)
     {
-        const auto material = model->materials[primitive.material];
-
-        if (model->textures.size() > material.pbrMetallicRoughness.baseColorTexture.index)
+        if (primitive.material.albedo.has_value() &&
+            primitive.material.albedo.value()->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(
                 GL_TEXTURE_2D,
-                static_cast<GLuint>(model->textures[material.pbrMetallicRoughness.baseColorTexture.index].extras.GetNumberAsInt()));
+                static_cast<GLuint>(primitive.material.albedo.value()->gpuResourceId.value()));
         }
 
-        if (model->textures.size() > material.normalTexture.index)
+        if (primitive.material.normal.has_value() &&
+            primitive.material.normal.value()->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(
                 GL_TEXTURE_2D,
-                static_cast<GLuint>(model->textures[material.normalTexture.index].extras.GetNumberAsInt()));
+                static_cast<GLuint>(primitive.material.normal.value()->gpuResourceId.value()));
         }
 
-        if (model->textures.size() > material.pbrMetallicRoughness.metallicRoughnessTexture.index)
+        if (primitive.material.metallicRoughness.has_value() &&
+            primitive.material.metallicRoughness.value()->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(
                 GL_TEXTURE_2D,
-                static_cast<GLuint>(model->textures[material.pbrMetallicRoughness.metallicRoughnessTexture.index].extras.GetNumberAsInt()));
+                static_cast<GLuint>(primitive.material.metallicRoughness.value()->gpuResourceId.value()));
         }
 
-        if (model->textures.size() > material.emissiveTexture.index)
+        if (primitive.material.emissive.has_value() &&
+            primitive.material.emissive.value()->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE3);
             glBindTexture(
                 GL_TEXTURE_2D,
-                static_cast<GLuint>(model->textures[material.emissiveTexture.index].extras.GetNumberAsInt()));
+                static_cast<GLuint>(primitive.material.emissive.value()->gpuResourceId.value()));
         }
 
-        if (model->textures.size() > material.occlusionTexture.index)
+        if (primitive.material.occlusion.has_value() &&
+            primitive.material.occlusion.value()->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE4);
             glBindTexture(
                 GL_TEXTURE_2D,
-                static_cast<GLuint>(model->textures[material.occlusionTexture.index].extras.GetNumberAsInt()));
+                static_cast<GLuint>(primitive.material.occlusion.value()->gpuResourceId.value()));
         }
 
-        tinygltf::Accessor indexAccessor = model->accessors[primitive.indices];
-
         glDrawElements(primitive.mode,
-                       static_cast<GLsizei>(indexAccessor.count),
-                       indexAccessor.componentType,
-                       (void*) (indexAccessor.byteOffset));
-    }
-}
-
-void OpenGLRenderer::drawModelNodes(RenderableEntity* entity, tinygltf::Model* model, tinygltf::Node& node)
-{
-    if (node.mesh != -1)
-    {
-        const auto joints = renderableEntityService.joints(entity, node);
-        setProgramUniform(1, "jointTransformationMatrixes", joints);
-        setProgramUniform(1, "animated", !joints.empty());
-
-        drawMesh(model, model->meshes[node.mesh]);
-    }
-
-    for (int i : node.children)
-    {
-        drawModelNodes(entity, model, model->nodes[i]);
+                       static_cast<GLsizei>(primitive.elementCount),
+                       primitive.indicesType == VertexIndicesType::UnsignedInt ? GL_UNSIGNED_INT :
+                       primitive.indicesType == VertexIndicesType::UnsignedShort ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
+                       primitive.indicesOffset);
     }
 }
 
@@ -138,23 +117,21 @@ void OpenGLRenderer::draw(const Scene& scene)
     {
         const auto entityModelMatrix = renderableEntityService.modelMatrix(entity.get());
 
+        const auto joints = renderableEntityService.joints(entity.get());
+        setProgramUniform(1, "jointTransformationMatrixes", joints);
+        setProgramUniform(1, "animated", !joints.empty());
 
         setProgramUniform(1, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
         setProgramUniform(1, "localToWorld4x4Matrix", entityModelMatrix);
         setProgramUniform(1, "localToWorld3x3Matrix", glm::mat3(entityModelMatrix));
-
-
         setProgramUniform(1, "normalMatrix",
                           glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
 
         auto model = entity->model;
-        glBindVertexArray(static_cast<GLuint>(model->extras.GetNumberAsInt()));
-
-        const auto& currentScene = model->scenes[model->defaultScene];
-
-        for (int node : currentScene.nodes)
+        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
+        for (const auto& mesh : entity->model->meshes)
         {
-            drawModelNodes(entity.get(), model, model->nodes[node]);
+            drawMesh(mesh);
         }
     }
 }
@@ -176,112 +153,54 @@ void OpenGLRenderer::bindMaterial(const Material* material)
     // }
 }
 
-std::vector<unsigned int>& OpenGLRenderer::bindMesh(
-    std::vector<unsigned int>& vbos,
-    tinygltf::Model* model,
-    tinygltf::Mesh& mesh)
+std::vector<unsigned int>& OpenGLRenderer::bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh)
 {
-    for (const auto& bufferView : model->bufferViews)
+    for (const auto& buffer : mesh.meshBuffers)
     {
-        if (bufferView.target == 0)
+        if (buffer.target == 0)
         {
             logger.warn("bufferView.target is zero. skipping buffer view.");
             continue;
         }
 
-        tinygltf::Buffer buffer = model->buffers[bufferView.buffer];
-
         GLuint vbo;
         glGenBuffers(1, &vbo);
         vbos.push_back(vbo);
 
-        glBindBuffer(bufferView.target, vbo);
-        glBufferData(bufferView.target, bufferView.byteLength,
-                     buffer.data.data() + bufferView.byteOffset, GL_STATIC_DRAW);
+        glBindBuffer(buffer.target, vbo);
+        glBufferData(buffer.target, buffer.length, buffer.data.data() + buffer.offset, GL_STATIC_DRAW);
     }
 
-    for (const auto& primitive : mesh.primitives)
+    for (const auto& primitive : mesh.meshPrimitives)
     {
-        for (auto& attrib : primitive.attributes)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[primitive.bufferIndex]);
+
+        if (primitive.attributeType.has_value())
         {
-            auto accessor = model->accessors[attrib.second];
-            auto byteStride = accessor.ByteStride(model->bufferViews[accessor.bufferView]);
-
-            glBindBuffer(GL_ARRAY_BUFFER, vbos[accessor.bufferView]);
-
-            int size = 1;
-            if (accessor.type != TINYGLTF_TYPE_SCALAR)
-            {
-                size = accessor.type;
-            }
-
-            int vertexAttribute = -1;
-            if (attrib.first == "POSITION")
-            {
-                vertexAttribute = 0;
-            }
-            else if (attrib.first == "TEXCOORD_0")
-            {
-                vertexAttribute = 1;
-            }
-            else if (attrib.first == "NORMAL")
-            {
-                vertexAttribute = 2;
-            }
-            else if (attrib.first == "JOINTS_0")
-            {
-                vertexAttribute = 3;
-            }
-            else if (attrib.first == "WEIGHTS_0")
-            {
-                vertexAttribute = 4;
-            }
-
-            if (vertexAttribute > -1)
-            {
-                glEnableVertexAttribArray(vertexAttribute);
-                glVertexAttribPointer(vertexAttribute, size, accessor.componentType,
-                                      accessor.normalized ? GL_TRUE : GL_FALSE,
-                                      byteStride, (void*) (accessor.byteOffset));
-            }
+            glEnableVertexAttribArray(static_cast<GLuint>(primitive.attributeType.value()));
+            glVertexAttribPointer(static_cast<GLuint>(primitive.attributeType.value()),
+                                  primitive.size,
+                                  primitive.componentType,
+                                  primitive.normalized ? GL_TRUE : GL_FALSE,
+                                  primitive.stride,
+                                  reinterpret_cast<void*>(primitive.offset));
         }
-    }
-
-    for (auto& texture : model->textures)
-    {
-        tinygltf::Image& image = model->images[texture.source];
-        auto textureId = static_cast<int>(createTexture(texture, image));
-        texture.extras = tinygltf::Value(textureId);
     }
 
     return vbos;
 }
 
-void OpenGLRenderer::bindModelNodes(std::vector<unsigned int>& vbos, tinygltf::Model* model, tinygltf::Node& node)
-{
-    if (node.mesh != -1)
-    {
-        bindMesh(vbos, model, model->meshes[node.mesh]);
-    }
-
-    for (auto i : node.children)
-    {
-        bindModelNodes(vbos, model, model->nodes[i]);
-    }
-}
-
-void OpenGLRenderer::upload(tinygltf::Model* model)
+void OpenGLRenderer::upload(Model* model)
 {
     GLuint vao;
     std::vector<unsigned int> vbos;
+
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
 
-    const tinygltf::Scene& scene = model->scenes[model->defaultScene];
-
-    for (auto node : scene.nodes)
+    for (const auto& mesh : model->meshes)
     {
-        bindModelNodes(vbos, model, model->nodes[node]);
+        bindMesh(vbos, mesh);
     }
 
     glBindVertexArray(0);
@@ -291,7 +210,15 @@ void OpenGLRenderer::upload(tinygltf::Model* model)
         glDeleteBuffers(1, &vbo);
     }
 
-    model->extras = tinygltf::Value(static_cast<int>(vao));
+    model->gpuResourceId = static_cast<int>(vao);
+
+    for (auto& mesh : model->meshes) {
+        for (auto& primitive : mesh.meshPrimitives) {
+            if (primitive.material.albedo.has_value() && !primitive.material.albedo.value()->gpuResourceId.has_value()) {
+                createTexture(primitive.material.albedo.value());
+            }
+        }
+    }
 }
 
 unsigned int OpenGLRenderer::createShaderObject(const Shader& object)
@@ -360,7 +287,7 @@ unsigned int OpenGLRenderer::createShaderObject(const Shader& object)
     return programId;
 }
 
-unsigned int OpenGLRenderer::createTexture(const tinygltf::Texture& texture, tinygltf::Image& image)
+unsigned int OpenGLRenderer::createTexture(Texture* texture) const
 {
     unsigned int textureId;
 
@@ -377,12 +304,16 @@ unsigned int OpenGLRenderer::createTexture(const tinygltf::Texture& texture, tin
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
     GLenum format =
-        image.component == 1 ? GL_RED : image.component == 1 ? GL_RG : image.component == 3 ? GL_RGB : GL_RGBA;
-    GLenum type = image.bits == 16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+        texture->format == TextureFormat::R ? GL_RED :
+        texture->format == TextureFormat::RG ? GL_RG :
+        TextureFormat::RGB == 3 ? GL_RGB : GL_RGBA;
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.width, image.height, NULL, format, type, image.image.data());
+    GLenum type = texture->pixelDataType == PixelDataType::UnsignedShort ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture->width, texture->height, NULL, format, type, texture->data.data());
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    texture->gpuResourceId = textureId;
     return textureId;
 }
 

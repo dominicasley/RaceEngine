@@ -9,7 +9,7 @@ RenderableEntityService::RenderableEntityService(spdlog::logger& logger, Animati
 
 RenderableEntity RenderableEntityService::createEntity(const RenderableEntityDesc& entityDescriptor) const
 {
-    return RenderableEntity{
+    return RenderableEntity {
         .parent = nullptr,
         .model =  entityDescriptor.model,
         .modelMatrix = glm::mat4(1.0f),
@@ -77,17 +77,18 @@ void RenderableEntityService::setAnimation(RenderableEntity* entity, unsigned in
     }
 }
 
-glm::mat4 ozzToMat4(const ozz::math::Float4x4& t) {
+glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
+{
     return glm::mat4({
-      t.cols[0].m128_f32[0], t.cols[0].m128_f32[1], t.cols[0].m128_f32[2], t.cols[0].m128_f32[3],
-      t.cols[1].m128_f32[0], t.cols[1].m128_f32[1], t.cols[1].m128_f32[2], t.cols[1].m128_f32[3],
-      t.cols[2].m128_f32[0], t.cols[2].m128_f32[1], t.cols[2].m128_f32[2], t.cols[2].m128_f32[3],
-      t.cols[3].m128_f32[0], t.cols[3].m128_f32[1], t.cols[3].m128_f32[2], t.cols[3].m128_f32[3]
+     t.cols[0].m128_f32[0], t.cols[0].m128_f32[1], t.cols[0].m128_f32[2], t.cols[0].m128_f32[3],
+     t.cols[1].m128_f32[0], t.cols[1].m128_f32[1], t.cols[1].m128_f32[2], t.cols[1].m128_f32[3],
+     t.cols[2].m128_f32[0], t.cols[2].m128_f32[1], t.cols[2].m128_f32[2], t.cols[2].m128_f32[3],
+     t.cols[3].m128_f32[0], t.cols[3].m128_f32[1], t.cols[3].m128_f32[2], t.cols[3].m128_f32[3]
     });
 }
 
 std::vector<glm::mat4>
-RenderableEntityService::joints(RenderableEntity* entity, tinygltf::Node& node) const
+RenderableEntityService::joints(RenderableEntity* entity) const
 {
     auto out = std::vector<glm::mat4>();
 
@@ -110,21 +111,11 @@ RenderableEntityService::joints(RenderableEntity* entity, tinygltf::Node& node) 
         ltm_job.output = ozz::make_span(entity->animationModelSpaceTransforms);
         ltm_job.Run();
 
-        for (auto j = 0; j < entity->model->skins[0].joints.size(); j++) {
-            if (entity->model->nodes[entity->model->skins[0].joints[j]].name.empty()) {
-                entity->model->nodes[entity->model->skins[0].joints[j]].name = "node_" + std::to_string(entity->model->skins[0].joints[j]);
-            }
-        }
-
         std::map<int, int> jointMap;
-        for (auto i = 0; i < entity->skeleton->num_joints(); i++) {
+        for (auto i = 0; i < entity->skeleton->num_joints(); i++)
+        {
             auto ozzJointName = entity->skeleton->joint_names()[i];
-            for (auto j = 0; j < entity->model->skins[0].joints.size(); j++) {
-                if (entity->model->nodes[entity->model->skins[0].joints[j]].name == ozzJointName) {
-                    jointMap[i] = j;
-                    break;
-                }
-            }
+            jointMap[i] = entity->model->meshes[0].skin[ozzJointName];
         }
 
         out.resize(entity->animationModelSpaceTransforms.size());
@@ -132,7 +123,7 @@ RenderableEntityService::joints(RenderableEntity* entity, tinygltf::Node& node) 
         {
             out[jointMap[i]] =
                 ozzToMat4(entity->animationModelSpaceTransforms[i]) *
-                entity->inverseBindPoseTransforms[jointMap[i]];
+                entity->model->meshes[0].inverseBindPoseTransforms[jointMap[i]];
         }
     }
 
@@ -160,8 +151,6 @@ void RenderableEntityService::setSkeleton(RenderableEntity* entity, ozz::animati
     entity->animationLocalSpaceTransforms.resize(skeleton->num_soa_joints());
     entity->animationModelSpaceTransforms.resize(skeleton->num_joints());
     entity->animationCache = std::make_unique<ozz::animation::SamplingCache>(skeleton->num_joints());
-    entity->inverseBindPoseTransforms = AccessorUtility::get<std::vector<glm::mat4>>(
-        *entity->model, entity->model->accessors[entity->model->skins[0].inverseBindMatrices]);
 }
 
 void RenderableEntityService::addAnimation(RenderableEntity* entity, ozz::animation::Animation* animation) const

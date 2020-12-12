@@ -1,8 +1,8 @@
 #pragma once
 
-#include <tiny_gltf.h>
+#include "Model.h"
 
 struct RenderableEntityDesc
 {
-    tinygltf::Model* model;
+    Model* model;
 };

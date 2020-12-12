@@ -6,45 +6,46 @@
 #include <array>
 #include <string>
 #include <spdlog/logger.h>
-#include <tiny_gltf.h>
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
+#include <Models/Scene/Model.h>
+#include <Models/Scene/Texture.h>
 
-template<typename T>
+template<typename K, typename T>
 class MemoryStorage
 {
     std::vector<T> buffer[1024];
     std::pmr::monotonic_buffer_resource bufferResource;
     mutable std::mutex accessorMutex;
-    mutable std::pmr::unordered_map<std::string, std::unique_ptr<T>> items;
+    mutable std::pmr::unordered_map<K, std::unique_ptr<T>> items;
 
 public:
     MemoryStorage() :
         bufferResource(buffer, buffer->size()),
-        items(std::pmr::unordered_map<std::string, std::unique_ptr<T>>(&bufferResource))
+        items(std::pmr::unordered_map<K, std::unique_ptr<T>>(&bufferResource))
     {
         items.reserve(1024);
     }
 
-    [[nodiscard]] T* get(const std::string& key) const
+    [[nodiscard]] T* get(const K& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         return items.at(key).get();
     };
 
-    [[nodiscard]] bool exists(const std::string& key) const
+    [[nodiscard]] bool exists(const K& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         return items.find(key) != items.end();
     };
 
-    void remove(const std::string& key) const
+    void remove(const K& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         items.erase(key);
     };
 
-    T* add(const std::string& key, const T& item) const
+    T* add(const K& key, const T& item) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         items.insert_or_assign(key, std::make_unique<T>(item));
@@ -67,9 +68,10 @@ private:
     spdlog::logger& logger;
 
 public:
-    const MemoryStorage<tinygltf::Model> models;
-    const MemoryStorage<ozz::animation::Skeleton> skeletons;
-    const MemoryStorage<ozz::animation::Animation> animations;
+    const MemoryStorage<std::string, Model> models;
+    const MemoryStorage<std::string, Texture> textures;
+    const MemoryStorage<std::string, ozz::animation::Skeleton> skeletons;
+    const MemoryStorage<std::string, ozz::animation::Animation> animations;
 
     explicit MemoryStorageService(spdlog::logger& logger);
 };
