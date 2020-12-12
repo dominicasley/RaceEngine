@@ -1,7 +1,7 @@
 #include "OpenGLRenderer.h"
 #include <gl/gl3w.h>
 #include <vector>
-#include "Resources/RenderableEntityDesc.h"
+#include "../Models/Scene/RenderableEntityDesc.h"
 #include "Resources/Shader.h"
 #include "../Models/Scene/Scene.h"
 #include "../Models/Scene/RenderableEntity.h"
@@ -11,12 +11,14 @@
 
 OpenGLRenderer::OpenGLRenderer(
     spdlog::logger& logger,
-    SceneService& sceneService,
     RenderableEntityService& renderableEntityService,
+    SceneService& sceneService,
+    SceneManagerService& sceneManagerService,
     CameraService& cameraService) :
     logger(logger),
-    sceneService(sceneService),
     renderableEntityService(renderableEntityService),
+    sceneService(sceneService),
+    sceneManagerService(sceneManagerService),
     cameraService(cameraService)
 {
 }
@@ -46,9 +48,9 @@ bool OpenGLRenderer::init()
     return true;
 }
 
-void OpenGLRenderer::drawMesh(const Mesh& mesh)
+void OpenGLRenderer::drawMesh(const RenderableMesh& mesh)
 {
-    for (const auto& primitive : mesh.meshPrimitives)
+    for (const auto& primitive : mesh.mesh->meshPrimitives)
     {
         if (primitive.material.albedo.has_value() &&
             primitive.material.albedo.value()->gpuResourceId.has_value())
@@ -115,11 +117,7 @@ void OpenGLRenderer::draw(const Scene& scene)
 
     for (auto& entity : scene.entities)
     {
-        const auto entityModelMatrix = renderableEntityService.modelMatrix(entity.get());
-
-        const auto joints = renderableEntityService.joints(entity.get());
-        setProgramUniform(1, "jointTransformationMatrixes", joints);
-        setProgramUniform(1, "animated", !joints.empty());
+        const auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
 
         setProgramUniform(1, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
         setProgramUniform(1, "localToWorld4x4Matrix", entityModelMatrix);
@@ -129,8 +127,11 @@ void OpenGLRenderer::draw(const Scene& scene)
 
         auto model = entity->model;
         glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
-        for (const auto& mesh : entity->model->meshes)
+        for (auto& mesh : entity->meshes)
         {
+            const auto joints = renderableEntityService.joints(mesh);
+            setProgramUniform(1, "jointTransformationMatrixes", joints);
+            setProgramUniform(1, "animated", !joints.empty());
             drawMesh(mesh);
         }
     }

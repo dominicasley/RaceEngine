@@ -7,6 +7,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include "../Services/SceneService.h"
+#include "../Services/SceneManagerService.h"
 
 typedef std::pair<unsigned int, std::string> UniformKey;
 typedef std::map<UniformKey, unsigned int> UniformPool;
@@ -25,6 +26,7 @@ private:
     spdlog::logger& logger;
     RenderableEntityService& renderableEntityService;
     SceneService& sceneService;
+    SceneManagerService& sceneManagerService;
     CameraService& cameraService;
 
 private:
@@ -33,13 +35,14 @@ private:
 public:
     explicit OpenGLRenderer(
         spdlog::logger& logger,
-        SceneService& sceneService,
         RenderableEntityService& renderableEntityService,
+        SceneService& sceneService,
+        SceneManagerService& sceneManagerService,
         CameraService& cameraService);
 
     bool init();
     void draw(const Scene&);
-    void drawMesh(const Mesh& mesh);
+    void drawMesh(const RenderableMesh& mesh);
     void bindMaterial(const Material* material);
     void upload(Model* model);
     unsigned int createShaderObject(const Shader&);

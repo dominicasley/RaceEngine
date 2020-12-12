@@ -9,7 +9,7 @@ add_library (Graphics
         Api/VulkanRenderer.h
         Api/OpenGLRenderer.cpp
         Api/OpenGLRenderer.h
-        Api/Resources/RenderableEntityDesc.h
+        Models/Scene/RenderableEntityDesc.h
         Api/Resources/Shader.h
         Models/Scene/Skeleton.h
         Api/Resources/Uniform.h
@@ -44,7 +44,8 @@ add_library (Graphics
         Models/Scene/Texture.h
         Models/Scene/TextureFormat.h
         Models/Scene/PixelDataType.h
-        Models/Scene/VertexIndicesType.h)
+        Models/Scene/VertexIndicesType.h
+        Models/Scene/SceneNode.h Models/Scene/RenderableMesh.h)
 
 target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
