@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <vector>
+#include <map>
 #include <ozz/animation/runtime/animation.h>
 #include <ozz/animation/runtime/local_to_model_job.h>
 #include <ozz/animation/runtime/sampling_job.h>
@@ -16,6 +18,7 @@
 struct RenderableMesh {
     const Mesh* mesh;
     unsigned int currentAnimationIndex;
+    float animationTime;
     ozz::animation::Skeleton* skeleton;
     ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms;
     ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;

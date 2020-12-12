@@ -23,5 +23,5 @@ public:
     void addAnimation(RenderableMesh& mesh, ozz::animation::Animation* animation) const;
     void setAnimation(RenderableMesh& mesh, const std::string& animationName) const;
     void setAnimation(RenderableMesh& mesh, unsigned int animationIndex) const;
-    [[nodiscard]] std::vector<glm::mat4> joints(RenderableMesh& entity) const;
+    [[nodiscard]] std::vector<glm::mat4> joints(RenderableMesh& entity, float frameTimeDelta) const;
 };

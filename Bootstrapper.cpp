@@ -42,13 +42,13 @@ Bootstrapper::Bootstrapper(
     });
 }
 
-void Bootstrapper::step()
+void Bootstrapper::step(float delta)
 {
     backgroundWorkerService.step();
 }
 
-void Bootstrapper::draw()
+void Bootstrapper::draw(float delta)
 {
-    renderer.draw(*sceneManager.getScene("game"));
+    renderer.draw(*sceneManager.getScene("game"), delta);
     window.swapBuffers();
 }

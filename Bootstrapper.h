@@ -32,6 +32,6 @@ public:
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService);
 
-    void step();
-    void draw();
+    void step(float delta);
+    void draw(float delta);
 };

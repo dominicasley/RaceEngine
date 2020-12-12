@@ -61,20 +61,18 @@ glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
 }
 
 std::vector<glm::mat4>
-RenderableEntityService::joints(RenderableMesh& mesh) const
+RenderableEntityService::joints(RenderableMesh& mesh, float frameTimeDelta) const
 {
     auto out = std::vector<glm::mat4>();
 
     if (!mesh.animations.empty())
     {
-        static float x = 0.0f;
-        x += 0.0001f;
-        x = fmod(x, 1.0);
+        mesh.animationTime = fmod(mesh.animationTime + frameTimeDelta, mesh.animations[mesh.currentAnimationIndex]->duration());
 
         ozz::animation::SamplingJob sampling_job;
         sampling_job.animation = mesh.animations[mesh.currentAnimationIndex];
         sampling_job.cache = mesh.animationCache.get();
-        sampling_job.ratio = x;
+        sampling_job.ratio = mesh.animationTime / mesh.animations[mesh.currentAnimationIndex]->duration();
         sampling_job.output = ozz::make_span(mesh.animationLocalSpaceTransforms);
         sampling_job.Run();
 

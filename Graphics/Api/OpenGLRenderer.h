@@ -41,7 +41,7 @@ public:
         CameraService& cameraService);
 
     bool init();
-    void draw(const Scene&);
+    void draw(const Scene&, float delta);
     void drawMesh(const RenderableMesh& mesh);
     void bindMaterial(const Material* material);
     void upload(Model* model);

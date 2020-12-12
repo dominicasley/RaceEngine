@@ -55,6 +55,6 @@ bool Engine::running() const
 
 void Engine::step()
 {
-    app.step();
-    app.draw();
+    app.step(window.delta());
+    app.draw(window.delta());
 }

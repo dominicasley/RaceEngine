@@ -105,7 +105,7 @@ void OpenGLRenderer::drawMesh(const RenderableMesh& mesh)
     }
 }
 
-void OpenGLRenderer::draw(const Scene& scene)
+void OpenGLRenderer::draw(const Scene& scene, float delta)
 {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -129,7 +129,7 @@ void OpenGLRenderer::draw(const Scene& scene)
         glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
         for (auto& mesh : entity->meshes)
         {
-            const auto joints = renderableEntityService.joints(mesh);
+            const auto joints = renderableEntityService.joints(mesh, delta);
             setProgramUniform(1, "jointTransformationMatrixes", joints);
             setProgramUniform(1, "animated", !joints.empty());
             drawMesh(mesh);
