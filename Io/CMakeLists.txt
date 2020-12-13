@@ -1,8 +1,6 @@
 ﻿cmake_minimum_required (VERSION 3.8)
 
 add_library (Io
-        Services/MemoryStorageService.cpp
-        Services/MemoryStorageService.h
         Services/ResourceService.cpp
         Services/ResourceService.h
         Services/GLTFService.cpp
@@ -11,6 +9,7 @@ add_library (Io
 
 target_include_directories(Io PUBLIC "../Async/")
 target_include_directories(Io PUBLIC "../Graphics/")
+target_include_directories(Io PUBLIC "../Shared/")
 target_include_directories(Io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 target_include_directories(Io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)
 

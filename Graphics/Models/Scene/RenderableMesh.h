@@ -17,6 +17,7 @@
 
 struct RenderableMesh {
     const Mesh* mesh;
+    Material* material;
     unsigned int currentAnimationIndex;
     float animationTime;
     ozz::animation::Skeleton* skeleton;

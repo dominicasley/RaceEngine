@@ -3,7 +3,7 @@ cmake_minimum_required (VERSION 3.8)
 
 add_library (Engine
         "Engine.h" "Engine.cpp"
-        "Bootstrapper.cpp" "Bootstrapper.h")
+        "Bootstrapper.cpp" "Bootstrapper.h" Shared/Shared.h)
 
 target_include_directories(Engine PUBLIC "vendor/di/include")
 
@@ -42,6 +42,10 @@ add_subdirectory("Io")
 project ("Async")
 add_subdirectory("Async")
 
+project ("Shared")
+add_subdirectory("Shared")
+
 target_link_libraries(Engine PUBLIC Graphics)
 target_link_libraries(Engine PUBLIC Io)
 target_link_libraries(Engine PUBLIC Async)
+target_link_libraries(Engine PUBLIC Shared)

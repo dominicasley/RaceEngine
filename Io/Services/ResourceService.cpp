@@ -30,7 +30,7 @@ std::string ResourceService::loadTextFile(const std::string& filePath)
     return output;
 }
 
-Model* ResourceService::loadModel(const std::string& filePath)
+Model* ResourceService::loadModel(std::string filePath)
 {
     if (memoryStorageService.models.exists(filePath))
     {

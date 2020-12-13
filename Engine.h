@@ -1,4 +1,5 @@
 #pragma once
+#define BOOST_DI_CFG_CTOR_LIMIT_SIZE 16
 
 #include <boost/di.hpp>
 #include "Bootstrapper.h"
@@ -20,6 +21,7 @@ public:
     SceneService& scene;
     RenderableEntityService& entity;
     CameraService& camera;
+    ShaderService& shader;
 
     Engine();
     [[nodiscard]] bool running() const;

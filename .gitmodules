@@ -1,12 +1,9 @@
 [submodule "vendor/di"]
 	path = vendor/di
-	url = https://github.com/boost-experimental/di.git
+	url = https://github.com/boost-ext/di.git
 [submodule "vendor/spdlog"]
 	path = vendor/spdlog
 	url = git@github.com:gabime/spdlog.git
-[submodule "vendor/boost"]
-    path = vendor/boost
-    url = git@github.com:boostorg/boost.git
 [submodule "vendor/glew"]
 	path = vendor/glew
 	url = git@github.com:nigels-com/glew.git

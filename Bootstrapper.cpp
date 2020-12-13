@@ -16,7 +16,8 @@ Bootstrapper::Bootstrapper(
     SceneManagerService& sceneManager,
     SceneService& sceneService,
     RenderableEntityService& renderableEntityService,
-    CameraService& cameraService) :
+    CameraService& cameraService,
+    ShaderService& shaderService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
@@ -26,7 +27,8 @@ Bootstrapper::Bootstrapper(
     sceneManager(sceneManager),
     sceneService(sceneService),
     renderableEntityService(renderableEntityService),
-    cameraService(cameraService)
+    cameraService(cameraService),
+    shaderService(shaderService)
 {
     renderer.init();
 
@@ -37,7 +39,7 @@ Bootstrapper::Bootstrapper(
 
         for (auto& camera : sceneManager.getScene("game")->cameras)
         {
-            cameraService.setAspectRatio(*camera, static_cast<float>(width) / static_cast<float>(height));
+            cameraService.setAspectRatio(camera.get(), static_cast<float>(width) / static_cast<float>(height));
         }
     });
 }
@@ -49,6 +51,10 @@ void Bootstrapper::step(float delta)
 
 void Bootstrapper::draw(float delta)
 {
-    renderer.draw(*sceneManager.getScene("game"), delta);
+    for (auto& scene : sceneManager.getScenes())
+    {
+        renderer.draw(scene.second.get(), delta);
+    }
+
     window.swapBuffers();
 }

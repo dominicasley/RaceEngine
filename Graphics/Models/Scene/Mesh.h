@@ -11,6 +11,7 @@ struct Mesh {
     std::optional<unsigned int> gpuResourceId;
     std::vector<MeshBuffer> meshBuffers;
     std::vector<MeshPrimitive> meshPrimitives;
+    std::vector<Material*> materials;
     std::map<std::string, int> skin;
     std::vector<glm::mat4> inverseBindPoseTransforms;
 };

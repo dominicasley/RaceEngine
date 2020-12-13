@@ -7,7 +7,7 @@
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
 
-#include "MemoryStorageService.h"
+#include "Services/MemoryStorageService.h"
 #include "GLTFService.h"
 #include "Async.h"
 
@@ -26,7 +26,7 @@ public:
         BackgroundWorkerService& backgroundWorkerService,
         GLTFService& gltfService);
     [[nodiscard]] std::string loadTextFile(const std::string& filePath);
-    [[nodiscard]] Model* loadModel(const std::string& filePath);
+    [[nodiscard]] Model* loadModel(std::string filePath);
     [[nodiscard]] ozz::animation::Skeleton* loadSkeleton(const std::string& filePath);
     [[nodiscard]] ozz::animation::Animation* loadAnimation(const std::string& filePath);
     const Observable<std::string>& loadTextFileAsync(std::string filePath);

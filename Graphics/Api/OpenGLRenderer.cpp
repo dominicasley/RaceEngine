@@ -2,7 +2,7 @@
 #include <gl/gl3w.h>
 #include <vector>
 #include "../Models/Scene/RenderableEntityDesc.h"
-#include "Resources/Shader.h"
+#include "../Models/Scene/ShaderDescriptor.h"
 #include "../Models/Scene/Scene.h"
 #include "../Models/Scene/RenderableEntity.h"
 #include "../Models/Scene/Light.h"
@@ -50,53 +50,13 @@ bool OpenGLRenderer::init()
 
 void OpenGLRenderer::drawMesh(const RenderableMesh& mesh)
 {
+    if (currentlyBoundMaterial != mesh.material) {
+        bindMaterial(mesh.material);
+        currentlyBoundMaterial = mesh.material;
+    }
+
     for (const auto& primitive : mesh.mesh->meshPrimitives)
     {
-        if (primitive.material.albedo.has_value() &&
-            primitive.material.albedo.value()->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(
-                GL_TEXTURE_2D,
-                static_cast<GLuint>(primitive.material.albedo.value()->gpuResourceId.value()));
-        }
-
-        if (primitive.material.normal.has_value() &&
-            primitive.material.normal.value()->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(
-                GL_TEXTURE_2D,
-                static_cast<GLuint>(primitive.material.normal.value()->gpuResourceId.value()));
-        }
-
-        if (primitive.material.metallicRoughness.has_value() &&
-            primitive.material.metallicRoughness.value()->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(
-                GL_TEXTURE_2D,
-                static_cast<GLuint>(primitive.material.metallicRoughness.value()->gpuResourceId.value()));
-        }
-
-        if (primitive.material.emissive.has_value() &&
-            primitive.material.emissive.value()->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE3);
-            glBindTexture(
-                GL_TEXTURE_2D,
-                static_cast<GLuint>(primitive.material.emissive.value()->gpuResourceId.value()));
-        }
-
-        if (primitive.material.occlusion.has_value() &&
-            primitive.material.occlusion.value()->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE4);
-            glBindTexture(
-                GL_TEXTURE_2D,
-                static_cast<GLuint>(primitive.material.occlusion.value()->gpuResourceId.value()));
-        }
-
         glDrawElements(primitive.mode,
                        static_cast<GLsizei>(primitive.elementCount),
                        primitive.indicesType == VertexIndicesType::UnsignedInt ? GL_UNSIGNED_INT :
@@ -105,33 +65,32 @@ void OpenGLRenderer::drawMesh(const RenderableMesh& mesh)
     }
 }
 
-void OpenGLRenderer::draw(const Scene& scene, float delta)
+void OpenGLRenderer::draw(const Scene* scene, float delta)
 {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     auto camera = sceneService.getCamera(scene, 0);
-    cameraService.updateModelViewProjectionMatrix(*camera);
+    cameraService.updateModelViewProjectionMatrix(camera);
 
-    glUseProgram(1);
-    setProgramUniform(1, "cameraPosition", camera->position);
-
-    for (auto& entity : scene.entities)
+    for (auto& entity : scene->entities)
     {
-        const auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
-
-        setProgramUniform(1, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
-        setProgramUniform(1, "localToWorld4x4Matrix", entityModelMatrix);
-        setProgramUniform(1, "localToWorld3x3Matrix", glm::mat3(entityModelMatrix));
-        setProgramUniform(1, "normalMatrix",
-                          glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
-
         auto model = entity->model;
         glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
+
         for (auto& mesh : entity->meshes)
         {
+            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
+
+            setProgramUniform(mesh.material->shader->gpuResourceId, "cameraPosition", camera->position);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToWorld4x4Matrix", entityModelMatrix);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToWorld3x3Matrix", glm::mat3(entityModelMatrix));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "normalMatrix",
+                              glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
             const auto joints = renderableEntityService.joints(mesh, delta);
-            setProgramUniform(1, "jointTransformationMatrixes", joints);
-            setProgramUniform(1, "animated", !joints.empty());
+            setProgramUniform(mesh.material->shader->gpuResourceId, "jointTransformationMatrixes", joints);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "animated", !joints.empty());
+
             drawMesh(mesh);
         }
     }
@@ -139,19 +98,38 @@ void OpenGLRenderer::draw(const Scene& scene, float delta)
 
 void OpenGLRenderer::bindMaterial(const Material* material)
 {
-    // glUseProgram(material->getShader());
+    glUseProgram(material->shader->gpuResourceId);
 
-    // auto offset = 0;
-    // for (const auto& texture : material->getTextures())
-    // {
-    //     if (texture)
-    //     {
-    //         glActiveTexture(GL_TEXTURE0 + offset);
-    //         glBindTexture(GL_TEXTURE_2D, texture);
-    //     }
+    if (material->albedo.has_value() && material->albedo.value()->gpuResourceId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->albedo.value()->gpuResourceId.value()));
+    }
 
-    //     offset++;
-    // }
+    if (material->normal.has_value() && material->normal.value()->gpuResourceId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->normal.value()->gpuResourceId.value()));
+    }
+
+    if (material->metallicRoughness.has_value() && material->metallicRoughness.value()->gpuResourceId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->metallicRoughness.value()->gpuResourceId.value()));
+    }
+
+    if (material->emissive.has_value() && material->emissive.value()->gpuResourceId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->emissive.value()->gpuResourceId.value()));
+
+    }
+
+    if (material->occlusion.has_value() && material->occlusion.value()->gpuResourceId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->occlusion.value()->gpuResourceId.value()));
+    }
 }
 
 std::vector<unsigned int>& OpenGLRenderer::bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh)
@@ -213,16 +191,40 @@ void OpenGLRenderer::upload(Model* model)
 
     model->gpuResourceId = static_cast<int>(vao);
 
-    for (auto& mesh : model->meshes) {
-        for (auto& primitive : mesh.meshPrimitives) {
-            if (primitive.material.albedo.has_value() && !primitive.material.albedo.value()->gpuResourceId.has_value()) {
-                createTexture(primitive.material.albedo.value());
+    for (auto& mesh : model->meshes)
+    {
+        for (auto material : mesh.materials)
+        {
+            if (material->albedo.has_value() && !material->albedo.value()->gpuResourceId.has_value())
+            {
+                createTexture(material->albedo.value());
+            }
+
+            if (material->occlusion.has_value() && !material->occlusion.value()->gpuResourceId.has_value())
+            {
+                createTexture(material->occlusion.value());
+            }
+
+            if (material->emissive.has_value() && !material->emissive.value()->gpuResourceId.has_value())
+            {
+                createTexture(material->emissive.value());
+            }
+
+            if (material->metallicRoughness.has_value() &&
+                !material->metallicRoughness.value()->gpuResourceId.has_value())
+            {
+                createTexture(material->metallicRoughness.value());
+            }
+
+            if (material->normal.has_value() && !material->normal.value()->gpuResourceId.has_value())
+            {
+                createTexture(material->normal.value());
             }
         }
     }
 }
 
-unsigned int OpenGLRenderer::createShaderObject(const Shader& object)
+std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
 {
     const auto programId = glCreateProgram();
     const auto vertexShaderId = glCreateShader(GL_VERTEX_SHADER);
@@ -234,34 +236,44 @@ unsigned int OpenGLRenderer::createShaderObject(const Shader& object)
 
     if (!object.vertexShaderSource.empty())
     {
-        compileShader(vertexShaderId, object.vertexShaderSource);
-        glAttachShader(programId, vertexShaderId);
+        if (compileShader(vertexShaderId, object.vertexShaderSource))
+        {
+            glAttachShader(programId, vertexShaderId);
+        }
     }
 
     if (!object.fragmentShaderSource.empty())
     {
-        compileShader(fragmentShaderId, object.fragmentShaderSource);
-        glAttachShader(programId, fragmentShaderId);
+        if (compileShader(fragmentShaderId, object.fragmentShaderSource))
+        {
+            glAttachShader(programId, fragmentShaderId);
+        }
     }
 
     if (!object.tessellationControlShaderSource.empty() && !object.tessellationEvaluationShaderSource.empty())
     {
-        compileShader(tessellationControlShaderId, object.tessellationControlShaderSource);
-        compileShader(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource);
-        glAttachShader(programId, tessellationControlShaderId);
-        glAttachShader(programId, tessellationEvaluationShaderId);
+        if (compileShader(tessellationControlShaderId, object.tessellationControlShaderSource) &&
+            compileShader(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource))
+        {
+            glAttachShader(programId, tessellationControlShaderId);
+            glAttachShader(programId, tessellationEvaluationShaderId);
+        }
     }
 
     if (!object.computeShaderSource.empty())
     {
-        compileShader(computeShaderId, object.computeShaderSource);
-        glAttachShader(programId, computeShaderId);
+        if (compileShader(computeShaderId, object.computeShaderSource))
+        {
+            glAttachShader(programId, computeShaderId);
+        }
     }
 
     if (!object.geometryShaderSource.empty())
     {
-        compileShader(geometryShaderId, object.geometryShaderSource);
-        glAttachShader(programId, geometryShaderId);
+        if (compileShader(geometryShaderId, object.geometryShaderSource))
+        {
+            glAttachShader(programId, geometryShaderId);
+        }
     }
 
     glLinkProgram(programId);
@@ -275,7 +287,9 @@ unsigned int OpenGLRenderer::createShaderObject(const Shader& object)
     {
         std::vector<char> errorMessage(infoLogLength + 1);
         glGetProgramInfoLog(programId, infoLogLength, nullptr, &errorMessage[0]);
-        fprintf(stderr, "%s", &errorMessage[0]);
+        logger.error("shader link error: {}", std::string(errorMessage.begin(), errorMessage.end()));
+
+        return {};
     }
 
     glDeleteShader(vertexShaderId);

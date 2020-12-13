@@ -13,8 +13,16 @@ RenderableEntity RenderableEntityService::createEntity(const RenderableEntityDes
         std::vector<RenderableMesh> meshes;
 
         for (const auto& m : entityDescriptor.model->meshes) {
+            auto material = !m.materials.empty() ? m.materials.front() : nullptr;
+
+            if (material != nullptr)
+            {
+                material->shader = entityDescriptor.shader;
+            }
+
             meshes.push_back(RenderableMesh {
                 .mesh = &m,
+                .material = material,
                 .skeleton = nullptr
             });
         }

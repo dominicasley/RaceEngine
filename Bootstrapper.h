@@ -5,6 +5,7 @@
 #include "Async/Async.h"
 #include "Graphics/Graphics.h"
 #include "Io/Io.h"
+#include "Shared/Shared.h"
 
 class Bootstrapper
 {
@@ -19,6 +20,7 @@ public:
     SceneService& sceneService;
     RenderableEntityService& renderableEntityService;
     CameraService& cameraService;
+    ShaderService& shaderService;
 
     Bootstrapper(
         spdlog::logger& logger,
@@ -30,7 +32,8 @@ public:
         SceneManagerService& sceneManager,
         SceneService& sceneService,
         RenderableEntityService& renderableEntityService,
-        CameraService& cameraService);
+        CameraService& cameraService,
+        ShaderService& shaderService);
 
     void step(float delta);
     void draw(float delta);

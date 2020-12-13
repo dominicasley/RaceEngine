@@ -2,7 +2,7 @@
 
 #include <string>
 
-struct Shader
+struct ShaderDescriptor
 {
 public:
     std::string vertexShaderSource;

@@ -16,74 +16,74 @@ Camera CameraService::createCamera()
     };
 }
 
-void CameraService::setPosition(Camera& camera, float x, float y, float z) const
+void CameraService::setPosition(Camera* camera, float x, float y, float z) const
 {
-    camera.position.x = x;
-    camera.position.y = y;
-    camera.position.z = z;
+    camera->position.x = x;
+    camera->position.y = y;
+    camera->position.z = z;
 }
 
-void CameraService::translate(Camera& camera, float x, float y, float z) const
+void CameraService::translate(Camera* camera, float x, float y, float z) const
 {
-    camera.position.x += x;
-    camera.position.y += y;
-    camera.position.z += z;
+    camera->position.x += x;
+    camera->position.y += y;
+    camera->position.z += z;
 }
 
-void CameraService::setDirection(Camera& camera, float x, float y, float z) const
+void CameraService::setDirection(Camera* camera, float x, float y, float z) const
 {
-    if (x == camera.position.x && y == camera.position.y && z == camera.position.z)
+    if (x == camera->position.x && y == camera->position.y && z == camera->position.z)
         return;
 
-    camera.direction.x = x;
-    camera.direction.y = y;
-    camera.direction.z = z;
+    camera->direction.x = x;
+    camera->direction.y = y;
+    camera->direction.z = z;
 }
 
-void CameraService::rotate(Camera& camera, float x, float y, float z) const
+void CameraService::rotate(Camera* camera, float x, float y, float z) const
 {
-    if (x == camera.position.x && y == camera.position.y && z == camera.position.z)
+    if (x == camera->position.x && y == camera->position.y && z == camera->position.z)
         return;
 
-    camera.direction.x += x;
-    camera.direction.y += y;
-    camera.direction.z += z;
+    camera->direction.x += x;
+    camera->direction.y += y;
+    camera->direction.z += z;
 }
 
-void CameraService::setRoll(Camera& camera, float x, float y, float z) const
+void CameraService::setRoll(Camera* camera, float x, float y, float z) const
 {
-    camera.roll.x = x;
-    camera.roll.y = y;
-    camera.roll.z = z;
+    camera->roll.x = x;
+    camera->roll.y = y;
+    camera->roll.z = z;
 }
 
-void CameraService::setAspectRatio(Camera& camera, float aspectRatio) const
+void CameraService::setAspectRatio(Camera* camera, float aspectRatio) const
 {
-    camera.aspectRatio = aspectRatio;
+    camera->aspectRatio = aspectRatio;
 }
 
-void CameraService::lookAtPoint(Camera& camera, float x, float y, float z) const
+void CameraService::lookAtPoint(Camera* camera, float x, float y, float z) const
 {
     const auto point = glm::vec3(x, y, z);
-    camera.direction = glm::normalize(point - camera.position);
+    camera->direction = glm::normalize(point - camera->position);
 }
 
-void CameraService::setFieldOfView(Camera& camera, float fov) const
+void CameraService::setFieldOfView(Camera* camera, float fov) const
 {
-    camera.fieldOfView = fov;
+    camera->fieldOfView = fov;
 }
 
-const glm::mat4& CameraService::updateModelViewMatrix(Camera& camera) const
+const glm::mat4& CameraService::updateModelViewMatrix(Camera* camera) const
 {
-    camera.modelViewMatrix = glm::lookAt(camera.position, camera.position + camera.direction, camera.roll);
-    return camera.modelViewMatrix;
+    camera->modelViewMatrix = glm::lookAt(camera->position, camera->position + camera->direction, camera->roll);
+    return camera->modelViewMatrix;
 }
 
-const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera& camera) const
+const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera* camera) const
 {
-    camera.modelViewProjectionMatrix =
-        glm::perspective(glm::radians(camera.fieldOfView), camera.aspectRatio, 1.0f, 1000.0f) *
+    camera->modelViewProjectionMatrix =
+        glm::perspective(glm::radians(camera->fieldOfView), camera->aspectRatio, 1.0f, 1000.0f) *
         updateModelViewMatrix(camera);
 
-    return camera.modelViewProjectionMatrix;
+    return camera->modelViewProjectionMatrix;
 }

@@ -8,8 +8,10 @@
 #include <spdlog/logger.h>
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
-#include <Models/Scene/Model.h>
-#include <Models/Scene/Texture.h>
+#include <../Graphics/Models/Scene/Model.h>
+#include <../Graphics/Models/Scene/Texture.h>
+#include <../Graphics/Models/Scene/Material.h>
+#include <../Graphics/Models/Scene/Shader.h>
 
 template<typename K, typename T>
 class MemoryStorage
@@ -70,6 +72,8 @@ private:
 public:
     const MemoryStorage<std::string, Model> models;
     const MemoryStorage<std::string, Texture> textures;
+    const MemoryStorage<std::string, Material> materials;
+    const MemoryStorage<std::string, Shader> shaders;
     const MemoryStorage<std::string, ozz::animation::Skeleton> skeletons;
     const MemoryStorage<std::string, ozz::animation::Animation> animations;
 

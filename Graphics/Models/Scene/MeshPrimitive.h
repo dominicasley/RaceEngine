@@ -17,5 +17,5 @@ struct MeshPrimitive {
     bool normalized;
     void* offset;
     void* indicesOffset;
-    Material material;
+    Material* material;
 };

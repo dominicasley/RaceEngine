@@ -58,10 +58,10 @@ std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath)
         logger.error(error);
     }
 
-    return gltfModelToInternal(model);
+    return gltfModelToInternal(filePath, model);
 }
 
-Model GLTFService::gltfModelToInternal(const tinygltf::Model& tinyGltfModel) const
+Model GLTFService::gltfModelToInternal(std::string filePath, const tinygltf::Model& tinyGltfModel) const
 {
     Model model;
 
@@ -71,7 +71,6 @@ Model GLTFService::gltfModelToInternal(const tinygltf::Model& tinyGltfModel) con
         {
             continue;
         }
-
 
         const auto tinyGltfMesh = tinyGltfModel.meshes[node.mesh];
 
@@ -102,10 +101,64 @@ Model GLTFService::gltfModelToInternal(const tinygltf::Model& tinyGltfModel) con
         {
             auto image = getImageFromIndex(tinyGltfModel, texture.source);
 
-            if (!memoryStorageService.textures.exists(image.name))
+            if (!memoryStorageService.textures.exists(filePath + ":" + image.name))
             {
-                memoryStorageService.textures.add(image.name, image);
+                memoryStorageService.textures.add(filePath + ":" + image.name, image);
             }
+        }
+
+        for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
+        {
+            if (memoryStorageService.materials.exists(filePath + ":" + tinyGltfMaterial.name))
+            {
+                continue;
+            }
+
+            std::optional<Texture*> albedoTexturePtr;
+            std::optional<Texture*> metallicRoughnessTexturePtr;
+            std::optional<Texture*> normalTexturePtr;
+            std::optional<Texture*> occlusionTexturePtr;
+            std::optional<Texture*> emissiveTexturePtr;
+
+            if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
+            {
+                auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
+                albedoTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+            }
+
+            if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
+            {
+                auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
+                metallicRoughnessTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+            }
+
+            if (tinyGltfMaterial.normalTexture.index != -1)
+            {
+                auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
+                normalTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+            }
+
+            if (tinyGltfMaterial.occlusionTexture.index != -1)
+            {
+                auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
+                occlusionTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+            }
+
+            if (tinyGltfMaterial.emissiveTexture.index != -1)
+            {
+                auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
+                emissiveTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+            }
+
+            auto material = memoryStorageService.materials.add(filePath + ":" + tinyGltfMaterial.name, Material {
+                .albedo = albedoTexturePtr,
+                .metallicRoughness = metallicRoughnessTexturePtr,
+                .normal = normalTexturePtr,
+                .occlusion = occlusionTexturePtr,
+                .emissive = emissiveTexturePtr
+            });
+
+            mesh.materials.push_back(material);
         }
 
         for (const auto& bufferView : tinyGltfModel.bufferViews)
@@ -136,52 +189,6 @@ Model GLTFService::gltfModelToInternal(const tinygltf::Model& tinyGltfModel) con
                         continue;
                     }
 
-                    auto tinyGltfMaterial = tinyGltfModel.materials[primitive.material];
-
-                    std::optional<Texture*> albedoTexturePtr;
-                    std::optional<Texture*> metallicRoughnessTexturePtr;
-                    std::optional<Texture*> normalTexturePtr;
-                    std::optional<Texture*> occlusionTexturePtr;
-                    std::optional<Texture*> emissiveTexturePtr;
-
-                    if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
-                    {
-                        auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
-                        albedoTexturePtr = memoryStorageService.textures.get(image.name);
-                    }
-
-                    if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
-                    {
-                        auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
-                        metallicRoughnessTexturePtr = memoryStorageService.textures.get(image.name);
-                    }
-
-                    if (tinyGltfMaterial.normalTexture.index != -1)
-                    {
-                        auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
-                        normalTexturePtr = memoryStorageService.textures.get(image.name);
-                    }
-
-                    if (tinyGltfMaterial.occlusionTexture.index != -1)
-                    {
-                        auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
-                        occlusionTexturePtr = memoryStorageService.textures.get(image.name);
-                    }
-
-                    if (tinyGltfMaterial.emissiveTexture.index != -1)
-                    {
-                        auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
-                        emissiveTexturePtr = memoryStorageService.textures.get(image.name);
-                    }
-
-                    auto material = Material {
-                        .albedo = albedoTexturePtr,
-                        .metallicRoughness = metallicRoughnessTexturePtr,
-                        .normal = normalTexturePtr,
-                        .occlusion = occlusionTexturePtr,
-                        .emissive = emissiveTexturePtr
-                    };
-
                     auto indexAccessor = tinyGltfModel.accessors[primitive.indices];
 
                     mesh.meshPrimitives.push_back(MeshPrimitive {
@@ -197,7 +204,8 @@ Model GLTFService::gltfModelToInternal(const tinygltf::Model& tinyGltfModel) con
                         .normalized = accessor.normalized,
                         .offset = reinterpret_cast<void*>(accessor.byteOffset),
                         .indicesOffset = reinterpret_cast<void*>(indexAccessor.byteOffset),
-                        .material = material
+                        .material = primitive.material != -1 ?
+                            memoryStorageService.materials.get(filePath + ":" + tinyGltfModel.materials[primitive.material].name) : nullptr
                     });
                 }
             }

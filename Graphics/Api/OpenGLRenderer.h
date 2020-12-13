@@ -6,6 +6,7 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include "../Models/Scene/ShaderDescriptor.h"
 #include "../Services/SceneService.h"
 #include "../Services/SceneManagerService.h"
 
@@ -28,6 +29,7 @@ private:
     SceneService& sceneService;
     SceneManagerService& sceneManagerService;
     CameraService& cameraService;
+    Material* currentlyBoundMaterial = nullptr;
 
 private:
     std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh);
@@ -41,11 +43,11 @@ public:
         CameraService& cameraService);
 
     bool init();
-    void draw(const Scene&, float delta);
+    void draw(const Scene* scene, float delta);
     void drawMesh(const RenderableMesh& mesh);
     void bindMaterial(const Material* material);
     void upload(Model* model);
-    unsigned int createShaderObject(const Shader&);
+    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor);
     unsigned int createTexture(Texture* texture) const;
     void setViewport(int width, int height);
 

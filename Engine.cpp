@@ -32,6 +32,8 @@ Engine::Engine() : app(di::make_injector(
         .to<AnimationService>(),
     di::bind<SceneService>
         .to<SceneService>(),
+    di::bind<ShaderService>
+        .to<ShaderService>(),
     di::bind<SceneManagerService>
         .in(di::singleton)
         .to<SceneManagerService>()).create<Bootstrapper>()),
@@ -43,7 +45,8 @@ Engine::Engine() : app(di::make_injector(
                    sceneManager(app.sceneManager),
                    scene(app.sceneService),
                    entity(app.renderableEntityService),
-                   camera(app.cameraService)
+                   camera(app.cameraService),
+                   shader(app.shaderService)
 {
 
 }

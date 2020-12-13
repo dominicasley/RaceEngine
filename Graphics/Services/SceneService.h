@@ -18,10 +18,10 @@ public:
         spdlog::logger& logger,
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService);
-    void update(Scene& scene, float delta) const;
-    [[nodiscard]] RenderableEntity* createEntity(Scene& scene, const RenderableEntityDesc& entityDescriptor) const;
-    [[nodiscard]] Camera* createCamera(Scene& scene) const;
-    [[nodiscard]] Light* createLight(Scene& scene) const;
-    [[nodiscard]] RenderableEntity* getEntity(const Scene& scene, unsigned int index) const;
-    [[nodiscard]] Camera* getCamera(const Scene& scene, unsigned int index) const;
+    void update(Scene* scene, float delta) const;
+    [[nodiscard]] RenderableEntity* createEntity(Scene* scene, const RenderableEntityDesc& entityDescriptor) const;
+    [[nodiscard]] Camera* createCamera(Scene* scene) const;
+    [[nodiscard]] Light* createLight(Scene* scene) const;
+    [[nodiscard]] RenderableEntity* getEntity(const Scene* scene, unsigned int index) const;
+    [[nodiscard]] Camera* getCamera(const Scene* scene, unsigned int index) const;
 };
