@@ -7,6 +7,7 @@
 
 struct Material {
     glm::vec4 baseColour;
+    glm::vec2 repeat = glm::vec2(1.0f);
     Shader* shader;
     std::optional<Texture*> albedo;
     std::optional<Texture*> metallicRoughness;

@@ -231,6 +231,10 @@ std::optional<PrimitiveAttributeType> GLTFService::toAttributeType(const std::st
     {
         return PrimitiveAttributeType::Normal;
     }
+    else if (attributeName == "TANGENT")
+    {
+        return PrimitiveAttributeType::Tangent;
+    }
     else if (attributeName == "JOINTS_0")
     {
         return PrimitiveAttributeType::Joint;

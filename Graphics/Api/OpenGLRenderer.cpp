@@ -31,7 +31,7 @@ bool OpenGLRenderer::init()
         return false;
     }
 
-    glClearColor(100.f / 255.f, 149.f / 255.f, 237.f / 255.f, 0);
+    glClearColor(0.f / 255.f, 0.f / 255.f, 0.f / 255.f, 0);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_3D);
@@ -79,17 +79,31 @@ void OpenGLRenderer::draw(const Scene* scene, float delta)
 
         for (auto& mesh : entity->meshes)
         {
+            if (mesh.material == nullptr)
+            {
+                continue;
+            }
+
             const auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
 
             setProgramUniform(mesh.material->shader->gpuResourceId, "cameraPosition", camera->position);
             setProgramUniform(mesh.material->shader->gpuResourceId, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToView4x4Matrix", camera->modelViewMatrix * entityModelMatrix);
             setProgramUniform(mesh.material->shader->gpuResourceId, "localToWorld4x4Matrix", entityModelMatrix);
-            setProgramUniform(mesh.material->shader->gpuResourceId, "localToWorld3x3Matrix", glm::mat3(entityModelMatrix));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera->modelViewMatrix));
             setProgramUniform(mesh.material->shader->gpuResourceId, "normalMatrix",
                               glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
             const auto joints = renderableEntityService.joints(mesh, delta);
             setProgramUniform(mesh.material->shader->gpuResourceId, "jointTransformationMatrixes", joints);
             setProgramUniform(mesh.material->shader->gpuResourceId, "animated", !joints.empty());
+
+            setProgramUniform(mesh.material->shader->gpuResourceId, "textureRepeat", mesh.material->repeat);
+
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859*2.5f, 1.2973*2.5f, 1.3*2.5f));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.attenuation", 1.0f);
 
             drawMesh(mesh);
         }
@@ -313,11 +327,6 @@ unsigned int OpenGLRenderer::createTexture(Texture* texture) const
     glBindTexture(GL_TEXTURE_2D, textureId);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
     GLenum format =
         texture->format == TextureFormat::R ? GL_RED :
         texture->format == TextureFormat::RG ? GL_RG :
@@ -326,6 +335,12 @@ unsigned int OpenGLRenderer::createTexture(Texture* texture) const
     GLenum type = texture->pixelDataType == PixelDataType::UnsignedShort ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture->width, texture->height, NULL, format, type, texture->data.data());
+
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR );
+    glTexParameterf(GL_TEXTURE_2D, GL_MAX_TEXTURE_MAX_ANISOTROPY, fLargest);
+
     glBindTexture(GL_TEXTURE_2D, 0);
 
     texture->gpuResourceId = textureId;
