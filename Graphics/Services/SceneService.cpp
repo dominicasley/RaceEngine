@@ -16,10 +16,17 @@ void SceneService::update(Scene* scene, float delta) const
 
 }
 
-RenderableEntity* SceneService::createEntity(Scene* scene, const RenderableEntityDesc& entityDescriptor) const
+RenderableModel* SceneService::createEntity(Scene* scene, const CreateRenderableModelDTO& entityDescriptor) const
 {
-    return scene->entities.emplace_back(
-        std::make_unique<RenderableEntity>(renderableEntityService.createEntity(entityDescriptor))
+    return scene->models.emplace_back(
+        std::make_unique<RenderableModel>(renderableEntityService.createModel(entityDescriptor))
+    ).get();
+}
+
+RenderableSkybox* SceneService::createEntity(Scene* scene, const CreateRenderableSkyboxDTO& entityDescriptor) const
+{
+    return scene->skybox.emplace_back(
+        std::make_unique<RenderableSkybox>(renderableEntityService.createSkybox(entityDescriptor))
     ).get();
 }
 
@@ -40,9 +47,9 @@ Camera* SceneService::getCamera(const Scene* scene, unsigned int index) const
     return scene->cameras[index].get();
 }
 
-RenderableEntity* SceneService::getEntity(const Scene* scene, unsigned int index) const
+RenderableModel* SceneService::getModel(const Scene* scene, unsigned int index) const
 {
-    return scene->entities[index].get();;
+    return scene->models[index].get();;
 }
 
 

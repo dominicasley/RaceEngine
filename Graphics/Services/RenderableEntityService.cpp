@@ -7,9 +7,9 @@ RenderableEntityService::RenderableEntityService(spdlog::logger& logger, Animati
 
 }
 
-RenderableEntity RenderableEntityService::createEntity(const RenderableEntityDesc& entityDescriptor) const
+RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
 {
-    auto createMeshes = [](const RenderableEntityDesc& entityDescriptor) {
+    auto createMeshes = [](const CreateRenderableModelDTO& entityDescriptor) {
         std::vector<RenderableMesh> meshes;
 
         for (const auto& m : entityDescriptor.model->meshes) {
@@ -30,11 +30,19 @@ RenderableEntity RenderableEntityService::createEntity(const RenderableEntityDes
         return meshes;
     };
 
-    return RenderableEntity {
-        .model =  entityDescriptor.model,
-        .node = entityDescriptor.node,
-        .meshes = createMeshes(entityDescriptor),
-    };
+    return RenderableModel(entityDescriptor.node, entityDescriptor.model, createMeshes(entityDescriptor));
+}
+
+RenderableSkybox RenderableEntityService::createSkybox(const CreateRenderableSkyboxDTO& entityDescriptor) const
+{
+    auto skybox = RenderableSkybox(
+        entityDescriptor.node,
+        entityDescriptor.cubeMap,
+        entityDescriptor.shader,
+        entityDescriptor.model
+    );
+
+    return skybox;
 }
 
 void RenderableEntityService::setAnimation(RenderableMesh& mesh, const std::string& animationName) const

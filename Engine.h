@@ -22,6 +22,7 @@ public:
     RenderableEntityService& entity;
     CameraService& camera;
     ShaderService& shader;
+    CubeMapService& cubeMap;
 
     Engine();
     [[nodiscard]] bool running() const;

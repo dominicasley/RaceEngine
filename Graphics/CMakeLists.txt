@@ -9,7 +9,7 @@ add_library (Graphics
         Api/VulkanRenderer.h
         Api/OpenGLRenderer.cpp
         Api/OpenGLRenderer.h
-        Models/Scene/RenderableEntityDesc.h
+        Models/Scene/CreateRenderableModelDTO.h
         Models/Scene/ShaderDescriptor.h
         Models/Scene/Skeleton.h
         Api/Resources/Uniform.h
@@ -49,7 +49,7 @@ add_library (Graphics
         Models/Scene/RenderableMesh.h
         Services/ShaderService.cpp
         Services/ShaderService.h
-        Models/Scene/Shader.h)
+        Models/Scene/Shader.h Models/Scene/CubeMap.h Services/CubeMapService.cpp Services/CubeMapService.h Models/Scene/RenderableEntityType.h Models/Scene/RenderableModel.h Models/Scene/RenderableSkybox.h)
 
 target_include_directories(Graphics PUBLIC "../Shared/")
 

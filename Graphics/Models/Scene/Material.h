@@ -14,4 +14,5 @@ struct Material {
     std::optional<Texture*> normal;
     std::optional<Texture*> occlusion;
     std::optional<Texture*> emissive;
+    std::vector<Texture*> textures;
 };

@@ -3,4 +3,5 @@
 enum class PixelDataType {
     UnsignedShort,
     UnsignedByte,
+    Float
 };

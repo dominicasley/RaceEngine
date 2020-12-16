@@ -22,3 +22,6 @@
 [submodule "vendor/ozz-animation"]
     path = vendor/ozz-animation
     url = https://github.com/guillaumeblanc/ozz-animation.git
+[submodule "vendor/freeimage"]
+    path = vendor/freeimage
+    url = git@github.com:rfratto/FreeImage.git

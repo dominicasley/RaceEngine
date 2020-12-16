@@ -4,9 +4,9 @@
 #include "Model.h"
 #include "Shader.h"
 
-struct RenderableEntityDesc
+struct CreateRenderableModelDTO
 {
-    Model* model;
     SceneNode* node;
     Shader* shader;
+    Model* model;
 };

@@ -2,6 +2,8 @@
 
 #include <spdlog/logger.h>
 #include "../Models/Scene/RenderableEntity.h"
+#include "../Models/Scene/RenderableModel.h"
+#include "../Models/Scene/RenderableSkybox.h"
 #include "../Models/Scene/Scene.h"
 #include "RenderableEntityService.h"
 #include "CameraService.h"
@@ -19,9 +21,10 @@ public:
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService);
     void update(Scene* scene, float delta) const;
-    [[nodiscard]] RenderableEntity* createEntity(Scene* scene, const RenderableEntityDesc& entityDescriptor) const;
+    [[nodiscard]] RenderableModel* createEntity(Scene* scene, const CreateRenderableModelDTO& entityDescriptor) const;
+    [[nodiscard]] RenderableSkybox* createEntity(Scene* scene, const CreateRenderableSkyboxDTO& entityDescriptor) const;
     [[nodiscard]] Camera* createCamera(Scene* scene) const;
     [[nodiscard]] Light* createLight(Scene* scene) const;
-    [[nodiscard]] RenderableEntity* getEntity(const Scene* scene, unsigned int index) const;
+    [[nodiscard]] RenderableModel* getModel(const Scene* scene, unsigned int index) const;
     [[nodiscard]] Camera* getCamera(const Scene* scene, unsigned int index) const;
 };

@@ -3,14 +3,14 @@
 #include <vector>
 
 #include "SceneNode.h"
-#include "Model.h"
-#include "RenderableMesh.h"
+#include "RenderableEntityType.h"
 
 struct RenderableEntity
 {
-    Model* model;
+    RenderableEntityType type;
     SceneNode* node;
-    std::vector<RenderableMesh> meshes;
+
+    explicit RenderableEntity(RenderableEntityType type, SceneNode* node) : type(type), node(node) {}
 };
 
 

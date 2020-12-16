@@ -1,13 +1,6 @@
 #include "OpenGLRenderer.h"
 #include <gl/gl3w.h>
 #include <vector>
-#include "../Models/Scene/RenderableEntityDesc.h"
-#include "../Models/Scene/ShaderDescriptor.h"
-#include "../Models/Scene/Scene.h"
-#include "../Models/Scene/RenderableEntity.h"
-#include "../Models/Scene/Light.h"
-#include "../Models/Scene/Camera.h"
-#include "../Models/Scene/Model.h"
 
 OpenGLRenderer::OpenGLRenderer(
     spdlog::logger& logger,
@@ -55,7 +48,12 @@ void OpenGLRenderer::drawMesh(const RenderableMesh& mesh)
         currentlyBoundMaterial = mesh.material;
     }
 
-    for (const auto& primitive : mesh.mesh->meshPrimitives)
+    drawPrimitives(mesh.mesh->meshPrimitives);
+}
+
+void OpenGLRenderer::drawPrimitives(const std::vector<MeshPrimitive>& primitives) const
+{
+    for (const auto& primitive : primitives)
     {
         glDrawElements(primitive.mode,
                        static_cast<GLsizei>(primitive.elementCount),
@@ -72,12 +70,30 @@ void OpenGLRenderer::draw(const Scene* scene, float delta)
     auto camera = sceneService.getCamera(scene, 0);
     cameraService.updateModelViewProjectionMatrix(camera);
 
-    for (auto& entity : scene->entities)
+    for (auto& sky : scene->skybox) {
+        glBindVertexArray(static_cast<GLuint>(sky->model->gpuResourceId));
+
+        for (auto& mesh : sky->model->meshes)
+        {
+            glUseProgram(sky->shader->gpuResourceId);
+
+            setProgramUniform(sky->shader->gpuResourceId, "localToScreen4x4Matrix",
+                              camera->modelViewProjectionMatrix *  sceneManagerService.modelMatrix(sky->node));
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(sky->cubeMap->gpuResourceId));
+
+            drawPrimitives(mesh.meshPrimitives);
+        }
+    }
+
+    for (auto& entity : scene->models)
     {
-        auto model = entity->model;
+        auto renderableModel = reinterpret_cast<RenderableModel*>(entity.get());
+        auto model = renderableModel->model;
         glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
 
-        for (auto& mesh : entity->meshes)
+        for (auto& mesh : renderableModel->meshes)
         {
             if (mesh.material == nullptr)
             {
@@ -87,10 +103,13 @@ void OpenGLRenderer::draw(const Scene* scene, float delta)
             const auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
 
             setProgramUniform(mesh.material->shader->gpuResourceId, "cameraPosition", camera->position);
-            setProgramUniform(mesh.material->shader->gpuResourceId, "localToScreen4x4Matrix", camera->modelViewProjectionMatrix * entityModelMatrix);
-            setProgramUniform(mesh.material->shader->gpuResourceId, "localToView4x4Matrix", camera->modelViewMatrix * entityModelMatrix);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToScreen4x4Matrix",
+                              camera->modelViewProjectionMatrix * entityModelMatrix);
+            setProgramUniform(mesh.material->shader->gpuResourceId, "localToView4x4Matrix",
+                              camera->modelViewMatrix * entityModelMatrix);
             setProgramUniform(mesh.material->shader->gpuResourceId, "localToWorld4x4Matrix", entityModelMatrix);
-            setProgramUniform(mesh.material->shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera->modelViewMatrix));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "modelView3x3Matrix",
+                              glm::mat3(camera->modelViewMatrix));
             setProgramUniform(mesh.material->shader->gpuResourceId, "normalMatrix",
                               glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
             const auto joints = renderableEntityService.joints(mesh, delta);
@@ -99,10 +118,14 @@ void OpenGLRenderer::draw(const Scene* scene, float delta)
 
             setProgramUniform(mesh.material->shader->gpuResourceId, "textureRepeat", mesh.material->repeat);
 
-            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
-            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859*2.5f, 1.2973*2.5f, 1.3*2.5f));
-            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
-            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.position",
+                              glm::vec3(0.0f, 350.0f, 350.0f));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.diffuse",
+                              glm::vec3(1.2859 * 2.5f, 1.2973 * 2.5f, 1.3 * 2.5f));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.specular",
+                              glm::vec3(1.2859, 1.2973, 1.3));
+            setProgramUniform(mesh.material->shader->gpuResourceId, "lights.ambient",
+                              glm::vec3(0.29859, 0.29973, 0.3));
             setProgramUniform(mesh.material->shader->gpuResourceId, "lights.attenuation", 1.0f);
 
             drawMesh(mesh);
@@ -143,6 +166,15 @@ void OpenGLRenderer::bindMaterial(const Material* material)
     {
         glActiveTexture(GL_TEXTURE4);
         glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->occlusion.value()->gpuResourceId.value()));
+    }
+
+    for (auto i = 0; i < material->textures.size(); i++)
+    {
+        if (material->textures[i]->gpuResourceId.has_value())
+        {
+            glActiveTexture(GL_TEXTURE4 + i + 1);
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(material->textures[i]->gpuResourceId.value()));
+        }
     }
 }
 
@@ -327,12 +359,8 @@ unsigned int OpenGLRenderer::createTexture(Texture* texture) const
     glBindTexture(GL_TEXTURE_2D, textureId);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    GLenum format =
-        texture->format == TextureFormat::R ? GL_RED :
-        texture->format == TextureFormat::RG ? GL_RG :
-        TextureFormat::RGB == 3 ? GL_RGB : GL_RGBA;
-
-    GLenum type = texture->pixelDataType == PixelDataType::UnsignedShort ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
+    auto format = getTextureFormat(texture->format);
+    auto type = getTextureDataType(texture->pixelDataType);
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture->width, texture->height, NULL, format, type, texture->data.data());
 
@@ -344,8 +372,47 @@ unsigned int OpenGLRenderer::createTexture(Texture* texture) const
     glBindTexture(GL_TEXTURE_2D, 0);
 
     texture->gpuResourceId = textureId;
+
     return textureId;
 }
+
+unsigned int OpenGLRenderer::createCubeMap(
+    Texture* front, Texture* back, Texture* left, Texture* right, Texture* top, Texture* bottom) const
+{
+    unsigned int textureId;
+    glGenTextures(1, &textureId);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, textureId);
+
+    Texture* textures[] = { right, left, bottom, top, front, back };
+    for (auto i = 0; i < 6; i++)
+    {
+        glTexImage2D(
+            GL_TEXTURE_CUBE_MAP_POSITIVE_X + i,
+            0,
+            getInternalFormatFromBitsPerPixel(
+            textures[i]->bitsPerPixel),
+            textures[i]->width,
+            textures[i]->height,
+            0,
+            getTextureFormat(textures[i]->format),
+            getTextureDataType(textures[i]->pixelDataType),
+            textures[i]->data.data());
+    }
+
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 6);
+
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+
+    return textureId;
+}
+
 
 bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
 {
@@ -472,4 +539,61 @@ void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::
 void OpenGLRenderer::setViewport(int width, int height)
 {
     glViewport(0, 0, width, height);
+}
+
+unsigned int OpenGLRenderer::getTextureDataType(PixelDataType type) const
+{
+    switch (type)
+    {
+        case PixelDataType::UnsignedByte:
+            return GL_UNSIGNED_BYTE;
+        case PixelDataType::UnsignedShort:
+            return GL_UNSIGNED_SHORT;
+        case PixelDataType::Float:
+            return GL_FLOAT;
+        default:
+            return GL_UNSIGNED_BYTE;
+    }
+}
+
+unsigned int OpenGLRenderer::getTextureFormat(TextureFormat format) const
+{
+    switch (format)
+    {
+        case TextureFormat::R:
+            return GL_RED;
+        case TextureFormat::RG:
+            return GL_RG;
+        case TextureFormat::RGB:
+            return GL_RGB;
+        case TextureFormat::RGBA:
+            return GL_RGBA;
+        case TextureFormat::BGR:
+            return GL_BGR;
+        case TextureFormat::BGRA:
+            return GL_BGRA;
+        default:
+            return GL_RGB;
+    }
+}
+
+unsigned int OpenGLRenderer::getInternalFormatFromBitsPerPixel(int bitsPerPixel) const
+{
+    switch (bitsPerPixel)
+    {
+        case 128:
+            return GL_RGBA32F;
+        case 96:
+            return GL_RGB32F;
+        case 32:
+            return GL_RGBA;
+        case 24:
+            return GL_RGB;
+        case 16:
+            return GL_RG;
+        case 8:
+            return GL_RED;
+        default:
+            return GL_RGB;
+    }
 }

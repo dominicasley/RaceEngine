@@ -9,3 +9,4 @@
 #include "Services/RenderableEntityService.h"
 #include "Services/AnimationService.h"
 #include "Services/ShaderService.h"
+#include "Services/CubeMapService.h"

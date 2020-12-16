@@ -12,5 +12,6 @@ struct Texture {
     PixelDataType pixelDataType;
     int width;
     int height;
+    int bitsPerPixel;
     std::vector<unsigned char> data;
 };

@@ -1,10 +1,11 @@
 #pragma once
 
-enum TextureFormat {
+enum class TextureFormat {
     R,
     RG,
     RGB,
     RGBA,
     BGR,
-    BRGA
+    BGRA,
+    Unkown
 };

@@ -21,6 +21,7 @@ public:
     RenderableEntityService& renderableEntityService;
     CameraService& cameraService;
     ShaderService& shaderService;
+    CubeMapService& cubeMapService;
 
     Bootstrapper(
         spdlog::logger& logger,
@@ -33,7 +34,8 @@ public:
         SceneService& sceneService,
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService,
-        ShaderService& shaderService);
+        ShaderService& shaderService,
+        CubeMapService& cubeMapService);
 
     void step(float delta);
     void draw(float delta);

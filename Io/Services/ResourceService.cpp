@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <ozz/base/io/archive.h>
+#include <FreeImage.h>
 
 
 ResourceService::ResourceService(
@@ -16,7 +17,7 @@ ResourceService::ResourceService(
 {
 }
 
-std::string ResourceService::loadTextFile(const std::string& filePath)
+std::string ResourceService::loadTextFile(const std::string& filePath) const
 {
     std::string output;
     std::ifstream fileStream(filePath);
@@ -30,7 +31,7 @@ std::string ResourceService::loadTextFile(const std::string& filePath)
     return output;
 }
 
-Model* ResourceService::loadModel(std::string filePath)
+Model* ResourceService::loadModel(const std::string& filePath) const
 {
     if (memoryStorageService.models.exists(filePath))
     {
@@ -57,7 +58,7 @@ Model* ResourceService::loadModel(std::string filePath)
     return memoryStorageService.models.add(filePath, model.value());
 }
 
-ozz::animation::Skeleton* ResourceService::loadSkeleton(const std::string& filePath)
+ozz::animation::Skeleton* ResourceService::loadSkeleton(const std::string& filePath) const
 {
     if (memoryStorageService.skeletons.exists(filePath))
     {
@@ -67,13 +68,15 @@ ozz::animation::Skeleton* ResourceService::loadSkeleton(const std::string& fileP
 
     ozz::io::File file(filePath.c_str(), "rb");
 
-    if (!file.opened()) {
+    if (!file.opened())
+    {
         logger.error("Failed to open skeleton file {}", filePath);
         return nullptr;
     }
 
     ozz::io::IArchive archive(&file);
-    if (!archive.TestTag<ozz::animation::Skeleton>()) {
+    if (!archive.TestTag<ozz::animation::Skeleton>())
+    {
         logger.error("Failed to load skeleton instance from file {}", filePath);
         return nullptr;
     }
@@ -85,7 +88,7 @@ ozz::animation::Skeleton* ResourceService::loadSkeleton(const std::string& fileP
 }
 
 
-ozz::animation::Animation* ResourceService::loadAnimation(const std::string& filePath)
+ozz::animation::Animation* ResourceService::loadAnimation(const std::string& filePath) const
 {
     if (memoryStorageService.animations.exists(filePath))
     {
@@ -95,13 +98,15 @@ ozz::animation::Animation* ResourceService::loadAnimation(const std::string& fil
 
     ozz::io::File file(filePath.c_str(), "rb");
 
-    if (!file.opened()) {
+    if (!file.opened())
+    {
         logger.error("Failed to open skeleton file {}", filePath);
         return nullptr;
     }
 
     ozz::io::IArchive archive(&file);
-    if (!archive.TestTag<ozz::animation::Animation>()) {
+    if (!archive.TestTag<ozz::animation::Animation>())
+    {
         logger.error("Failed to load skeleton instance from file {}", filePath);
         return nullptr;
     }
@@ -112,7 +117,55 @@ ozz::animation::Animation* ResourceService::loadAnimation(const std::string& fil
     return memoryStorageService.animations.takeOwnership(filePath, animation);
 }
 
-const Observable<std::string>& ResourceService::loadTextFileAsync(std::string filePath)
+Texture* ResourceService::loadTexture(const std::string& filePath) const
+{
+    auto format = FreeImage_GetFileType(filePath.c_str(), 0);
+
+    if (format == FIF_UNKNOWN)
+    {
+        format = FreeImage_GetFIFFromFilename(filePath.c_str());
+    }
+
+    if (!FreeImage_FIFSupportsReading(format))
+    {
+        logger.error("No read support for image format {}: {}", format, filePath);
+        return nullptr;
+    }
+
+    auto image = FreeImage_Load(format, filePath.c_str());
+
+    if (!image)
+    {
+        logger.error("Unable to load image with path {}", filePath);
+        return nullptr;
+    }
+
+    auto imageData = FreeImage_GetBits(image);
+    auto size = FreeImage_GetMemorySize(image);
+    auto bitsPerPixel = static_cast<int>(FreeImage_GetBPP(image));
+    auto imageWidth = static_cast<int>(FreeImage_GetWidth(image));
+    auto imageHeight = static_cast<int>(FreeImage_GetHeight(image));
+    auto data = std::vector(imageData, imageData + size);
+
+    FreeImage_Unload(image);
+
+    return memoryStorageService.textures.add(filePath, Texture{
+        .name = filePath,
+        .format = bitsPerPixel == 24 ? TextureFormat::BGR :
+            bitsPerPixel == 32 ? TextureFormat::BGRA :
+            bitsPerPixel == 96 ? TextureFormat::RGB :
+            bitsPerPixel == 128 ? TextureFormat::RGBA :
+            TextureFormat::Unkown,
+        .pixelDataType = bitsPerPixel == 96 ? PixelDataType::Float : PixelDataType::UnsignedByte,
+        .width = imageWidth,
+        .height = imageHeight,
+        .bitsPerPixel = bitsPerPixel,
+        .data = data
+    });
+}
+
+
+const Observable<std::string>& ResourceService::loadTextFileAsync(std::string filePath) const
 {
     logger.info("Loading file: {}", filePath);
 
@@ -121,7 +174,7 @@ const Observable<std::string>& ResourceService::loadTextFileAsync(std::string fi
         ->asObservable();
 }
 
-const Observable<Model*>& ResourceService::loadModelAsync(std::string filePath)
+const Observable<Model*>& ResourceService::loadModelAsync(std::string filePath) const
 {
     logger.info("Loading model: {}", filePath);
 
@@ -130,7 +183,7 @@ const Observable<Model*>& ResourceService::loadModelAsync(std::string filePath)
         ->asObservable();
 }
 
-const Observable<ozz::animation::Skeleton*>& ResourceService::loadSkeletonAsync(std::string filePath)
+const Observable<ozz::animation::Skeleton*>& ResourceService::loadSkeletonAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
@@ -139,7 +192,7 @@ const Observable<ozz::animation::Skeleton*>& ResourceService::loadSkeletonAsync(
         ->asObservable();
 }
 
-const Observable<ozz::animation::Animation*>& ResourceService::loadAnimationAsync(std::string filePath)
+const Observable<ozz::animation::Animation*>& ResourceService::loadAnimationAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
@@ -147,3 +200,13 @@ const Observable<ozz::animation::Animation*>& ResourceService::loadAnimationAsyn
         std::async(std::launch::async, &ResourceService::loadAnimation, this, filePath))
         ->asObservable();
 }
+
+const Observable<Texture*>& ResourceService::loadTextureAsync(std::string filePath) const
+{
+    logger.info("Loading image: {}", filePath);
+
+    return BackgroundWorkerService::registerTask(
+        std::async(std::launch::async, &ResourceService::loadTexture, this, filePath))
+        ->asObservable();
+}
+

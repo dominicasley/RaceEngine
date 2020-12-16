@@ -17,7 +17,8 @@ Bootstrapper::Bootstrapper(
     SceneService& sceneService,
     RenderableEntityService& renderableEntityService,
     CameraService& cameraService,
-    ShaderService& shaderService) :
+    ShaderService& shaderService,
+    CubeMapService& cubeMapService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
@@ -28,7 +29,8 @@ Bootstrapper::Bootstrapper(
     sceneService(sceneService),
     renderableEntityService(renderableEntityService),
     cameraService(cameraService),
-    shaderService(shaderService)
+    shaderService(shaderService),
+    cubeMapService(cubeMapService)
 {
     renderer.init();
 

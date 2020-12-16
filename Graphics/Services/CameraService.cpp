@@ -82,7 +82,7 @@ const glm::mat4& CameraService::updateModelViewMatrix(Camera* camera) const
 const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera* camera) const
 {
     camera->modelViewProjectionMatrix =
-        glm::perspective(glm::radians(camera->fieldOfView), camera->aspectRatio, 1.0f, 1000.0f) *
+        glm::perspective(glm::radians(camera->fieldOfView), camera->aspectRatio, 1.0f, 5000.0f) *
         updateModelViewMatrix(camera);
 
     return camera->modelViewProjectionMatrix;

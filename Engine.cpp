@@ -34,6 +34,8 @@ Engine::Engine() : app(di::make_injector(
         .to<SceneService>(),
     di::bind<ShaderService>
         .to<ShaderService>(),
+    di::bind<CubeMapService>
+        .to<CubeMapService>(),
     di::bind<SceneManagerService>
         .in(di::singleton)
         .to<SceneManagerService>()).create<Bootstrapper>()),
@@ -46,7 +48,8 @@ Engine::Engine() : app(di::make_injector(
                    scene(app.sceneService),
                    entity(app.renderableEntityService),
                    camera(app.cameraService),
-                   shader(app.shaderService)
+                   shader(app.shaderService),
+                   cubeMap(app.cubeMapService)
 {
 
 }

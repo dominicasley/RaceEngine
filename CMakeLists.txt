@@ -30,8 +30,7 @@ target_link_libraries(Engine PUBLIC glfw)
 
 target_include_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
-target_include_directories(Engine PUBLIC vendor/tinygltf)
-
+target_include_directories(Engine PRIVATE vendor/tinygltf)
 
 project ("Graphics")
 add_subdirectory("Graphics")
