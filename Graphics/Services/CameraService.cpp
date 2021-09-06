@@ -1,18 +1,46 @@
 #include "CameraService.h"
 
-CameraService::CameraService(spdlog::logger& logger) : logger(logger)
+CameraService::CameraService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
+    logger(logger),
+    memoryStorageService(memoryStorageService),
+    fboService(fboService),
+    window(window)
 {
 }
 
 Camera CameraService::createCamera()
 {
+    auto windowState = window.state();
+
+    auto windowWidth = static_cast<unsigned int>(windowState.windowWidth);
+    auto windowHeight = static_cast<unsigned int>(windowState.windowHeight);
+
     return Camera {
         .iso = 6400,
         .aspectRatio = 16.0f / 9.0f,
         .aperture = 1.4f,
-        .fieldOfView = 55.f,
+        .fieldOfView = 75.f,
         .direction = glm::vec3(0, 0, 1),
-        .roll = glm::vec3(0, 1, 0)
+        .roll = glm::vec3(0, 1, 0),
+        .output = fboService.create(CreateFboDTO {
+            .type = FboType::Planar,
+            .attachments = {
+                CreateFboAttachmentDTO {
+                    .width = windowWidth,
+                    .height = windowHeight,
+                    .type = FboAttachmentType::Color,
+                    .captureFormat = TextureFormat::RGBA,
+                    .internalFormat = TextureFormat::RGBA16F
+                },
+                CreateFboAttachmentDTO {
+                    .width = windowWidth,
+                    .height = windowHeight,
+                    .type = FboAttachmentType::Depth,
+                    .captureFormat = TextureFormat::DepthComponent,
+                    .internalFormat = TextureFormat::DepthComponent
+                },
+            }
+        })
     };
 }
 
@@ -62,6 +90,14 @@ void CameraService::setAspectRatio(Camera* camera, float aspectRatio) const
     camera->aspectRatio = aspectRatio;
 }
 
+void CameraService::recreateOutputBuffer(Camera* camera, int width, int height) const
+{
+    auto windowWidth = static_cast<unsigned int>(width);
+    auto windowHeight = static_cast<unsigned int>(height);
+
+    fboService.resize(camera->output.value(), windowWidth, windowHeight);
+}
+
 void CameraService::lookAtPoint(Camera* camera, float x, float y, float z) const
 {
     const auto point = glm::vec3(x, y, z);
@@ -86,4 +122,13 @@ const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera* camera) 
         updateModelViewMatrix(camera);
 
     return camera->modelViewProjectionMatrix;
+}
+
+void CameraService::addPostProcess(Camera* camera, const Resource<PostProcess>& postProcessKey) const
+{
+    camera->postProcesses.push_back(postProcessKey);
+}
+
+const Fbo& CameraService::getOutputBuffer(Camera* camera) const {
+    return memoryStorageService.frameBuffers.get(camera->output.value());
 }

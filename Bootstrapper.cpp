@@ -1,10 +1,4 @@
-//
-// Created by Dominic on 6/11/2019.
-//
-
 #include "Bootstrapper.h"
-
-#include <utility>
 
 Bootstrapper::Bootstrapper(
     spdlog::logger& logger,
@@ -18,7 +12,10 @@ Bootstrapper::Bootstrapper(
     RenderableEntityService& renderableEntityService,
     CameraService& cameraService,
     ShaderService& shaderService,
-    CubeMapService& cubeMapService) :
+    CubeMapService& cubeMapService,
+    FboService& fboService,
+    PostProcessService& postProcessService,
+    PresenterService& presenterService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
@@ -30,18 +27,30 @@ Bootstrapper::Bootstrapper(
     renderableEntityService(renderableEntityService),
     cameraService(cameraService),
     shaderService(shaderService),
-    cubeMapService(cubeMapService)
+    cubeMapService(cubeMapService),
+    fboService(fboService),
+    postProcessService(postProcessService),
+    presenterService(presenterService)
 {
     renderer.init();
 
-    window.windowResize.subscribe([&, this](auto size) {
+    window.windowResize.subscribe([&](auto size) {
         const auto& [width, height] = size;
         logger.info("Window Resized: {}px x {}px", width, height);
         renderer.setViewport(width, height);
 
-        for (auto& camera : sceneManager.getScene("game")->cameras)
+        for (auto& scene : sceneManager.getScenes())
         {
-            cameraService.setAspectRatio(camera.get(), static_cast<float>(width) / static_cast<float>(height));
+            for (auto& camera : scene.second->cameras)
+            {
+                cameraService.setAspectRatio(camera.get(), static_cast<float>(width) / static_cast<float>(height));
+                cameraService.recreateOutputBuffer(camera.get(), width, height);
+
+                for (auto postProcess : camera->postProcesses)
+                {
+                    postProcessService.recreateOutputBuffer(postProcess, width, height);
+                }
+            }
         }
     });
 }
@@ -49,14 +58,26 @@ Bootstrapper::Bootstrapper(
 void Bootstrapper::step(float delta)
 {
     backgroundWorkerService.step();
+
+    for (auto& scene : sceneManager.getScenes())
+    {
+        for (auto& camera : scene.second->cameras)
+        {
+            cameraService.updateModelViewProjectionMatrix(camera.get());
+        }
+    }
 }
 
 void Bootstrapper::draw(float delta)
 {
     for (auto& scene : sceneManager.getScenes())
     {
-        renderer.draw(scene.second.get(), delta);
+        for (const auto& camera : scene.second->cameras)
+        {
+            renderer.draw(scene.second.get(), camera.get(), delta);
+        }
     }
 
+    presenterService.present();
     window.swapBuffers();
 }

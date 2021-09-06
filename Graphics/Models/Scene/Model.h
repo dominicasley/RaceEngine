@@ -4,5 +4,5 @@
 
 struct Model {
     int gpuResourceId;
-    std::vector<Mesh> meshes;
+    std::vector<Resource<Mesh>> meshes;
 };

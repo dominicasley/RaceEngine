@@ -17,7 +17,9 @@ Scene* SceneManagerService::getScene(const std::string& name)
 
 Scene* SceneManagerService::createScene(const std::string& name)
 {
-    auto e = scenes.emplace(name, std::make_unique<Scene>());
+    auto scene = std::make_unique<Scene>();
+
+    auto e = scenes.emplace(name, std::move(scene));
     return e.first->second.get();
 }
 
@@ -54,7 +56,7 @@ void SceneManagerService::translate(SceneNode* node, float x, float y, float z) 
 void SceneManagerService::rotate(SceneNode* node, float angle, float x, float y, float z) const
 {
     node->rotation += glm::vec4(x, y, z, angle);
-    node->rotationMatrix = glm::rotate(node->rotationMatrix, angle, glm::vec3(x, y, z));
+    node->rotationMatrix = glm::rotate(node->rotationMatrix, glm::radians(angle), glm::vec3(x, y, z));
 }
 
 void SceneManagerService::scale(SceneNode* node, float x, float y, float z) const

@@ -1,18 +1,18 @@
 #pragma once
 
-#include <string>
 #include <optional>
-#include "TextureFormat.h"
-#include "PixelDataType.h"
 
-struct Texture
+#include "Texture.h"
+#include "TextureFormat.h"
+#include "FboAttachmentType.h"
+
+struct FboAttachment
 {
-    std::string name;
+    FboAttachmentType type;
     std::optional<unsigned int> gpuResourceId;
-    TextureFormat format;
-    PixelDataType pixelDataType;
     unsigned int width;
     unsigned int height;
-    unsigned int bitsPerPixel;
+    TextureFormat captureFormat;
+    TextureFormat internalFormat;
     std::vector<unsigned char> data;
 };

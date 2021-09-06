@@ -22,6 +22,9 @@ public:
     CameraService& cameraService;
     ShaderService& shaderService;
     CubeMapService& cubeMapService;
+    FboService& fboService;
+    PostProcessService& postProcessService;
+    PresenterService& presenterService;
 
     Bootstrapper(
         spdlog::logger& logger,
@@ -35,7 +38,10 @@ public:
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService,
         ShaderService& shaderService,
-        CubeMapService& cubeMapService);
+        CubeMapService& cubeMapService,
+        FboService& fboService,
+        PostProcessService& postProcessService,
+        PresenterService& presenterService);
 
     void step(float delta);
     void draw(float delta);

@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <functional>
+#include <optional>
 #include <future>
 #include <iostream>
 #include <utility>

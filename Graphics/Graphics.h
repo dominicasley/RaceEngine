@@ -10,3 +10,8 @@
 #include "Services/AnimationService.h"
 #include "Services/ShaderService.h"
 #include "Services/CubeMapService.h"
+#include "Services/FboService.h"
+#include "Services/PostProcessService.h"
+#include "Services/SceneService.h"
+#include "Services/CameraService.h"
+#include "Services/PresenterService.h"

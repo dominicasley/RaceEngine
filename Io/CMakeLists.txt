@@ -1,4 +1,5 @@
-﻿cmake_minimum_required (VERSION 3.8)
+﻿set(CMAKE_CXX_STANDARD 20)
+cmake_minimum_required (VERSION 3.8)
 
 add_library (Io
         Services/ResourceService.cpp
@@ -7,9 +8,7 @@ add_library (Io
         Services/GLTFService.h
         Utility/AccessorUtility.h)
 
-target_include_directories(Io PUBLIC "../Async/")
-target_include_directories(Io PUBLIC "../Graphics/")
-target_include_directories(Io PUBLIC "../Shared/")
+target_include_directories(Io PUBLIC "../")
 target_include_directories(Io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 target_include_directories(Io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)
 include_directories(../vendor/FreeImage/bin)

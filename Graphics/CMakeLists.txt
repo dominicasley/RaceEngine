@@ -1,6 +1,7 @@
 ﻿# CMakeList.txt : CMake project for OpenStreetRace, include source and define
 # project specific logic here.
 #
+set(CMAKE_CXX_STANDARD 20)
 cmake_minimum_required (VERSION 3.8)
 
 # Add source to this project's executable.
@@ -49,9 +50,29 @@ add_library (Graphics
         Models/Scene/RenderableMesh.h
         Services/ShaderService.cpp
         Services/ShaderService.h
-        Models/Scene/Shader.h Models/Scene/CubeMap.h Services/CubeMapService.cpp Services/CubeMapService.h Models/Scene/RenderableEntityType.h Models/Scene/RenderableModel.h Models/Scene/RenderableSkybox.h)
+        Models/Scene/Shader.h
+        Models/Scene/CubeMap.h
+        Services/CubeMapService.cpp
+        Services/CubeMapService.h
+        Models/Scene/RenderableEntityType.h
+        Models/Scene/RenderableModel.h
+        Models/Scene/RenderableSkybox.h
+        Models/Scene/Fbo.h
+        Models/Scene/FboAttachment.h
+        Models/Scene/FboAttachmentType.h
+        Models/Scene/FboType.h
+        Services/FboService.cpp
+        Services/FboService.h
+        Models/Scene/CreateFboDTO.h
+        Models/Scene/CreateFboAttachmentDTO.h
+        Models/Scene/PostProcess.h
+        Services/PostProcessService.cpp
+        Services/PostProcessService.h
+        Services/PresenterService.cpp
+        Services/PresenterService.h
+        Models/Scene/Presenter.h)
 
-target_include_directories(Graphics PUBLIC "../Shared/")
+target_include_directories(Graphics PUBLIC "../")
 
 target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
@@ -63,6 +84,9 @@ target_link_libraries(Graphics PUBLIC gl3w)
 target_link_libraries(Graphics PUBLIC glfw)
 target_link_libraries(Graphics PUBLIC ozz_animation)
 target_link_libraries(Graphics PUBLIC ozz_base)
+
+target_link_libraries(Graphics PUBLIC Shared)
+target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../Shared)
 
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)

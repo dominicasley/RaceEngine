@@ -23,6 +23,9 @@ public:
     CameraService& camera;
     ShaderService& shader;
     CubeMapService& cubeMap;
+    FboService& fbo;
+    PostProcessService& postProcess;
+    PresenterService& presenter;
 
     Engine();
     [[nodiscard]] bool running() const;

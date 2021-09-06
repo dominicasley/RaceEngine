@@ -2,17 +2,22 @@
 
 #include <glm/glm.hpp>
 #include <optional>
+#include <Shared/Types/Resource.h>
+
 #include "Texture.h"
+#include "CubeMap.h"
 #include "Shader.h"
 
-struct Material {
+struct Material
+{
     glm::vec4 baseColour;
     glm::vec2 repeat = glm::vec2(1.0f);
-    Shader* shader;
-    std::optional<Texture*> albedo;
-    std::optional<Texture*> metallicRoughness;
-    std::optional<Texture*> normal;
-    std::optional<Texture*> occlusion;
-    std::optional<Texture*> emissive;
-    std::vector<Texture*> textures;
+    std::optional<Resource<Shader>> shader;
+    std::optional<Resource<Texture>> albedo;
+    std::optional<Resource<Texture>> metallicRoughness;
+    std::optional<Resource<Texture>> normal;
+    std::optional<Resource<Texture>> occlusion;
+    std::optional<Resource<Texture>> emissive;
+    std::optional<Resource<Texture>> environment;
+    std::vector<Resource<Texture>> textures;
 };

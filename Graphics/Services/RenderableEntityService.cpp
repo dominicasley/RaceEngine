@@ -1,7 +1,9 @@
 #include "RenderableEntityService.h"
 
-RenderableEntityService::RenderableEntityService(spdlog::logger& logger, AnimationService& animationService) :
+
+RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService) :
     logger(logger),
+    memoryStorageService(memoryStorageService),
     animationService(animationService)
 {
 
@@ -9,21 +11,28 @@ RenderableEntityService::RenderableEntityService(spdlog::logger& logger, Animati
 
 RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
 {
-    auto createMeshes = [](const CreateRenderableModelDTO& entityDescriptor) {
+    auto createMeshes = [&](const CreateRenderableModelDTO& entityDescriptor) {
         std::vector<RenderableMesh> meshes;
 
-        for (const auto& m : entityDescriptor.model->meshes) {
-            auto material = !m.materials.empty() ? m.materials.front() : nullptr;
+        for (const auto& meshKey : entityDescriptor.model->meshes) {
+            auto mesh = memoryStorageService.meshes.get(meshKey);
+            std::optional<Resource<Material>> materialKey;
 
-            if (material != nullptr)
+            if (!mesh.materials.empty())
+                materialKey = mesh.materials.front();
+
+            if (materialKey.has_value())
             {
-                material->shader = entityDescriptor.shader;
+                auto material = memoryStorageService.materials.get(materialKey.value());
+                material.shader = entityDescriptor.shader;
+
+                memoryStorageService.materials.update(materialKey.value(), material);
             }
 
             meshes.push_back(RenderableMesh {
-                .mesh = &m,
-                .material = material,
-                .skeleton = nullptr
+                .mesh = meshKey,
+                .material = materialKey,
+                .skeleton = std::nullopt
             });
         }
 
@@ -55,14 +64,7 @@ void RenderableEntityService::setAnimation(RenderableMesh& mesh, unsigned int an
     if (mesh.animations.size() > animationIndex)
     {
         mesh.currentAnimationIndex = animationIndex;
-
         const auto animation = mesh.animations[animationIndex];
-
-        logger.info(
-            "set animation: {} {} duration {} channels",
-            animation->name(),
-            animation->duration(),
-            animation->num_tracks());
     }
 }
 
@@ -77,55 +79,62 @@ glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
 }
 
 std::vector<glm::mat4>
-RenderableEntityService::joints(RenderableMesh& mesh, float frameTimeDelta) const
+RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeDelta) const
 {
     auto out = std::vector<glm::mat4>();
 
-    if (!mesh.animations.empty())
+    if (!renderableMesh.animations.empty())
     {
-        mesh.animationTime = fmod(mesh.animationTime + frameTimeDelta, mesh.animations[mesh.currentAnimationIndex]->duration());
+        auto mesh = renderableMesh.mesh;
+        auto animation = renderableMesh.animations[renderableMesh.currentAnimationIndex].value;
+        auto skeleton = renderableMesh.skeleton.value().value;
+
+        renderableMesh.animationTime = fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
 
         ozz::animation::SamplingJob sampling_job;
-        sampling_job.animation = mesh.animations[mesh.currentAnimationIndex];
-        sampling_job.cache = mesh.animationCache.get();
-        sampling_job.ratio = mesh.animationTime / mesh.animations[mesh.currentAnimationIndex]->duration();
-        sampling_job.output = ozz::make_span(mesh.animationLocalSpaceTransforms);
+        sampling_job.animation = animation->get();
+        sampling_job.cache = renderableMesh.animationCache.get();
+        sampling_job.ratio = renderableMesh.animationTime / animation->get()->duration();
+        sampling_job.output = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
         sampling_job.Run();
 
         ozz::animation::LocalToModelJob ltm_job;
-        ltm_job.skeleton = mesh.skeleton;
-        ltm_job.input = ozz::make_span(mesh.animationLocalSpaceTransforms);
-        ltm_job.output = ozz::make_span(mesh.animationModelSpaceTransforms);
+        ltm_job.skeleton = skeleton->get();
+        ltm_job.input = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
+        ltm_job.output = ozz::make_span(renderableMesh.animationModelSpaceTransforms);
         ltm_job.Run();
 
-        out.resize(mesh.animationModelSpaceTransforms.size());
-        for (auto i = 0; i < mesh.animationModelSpaceTransforms.size(); i++)
+        out.resize(renderableMesh.animationModelSpaceTransforms.size());
+        for (auto i = 0; i < renderableMesh.animationModelSpaceTransforms.size(); i++)
         {
-            out[mesh.jointMap[i]] =
-                ozzToMat4(mesh.animationModelSpaceTransforms[i]) *
-                mesh.mesh->inverseBindPoseTransforms[mesh.jointMap[i]];
+            out[renderableMesh.jointMap[i]] =
+                ozzToMat4(renderableMesh.animationModelSpaceTransforms[i]) *
+                    mesh->inverseBindPoseTransforms[renderableMesh.jointMap[i]];
         }
     }
 
     return out;
 }
 
-void RenderableEntityService::setSkeleton(RenderableMesh& mesh, ozz::animation::Skeleton* skeleton) const
+void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeletonKey) const
 {
-    mesh.skeleton = skeleton;
+    auto skeleton = skeletonKey.value;
 
-    mesh.animationLocalSpaceTransforms.resize(skeleton->num_soa_joints());
-    mesh.animationModelSpaceTransforms.resize(skeleton->num_joints());
-    mesh.animationCache = std::make_unique<ozz::animation::SamplingCache>(skeleton->num_joints());
+    mesh.skeleton = skeletonKey;
+    mesh.animationLocalSpaceTransforms.resize(skeleton->get()->num_soa_joints());
+    mesh.animationModelSpaceTransforms.resize(skeleton->get()->num_joints());
+    mesh.animationCache = std::make_unique<ozz::animation::SamplingCache>(skeleton->get()->num_joints());
 
-    for (auto i = 0; i < mesh.skeleton->num_joints(); i++)
+    for (auto i = 0; i < skeleton->get()->num_joints(); i++)
     {
-        auto ozzJointName = mesh.skeleton->joint_names()[i];
-        mesh.jointMap[i] = mesh.mesh->skin.at(ozzJointName);
+        auto m = memoryStorageService.meshes.get(mesh.mesh);
+        auto ozzJointName = skeleton->get()->joint_names()[i];
+
+        mesh.jointMap[i] = m.skin.at(ozzJointName);
     }
 }
 
-void RenderableEntityService::addAnimation(RenderableMesh& mesh, ozz::animation::Animation* animation) const
+void RenderableEntityService::addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const
 {
     mesh.animations.push_back(animation);
 }

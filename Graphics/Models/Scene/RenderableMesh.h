@@ -16,14 +16,14 @@
 #include "Mesh.h"
 
 struct RenderableMesh {
-    const Mesh* mesh;
-    Material* material;
-    unsigned int currentAnimationIndex;
+    const Resource<Mesh> mesh;
+    std::optional<Resource<Material>> material;
     float animationTime;
-    ozz::animation::Skeleton* skeleton;
+    unsigned int currentAnimationIndex;
     ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms;
     ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;
-    std::vector<ozz::animation::Animation*> animations;
+    std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;
+    std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations;
     std::unique_ptr<ozz::animation::SamplingCache> animationCache;
     std::map<int, int> jointMap;
 };

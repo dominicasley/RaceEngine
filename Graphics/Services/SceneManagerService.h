@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 #include <map>
+
 #include "../Models/Scene/Scene.h"
 
 class SceneManagerService

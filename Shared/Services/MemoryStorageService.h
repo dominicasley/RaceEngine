@@ -8,60 +8,89 @@
 #include <spdlog/logger.h>
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
-#include <../Graphics/Models/Scene/Model.h>
-#include <../Graphics/Models/Scene/Texture.h>
-#include <../Graphics/Models/Scene/CubeMap.h>
-#include <../Graphics/Models/Scene/Material.h>
-#include <../Graphics/Models/Scene/Shader.h>
+#include <Graphics/Models/Scene/Model.h>
+#include <Graphics/Models/Scene/Texture.h>
+#include <Graphics/Models/Scene/CubeMap.h>
+#include <Graphics/Models/Scene/Material.h>
+#include <Graphics/Models/Scene/Shader.h>
+#include <Graphics/Models/Scene/Fbo.h>
+#include <Graphics/Models/Scene/PostProcess.h>
+#include <Shared/Types/Resource.h>
 
-template<typename K, typename T>
+template<typename T>
 class MemoryStorage
 {
     std::vector<T> buffer[1024];
     std::pmr::monotonic_buffer_resource bufferResource;
     mutable std::mutex accessorMutex;
-    mutable std::pmr::unordered_map<K, std::unique_ptr<T>> items;
+    mutable std::pmr::vector<T> items;
 
 public:
-    MemoryStorage() :
+    explicit MemoryStorage() :
         bufferResource(buffer, buffer->size()),
-        items(std::pmr::unordered_map<K, std::unique_ptr<T>>(&bufferResource))
+        items(std::pmr::vector<T>(&bufferResource))
     {
         items.reserve(1024);
     }
 
-    [[nodiscard]] T* get(const K& key) const
+    [[nodiscard]] const T& get(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        return items.at(key).get();
+        return items[key.id];
     };
 
-    [[nodiscard]] bool exists(const K& key) const
+    [[nodiscard]] bool exists(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        return items.find(key) != items.end();
+        return items.size() > key.id;
     };
 
-    void remove(const K& key) const
+    [[nodiscard]] std::optional<Resource<T>> getKeyIfExists(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        items.erase(key);
+
+        if (items.find(key) != items.end()) {
+            return key;
+        }
+
+        return std::nullopt;
     };
 
-    T* add(const K& key, const T& item) const
+    void remove(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        items.insert_or_assign(key, std::make_unique<T>(item));
-
-        return items[key].get();
+        // items.erase(key.id);
+        // todo: idek
     };
 
-    T* takeOwnership(const std::string& key, std::unique_ptr<T>& ptr) const
+    Resource<T> add(const T& item) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        items.insert_or_assign(key, std::move(ptr));
+        auto value = items.emplace_back(item);
 
-        return items[key].get();
+        return Resource<T> {
+            .id = items.size() - 1,
+            .value = &items[items.size() - 1]
+        };
+    };
+
+    void update(const Resource<T>& resource, T& value) const
+    {
+        std::lock_guard<std::mutex> lock(accessorMutex);
+        items[resource.id] = value;
+    };
+
+
+    Resource<T> takeOwnership(T& item) const
+    {
+        std::lock_guard<std::mutex> lock(accessorMutex);
+
+        auto value = items.emplace_back(std::move(item)).get();
+
+        return Resource<T> {
+            .id = items.size() - 1,
+            .value = &items[items.size() - 1]
+        };
     };
 };
 
@@ -71,13 +100,17 @@ private:
     spdlog::logger& logger;
 
 public:
-    const MemoryStorage<std::string, Model> models;
-    const MemoryStorage<std::string, Texture> textures;
-    const MemoryStorage<std::string, Material> materials;
-    const MemoryStorage<std::string, CubeMap> cubeMaps;
-    const MemoryStorage<std::string, Shader> shaders;
-    const MemoryStorage<std::string, ozz::animation::Skeleton> skeletons;
-    const MemoryStorage<std::string, ozz::animation::Animation> animations;
+    const MemoryStorage<Model> models;
+    const MemoryStorage<Mesh> meshes;
+    const MemoryStorage<Texture> textures;
+    const MemoryStorage<Material> materials;
+    const MemoryStorage<CubeMap> cubeMaps;
+    const MemoryStorage<Shader> shaders;
+    const MemoryStorage<Fbo> frameBuffers;
+    const MemoryStorage<FboAttachment> bufferAttachments;
+    const MemoryStorage<PostProcess> postProcesses;
+    const MemoryStorage<std::unique_ptr<ozz::animation::Skeleton>> skeletons;
+    const MemoryStorage<std::unique_ptr<ozz::animation::Animation>> animations;
 
     explicit MemoryStorageService(spdlog::logger& logger);
 };

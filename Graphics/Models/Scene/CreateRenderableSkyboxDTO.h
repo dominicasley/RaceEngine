@@ -8,7 +8,7 @@
 struct CreateRenderableSkyboxDTO
 {
     SceneNode* node;
-    Shader* shader;
-    CubeMap* cubeMap;
-    Model* model;
+    Resource<Shader> shader;
+    Resource<CubeMap> cubeMap;
+    Resource<Model> model;
 };

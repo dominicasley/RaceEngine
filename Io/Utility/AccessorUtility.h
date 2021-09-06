@@ -6,7 +6,6 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <spdlog/spdlog.h>
 
-
 class AccessorUtility
 {
 private:

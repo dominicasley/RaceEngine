@@ -1,6 +1,5 @@
 #include <spdlog/async.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
 
 #include "Engine.h"
 
@@ -36,9 +35,16 @@ Engine::Engine() : app(di::make_injector(
         .to<ShaderService>(),
     di::bind<CubeMapService>
         .to<CubeMapService>(),
+    di::bind<FboService>
+        .to<FboService>(),
+    di::bind<PostProcessService>
+        .to<PostProcessService>(),
+    di::bind<PresenterService>
+        .to<PresenterService>(),
     di::bind<SceneManagerService>
         .in(di::singleton)
-        .to<SceneManagerService>()).create<Bootstrapper>()),
+        .to<SceneManagerService>())
+        .create<Bootstrapper>()),
                    window(app.window),
                    renderer(app.renderer),
                    resource(app.resourceService),
@@ -49,7 +55,10 @@ Engine::Engine() : app(di::make_injector(
                    entity(app.renderableEntityService),
                    camera(app.cameraService),
                    shader(app.shaderService),
-                   cubeMap(app.cubeMapService)
+                   cubeMap(app.cubeMapService),
+                   fbo(app.fboService),
+                   postProcess(app.postProcessService),
+                   presenter(app.presenterService)
 {
 
 }

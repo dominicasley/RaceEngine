@@ -6,11 +6,13 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <Shared/Services/MemoryStorageService.h>
+#include "../Models/Scene/Fbo.h"
 #include "../Models/Scene/ShaderDescriptor.h"
-#include "../Services/SceneService.h"
-#include "../Services/SceneManagerService.h"
 #include "../Models/Scene/PixelDataType.h"
 #include "../Models/Scene/TextureFormat.h"
+#include "../Services/SceneManagerService.h"
+#include "../Services/RenderableEntityService.h"
 
 typedef std::pair<unsigned int, std::string> UniformKey;
 typedef std::map<UniformKey, unsigned int> UniformPool;
@@ -27,11 +29,14 @@ class OpenGLRenderer
 private:
     UniformPool uniformPool;
     spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
-    SceneService& sceneService;
     SceneManagerService& sceneManagerService;
-    CameraService& cameraService;
-    Material* currentlyBoundMaterial = nullptr;
+    std::optional<Resource<Material>> currentlyBoundMaterial;
+    unsigned int quadVao;
+    std::vector<float> vertices;
+    int viewportWidth;
+    int viewportHeight;
 
     std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh);
 
@@ -39,24 +44,29 @@ public:
     explicit OpenGLRenderer(
         spdlog::logger& logger,
         RenderableEntityService& renderableEntityService,
-        SceneService& sceneService,
         SceneManagerService& sceneManagerService,
-        CameraService& cameraService);
+        MemoryStorageService& memoryStorageService);
 
     bool init();
-    void draw(const Scene* scene, float delta);
+    void draw(const Scene* scene, const Camera* camera, float delta);
+    void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
+    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const;
     void drawMesh(const RenderableMesh& mesh);
     void drawPrimitives(const std::vector<MeshPrimitive>& primitives) const;
-    void bindMaterial(const Material* material);
-    void upload(Model* model);
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor);
-    unsigned int createTexture(Texture* texture) const;
-    unsigned int createCubeMap(Texture* front, Texture* back, Texture* left, Texture* right, Texture* top, Texture* bottom) const;
+    void bindMaterial(const Resource<Material>& material);
+    void upload(const Resource<Model>& model);
     void setViewport(int width, int height);
+    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor);
+    [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
+    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left, const Texture& right, const Texture& top, const Texture& bottom) const;
+    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const;
+    void deleteFbo(Fbo& fbo) const;
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
     [[nodiscard]] unsigned int getInternalFormatFromBitsPerPixel(int bitsPerPixel) const;
 
+private:
+    void createQuad();
     bool compileShader(unsigned int id, const std::string& source);
     unsigned int getUniformLocation(unsigned int, const std::string&);
     void setProgramUniform(unsigned int, const std::string&, int);

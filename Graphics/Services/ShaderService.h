@@ -2,7 +2,7 @@
 
 
 #include <spdlog/logger.h>
-#include "Services/MemoryStorageService.h"
+#include "Shared/Services/MemoryStorageService.h"
 #include "../Models/Scene/ShaderDescriptor.h"
 #include "../Models/Scene/Shader.h"
 #include "../Api/OpenGLRenderer.h"
@@ -16,7 +16,7 @@ private:
 
 public:
     explicit ShaderService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer);
-    std::optional<Shader*> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
+    std::optional<Resource<Shader>> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
 };
 
 

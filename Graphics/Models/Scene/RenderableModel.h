@@ -6,10 +6,10 @@
 
 struct RenderableModel : public RenderableEntity
 {
-    Model* model;
+    Resource<Model> model;
     std::vector<RenderableMesh> meshes;
 
-    explicit RenderableModel(SceneNode* node, Model* model, std::vector<RenderableMesh> meshes) :
+    explicit RenderableModel(SceneNode* node, Resource<Model> model, std::vector<RenderableMesh> meshes) :
         model(model),
         meshes(std::move(meshes)),
         RenderableEntity(RenderableEntityType::Mesh, node) { }

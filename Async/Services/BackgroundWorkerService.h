@@ -14,7 +14,7 @@ class BackgroundWorkerService
     static std::vector<std::shared_ptr<ITask>> tasks;
 
 public:
-    BackgroundWorkerService(spdlog::logger& logger);
+    explicit BackgroundWorkerService(spdlog::logger& logger);
 
     template <class T>
     static std::shared_ptr<AsyncTask<T>> registerTask(std::future<T> future)
@@ -26,5 +26,6 @@ public:
     }
 
     void prune();
+
     void step();
 };

@@ -12,7 +12,7 @@ ShaderService::ShaderService(
 
 }
 
-std::optional<Shader*> ShaderService::createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor)
+std::optional<Resource<Shader>> ShaderService::createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor)
 {
     auto shaderProgramId = openGlRenderer.createShaderObject(shaderDescriptor);
 
@@ -22,8 +22,7 @@ std::optional<Shader*> ShaderService::createShader(const std::string& name, cons
     }
 
     return memoryStorageService.shaders.add(
-        name,
-        Shader{
+        Shader {
             .gpuResourceId = shaderProgramId.value()
         });
 }

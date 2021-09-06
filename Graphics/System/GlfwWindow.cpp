@@ -28,8 +28,8 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    windowState.windowWidth = 2880;
-    windowState.windowHeight = 1620;
+    windowState.windowWidth = 1920;
+    windowState.windowHeight = 1080;
     window = glfwCreateWindow(windowState.windowWidth,  windowState.windowHeight, "Quack!", nullptr, nullptr);
     glfwSetWindowPos(window, 150, 150);
     glfwSetWindowUserPointer(window, this);
@@ -42,7 +42,7 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0);
+    glfwSwapInterval(1);
 }
 
 GLFWWindow::~GLFWWindow()

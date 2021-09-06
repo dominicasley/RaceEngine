@@ -6,11 +6,11 @@
 
 struct RenderableSkybox : RenderableEntity
 {
-    CubeMap* cubeMap;
-    Shader* shader;
-    Model* model;
+    Resource<CubeMap> cubeMap;
+    Resource<Shader> shader;
+    Resource<Model> model;
 
-    explicit RenderableSkybox(SceneNode* node, CubeMap* cubeMap, Shader* shader, Model* model) :
+    explicit RenderableSkybox(SceneNode* node, Resource<CubeMap> cubeMap, Resource<Shader> shader, Resource<Model> model) :
         cubeMap(cubeMap),
         shader(shader),
         model(model),

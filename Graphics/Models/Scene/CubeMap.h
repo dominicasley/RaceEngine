@@ -4,10 +4,10 @@
 
 struct CubeMap {
     unsigned int gpuResourceId;
-    Texture* front;
-    Texture* back;
-    Texture* left;
-    Texture* right;
-    Texture* top;
-    Texture* bottom;
+    Resource<Texture> front;
+    Resource<Texture> back;
+    Resource<Texture> left;
+    Resource<Texture> right;
+    Resource<Texture> top;
+    Resource<Texture> bottom;
 };

@@ -12,18 +12,31 @@ CubeMapService::CubeMapService(
 
 }
 
-CubeMap* CubeMapService::create(const std::string& name, Texture* front, Texture* back, Texture* left,
-                                       Texture* right, Texture* top, Texture* bottom) const
+Resource<CubeMap> CubeMapService::create(
+    const std::string& name,
+    const Resource<Texture>& frontTextureKey,
+    const Resource<Texture>& backTextureKey,
+    const Resource<Texture>& leftTextureKey,
+    const Resource<Texture>& rightTextureKey,
+    const Resource<Texture>& topTextureKey,
+    const Resource<Texture>& bottomTextureKey) const
 {
-    auto gpuResourceId = renderer.createCubeMap(front, back, left, right, top, bottom);
+    auto gpuResourceId = renderer.createCubeMap(
+        memoryStorageService.textures.get(frontTextureKey),
+        memoryStorageService.textures.get(backTextureKey),
+        memoryStorageService.textures.get(leftTextureKey),
+        memoryStorageService.textures.get(rightTextureKey),
+        memoryStorageService.textures.get(topTextureKey),
+        memoryStorageService.textures.get(bottomTextureKey)
+    );
 
-    return memoryStorageService.cubeMaps.add(name, CubeMap {
+    return memoryStorageService.cubeMaps.add(CubeMap {
         .gpuResourceId = gpuResourceId,
-        .front = front,
-        .back = back,
-        .left = left,
-        .right = right,
-        .top = top,
-        .bottom = bottom
+        .front = frontTextureKey,
+        .back = backTextureKey,
+        .left = leftTextureKey,
+        .right = rightTextureKey,
+        .top = topTextureKey,
+        .bottom = bottomTextureKey
     });
 }

@@ -61,7 +61,7 @@ std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath)
     return gltfModelToInternal(filePath, model);
 }
 
-Model GLTFService::gltfModelToInternal(std::string filePath, const tinygltf::Model& tinyGltfModel) const
+Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygltf::Model& tinyGltfModel) const
 {
     Model model;
 
@@ -97,60 +97,54 @@ Model GLTFService::gltfModelToInternal(std::string filePath, const tinygltf::Mod
                 tinyGltfModel.accessors[skin.inverseBindMatrices]);
         }
 
+        std::map<std::string, Resource<Texture>> textureMap;
+
         for (const auto& texture : tinyGltfModel.textures)
         {
             auto image = getImageFromIndex(tinyGltfModel, texture.source);
-
-            if (!memoryStorageService.textures.exists(filePath + ":" + image.name))
-            {
-                memoryStorageService.textures.add(filePath + ":" + image.name, image);
-            }
+            textureMap.insert_or_assign(filePath + ":" + image.name, memoryStorageService.textures.add(image));
         }
 
+        std::vector<Resource<Material>> modelMaterials;
         for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
         {
-            if (memoryStorageService.materials.exists(filePath + ":" + tinyGltfMaterial.name))
-            {
-                continue;
-            }
-
-            std::optional<Texture*> albedoTexturePtr;
-            std::optional<Texture*> metallicRoughnessTexturePtr;
-            std::optional<Texture*> normalTexturePtr;
-            std::optional<Texture*> occlusionTexturePtr;
-            std::optional<Texture*> emissiveTexturePtr;
+            std::optional<Resource<Texture>> albedoTexturePtr;
+            std::optional<Resource<Texture>> metallicRoughnessTexturePtr;
+            std::optional<Resource<Texture>> normalTexturePtr;
+            std::optional<Resource<Texture>> occlusionTexturePtr;
+            std::optional<Resource<Texture>> emissiveTexturePtr;
 
             if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
             {
                 auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
-                albedoTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+                albedoTexturePtr = textureMap[filePath + ":" + image.name];
             }
 
             if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
             {
                 auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
-                metallicRoughnessTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+                metallicRoughnessTexturePtr = textureMap[filePath + ":" + image.name];
             }
 
             if (tinyGltfMaterial.normalTexture.index != -1)
             {
                 auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
-                normalTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+                normalTexturePtr = textureMap[filePath + ":" + image.name];
             }
 
             if (tinyGltfMaterial.occlusionTexture.index != -1)
             {
                 auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
-                occlusionTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+                occlusionTexturePtr = textureMap[filePath + ":" + image.name];
             }
 
             if (tinyGltfMaterial.emissiveTexture.index != -1)
             {
                 auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
-                emissiveTexturePtr = memoryStorageService.textures.get(filePath + ":" + image.name);
+                emissiveTexturePtr = textureMap[filePath + ":" + image.name];
             }
 
-            auto material = memoryStorageService.materials.add(filePath + ":" + tinyGltfMaterial.name, Material {
+            auto material = memoryStorageService.materials.add(Material {
                 .albedo = albedoTexturePtr,
                 .metallicRoughness = metallicRoughnessTexturePtr,
                 .normal = normalTexturePtr,
@@ -158,6 +152,7 @@ Model GLTFService::gltfModelToInternal(std::string filePath, const tinygltf::Mod
                 .emissive = emissiveTexturePtr
             });
 
+            modelMaterials.push_back(material);
             mesh.materials.push_back(material);
         }
 
@@ -205,13 +200,13 @@ Model GLTFService::gltfModelToInternal(std::string filePath, const tinygltf::Mod
                         .offset = reinterpret_cast<void*>(accessor.byteOffset),
                         .indicesOffset = reinterpret_cast<void*>(indexAccessor.byteOffset),
                         .material = primitive.material != -1 ?
-                            memoryStorageService.materials.get(filePath + ":" + tinyGltfModel.materials[primitive.material].name) : nullptr
+                            std::optional<Resource<Material>>(modelMaterials[primitive.material]) : std::nullopt
                     });
                 }
             }
         }
 
-        model.meshes.push_back(mesh);
+        model.meshes.push_back(memoryStorageService.meshes.add(mesh));
     }
 
     return model;
@@ -267,12 +262,15 @@ Texture GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) 
 {
     auto image = model.images[index];
 
+    auto width = static_cast<unsigned int>(image.width);
+    auto height = static_cast<unsigned int>(image.height);
+
     return Texture {
         .name = image.name,
         .format = toTextureFormat(image.component),
         .pixelDataType = image.bits == 16 ? PixelDataType::UnsignedShort : PixelDataType::UnsignedByte,
-        .width = image.width,
-        .height = image.height,
+        .width = width,
+        .height = height,
         .data = image.image
     };
 }
