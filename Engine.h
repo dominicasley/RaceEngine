@@ -19,13 +19,14 @@ public:
     BackgroundWorkerService& backgroundWorker;
     SceneManagerService& sceneManager;
     SceneService& scene;
-    RenderableEntityService& entity;
+    RenderableEntityService& renderableEntity;
     CameraService& camera;
     ShaderService& shader;
     CubeMapService& cubeMap;
     FboService& fbo;
     PostProcessService& postProcess;
     PresenterService& presenter;
+    EntityService& entity;
 
     Engine();
     [[nodiscard]] bool running() const;

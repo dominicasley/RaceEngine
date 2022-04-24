@@ -12,7 +12,6 @@ add_library (Graphics
         Api/OpenGLRenderer.h
         Models/Scene/CreateRenderableModelDTO.h
         Models/Scene/ShaderDescriptor.h
-        Models/Scene/Skeleton.h
         Api/Resources/Uniform.h
         Api/Resources/UniformDataType.h
         Models/Scene/Camera.h
@@ -32,12 +31,10 @@ add_library (Graphics
         Services/SceneService.h
         Services/CameraService.cpp
         Services/CameraService.h
-        Models/Scene/Joint.h
         Services/AnimationService.cpp
         Services/AnimationService.h
         Models/Scene/Model.h
         Models/Scene/Mesh.h
-        Models/Scene/Skin.h
         Models/Scene/MeshBuffer.h
         Models/Scene/MeshPrimitive.h
         Models/Scene/PrimitiveAttributeType.h
@@ -90,6 +87,3 @@ target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../Shared
 
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/tinygltf)
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/ozz-animation/include)
-
-
-# TODO: Add tests and install targets if needed.

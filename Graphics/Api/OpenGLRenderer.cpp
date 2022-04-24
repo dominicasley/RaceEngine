@@ -77,7 +77,12 @@ void OpenGLRenderer::draw(const Scene* scene, const Camera* camera, float delta)
     for (auto& sky: scene->skybox)
     {
         auto model = sky->model;
-        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
+
+        if (!model->gpuResourceId.has_value()) {
+            upload(model);
+        }
+
+        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId.value()));
 
         for (auto& mesh: model->meshes)
         {
@@ -100,7 +105,12 @@ void OpenGLRenderer::draw(const Scene* scene, const Camera* camera, float delta)
     {
         auto renderableModel = entity.get();
         auto model = renderableModel->model;
-        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId));
+
+        if (!model->gpuResourceId.has_value()) {
+            upload(model);
+        }
+
+        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId.value()));
 
         for (auto& mesh: renderableModel->meshes)
         {
@@ -291,13 +301,16 @@ std::vector<unsigned int>& OpenGLRenderer::bindMesh(std::vector<unsigned int>& v
 
 void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 {
+    auto model = memoryStorageService.models.get(modelKey);
+
+    if (model.gpuResourceId.has_value())
+        return;
+
     GLuint vao;
     std::vector<unsigned int> vbos;
 
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
-
-    auto model = memoryStorageService.models.get(modelKey);
 
     for (const auto& mesh: model.meshes)
     {

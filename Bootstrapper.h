@@ -3,6 +3,7 @@
 #include <spdlog/logger.h>
 
 #include "Async/Async.h"
+#include "Game/Game.h"
 #include "Graphics/Graphics.h"
 #include "Io/Io.h"
 #include "Shared/Shared.h"
@@ -25,6 +26,7 @@ public:
     FboService& fboService;
     PostProcessService& postProcessService;
     PresenterService& presenterService;
+    EntityService& entityService;
 
     Bootstrapper(
         spdlog::logger& logger,
@@ -41,7 +43,8 @@ public:
         CubeMapService& cubeMapService,
         FboService& fboService,
         PostProcessService& postProcessService,
-        PresenterService& presenterService);
+        PresenterService& presenterService,
+        EntityService& entityService);
 
     void step(float delta);
     void draw(float delta);

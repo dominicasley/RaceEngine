@@ -14,9 +14,12 @@ private:
     MemoryStorageService& memoryStorageService;
     OpenGLRenderer& openGlRenderer;
 
+    std::map<std::string, Resource<Shader>> shaders;
+
 public:
     explicit ShaderService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer);
     std::optional<Resource<Shader>> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
+    std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
 

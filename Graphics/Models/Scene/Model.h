@@ -3,6 +3,6 @@
 #include "Mesh.h"
 
 struct Model {
-    int gpuResourceId;
+    std::optional<int> gpuResourceId;
     std::vector<Resource<Mesh>> meshes;
 };

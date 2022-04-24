@@ -3,7 +3,7 @@ cmake_minimum_required (VERSION 3.8)
 
 add_library (Engine
         "Engine.h" "Engine.cpp"
-        "Bootstrapper.cpp" "Bootstrapper.h" Shared/Shared.h)
+        "Bootstrapper.cpp" "Bootstrapper.h")
 
 target_include_directories(Engine PUBLIC "vendor/di/include")
 
@@ -27,7 +27,6 @@ target_link_libraries(Engine PUBLIC glm)
 target_link_libraries(Engine PRIVATE gl3w)
 target_link_libraries(Engine PUBLIC glfw)
 
-
 target_include_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
 target_link_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
 target_include_directories(Engine PRIVATE vendor/tinygltf)
@@ -44,6 +43,10 @@ add_subdirectory("Async")
 project ("Shared")
 add_subdirectory("Shared")
 
+project ("Game")
+add_subdirectory("Game")
+
+target_link_libraries(Engine PUBLIC Game)
 target_link_libraries(Engine PUBLIC Graphics)
 target_link_libraries(Engine PUBLIC Io)
 target_link_libraries(Engine PUBLIC Async)

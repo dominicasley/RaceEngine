@@ -15,7 +15,8 @@ Bootstrapper::Bootstrapper(
     CubeMapService& cubeMapService,
     FboService& fboService,
     PostProcessService& postProcessService,
-    PresenterService& presenterService) :
+    PresenterService& presenterService,
+    EntityService& entityService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
@@ -30,7 +31,8 @@ Bootstrapper::Bootstrapper(
     cubeMapService(cubeMapService),
     fboService(fboService),
     postProcessService(postProcessService),
-    presenterService(presenterService)
+    presenterService(presenterService),
+    entityService(entityService)
 {
     renderer.init();
 

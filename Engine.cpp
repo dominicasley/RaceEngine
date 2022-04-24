@@ -41,6 +41,8 @@ Engine::Engine() : app(di::make_injector(
         .to<PostProcessService>(),
     di::bind<PresenterService>
         .to<PresenterService>(),
+    di::bind<EntityService>
+        .to<EntityService>(),
     di::bind<SceneManagerService>
         .in(di::singleton)
         .to<SceneManagerService>())
@@ -52,12 +54,13 @@ Engine::Engine() : app(di::make_injector(
                    backgroundWorker(app.backgroundWorkerService),
                    sceneManager(app.sceneManager),
                    scene(app.sceneService),
-                   entity(app.renderableEntityService),
+                   renderableEntity(app.renderableEntityService),
                    camera(app.cameraService),
                    shader(app.shaderService),
                    cubeMap(app.cubeMapService),
                    fbo(app.fboService),
                    postProcess(app.postProcessService),
+                   entity(app.entityService),
                    presenter(app.presenterService)
 {
 
