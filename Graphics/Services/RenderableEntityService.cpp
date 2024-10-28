@@ -1,6 +1,5 @@
 #include "RenderableEntityService.h"
 
-
 RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
@@ -14,24 +13,16 @@ RenderableModel RenderableEntityService::createModel(const CreateRenderableModel
     auto createMeshes = [&](const CreateRenderableModelDTO& entityDescriptor) {
         std::vector<RenderableMesh> meshes;
 
+        for (auto materialKey : entityDescriptor.model->materials) {
+            auto material = memoryStorageService.materials.get(materialKey);
+            material.shader = entityDescriptor.shader;
+
+            memoryStorageService.materials.update(materialKey, material);
+        }
+
         for (const auto& meshKey : entityDescriptor.model->meshes) {
-            auto mesh = memoryStorageService.meshes.get(meshKey);
-            std::optional<Resource<Material>> materialKey;
-
-            if (!mesh.materials.empty())
-                materialKey = mesh.materials.front();
-
-            if (materialKey.has_value())
-            {
-                auto material = memoryStorageService.materials.get(materialKey.value());
-                material.shader = entityDescriptor.shader;
-
-                memoryStorageService.materials.update(materialKey.value(), material);
-            }
-
-            meshes.push_back(RenderableMesh {
+            meshes.emplace_back(RenderableMesh {
                 .mesh = meshKey,
-                .material = materialKey,
                 .skeleton = std::nullopt
             });
         }
@@ -40,18 +31,6 @@ RenderableModel RenderableEntityService::createModel(const CreateRenderableModel
     };
 
     return RenderableModel(entityDescriptor.node, entityDescriptor.model, createMeshes(entityDescriptor));
-}
-
-RenderableSkybox RenderableEntityService::createSkybox(const CreateRenderableSkyboxDTO& entityDescriptor) const
-{
-    auto skybox = RenderableSkybox(
-        entityDescriptor.node,
-        entityDescriptor.cubeMap,
-        entityDescriptor.shader,
-        entityDescriptor.model
-    );
-
-    return skybox;
 }
 
 void RenderableEntityService::setAnimation(RenderableMesh& mesh, const std::string& animationName) const

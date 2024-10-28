@@ -1,85 +1,86 @@
 #include "SceneManagerService.h"
 
-SceneManagerService::SceneManagerService(spdlog::logger& logger) : logger(logger)
+SceneManagerService::SceneManagerService(spdlog::logger& logger) :
+    logger(logger),
+    sceneBufferResource(sceneBuffer, sceneBuffer->size()),
+    scenes(std::pmr::vector<Scene>(&sceneBufferResource))
 {
-
+    scenes.reserve(1024);
 }
 
-const std::map<std::string, std::unique_ptr<Scene>>& SceneManagerService::getScenes()
+std::pmr::vector<Scene>& SceneManagerService::getScenes()
 {
     return scenes;
 }
 
-Scene* SceneManagerService::getScene(const std::string& name)
+Scene& SceneManagerService::getScene(int index)
 {
-    return scenes.at(name).get();
+    return scenes.at(index);
 }
 
-Scene* SceneManagerService::createScene(const std::string& name)
+Scene& SceneManagerService::createScene()
 {
-    auto scene = std::make_unique<Scene>();
-
-    auto e = scenes.emplace(name, std::move(scene));
-    return e.first->second.get();
+    auto& e =  scenes.emplace_back();
+    return e;
 }
 
-SceneNode* SceneManagerService::createNode(Scene* scene)
+SceneNode& SceneManagerService::createNode(Scene& scene)
 {
-    auto& e = scene->nodes.emplace_back(std::make_unique<SceneNode>());
-    return e.get();
+    auto& e = scene.nodes.emplace_back();
+    return e;
 }
 
-void SceneManagerService::setPosition(SceneNode* node, float x, float y, float z) const
+void SceneManagerService::setPosition(SceneNode& node, float x, float y, float z) const
 {
-    node->position = glm::vec3(x, y, z);
-    node->translationMatrix = glm::translate(glm::mat4(1.0f), node->position);
+    node.position = glm::vec3(x, y, z);
+    node.translationMatrix = glm::translate(glm::mat4(1.0f), node.position);
 }
 
-void SceneManagerService::setDirection(SceneNode* node, float angle, float x, float y, float z) const
+void SceneManagerService::setDirection(SceneNode& node, float angle, float x, float y, float z) const
 {
-    node->rotation = glm::vec4(x, y, z, angle);
-    node->rotationMatrix = glm::rotate(glm::mat4(1.0), angle, glm::vec3(x, y, z));
+    node.rotation = glm::vec4(x, y, z, angle);
+    node.rotationMatrix = glm::rotate(glm::mat4(1.0), angle, glm::vec3(x, y, z));
 }
 
-void SceneManagerService::setScale(SceneNode* node, float x, float y, float z) const
+void SceneManagerService::setScale(SceneNode& node, float x, float y, float z) const
 {
-    node->scale = glm::vec3(x, y, z);
-    node->scaleMatrix = glm::scale(glm::mat4(1.0f), node->scale);
+    node.scale = glm::vec3(x, y, z);
+    node.scaleMatrix = glm::scale(glm::mat4(1.0f), node.scale);
 }
 
-void SceneManagerService::translate(SceneNode* node, float x, float y, float z) const
+void SceneManagerService::translate(SceneNode& node, float x, float y, float z) const
 {
-    node->position += glm::vec3(x, y, z);
-    node->translationMatrix = glm::translate(node->translationMatrix, glm::vec3(x, y, z));
+    node.position += glm::vec3(x, y, z);
+    node.translationMatrix = glm::translate(node.translationMatrix, glm::vec3(x, y, z));
 }
 
-void SceneManagerService::rotate(SceneNode* node, float angle, float x, float y, float z) const
+void SceneManagerService::rotate(SceneNode& node, float angle, float x, float y, float z) const
 {
-    node->rotation += glm::vec4(x, y, z, angle);
-    node->rotationMatrix = glm::rotate(node->rotationMatrix, glm::radians(angle), glm::vec3(x, y, z));
+    node.rotation += glm::vec4(x, y, z, angle);
+    node.rotationMatrix = glm::rotate(node.rotationMatrix, glm::radians(angle), glm::vec3(x, y, z));
 }
 
-void SceneManagerService::scale(SceneNode* node, float x, float y, float z) const
+void SceneManagerService::scale(SceneNode& node, float x, float y, float z) const
 {
-    node->scale += glm::vec3(x, y, z);
-    node->scaleMatrix = glm::scale(node->scaleMatrix, glm::vec3(x, y, z));
+    node.scale += glm::vec3(x, y, z);
+    node.scaleMatrix = glm::scale(node.scaleMatrix, glm::vec3(x, y, z));
 }
 
-void SceneManagerService::setParent(SceneNode* node, SceneNode* parent) const
+void SceneManagerService::setParent(SceneNode& node, SceneNode& parent) const
 {
-    node->parent = parent;
+    node.parent = &parent;
 }
 
-const glm::mat4& SceneManagerService::modelMatrix(SceneNode* node) const
+const glm::mat4& SceneManagerService::modelMatrix(SceneNode& node) const
 {
-    node->modelMatrix = node->translationMatrix * node->rotationMatrix * node->scaleMatrix;
+    node.modelMatrix = node.translationMatrix * node.rotationMatrix * node.scaleMatrix;
 
-    if (node->parent)
+    if (node.parent)
     {
-        node->modelMatrix = modelMatrix(node->parent) * node->modelMatrix;
+        node.modelMatrix = modelMatrix(*node.parent) * node.modelMatrix;
     }
 
-    node->forward = normalize(glm::vec3(glm::inverse(node->modelMatrix)[2]));
+    node.forward = normalize(glm::vec3(glm::inverse(node.modelMatrix)[2]));
 
-    return node->modelMatrix;
+    return node.modelMatrix;
 }

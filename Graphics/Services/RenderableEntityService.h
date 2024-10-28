@@ -12,7 +12,6 @@
 #include "../Models/Scene/RenderableEntity.h"
 #include "../Models/Scene/RenderableMesh.h"
 #include "../Models/Scene/RenderableModel.h"
-#include "../Models/Scene/RenderableSkybox.h"
 
 class RenderableEntityService
 {
@@ -25,7 +24,6 @@ public:
     explicit RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService);
 
     [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
-    [[nodiscard]] RenderableSkybox createSkybox(const CreateRenderableSkyboxDTO& entityDescriptor) const;
     void setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeleton) const;
     void addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const;
     void setAnimation(RenderableMesh& mesh, const std::string& animationName) const;

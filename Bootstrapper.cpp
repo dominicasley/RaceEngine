@@ -43,12 +43,12 @@ Bootstrapper::Bootstrapper(
 
         for (auto& scene : sceneManager.getScenes())
         {
-            for (auto& camera : scene.second->cameras)
+            for (auto& camera : scene.cameras)
             {
-                cameraService.setAspectRatio(camera.get(), static_cast<float>(width) / static_cast<float>(height));
-                cameraService.recreateOutputBuffer(camera.get(), width, height);
+                cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
+                cameraService.recreateOutputBuffer(camera, width, height);
 
-                for (auto postProcess : camera->postProcesses)
+                for (auto postProcess : camera.postProcesses)
                 {
                     postProcessService.recreateOutputBuffer(postProcess, width, height);
                 }
@@ -63,9 +63,9 @@ void Bootstrapper::step(float delta)
 
     for (auto& scene : sceneManager.getScenes())
     {
-        for (auto& camera : scene.second->cameras)
+        for (auto& camera : scene.cameras)
         {
-            cameraService.updateModelViewProjectionMatrix(camera.get());
+            cameraService.updateModelViewProjectionMatrix(camera);
         }
     }
 }
@@ -74,9 +74,9 @@ void Bootstrapper::draw(float delta)
 {
     for (auto& scene : sceneManager.getScenes())
     {
-        for (const auto& camera : scene.second->cameras)
+        for (auto& camera : scene.cameras)
         {
-            renderer.draw(scene.second.get(), camera.get(), delta);
+            renderer.draw(scene, camera, delta);
         }
     }
 

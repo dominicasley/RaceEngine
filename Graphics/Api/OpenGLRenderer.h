@@ -38,8 +38,6 @@ private:
     int viewportWidth;
     int viewportHeight;
 
-    std::vector<unsigned int>& bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh);
-
 public:
     explicit OpenGLRenderer(
         spdlog::logger& logger,
@@ -48,11 +46,9 @@ public:
         MemoryStorageService& memoryStorageService);
 
     bool init();
-    void draw(const Scene* scene, const Camera* camera, float delta);
+    void draw(Scene& scene, Camera& camera, float delta);
     void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
     void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const;
-    void drawMesh(const RenderableMesh& mesh);
-    void drawPrimitives(const std::vector<MeshPrimitive>& primitives) const;
     void bindMaterial(const Resource<Material>& material);
     void upload(const Resource<Model>& model);
     void setViewport(int width, int height);

@@ -8,9 +8,9 @@
 struct RenderableEntity
 {
     RenderableEntityType type;
-    SceneNode* node;
+    SceneNode& node;
 
-    explicit RenderableEntity(RenderableEntityType type, SceneNode* node) : type(type), node(node) {}
+    explicit RenderableEntity(RenderableEntityType type, SceneNode& node) : type(type), node(node) {}
 };
 
 

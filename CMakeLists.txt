@@ -17,6 +17,7 @@ add_subdirectory(vendor/glm vendor/glm)
 add_subdirectory(vendor/glfw vendor/glfw)
 
 set(ozz_build_samples OFF)
+set(ozz_build_tests OFF)
 set(ozz_build_howtos OFF)
 set(ozz_build_gltf OFF)
 add_subdirectory(vendor/ozz-animation vendor/ozz-animation)

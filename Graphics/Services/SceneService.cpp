@@ -11,45 +11,40 @@ SceneService::SceneService(
 
 }
 
-void SceneService::update(Scene* scene, float delta) const
+void SceneService::update(Scene& scene, float delta) const
 {
 
 }
 
-RenderableModel* SceneService::createEntity(Scene* scene, const CreateRenderableModelDTO& entityDescriptor) const
+RenderableModel& SceneService::createEntity(Scene& scene, const CreateRenderableModelDTO& entityDescriptor) const
 {
-    return scene->models.emplace_back(
-        std::make_unique<RenderableModel>(renderableEntityService.createModel(entityDescriptor))
-    ).get();
+    return scene.models.emplace_back(
+        std::move(renderableEntityService.createModel(entityDescriptor))
+    );
 }
 
-RenderableSkybox* SceneService::createEntity(Scene* scene, const CreateRenderableSkyboxDTO& entityDescriptor) const
+Camera& SceneService::createCamera(Scene& scene) const
 {
-    return scene->skybox.emplace_back(
-        std::make_unique<RenderableSkybox>(renderableEntityService.createSkybox(entityDescriptor))
-    ).get();
+    return scene.cameras.emplace_back(
+        std::move(cameraService.createCamera())
+    );
 }
 
-Camera* SceneService::createCamera(Scene* scene) const
+Light& SceneService::createLight(Scene& scene) const
 {
-    return scene->cameras.emplace_back(
-        std::make_unique<Camera>(cameraService.createCamera())
-    ).get();
+    return scene.lights.emplace_back(
+        std::move(Light())
+    );;
 }
 
-Light* SceneService::createLight(Scene* scene) const
+Camera& SceneService::getCamera(Scene& scene, unsigned int index) const
 {
-    return nullptr;
+    return scene.cameras.at(index);
 }
 
-Camera* SceneService::getCamera(const Scene* scene, unsigned int index) const
+RenderableModel& SceneService::getModel(Scene& scene, unsigned int index) const
 {
-    return scene->cameras[index].get();
-}
-
-RenderableModel* SceneService::getModel(const Scene* scene, unsigned int index) const
-{
-    return scene->models[index].get();;
+    return scene.models.at(index);
 }
 
 

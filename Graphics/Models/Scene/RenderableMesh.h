@@ -19,7 +19,6 @@ struct RenderableMesh {
     float animationTime;
     unsigned int currentAnimationIndex;
     const Resource<Mesh> mesh;
-    std::optional<Resource<Material>> material;
     ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms;
     ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;
     std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;

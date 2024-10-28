@@ -24,6 +24,7 @@ public:
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
     [[nodiscard]] Texture getImageFromIndex(const tinygltf::Model& model, int index) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
+    void processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node &node, const glm::mat4 parentTransform) const;
 };
 
 

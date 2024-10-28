@@ -53,7 +53,6 @@ add_library (Graphics
         Services/CubeMapService.h
         Models/Scene/RenderableEntityType.h
         Models/Scene/RenderableModel.h
-        Models/Scene/RenderableSkybox.h
         Models/Scene/Fbo.h
         Models/Scene/FboAttachment.h
         Models/Scene/FboAttachmentType.h
@@ -67,7 +66,8 @@ add_library (Graphics
         Services/PostProcessService.h
         Services/PresenterService.cpp
         Services/PresenterService.h
-        Models/Scene/Presenter.h)
+        Models/Scene/Presenter.h
+        Models/Scene/ReflectionProbe.h)
 
 target_include_directories(Graphics PUBLIC "../")
 

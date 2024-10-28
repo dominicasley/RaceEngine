@@ -6,7 +6,7 @@
 
 struct CreateRenderableModelDTO
 {
-    SceneNode* node;
+    SceneNode& node;
     Resource<Shader> shader;
     Resource<Model> model;
 };

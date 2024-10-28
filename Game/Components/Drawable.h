@@ -7,5 +7,11 @@
 
 struct Drawable : public Component {
 public:
-    RenderableEntity* renderableEntity;
+    RenderableEntity& renderableEntity;
+    std::optional<std::function<void()>> beforeDraw;
+    std::optional<std::function<void()>> afterDraw;
+
+    explicit Drawable(RenderableEntity& _renderableEntity) : renderableEntity(_renderableEntity) {
+
+    }
 };

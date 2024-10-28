@@ -27,6 +27,7 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES, 32);
 
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;

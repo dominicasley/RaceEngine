@@ -23,7 +23,7 @@ bool OpenGLRenderer::init()
         return false;
     }
 
-    glClearColor(0.f / 255.f, 0.f / 255.f, 0.f / 255.f, 0);
+    glClearColor(255.f / 255.f, 255.f / 255.f, 255.f / 255.f, 1.0f);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_3D);
@@ -32,8 +32,8 @@ bool OpenGLRenderer::init()
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
     glEnable(GL_CULL_FACE);
 
-    glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_BLEND);
 
     glCullFace(GL_BACK);
 
@@ -42,124 +42,92 @@ bool OpenGLRenderer::init()
     return true;
 }
 
-void OpenGLRenderer::drawMesh(const RenderableMesh& renderableMesh)
+void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 {
-    if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != renderableMesh.material.value().id)
+    if (camera.output.has_value())
     {
-        bindMaterial(renderableMesh.material.value());
-        currentlyBoundMaterial = renderableMesh.material.value();
-    }
-
-    drawPrimitives(renderableMesh.mesh->meshPrimitives);
-}
-
-void OpenGLRenderer::drawPrimitives(const std::vector<MeshPrimitive>& primitives) const
-{
-    for (const auto& primitive: primitives)
-    {
-        glDrawElements(primitive.mode,
-                       static_cast<GLsizei>(primitive.elementCount),
-                       primitive.indicesType == VertexIndicesType::UnsignedInt ? GL_UNSIGNED_INT :
-                       primitive.indicesType == VertexIndicesType::UnsignedShort ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
-                       primitive.indicesOffset);
-    }
-}
-
-void OpenGLRenderer::draw(const Scene* scene, const Camera* camera, float delta)
-{
-    if (camera->output.has_value())
-    {
-        glBindFramebuffer(GL_FRAMEBUFFER, camera->output.value()->gpuResourceId.value());
+        glBindFramebuffer(GL_FRAMEBUFFER, camera.output.value()->gpuResourceId.value());
     }
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    for (auto& sky: scene->skybox)
+    for (auto& entity: scene.models)
     {
-        auto model = sky->model;
+        auto& model = entity.model;
 
-        if (!model->gpuResourceId.has_value()) {
-            upload(model);
-        }
-
-        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId.value()));
-
-        for (auto& mesh: model->meshes)
+        for (auto& mesh : entity.meshes)
         {
-            auto shader = sky->shader;
-            auto cubeMap = sky->cubeMap;
-
-            glUseProgram(shader->gpuResourceId);
-
-            setProgramUniform(shader->gpuResourceId, "localToScreen4x4Matrix",
-                              camera->modelViewProjectionMatrix * sceneManagerService.modelMatrix(sky->node));
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(cubeMap->gpuResourceId));
-
-            drawPrimitives(mesh->meshPrimitives);
-        }
-    }
-
-    for (auto& entity: scene->models)
-    {
-        auto renderableModel = entity.get();
-        auto model = renderableModel->model;
-
-        if (!model->gpuResourceId.has_value()) {
-            upload(model);
-        }
-
-        glBindVertexArray(static_cast<GLuint>(model->gpuResourceId.value()));
-
-        for (auto& mesh: renderableModel->meshes)
-        {
-            if (!mesh.material.has_value())
-            {
-                continue;
+            if (!mesh.mesh->gpuResourceId.has_value()) {
+                upload(model);
             }
 
-            auto material = mesh.material;
+            glBindVertexArray(static_cast<GLuint>(mesh.mesh->gpuResourceId.value()));
 
-            if (material.value()->shader.has_value())
-            {
-                auto shader = material.value()->shader.value();
-                auto entityModelMatrix = sceneManagerService.modelMatrix(entity->node);
+            auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
+
+            for (auto& primitive : mesh.mesh->meshPrimitives) {
+                if (!model->meshBuffers[primitive.meshBufferIndex].gpuId.has_value()) {
+                    continue;
+                }
+
+                auto material = primitive.material.value();
+                auto shader = material->shader.value();
+
                 const auto joints = renderableEntityService.joints(mesh, delta);
 
-                setProgramUniform(shader->gpuResourceId, "cameraPosition", camera->position);
                 setProgramUniform(shader->gpuResourceId, "localToScreen4x4Matrix",
-                                  camera->modelViewProjectionMatrix * entityModelMatrix);
+                                  camera.modelViewProjectionMatrix * entityModelMatrix);
                 setProgramUniform(shader->gpuResourceId, "localToView4x4Matrix",
-                                  camera->modelViewMatrix * entityModelMatrix);
+                                  camera.modelViewMatrix * entityModelMatrix);
                 setProgramUniform(shader->gpuResourceId, "localToWorld4x4Matrix", entityModelMatrix);
-                setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix",
-                                  glm::mat3(camera->modelViewMatrix));
+
                 setProgramUniform(shader->gpuResourceId, "normalMatrix",
-                                  glm::transpose(glm::inverse(glm::mat3(camera->modelViewMatrix * entityModelMatrix))));
+                                  glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))));
                 setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints);
                 setProgramUniform(shader->gpuResourceId, "animated", !joints.empty());
 
-                setProgramUniform(shader->gpuResourceId, "textureRepeat", material.value()->repeat);
+                setProgramUniform(shader->gpuResourceId, "textureRepeat", material->repeat);
 
-                setProgramUniform(shader->gpuResourceId, "lights.position",
-                                  glm::vec3(0.0f, 350.0f, 350.0f));
-                setProgramUniform(shader->gpuResourceId, "lights.diffuse",
-                                  glm::vec3(1.2859 * 2.5f, 1.2973 * 2.5f, 1.3 * 2.5f));
-                setProgramUniform(shader->gpuResourceId, "lights.specular",
-                                  glm::vec3(1.2859, 1.2973, 1.3));
-                setProgramUniform(shader->gpuResourceId, "lights.ambient",
-                                  glm::vec3(0.29859, 0.29973, 0.3));
-                setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
+                if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != material.id)
+                {
+                    bindMaterial(material);
+
+                    if (!material->opaque) {
+                        glDisable(GL_CULL_FACE);
+                    } else {
+                        glEnable(GL_CULL_FACE);
+                    }
+
+                    setProgramUniform(shader->gpuResourceId, "u_baseColour", material->baseColour);
+                    setProgramUniform(shader->gpuResourceId, "u_metalness", material->metalness);
+                    setProgramUniform(shader->gpuResourceId, "u_roughness", material->roughness);
+
+                    currentlyBoundMaterial = material;
+
+                    setProgramUniform(shader->gpuResourceId, "cameraPosition", camera.position);
+                    setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
+                    setProgramUniform(shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
+                    setProgramUniform(shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859 * 2.5f, 1.2973 * 2.5f, 1.3 * 2.5f));
+                    setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
+                    setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
+                    setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
+                }
+
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(model->meshBuffers[primitive.meshBufferIndex].gpuId.value()));
+
+                glDrawElements(primitive.mode,
+                               static_cast<GLsizei>(primitive.elementCount),
+                               primitive.componentType,
+                               (char*)(NULL + primitive.byteOffset));
             }
-
-            drawMesh(mesh);
         }
+
+        glBindVertexArray(0);
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    for (const auto& postProcess: camera->postProcesses)
+    for (const auto& postProcess: camera.postProcesses)
     {
         if (postProcess->output.has_value())
         {
@@ -191,7 +159,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
         {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(albedo->gpuResourceId.value()));
+            setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", true);
         }
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", false);
     }
 
     if (material->normal.has_value())
@@ -202,7 +177,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
         {
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(normal->gpuResourceId.value()));
+            setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", true);
         }
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", false);
     }
 
     if (material->metallicRoughness.has_value())
@@ -213,7 +195,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
         {
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(metallicRoughness->gpuResourceId.value()));
+            setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", true);
         }
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", false);
     }
 
     if (material->emissive.has_value())
@@ -224,8 +213,15 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
         {
             glActiveTexture(GL_TEXTURE3);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(emissive.gpuResourceId.value()));
+            setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", true);
         }
 
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", false);
     }
 
     if (material->occlusion.has_value())
@@ -236,7 +232,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
         {
             glActiveTexture(GL_TEXTURE4);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(occlusion->gpuResourceId.value()));
+            setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", true);
         }
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", false);
     }
 
     if (material->environment.has_value())
@@ -248,6 +251,11 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
             glActiveTexture(GL_TEXTURE5);
             glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(environment->gpuResourceId.value()));
         }
+    }
+    else
+    {
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     for (auto i = 0; i < material->textures.size(); i++)
@@ -262,130 +270,116 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
     }
 }
 
-std::vector<unsigned int>& OpenGLRenderer::bindMesh(std::vector<unsigned int>& vbos, const Mesh& mesh)
-{
-    for (const auto& buffer: mesh.meshBuffers)
-    {
-        if (buffer.target == 0)
-        {
-            logger.warn("bufferView.target is zero. skipping buffer view.");
-            continue;
-        }
-
-        GLuint vbo;
-        glGenBuffers(1, &vbo);
-        vbos.push_back(vbo);
-
-        glBindBuffer(buffer.target, vbo);
-        glBufferData(buffer.target, buffer.length, buffer.data.data() + buffer.offset, GL_STATIC_DRAW);
-    }
-
-    for (const auto& primitive: mesh.meshPrimitives)
-    {
-        glBindBuffer(GL_ARRAY_BUFFER, vbos[primitive.bufferIndex]);
-
-        if (primitive.attributeType.has_value())
-        {
-            glEnableVertexAttribArray(static_cast<GLuint>(primitive.attributeType.value()));
-            glVertexAttribPointer(static_cast<GLuint>(primitive.attributeType.value()),
-                                  primitive.size,
-                                  primitive.componentType,
-                                  primitive.normalized ? GL_TRUE : GL_FALSE,
-                                  primitive.stride,
-                                  reinterpret_cast<void*>(primitive.offset));
-        }
-    }
-
-    return vbos;
-}
-
 void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 {
     auto model = memoryStorageService.models.get(modelKey);
 
-    if (model.gpuResourceId.has_value())
-        return;
-
-    GLuint vao;
-    std::vector<unsigned int> vbos;
-
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
-    for (const auto& mesh: model.meshes)
-    {
-        bindMesh(vbos, memoryStorageService.meshes.get(mesh));
-    }
-
-    glBindVertexArray(0);
-
-    for (unsigned int& vbo: vbos)
-    {
-        glDeleteBuffers(1, &vbo);
-    }
-
-    model.gpuResourceId = static_cast<int>(vao);
-    memoryStorageService.models.update(modelKey, model);
-
-    for (auto& meshKey: model.meshes)
+    for (const auto& meshKey: model.meshes)
     {
         auto mesh = memoryStorageService.meshes.get(meshKey);
 
-        for (const auto& resource: mesh.materials)
+        if (mesh.gpuResourceId.has_value())
+            continue;
+
+        GLuint vao;
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+
+        for (auto& buffer : model.meshBuffers)
         {
-            auto material = memoryStorageService.materials.get(resource);
-
-            if (material.albedo.has_value() && memoryStorageService.textures.exists(material.albedo.value()))
-            {
-                auto albedo = memoryStorageService.textures.get(material.albedo.value());
-                albedo.gpuResourceId = createTexture(albedo);
-                memoryStorageService.textures.update(material.albedo.value(), albedo);
+            if (buffer.gpuId.has_value()) {
+                continue;
             }
 
-            if (material.normal.has_value() && memoryStorageService.textures.exists(material.normal.value()))
-            {
-                auto normal = memoryStorageService.textures.get(material.normal.value());
-                normal.gpuResourceId = createTexture(normal);
-                memoryStorageService.textures.update(material.normal.value(), normal);
-            }
+            GLuint vbo;
+            glGenBuffers(1, &vbo);
+            glBindBuffer(buffer.target, vbo);
+            glBufferData(buffer.target, buffer.length, &buffer.data.at(0) + buffer.offset, GL_STATIC_DRAW);
 
-            if (material.metallicRoughness.has_value() &&
-                memoryStorageService.textures.exists(material.metallicRoughness.value()))
-            {
-                auto metallicRoughness = memoryStorageService.textures.get(material.metallicRoughness.value());
-                metallicRoughness.gpuResourceId = createTexture(metallicRoughness);
-                memoryStorageService.textures.update(material.metallicRoughness.value(), metallicRoughness);
-            }
+            buffer.gpuId = vbo;
+        }
 
-            if (material.emissive.has_value() && memoryStorageService.textures.exists(material.emissive.value()))
-            {
-                auto emissive = memoryStorageService.textures.get(material.emissive.value());
-                emissive.gpuResourceId = createTexture(emissive);
-                memoryStorageService.textures.update(material.emissive.value(), emissive);
-            }
+        memoryStorageService.models.update(modelKey, model);
 
-            if (material.occlusion.has_value() && memoryStorageService.textures.exists(material.occlusion.value()))
+        for (const auto& primitive: mesh.meshPrimitives)
+        {
+            for (const auto& attribute : primitive.attributes)
             {
-                auto occlusion = memoryStorageService.textures.get(material.occlusion.value());
-                occlusion.gpuResourceId = createTexture(occlusion);
-                memoryStorageService.textures.update(material.occlusion.value(), occlusion);
-            }
+                glBindBuffer(GL_ARRAY_BUFFER, model.meshBuffers[attribute.bufferIndex].gpuId.value());
 
-            if (material.environment.has_value())
-            {
-                auto environment = memoryStorageService.textures.get(material.environment.value());
-                environment.gpuResourceId = createTexture(environment);
-                memoryStorageService.textures.update(material.environment.value(), environment);
-            }
-
-            for (auto& i: material.textures)
-            {
-                auto texture = memoryStorageService.textures.get(i);
-                if (!texture.gpuResourceId.has_value())
+                if (attribute.attributeType.has_value())
                 {
-                    texture.gpuResourceId = createTexture(texture);
-                    memoryStorageService.textures.update(i, texture);
+                    glEnableVertexAttribArray(static_cast<GLuint>(attribute.attributeType.value()));
+                    glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()),
+                                          attribute.size,
+                                          attribute.componentType,
+                                          attribute.normalized ? GL_TRUE : GL_FALSE,
+                                          attribute.stride,
+                                          (char*) (NULL + attribute.offset));
                 }
+            }
+        }
+
+        mesh.gpuResourceId = static_cast<int>(vao);
+        memoryStorageService.meshes.update(meshKey, mesh);
+
+        glBindVertexArray(0);
+    }
+
+    for (const auto& resource: model.materials)
+    {
+        auto material = memoryStorageService.materials.get(resource);
+
+        if (material.albedo.has_value() && memoryStorageService.textures.exists(material.albedo.value()))
+        {
+            auto albedo = memoryStorageService.textures.get(material.albedo.value());
+            albedo.gpuResourceId = createTexture(albedo);
+            memoryStorageService.textures.update(material.albedo.value(), albedo);
+        }
+
+        if (material.normal.has_value() && memoryStorageService.textures.exists(material.normal.value()))
+        {
+            auto normal = memoryStorageService.textures.get(material.normal.value());
+            normal.gpuResourceId = createTexture(normal);
+            memoryStorageService.textures.update(material.normal.value(), normal);
+        }
+
+        if (material.metallicRoughness.has_value() &&
+            memoryStorageService.textures.exists(material.metallicRoughness.value()))
+        {
+            auto metallicRoughness = memoryStorageService.textures.get(material.metallicRoughness.value());
+            metallicRoughness.gpuResourceId = createTexture(metallicRoughness);
+            memoryStorageService.textures.update(material.metallicRoughness.value(), metallicRoughness);
+        }
+
+        if (material.emissive.has_value() && memoryStorageService.textures.exists(material.emissive.value()))
+        {
+            auto emissive = memoryStorageService.textures.get(material.emissive.value());
+            emissive.gpuResourceId = createTexture(emissive);
+            memoryStorageService.textures.update(material.emissive.value(), emissive);
+        }
+
+        if (material.occlusion.has_value() && memoryStorageService.textures.exists(material.occlusion.value()))
+        {
+            auto occlusion = memoryStorageService.textures.get(material.occlusion.value());
+            occlusion.gpuResourceId = createTexture(occlusion);
+            memoryStorageService.textures.update(material.occlusion.value(), occlusion);
+        }
+
+        if (material.environment.has_value())
+        {
+            auto environment = memoryStorageService.textures.get(material.environment.value());
+            environment.gpuResourceId = createTexture(environment);
+            memoryStorageService.textures.update(material.environment.value(), environment);
+        }
+
+        for (auto& i: material.textures)
+        {
+            auto texture = memoryStorageService.textures.get(i);
+            if (!texture.gpuResourceId.has_value())
+            {
+                texture.gpuResourceId = createTexture(texture);
+                memoryStorageService.textures.update(i, texture);
             }
         }
     }
@@ -520,14 +514,14 @@ unsigned int OpenGLRenderer::createCubeMap(
             textures[i]->data.data());
     }
 
-    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 6);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 12);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
 
     glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
 
@@ -597,7 +591,6 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 
     return fboGpuResourceId;
 }
-
 
 void OpenGLRenderer::deleteFbo(Fbo& fbo) const
 {
@@ -811,13 +804,13 @@ unsigned int OpenGLRenderer::getInternalFormatFromBitsPerPixel(int bitsPerPixel)
 void OpenGLRenderer::createQuad()
 {
     vertices = std::vector<float>({
-                                      -1.0, -1.0, 1.0, -1.0,
-                                      1.0, 1.0, 1.0, 1.0,
-                                      -1.0, 1.0, -1.0, -1.0,
-                                      0.0, 0.0, 1.0, 0.0,
-                                      1.0, 1.0, 1.0, 1.0,
-                                      0.0, 1.0, 0.0, 0.0
-                                  });
+        -1.0, -1.0, 1.0, -1.0,
+        1.0, 1.0, 1.0, 1.0,
+        -1.0, 1.0, -1.0, -1.0,
+        0.0, 0.0, 1.0, 0.0,
+        1.0, 1.0, 1.0, 1.0,
+        0.0, 1.0, 0.0, 0.0
+    });
 
     glGenVertexArrays(1, &quadVao);
     glBindVertexArray(quadVao);
