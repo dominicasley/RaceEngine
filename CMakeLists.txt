@@ -39,7 +39,6 @@ add_library(glad STATIC vendor/glad/src/gl.c)
 target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
 
 add_library (Engine STATIC
-        "Engine.h" "Engine.cpp"
         Graphics/Api/VulkanRenderer.cpp
         Graphics/Api/VulkanRenderer.h
         Graphics/Api/OpenGLRenderer.cpp
@@ -114,6 +113,11 @@ add_library (Engine STATIC
         Game/Models/Entity.h
         Game/Services/EntityService.cpp
         Game/Services/EntityService.h)
+
+target_sources(Engine PUBLIC
+        FILE_SET CXX_MODULES
+        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+        FILES Engine.cppm)
 
 target_include_directories(Engine PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}

@@ -1,13 +1,142 @@
-#include <glad/gl.h>
-
-#include "Engine.h"
+module;
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
+
+#include <glad/gl.h>
 #include <spdlog/async.h>
+#include <spdlog/logger.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <stb_image_write.h>
+
+#include "Async/Async.h"
+#include "Game/Game.h"
+#include "Graphics/Graphics.h"
+#include "Io/Io.h"
+#include "Shared/Shared.h"
+
+export module raceengine;
+
+export using ::awaitAll;
+export using ::Camera;
+export using ::CreateRenderableModelDTO;
+export using ::Drawable;
+export using ::Entity;
+export using ::FboAttachmentType;
+export using ::Presenter;
+export using ::RenderableModel;
+export using ::Scene;
+export using ::SceneNode;
+export using ::ShaderDescriptor;
+
+namespace raceengine
+{
+
+export class Engine
+{
+private:
+    // Declaration order IS initialization order and reverse-destruction order:
+    // each member may only depend on members declared above it.
+    std::shared_ptr<spdlog::logger> logger;
+    GLFWWindow glfwWindow;
+    MemoryStorageService memoryStorageService;
+    BackgroundWorkerService backgroundWorkerService;
+    GLTFService gltfService;
+    ResourceService resourceService;
+    RenderableEntityService renderableEntityService;
+    SceneManagerService sceneManagerService;
+    OpenGLRenderer openGlRenderer;
+    FboService fboService;
+    ShaderService shaderService;
+    CubeMapService cubeMapService;
+    PostProcessService postProcessService;
+    PresenterService presenterService;
+    CameraService cameraService;
+    SceneService sceneService;
+    EntityService entityService;
+
+public:
+    Engine();
+    [[nodiscard]] bool running() const;
+    void step();
+
+    [[nodiscard]] IWindow& window()
+    {
+        return glfwWindow;
+    }
+
+    [[nodiscard]] ResourceService& resource()
+    {
+        return resourceService;
+    }
+
+    [[nodiscard]] MemoryStorageService& memoryStorage()
+    {
+        return memoryStorageService;
+    }
+
+    [[nodiscard]] SceneManagerService& sceneManager()
+    {
+        return sceneManagerService;
+    }
+
+    [[nodiscard]] SceneService& scene()
+    {
+        return sceneService;
+    }
+
+    [[nodiscard]] RenderableEntityService& renderableEntity()
+    {
+        return renderableEntityService;
+    }
+
+    [[nodiscard]] CameraService& camera()
+    {
+        return cameraService;
+    }
+
+    [[nodiscard]] ShaderService& shader()
+    {
+        return shaderService;
+    }
+
+    [[nodiscard]] CubeMapService& cubeMap()
+    {
+        return cubeMapService;
+    }
+
+    [[nodiscard]] FboService& fbo()
+    {
+        return fboService;
+    }
+
+    [[nodiscard]] PostProcessService& postProcess()
+    {
+        return postProcessService;
+    }
+
+    [[nodiscard]] PresenterService& presenter()
+    {
+        return presenterService;
+    }
+
+    [[nodiscard]] EntityService& entity()
+    {
+        return entityService;
+    }
+
+private:
+    void dumpFrameIfRequested();
+};
+
+} // namespace raceengine
+
+module :private;
+
+namespace raceengine
+{
 
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
@@ -126,3 +255,5 @@ void Engine::dumpFrameIfRequested()
     logger->info("Frame dump written to {}", dumpPath);
     std::exit(0);
 }
+
+} // namespace raceengine
