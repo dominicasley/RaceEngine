@@ -48,4 +48,7 @@ public:
 
     void step(float delta);
     void draw(float delta);
+
+private:
+    void dumpFrameIfRequested();
 };
