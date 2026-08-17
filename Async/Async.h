@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Models/Observable.h"
-#include "Models/IAsyncTask.h"
+#include "Models/AsyncResult.h"
+#include "Operators/AwaitAll.h"
 #include "Services/BackgroundWorkerService.h"
-#include "Operators/ForkJoin.h"

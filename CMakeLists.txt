@@ -102,13 +102,10 @@ add_library (Engine STATIC
         Io/Services/GLTFService.cpp
         Io/Services/GLTFService.h
         Io/Utility/AccessorUtility.h
-        Async/Models/IAsyncTask.h
-        Async/Models/Observable.h
+        Async/Models/AsyncResult.h
         Async/Services/BackgroundWorkerService.cpp
         Async/Services/BackgroundWorkerService.h
-        Async/Operators/ForkJoin.h
-        Async/Models/AsyncTask.h
-        Async/Models/ITask.h
+        Async/Operators/AwaitAll.h
         Shared/Services/MemoryStorageService.cpp
         Shared/Services/MemoryStorageService.h
         Shared/Types/Resource.h

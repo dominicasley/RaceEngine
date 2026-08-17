@@ -1,8 +1,10 @@
 #pragma once
 
+#include <functional>
+#include <utility>
+#include <vector>
 #include <vulkan/vulkan.h>
 #include "../Api/VulkanWindowRequiredExtensions.h"
-#include "../../Async/Async.h"
 #include "WindowState.h"
 
 class IWindow
@@ -19,5 +21,11 @@ public:
     [[nodiscard]] virtual std::tuple<double, double> mousePosition() = 0;
     [[nodiscard]] virtual float delta() const = 0;
 
-    Observable<std::tuple<int, int>> windowResize;
+    void onResize(std::function<void(int, int)> callback)
+    {
+        resizeCallbacks.push_back(std::move(callback));
+    }
+
+protected:
+    std::vector<std::function<void(int, int)>> resizeCallbacks;
 };

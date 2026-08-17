@@ -116,7 +116,11 @@ void GLFWWindow::windowResized(GLFWwindow *window, int width, int height)
     auto caller = reinterpret_cast<GLFWWindow *>(glfwGetWindowUserPointer(window));
     caller->windowState.windowWidth = width;
     caller->windowState.windowHeight = height;
-    caller->windowResize.next(std::make_tuple(width, height));
+
+    for (const auto& callback : caller->resizeCallbacks)
+    {
+        callback(width, height);
+    }
 }
 
 bool GLFWWindow::keyPressed(int key) const

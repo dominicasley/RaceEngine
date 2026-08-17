@@ -17,10 +17,15 @@ ResourceService::ResourceService(
 {
 }
 
-std::string ResourceService::loadTextFile(const std::string& filePath) const
+std::expected<std::string, std::string> ResourceService::loadTextFile(const std::string& filePath) const
 {
     std::string output;
     std::ifstream fileStream(filePath);
+
+    if (!fileStream.is_open())
+    {
+        return std::unexpected("Unable to open file with path " + filePath);
+    }
 
     fileStream.seekg(0, std::ios::end);
     output.reserve(fileStream.tellg());
@@ -31,31 +36,36 @@ std::string ResourceService::loadTextFile(const std::string& filePath) const
     return output;
 }
 
-Resource<Model> ResourceService::loadModel(const std::string& filePath) const
+std::expected<Resource<Model>, std::string> ResourceService::loadModel(const std::string& filePath) const
 {
-    std::optional<Model> model;
     auto fileExtension = filePath.substr(filePath.find_last_of('.') + 1);
-    if (fileExtension == "gltf" || fileExtension == "glb")
+    if (fileExtension != "gltf" && fileExtension != "glb")
     {
-        model = gltfService.loadModelFromFile(filePath);
+        return std::unexpected("Unknown extension " + fileExtension + " when loading model with path " + filePath);
     }
 
-    return memoryStorageService.models.add(model.value());
+    auto model = gltfService.loadModelFromFile(filePath);
+    if (!model)
+    {
+        return std::unexpected("Unable to load model with path " + filePath);
+    }
+
+    return memoryStorageService.models.add(std::move(model).value());
 }
 
-Resource<std::unique_ptr<ozz::animation::Skeleton>> ResourceService::loadSkeleton(const std::string& filePath) const
+std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> ResourceService::loadSkeleton(const std::string& filePath) const
 {
     ozz::io::File file(filePath.c_str(), "rb");
 
     if (!file.opened())
     {
-        logger.error("Failed to open skeleton file {}", filePath);
+        return std::unexpected("Failed to open skeleton file " + filePath);
     }
 
     ozz::io::IArchive archive(&file);
     if (!archive.TestTag<ozz::animation::Skeleton>())
     {
-        logger.error("Failed to load skeleton instance from file {}", filePath);
+        return std::unexpected("Failed to load skeleton instance from file " + filePath);
     }
 
     auto skeleton = std::make_unique<ozz::animation::Skeleton>();
@@ -65,20 +75,20 @@ Resource<std::unique_ptr<ozz::animation::Skeleton>> ResourceService::loadSkeleto
 }
 
 
-Resource<std::unique_ptr<ozz::animation::Animation>> ResourceService::loadAnimation(const std::string& filePath) const
+std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string> ResourceService::loadAnimation(const std::string& filePath) const
 {
 
     ozz::io::File file(filePath.c_str(), "rb");
 
     if (!file.opened())
     {
-        logger.error("Failed to open skeleton file {}", filePath);
+        return std::unexpected("Failed to open animation file " + filePath);
     }
 
     ozz::io::IArchive archive(&file);
     if (!archive.TestTag<ozz::animation::Animation>())
     {
-        logger.error("Failed to load skeleton instance from file {}", filePath);
+        return std::unexpected("Failed to load animation instance from file " + filePath);
     }
 
     auto animation = std::make_unique<ozz::animation::Animation>();
@@ -87,7 +97,7 @@ Resource<std::unique_ptr<ozz::animation::Animation>> ResourceService::loadAnimat
     return memoryStorageService.animations.add(std::move(animation));
 }
 
-Resource<Texture> ResourceService::loadTexture(const std::string& filePath) const
+std::expected<Resource<Texture>, std::string> ResourceService::loadTexture(const std::string& filePath) const
 {
     int width = 0;
     int height = 0;
@@ -99,16 +109,7 @@ Resource<Texture> ResourceService::loadTexture(const std::string& filePath) cons
 
         if (!pixels)
         {
-            logger.error("Unable to load image with path {}: {}", filePath, stbi_failure_reason());
-            return memoryStorageService.textures.add(Texture {
-                .name = filePath,
-                .format = TextureFormat::Unknown,
-                .pixelDataType = PixelDataType::Float,
-                .width = 0,
-                .height = 0,
-                .bitsPerPixel = 0,
-                .data = {}
-            });
+            return std::unexpected("Unable to load image with path " + filePath + ": " + stbi_failure_reason());
         }
 
         const auto byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 * sizeof(float);
@@ -132,16 +133,7 @@ Resource<Texture> ResourceService::loadTexture(const std::string& filePath) cons
 
     if (!pixels)
     {
-        logger.error("Unable to load image with path {}: {}", filePath, stbi_failure_reason());
-        return memoryStorageService.textures.add(Texture {
-            .name = filePath,
-            .format = TextureFormat::Unknown,
-            .pixelDataType = PixelDataType::UnsignedByte,
-            .width = 0,
-            .height = 0,
-            .bitsPerPixel = 0,
-            .data = {}
-        });
+        return std::unexpected("Unable to load image with path " + filePath + ": " + stbi_failure_reason());
     }
 
     const auto byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
@@ -161,48 +153,43 @@ Resource<Texture> ResourceService::loadTexture(const std::string& filePath) cons
 }
 
 
-const Observable<std::string>& ResourceService::loadTextFileAsync(std::string filePath) const
+AsyncResult<std::string> ResourceService::loadTextFileAsync(std::string filePath) const
 {
     logger.info("Loading file: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(
-        std::async(std::launch::async, &ResourceService::loadTextFile, this, filePath))
-        ->asObservable();
+    return backgroundWorkerService.submit(
+        [this, filePath = std::move(filePath)] { return loadTextFile(filePath); });
 }
 
-const Observable<Resource<Model>>& ResourceService::loadModelAsync(std::string filePath) const
+AsyncResult<Resource<Model>> ResourceService::loadModelAsync(std::string filePath) const
 {
     logger.info("Loading model: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(
-            std::async(std::launch::async, &ResourceService::loadModel, this, filePath))
-        ->asObservable();
+    return backgroundWorkerService.submit(
+        [this, filePath = std::move(filePath)] { return loadModel(filePath); });
 }
 
-const Observable<Resource<std::unique_ptr<ozz::animation::Skeleton>>>& ResourceService::loadSkeletonAsync(std::string filePath) const
+AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>> ResourceService::loadSkeletonAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(
-        std::async(std::launch::async, &ResourceService::loadSkeleton, this, filePath))
-        ->asObservable();
+    return backgroundWorkerService.submit(
+        [this, filePath = std::move(filePath)] { return loadSkeleton(filePath); });
 }
 
-const Observable<Resource<std::unique_ptr<ozz::animation::Animation>>>& ResourceService::loadAnimationAsync(std::string filePath) const
+AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>> ResourceService::loadAnimationAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(
-        std::async(std::launch::async, &ResourceService::loadAnimation, this, filePath))
-        ->asObservable();
+    return backgroundWorkerService.submit(
+        [this, filePath = std::move(filePath)] { return loadAnimation(filePath); });
 }
 
-const Observable<Resource<Texture>>& ResourceService::loadTextureAsync(std::string filePath) const
+AsyncResult<Resource<Texture>> ResourceService::loadTextureAsync(std::string filePath) const
 {
     logger.info("Loading image: {}", filePath);
 
-    return BackgroundWorkerService::registerTask(
-        std::async(std::launch::async, &ResourceService::loadTexture, this, filePath))
-        ->asObservable();
+    return backgroundWorkerService.submit(
+        [this, filePath = std::move(filePath)] { return loadTexture(filePath); });
 }
 

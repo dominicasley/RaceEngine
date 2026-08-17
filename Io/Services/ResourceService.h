@@ -1,6 +1,7 @@
 #pragma once
 
 #include <spdlog/logger.h>
+#include <expected>
 #include <map>
 #include <string>
 #include <future>
@@ -25,14 +26,14 @@ public:
         MemoryStorageService& memoryStorageService,
         BackgroundWorkerService& backgroundWorkerService,
         GLTFService& gltfService);
-    [[nodiscard]] std::string loadTextFile(const std::string& filePath) const;
-    [[nodiscard]] Resource<Model> loadModel(const std::string& filePath) const;
-    [[nodiscard]] Resource<std::unique_ptr<ozz::animation::Skeleton>> loadSkeleton(const std::string& filePath) const;
-    [[nodiscard]] Resource<std::unique_ptr<ozz::animation::Animation>> loadAnimation(const std::string& filePath) const;
-    [[nodiscard]] Resource<Texture> loadTexture(const std::string& filePath) const;
-    [[nodiscard]] const Observable<std::string>& loadTextFileAsync(std::string filePath) const;
-    [[nodiscard]] const Observable<Resource<Model>>& loadModelAsync(std::string filePath) const;
-    [[nodiscard]] const Observable<Resource<Texture>>& loadTextureAsync(std::string filePath) const;
-    [[nodiscard]] const Observable<Resource<std::unique_ptr<ozz::animation::Skeleton>>>& loadSkeletonAsync(std::string filePath) const;
-    [[nodiscard]] const Observable<Resource<std::unique_ptr<ozz::animation::Animation>>>& loadAnimationAsync(std::string filePath) const;
+    [[nodiscard]] std::expected<std::string, std::string> loadTextFile(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<Model>, std::string> loadModel(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> loadSkeleton(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string> loadAnimation(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<Texture>, std::string> loadTexture(const std::string& filePath) const;
+    [[nodiscard]] AsyncResult<std::string> loadTextFileAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<Model>> loadModelAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<Texture>> loadTextureAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>> loadSkeletonAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>> loadAnimationAsync(std::string filePath) const;
 };

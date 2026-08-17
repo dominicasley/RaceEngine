@@ -31,8 +31,7 @@ Engine::Engine() :
     openGlRenderer.init();
     openGlRenderer.setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
 
-    glfwWindow.windowResize.subscribe([&](auto size) {
-        const auto& [width, height] = size;
+    glfwWindow.onResize([&](int width, int height) {
         logger->info("Window Resized: {}px x {}px", width, height);
         openGlRenderer.setViewport(width, height);
 
@@ -60,8 +59,6 @@ bool Engine::running() const
 void Engine::step()
 {
     const auto delta = glfwWindow.delta();
-
-    backgroundWorkerService.step();
 
     for (auto& scene : sceneManagerService.getScenes())
     {
