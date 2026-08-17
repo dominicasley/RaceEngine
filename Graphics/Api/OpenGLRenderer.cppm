@@ -5,6 +5,8 @@ module;
 
 #include <GLFW/glfw3.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <ranges>
 #include <stdexcept>
@@ -17,9 +19,11 @@ module;
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <spdlog/logger.h>
+#include <stb_image_write.h>
 
 export module raceengine.graphics:OpenGLRenderer;
 
+import :IRenderer;
 import :SceneManagerService;
 import :RenderableEntityService;
 import raceengine.graphics.models;
@@ -55,7 +59,7 @@ struct UniformKeyEqual
 
 typedef std::unordered_map<std::pair<unsigned int, std::string>, int, UniformKeyHash, UniformKeyEqual> UniformPool;
 
-export class OpenGLRenderer
+export class OpenGLRenderer : public IRenderer
 {
 private:
     UniformPool uniformPool;
@@ -81,26 +85,28 @@ private:
 public:
     explicit OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
                             SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
-    ~OpenGLRenderer();
+    ~OpenGLRenderer() override;
 
-    bool init();
-    void draw(Scene& scene, Camera& camera, float delta);
+    bool init() override;
+    void draw(Scene& scene, Camera& camera, float delta) override;
+    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const override;
+    void setViewport(int width, int height) override;
+    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
+    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
+                                             const Texture& right, const Texture& top,
+                                             const Texture& bottom) const override;
+    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const override;
+    void deleteFbo(Fbo& fbo) const override;
+    void captureFrame(const std::string& path) override;
+
+private:
     void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
-    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const;
     void bindMaterial(const Resource<Material>& material);
     void upload(const Resource<Model>& model);
-    void setViewport(int width, int height);
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor);
     [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                             const Texture& right, const Texture& top, const Texture& bottom) const;
-    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const;
-    void deleteFbo(Fbo& fbo) const;
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
     [[nodiscard]] unsigned int getInternalFormatFromBitsPerPixel(int bitsPerPixel) const;
-
-private:
     void createQuad();
     bool compileShader(unsigned int id, const std::string& source);
     int getUniformLocation(unsigned int, const char*);
@@ -547,9 +553,9 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
             }
 
             // The element buffer binding is VAO state; baking it here removes the per-draw rebind.
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
-                         static_cast<GLuint>(
-                             model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
+            glBindBuffer(
+                GL_ELEMENT_ARRAY_BUFFER,
+                static_cast<GLuint>(model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
 
             primitive.gpuVao = vao;
             mesh.gpuResourceId = vao;
@@ -1002,6 +1008,39 @@ void OpenGLRenderer::setViewport(int width, int height)
     viewportWidth = width;
     viewportHeight = height;
     glViewport(0, 0, width, height);
+}
+
+void OpenGLRenderer::captureFrame(const std::string& path)
+{
+    // viewportWidth/Height track the window size: set from the window state at startup
+    // and updated by the resize callback before any capture can run.
+    const auto width = viewportWidth;
+    const auto height = viewportHeight;
+    const auto rowBytes = static_cast<size_t>(width) * 4;
+
+    auto pixels = std::vector<unsigned char>(rowBytes * static_cast<size_t>(height));
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+    auto row = std::vector<unsigned char>(rowBytes);
+    for (auto y = 0; y < height / 2; y++)
+    {
+        auto* top = pixels.data() + static_cast<size_t>(y) * rowBytes;
+        auto* bottom = pixels.data() + static_cast<size_t>(height - 1 - y) * rowBytes;
+        std::memcpy(row.data(), top, rowBytes);
+        std::memcpy(top, bottom, rowBytes);
+        std::memcpy(bottom, row.data(), rowBytes);
+    }
+
+    if (stbi_write_png(path.c_str(), width, height, 4, pixels.data(), static_cast<int>(rowBytes)) == 0)
+    {
+        logger.error("Failed to write frame dump to {}", path);
+        std::exit(1);
+    }
+
+    logger.info("Frame dump written to {}", path);
 }
 
 unsigned int OpenGLRenderer::getTextureDataType(PixelDataType type) const

@@ -1,15 +1,13 @@
 module;
 
 #include <cstdlib>
-#include <cstring>
 #include <memory>
-#include <vector>
+#include <string>
+#include <string_view>
 
-#include <glad/gl.h>
 #include <spdlog/async.h>
 #include <spdlog/logger.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <stb_image_write.h>
 
 export module raceengine;
 
@@ -52,7 +50,10 @@ private:
     ResourceService resourceService;
     RenderableEntityService renderableEntityService;
     SceneManagerService sceneManagerService;
-    OpenGLRenderer openGlRenderer;
+    // unique_ptr for backend selection, but the declaration position is still load-bearing:
+    // the GL renderer's destructor issues GL deletes that need the GLFW context current, so
+    // this member must keep destroying before glfwWindow — same slot the value member had.
+    std::unique_ptr<IRenderer> renderer;
     FboService fboService;
     ShaderService shaderService;
     CubeMapService cubeMapService;
@@ -143,29 +144,50 @@ module :private;
 namespace raceengine
 {
 
+namespace
+{
+
+// Renderer backend selection for the composition root, driven by RACEENGINE_RENDERER.
+// Unset or "opengl" selects OpenGL; "vulkan" is accepted but not yet implemented.
+[[nodiscard]] std::unique_ptr<IRenderer> createRenderer(spdlog::logger& logger,
+                                                        RenderableEntityService& renderableEntityService,
+                                                        SceneManagerService& sceneManagerService,
+                                                        MemoryStorageService& memoryStorageService)
+{
+    const char* requested = std::getenv("RACEENGINE_RENDERER");
+    if (requested != nullptr && std::string_view(requested) == "vulkan")
+    {
+        logger.warn("Vulkan renderer requested but not yet available; falling back to OpenGL");
+    }
+
+    return std::make_unique<OpenGLRenderer>(logger, renderableEntityService, sceneManagerService, memoryStorageService);
+}
+
+} // namespace
+
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
     glfwWindow(*logger),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
     renderableEntityService(*logger, memoryStorageService),
-    openGlRenderer(*logger, renderableEntityService, sceneManagerService, memoryStorageService),
-    fboService(memoryStorageService, openGlRenderer),
-    shaderService(memoryStorageService, openGlRenderer),
-    cubeMapService(openGlRenderer, memoryStorageService),
+    renderer(createRenderer(*logger, renderableEntityService, sceneManagerService, memoryStorageService)),
+    fboService(memoryStorageService, *renderer),
+    shaderService(memoryStorageService, *renderer),
+    cubeMapService(*renderer, memoryStorageService),
     postProcessService(memoryStorageService, fboService, glfwWindow),
-    presenterService(openGlRenderer),
+    presenterService(*renderer),
     cameraService(memoryStorageService, fboService, glfwWindow),
     sceneService(renderableEntityService, cameraService)
 {
-    openGlRenderer.init();
-    openGlRenderer.setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
+    renderer->init();
+    renderer->setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
 
     glfwWindow.onResize(
         [&](int width, int height)
         {
             logger->info("Window Resized: {}px x {}px", width, height);
-            openGlRenderer.setViewport(width, height);
+            renderer->setViewport(width, height);
 
             for (auto& scene : sceneManagerService.getScenes())
             {
@@ -204,7 +226,7 @@ void Engine::step()
     {
         for (auto& camera : scene.cameras)
         {
-            openGlRenderer.draw(scene, camera, delta);
+            renderer->draw(scene, camera, delta);
         }
     }
 
@@ -228,34 +250,7 @@ void Engine::dumpFrameIfRequested()
         return;
     }
 
-    const auto& windowState = glfwWindow.state();
-    const auto width = windowState.windowWidth;
-    const auto height = windowState.windowHeight;
-    const auto rowBytes = static_cast<size_t>(width) * 4;
-
-    auto pixels = std::vector<unsigned char>(rowBytes * static_cast<size_t>(height));
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-
-    auto row = std::vector<unsigned char>(rowBytes);
-    for (auto y = 0; y < height / 2; y++)
-    {
-        auto* top = pixels.data() + static_cast<size_t>(y) * rowBytes;
-        auto* bottom = pixels.data() + static_cast<size_t>(height - 1 - y) * rowBytes;
-        std::memcpy(row.data(), top, rowBytes);
-        std::memcpy(top, bottom, rowBytes);
-        std::memcpy(bottom, row.data(), rowBytes);
-    }
-
-    if (stbi_write_png(dumpPath, width, height, 4, pixels.data(), static_cast<int>(rowBytes)) == 0)
-    {
-        logger->error("Failed to write frame dump to {}", dumpPath);
-        std::exit(1);
-    }
-
-    logger->info("Frame dump written to {}", dumpPath);
+    renderer->captureFrame(dumpPath);
     std::exit(0);
 }
 

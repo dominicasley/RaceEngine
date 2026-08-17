@@ -4,7 +4,7 @@ module;
 
 export module raceengine.graphics:PresenterService;
 
-import :OpenGLRenderer;
+import :IRenderer;
 import raceengine.graphics.models;
 
 namespace raceengine
@@ -13,16 +13,16 @@ namespace raceengine
 export class PresenterService
 {
 private:
-    OpenGLRenderer& renderer;
+    IRenderer& renderer;
     std::optional<Presenter> presenter;
 
 public:
-    explicit PresenterService(OpenGLRenderer& renderer);
+    explicit PresenterService(IRenderer& renderer);
     void setPresenter(const Presenter& presenter);
     void present() const;
 };
 
-PresenterService::PresenterService(OpenGLRenderer& renderer) :
+PresenterService::PresenterService(IRenderer& renderer) :
     renderer(renderer)
 {
 }

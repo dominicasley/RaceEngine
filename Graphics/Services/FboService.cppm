@@ -5,7 +5,7 @@ module;
 
 export module raceengine.graphics:FboService;
 
-import :OpenGLRenderer;
+import :IRenderer;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -16,10 +16,10 @@ export class FboService
 {
 private:
     MemoryStorageService& memoryStorageService;
-    OpenGLRenderer& renderer;
+    IRenderer& renderer;
 
 public:
-    explicit FboService(MemoryStorageService& memoryStorageService, OpenGLRenderer& renderer);
+    explicit FboService(MemoryStorageService& memoryStorageService, IRenderer& renderer);
     [[nodiscard]] Resource<Fbo> create(const CreateFboDTO& createFboDTO) const;
     void recreate(const Resource<Fbo>& fbo) const;
     void resize(const Resource<Fbo>& fbo, unsigned int width, unsigned int height) const;
@@ -28,7 +28,7 @@ public:
                                                                             FboAttachmentType type) const;
 };
 
-FboService::FboService(MemoryStorageService& memoryStorageService, OpenGLRenderer& renderer) :
+FboService::FboService(MemoryStorageService& memoryStorageService, IRenderer& renderer) :
     memoryStorageService(memoryStorageService),
     renderer(renderer)
 {

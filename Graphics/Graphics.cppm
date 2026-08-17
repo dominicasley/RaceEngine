@@ -1,6 +1,7 @@
 export module raceengine.graphics;
 
 export import :Window;
+export import :IRenderer;
 export import :VulkanRenderer;
 export import :SceneManagerService;
 export import :RenderableEntityService;

@@ -6,7 +6,7 @@ module;
 
 export module raceengine.graphics:ShaderService;
 
-import :OpenGLRenderer;
+import :IRenderer;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -17,26 +17,26 @@ export class ShaderService
 {
 private:
     MemoryStorageService& memoryStorageService;
-    OpenGLRenderer& openGlRenderer;
+    IRenderer& renderer;
 
     std::map<std::string, Resource<Shader>> shaders;
 
 public:
-    explicit ShaderService(MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer);
+    explicit ShaderService(MemoryStorageService& memoryStorageService, IRenderer& renderer);
     std::optional<Resource<Shader>> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
     std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
-ShaderService::ShaderService(MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer) :
+ShaderService::ShaderService(MemoryStorageService& memoryStorageService, IRenderer& renderer) :
     memoryStorageService(memoryStorageService),
-    openGlRenderer(openGlRenderer)
+    renderer(renderer)
 {
 }
 
 std::optional<Resource<Shader>> ShaderService::createShader(const std::string& name,
                                                             const ShaderDescriptor& shaderDescriptor)
 {
-    auto shaderProgramId = openGlRenderer.createShaderObject(shaderDescriptor);
+    auto shaderProgramId = renderer.createShaderObject(shaderDescriptor);
 
     if (!shaderProgramId.has_value())
     {

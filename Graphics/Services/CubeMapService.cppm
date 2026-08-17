@@ -4,7 +4,7 @@ module;
 
 export module raceengine.graphics:CubeMapService;
 
-import :OpenGLRenderer;
+import :IRenderer;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -14,17 +14,17 @@ namespace raceengine
 export class CubeMapService
 {
 private:
-    OpenGLRenderer& renderer;
+    IRenderer& renderer;
     MemoryStorageService& memoryStorageService;
 
 public:
-    explicit CubeMapService(OpenGLRenderer& renderer, MemoryStorageService& memoryStorageService);
+    explicit CubeMapService(IRenderer& renderer, MemoryStorageService& memoryStorageService);
     Resource<CubeMap> create(const std::string& name, const Resource<Texture>& front, const Resource<Texture>& back,
                              const Resource<Texture>& left, const Resource<Texture>& right,
                              const Resource<Texture>& top, const Resource<Texture>& bottom) const;
 };
 
-CubeMapService::CubeMapService(OpenGLRenderer& renderer, MemoryStorageService& memoryStorageService) :
+CubeMapService::CubeMapService(IRenderer& renderer, MemoryStorageService& memoryStorageService) :
     renderer(renderer),
     memoryStorageService(memoryStorageService)
 {

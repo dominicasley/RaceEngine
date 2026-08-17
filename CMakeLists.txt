@@ -58,6 +58,7 @@ target_sources(Engine PUBLIC
         Graphics/Models/Shader.cppm
         Graphics/Models/Texture.cppm
         Graphics/System/Window.cppm
+        Graphics/Api/IRenderer.cppm
         Graphics/Api/VulkanRenderer.cppm
         Graphics/Api/OpenGLRenderer.cppm
         Graphics/Services/SceneManagerService.cppm
