@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <spdlog/logger.h>
 
 #include "Game/Models/Entity.h"
@@ -9,7 +10,7 @@ class EntityService
 {
 private:
     spdlog::logger& logger;
-    std::vector<Entity> entities;
+    std::deque<Entity> entities;
 
 public:
     explicit EntityService(spdlog::logger& logger);

@@ -1,13 +1,11 @@
 #include "SceneManagerService.h"
 
 SceneManagerService::SceneManagerService(spdlog::logger& logger) :
-    logger(logger),
-    scenes(std::pmr::vector<Scene>(&sceneBufferResource))
+    logger(logger)
 {
-    scenes.reserve(1024);
 }
 
-std::pmr::vector<Scene>& SceneManagerService::getScenes()
+std::deque<Scene>& SceneManagerService::getScenes()
 {
     return scenes;
 }

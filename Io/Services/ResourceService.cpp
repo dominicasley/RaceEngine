@@ -61,7 +61,7 @@ Resource<std::unique_ptr<ozz::animation::Skeleton>> ResourceService::loadSkeleto
     auto skeleton = std::make_unique<ozz::animation::Skeleton>();
     archive >> *skeleton;
 
-    return memoryStorageService.skeletons.takeOwnership(skeleton);
+    return memoryStorageService.skeletons.add(std::move(skeleton));
 }
 
 
@@ -84,7 +84,7 @@ Resource<std::unique_ptr<ozz::animation::Animation>> ResourceService::loadAnimat
     auto animation = std::make_unique<ozz::animation::Animation>();
     archive >> *animation;
 
-    return memoryStorageService.animations.takeOwnership(animation);
+    return memoryStorageService.animations.add(std::move(animation));
 }
 
 Resource<Texture> ResourceService::loadTexture(const std::string& filePath) const

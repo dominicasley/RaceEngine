@@ -2,7 +2,6 @@
 
 EntityService::EntityService(
     spdlog::logger& logger): logger(logger) {
-    entities.reserve(1024);
 }
 
 Entity& EntityService::createEntity()

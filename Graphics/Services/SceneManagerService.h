@@ -1,7 +1,7 @@
 #pragma once
 
 #include <spdlog/spdlog.h>
-#include <memory_resource>
+#include <deque>
 
 
 #include "../Models/Scene/Scene.h"
@@ -11,13 +11,12 @@ class SceneManagerService
 private:
     spdlog::logger& logger;
 
-    std::pmr::monotonic_buffer_resource sceneBufferResource;
-    mutable std::pmr::vector<Scene> scenes;
+    std::deque<Scene> scenes;
 
 public:
     explicit SceneManagerService(spdlog::logger& logger);
 
-    [[nodiscard]] std::pmr::vector<Scene>& getScenes();
+    [[nodiscard]] std::deque<Scene>& getScenes();
     [[nodiscard]] Scene& getScene(int index);
     [[nodiscard]] Scene& createScene();
     [[nodiscard]] SceneNode& createNode(Scene& scene);

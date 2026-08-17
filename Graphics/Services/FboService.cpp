@@ -50,14 +50,6 @@ void FboService::recreate(const Resource<Fbo>& fbo) const
     memoryStorageService.frameBuffers.update(fbo, frameBuffer);
 }
 
-void FboService::deleteFbo(const Resource<Fbo>& fbo) const
-{
-    auto frameBuffer = memoryStorageService.frameBuffers.get(fbo);
-
-    renderer.deleteFbo(frameBuffer);
-    memoryStorageService.frameBuffers.remove(fbo);
-}
-
 void FboService::resize(const Resource<Fbo>& fbo, unsigned int width, unsigned int height) const
 {
     auto frameBuffer = memoryStorageService.frameBuffers.get(fbo);

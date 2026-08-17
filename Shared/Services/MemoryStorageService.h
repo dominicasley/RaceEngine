@@ -2,7 +2,7 @@
 
 #include <mutex>
 #include <thread>
-#include <memory_resource>
+#include <deque>
 #include <array>
 #include <string>
 #include <spdlog/logger.h>
@@ -17,20 +17,14 @@
 #include <Graphics/Models/Scene/PostProcess.h>
 #include <Shared/Types/Resource.h>
 
+// std::deque backing: growth never relocates elements, so cached Resource<T>::value pointers stay valid; removal would require generational handles.
 template<typename T>
 class MemoryStorage
 {
-    std::pmr::monotonic_buffer_resource bufferResource;
     mutable std::mutex accessorMutex;
-    mutable std::pmr::vector<T> items;
+    mutable std::deque<T> items;
 
 public:
-    explicit MemoryStorage() :
-        items(std::pmr::vector<T>(&bufferResource))
-    {
-        items.reserve(1024);
-    }
-
     [[nodiscard]] const T& get(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
@@ -43,32 +37,25 @@ public:
         return items.size() > key.id;
     };
 
-    [[nodiscard]] std::optional<Resource<T>> getKeyIfExists(const Resource<T>& key) const
-    {
-        std::lock_guard<std::mutex> lock(accessorMutex);
-
-        if (items.find(key) != items.end()) {
-            return key;
-        }
-
-        return std::nullopt;
-    };
-
-    void remove(const Resource<T>& key) const
-    {
-        std::lock_guard<std::mutex> lock(accessorMutex);
-        // items.erase(key.id);
-        // todo: idek
-    };
-
     Resource<T> add(const T& item) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        auto value = items.emplace_back(item);
+        T& stored = items.emplace_back(item);
 
         return Resource<T> {
             .id = items.size() - 1,
-            .value = &items[items.size() - 1]
+            .value = &stored
+        };
+    };
+
+    Resource<T> add(T&& item) const
+    {
+        std::lock_guard<std::mutex> lock(accessorMutex);
+        T& stored = items.emplace_back(std::move(item));
+
+        return Resource<T> {
+            .id = items.size() - 1,
+            .value = &stored
         };
     };
 
@@ -76,19 +63,6 @@ public:
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         items[resource.id] = value;
-    };
-
-
-    Resource<T> takeOwnership(T& item) const
-    {
-        std::lock_guard<std::mutex> lock(accessorMutex);
-
-        auto value = items.emplace_back(std::move(item)).get();
-
-        return Resource<T> {
-            .id = items.size() - 1,
-            .value = &items[items.size() - 1]
-        };
     };
 };
 
