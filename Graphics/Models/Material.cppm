@@ -27,7 +27,7 @@ export struct Material
     std::optional<Resource<Texture>> normal;
     std::optional<Resource<Texture>> occlusion;
     std::optional<Resource<Texture>> emissive;
-    std::optional<Resource<Texture>> environment{};
+    std::optional<Resource<CubeMap>> environment{};
     std::vector<Resource<Texture>> textures{};
 };
 

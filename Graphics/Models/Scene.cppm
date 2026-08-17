@@ -26,6 +26,7 @@ export module raceengine.graphics.models:Scene;
 import raceengine.resource;
 import :Fbo;
 import :Mesh;
+import :Texture;
 
 namespace raceengine
 {
@@ -125,6 +126,8 @@ export struct Scene
     std::deque<Light> lights;
     std::deque<RenderableModel> models;
     std::deque<SceneNode> nodes;
+
+    std::optional<Resource<CubeMap>> environment{};
 };
 
 } // namespace raceengine
