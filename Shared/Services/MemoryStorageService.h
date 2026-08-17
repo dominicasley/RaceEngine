@@ -20,14 +20,12 @@
 template<typename T>
 class MemoryStorage
 {
-    std::vector<T> buffer[1024];
     std::pmr::monotonic_buffer_resource bufferResource;
     mutable std::mutex accessorMutex;
     mutable std::pmr::vector<T> items;
 
 public:
     explicit MemoryStorage() :
-        bufferResource(buffer, buffer->size()),
         items(std::pmr::vector<T>(&bufferResource))
     {
         items.reserve(1024);

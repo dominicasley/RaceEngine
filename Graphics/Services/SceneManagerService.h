@@ -12,7 +12,6 @@ private:
     spdlog::logger& logger;
 
     std::pmr::monotonic_buffer_resource sceneBufferResource;
-    std::vector<Scene> sceneBuffer[1024];
     mutable std::pmr::vector<Scene> scenes;
 
 public:

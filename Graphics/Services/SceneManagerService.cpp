@@ -2,7 +2,6 @@
 
 SceneManagerService::SceneManagerService(spdlog::logger& logger) :
     logger(logger),
-    sceneBufferResource(sceneBuffer, sceneBuffer->size()),
     scenes(std::pmr::vector<Scene>(&sceneBufferResource))
 {
     scenes.reserve(1024);
