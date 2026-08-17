@@ -22,6 +22,8 @@ module;
 
 export module raceengine.graphics:Window;
 
+import :GraphicsApi;
+
 namespace raceengine
 {
 
@@ -84,12 +86,13 @@ private:
 
     WindowState windowState;
     spdlog::logger& logger;
+    GraphicsApi graphicsApi;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
 
 public:
-    explicit GLFWWindow(spdlog::logger& logger);
+    explicit GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi);
     ~GLFWWindow();
     void makeContextCurrent() override;
     void swapBuffers() const override;
@@ -103,13 +106,14 @@ public:
     [[nodiscard]] float delta() const override;
 };
 
-GLFWWindow::GLFWWindow(spdlog::logger& logger) :
+GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     _delta(0),
     _frameTime(0),
     _avgFrameRate(0),
     _frameCount(0),
     windowState({0, 0, 0, 0}),
-    logger(logger)
+    logger(logger),
+    graphicsApi(graphicsApi)
 {
     if (!glfwInit())
     {
@@ -122,12 +126,16 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger) :
         logger.info("Vulkan support detected");
     }
 
-    // glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    // glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    if (graphicsApi == GraphicsApi::Vulkan)
+    {
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    }
+    else
+    {
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    }
 
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
@@ -145,8 +153,11 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     glfwSetFramebufferSizeCallback(window, windowResized);
     glfwSetCursorPosCallback(window, cursorPositionChanged);
 
-    glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
+    if (graphicsApi == GraphicsApi::OpenGL)
+    {
+        glfwMakeContextCurrent(window);
+        glfwSwapInterval(1);
+    }
 }
 
 GLFWWindow::~GLFWWindow()
@@ -204,7 +215,11 @@ void GLFWWindow::swapBuffers() const
         _frameCount = 0;
     }
 
-    glfwSwapBuffers(window);
+    if (graphicsApi == GraphicsApi::OpenGL)
+    {
+        glfwSwapBuffers(window);
+    }
+
     glfwPollEvents();
 }
 

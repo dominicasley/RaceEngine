@@ -3,6 +3,11 @@
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#define VMA_IMPLEMENTATION
+
+#include <vulkan/vulkan.h>
+
+#include <vk_mem_alloc.h>
 
 #include <tiny_gltf.h>
 

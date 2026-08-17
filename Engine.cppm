@@ -3,7 +3,6 @@ module;
 #include <cstdlib>
 #include <memory>
 #include <string>
-#include <string_view>
 
 #include <spdlog/async.h>
 #include <spdlog/logger.h>
@@ -43,6 +42,9 @@ private:
     // Declaration order IS initialization order and reverse-destruction order:
     // each member may only depend on members declared above it.
     std::shared_ptr<spdlog::logger> logger;
+    // Resolved before the window: the window's client API and the renderer factory both
+    // depend on the selection (member init order is the mechanism).
+    GraphicsApi graphicsApi;
     GLFWWindow glfwWindow;
     MemoryStorageService memoryStorageService;
     BackgroundWorkerService backgroundWorkerService;
@@ -147,17 +149,18 @@ namespace raceengine
 namespace
 {
 
-// Renderer backend selection for the composition root, driven by RACEENGINE_RENDERER.
-// Unset or "opengl" selects OpenGL; "vulkan" is accepted but not yet implemented.
-[[nodiscard]] std::unique_ptr<IRenderer> createRenderer(spdlog::logger& logger,
+// Renderer backend factory for the composition root; the api was already resolved by
+// selectGraphicsApi before the window existed. The Vulkan backend takes only the window:
+// it needs no scene/storage services until it draws real geometry (V2/V3).
+[[nodiscard]] std::unique_ptr<IRenderer> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
+                                                        IWindow& window,
                                                         RenderableEntityService& renderableEntityService,
                                                         SceneManagerService& sceneManagerService,
                                                         MemoryStorageService& memoryStorageService)
 {
-    const char* requested = std::getenv("RACEENGINE_RENDERER");
-    if (requested != nullptr && std::string_view(requested) == "vulkan")
+    if (graphicsApi == GraphicsApi::Vulkan)
     {
-        logger.warn("Vulkan renderer requested but not yet available; falling back to OpenGL");
+        return std::make_unique<VulkanRenderer>(logger, window);
     }
 
     return std::make_unique<OpenGLRenderer>(logger, renderableEntityService, sceneManagerService, memoryStorageService);
@@ -167,11 +170,13 @@ namespace
 
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
-    glfwWindow(*logger),
+    graphicsApi(selectGraphicsApi(*logger)),
+    glfwWindow(*logger, graphicsApi),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
     renderableEntityService(*logger, memoryStorageService),
-    renderer(createRenderer(*logger, renderableEntityService, sceneManagerService, memoryStorageService)),
+    renderer(createRenderer(graphicsApi, *logger, glfwWindow, renderableEntityService, sceneManagerService,
+                            memoryStorageService)),
     fboService(memoryStorageService, *renderer),
     shaderService(memoryStorageService, *renderer),
     cubeMapService(*renderer, memoryStorageService),

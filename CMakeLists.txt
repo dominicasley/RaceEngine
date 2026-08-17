@@ -18,6 +18,8 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_package(unofficial-shaderc CONFIG REQUIRED)
 find_path(STB_INCLUDE_DIRS "stb_image.h" REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h" REQUIRED)
 
@@ -58,6 +60,7 @@ target_sources(Engine PUBLIC
         Graphics/Models/Shader.cppm
         Graphics/Models/Texture.cppm
         Graphics/System/Window.cppm
+        Graphics/Api/GraphicsApi.cppm
         Graphics/Api/IRenderer.cppm
         Graphics/Api/VulkanRenderer.cppm
         Graphics/Api/OpenGLRenderer.cppm
@@ -88,6 +91,8 @@ target_link_libraries(Engine PUBLIC spdlog::spdlog)
 target_link_libraries(Engine PUBLIC glm::glm)
 target_link_libraries(Engine PUBLIC glfw)
 target_link_libraries(Engine PUBLIC Vulkan::Vulkan)
+target_link_libraries(Engine PRIVATE GPUOpen::VulkanMemoryAllocator)
+target_link_libraries(Engine PRIVATE unofficial::shaderc::shaderc)
 target_link_libraries(Engine PUBLIC ozz_animation ozz_base)
 target_link_libraries(Engine PRIVATE glad)
 if(WIN32)
