@@ -1,5 +1,18 @@
 ﻿set(CMAKE_CXX_STANDARD 20)
-cmake_minimum_required (VERSION 3.8)
+cmake_minimum_required (VERSION 3.28)
+
+# Warning/sanitizer flags ride an INTERFACE carrier so vendored code stays untouched.
+# -Werror arrives once the first-party warning count reaches zero.
+add_library(raceengine_warnings INTERFACE)
+target_compile_options(raceengine_warnings INTERFACE
+        -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+        -Wold-style-cast -Wnon-virtual-dtor -Woverloaded-virtual
+        -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough)
+option(RACEENGINE_SANITIZE "Build first-party code with ASan+UBSan" OFF)
+if(RACEENGINE_SANITIZE)
+    target_compile_options(raceengine_warnings INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(raceengine_warnings INTERFACE -fsanitize=address,undefined)
+endif()
 
 add_library (Engine
         "Engine.h" "Engine.cpp"
@@ -73,3 +86,7 @@ target_link_libraries(Engine PUBLIC Graphics)
 target_link_libraries(Engine PUBLIC Io)
 target_link_libraries(Engine PUBLIC Async)
 target_link_libraries(Engine PUBLIC Shared)
+
+foreach(firstparty Engine Game Graphics Io Async Shared)
+    target_link_libraries(${firstparty} PRIVATE raceengine_warnings)
+endforeach()
