@@ -64,6 +64,7 @@ private:
     RenderableEntityService& renderableEntityService;
     SceneManagerService& sceneManagerService;
     std::optional<Resource<Material>> currentlyBoundMaterial;
+    std::optional<unsigned int> sceneEnvironmentGpuId;
     unsigned int quadVao;
     std::vector<float> vertices;
     int viewportWidth;
@@ -215,6 +216,12 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 {
     currentlyBoundMaterial.reset();
 
+    sceneEnvironmentGpuId.reset();
+    if (scene.environment.has_value())
+    {
+        sceneEnvironmentGpuId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
+    }
+
     if (camera.output.has_value())
     {
         if (camera.output.value()->gpuResourceId.has_value())
@@ -256,8 +263,6 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
                 continue;
             }
-
-            glBindVertexArray(static_cast<GLuint>(mesh.mesh->gpuResourceId.value()));
 
             auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
 
@@ -327,9 +332,12 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
                 }
 
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
-                             static_cast<GLuint>(
-                                 model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
+                if (!primitive.gpuVao.has_value())
+                {
+                    continue;
+                }
+
+                glBindVertexArray(primitive.gpuVao.value());
 
                 glDrawElements(primitive.mode, static_cast<GLsizei>(primitive.elementCount), primitive.componentType,
                                reinterpret_cast<const void*>(primitive.byteOffset));
@@ -457,13 +465,15 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
 
     if (material->environment.has_value())
     {
-        auto environment = material->environment.value();
+        const auto environment = material->environment.value();
 
-        if (environment->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE5);
-            glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(environment->gpuResourceId.value()));
-        }
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, environment->gpuResourceId);
+    }
+    else if (sceneEnvironmentGpuId.has_value())
+    {
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, sceneEnvironmentGpuId.value());
     }
     else
     {
@@ -494,11 +504,6 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
         if (mesh.gpuResourceId.has_value())
             continue;
 
-        GLuint vao;
-        glGenVertexArrays(1, &vao);
-        glBindVertexArray(vao);
-        createdVaos.push_back(vao);
-
         for (auto& buffer : model.meshBuffers)
         {
             if (buffer.gpuId.has_value())
@@ -520,8 +525,13 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
         memoryStorageService.models.update(modelKey, model);
 
-        for (const auto& primitive : mesh.meshPrimitives)
+        for (auto& primitive : mesh.meshPrimitives)
         {
+            GLuint vao;
+            glGenVertexArrays(1, &vao);
+            glBindVertexArray(vao);
+            createdVaos.push_back(vao);
+
             for (const auto& attribute : primitive.attributes)
             {
                 glBindBuffer(GL_ARRAY_BUFFER,
@@ -535,12 +545,19 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
                                           attribute.stride, reinterpret_cast<const void*>(attribute.offset));
                 }
             }
+
+            // The element buffer binding is VAO state; baking it here removes the per-draw rebind.
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLuint>(
+                             model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
+
+            primitive.gpuVao = vao;
+            mesh.gpuResourceId = vao;
+
+            glBindVertexArray(0);
         }
 
-        mesh.gpuResourceId = static_cast<int>(vao);
         memoryStorageService.meshes.update(meshKey, mesh);
-
-        glBindVertexArray(0);
     }
 
     for (const auto& resource : model.materials)
@@ -581,13 +598,6 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
             auto occlusion = memoryStorageService.textures.get(material.occlusion.value());
             occlusion.gpuResourceId = createTexture(occlusion);
             memoryStorageService.textures.update(material.occlusion.value(), occlusion);
-        }
-
-        if (material.environment.has_value())
-        {
-            auto environment = memoryStorageService.textures.get(material.environment.value());
-            environment.gpuResourceId = createTexture(environment);
-            memoryStorageService.textures.update(material.environment.value(), environment);
         }
 
         for (auto& i : material.textures)

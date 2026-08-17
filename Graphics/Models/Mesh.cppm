@@ -45,6 +45,9 @@ export struct MeshPrimitiveAttribute
 export struct MeshPrimitive
 {
     int mode;
+    // Each primitive owns its VAO: attribute bindings are VAO state, so primitives sharing a
+    // mesh-level VAO would overwrite each other's vertex setup (they did, once).
+    std::optional<unsigned int> gpuVao{};
     std::optional<Resource<Material>> material;
     size_t elementCount;
     size_t byteOffset;
