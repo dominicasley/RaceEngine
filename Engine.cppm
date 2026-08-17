@@ -150,8 +150,9 @@ namespace
 {
 
 // Renderer backend factory for the composition root; the api was already resolved by
-// selectGraphicsApi before the window existed. The Vulkan backend takes only the window:
-// it needs no scene/storage services until it draws real geometry (V2/V3).
+// selectGraphicsApi before the window existed. The Vulkan backend takes the storage
+// service to write FBO attachment ids back through their Resources (V2); the scene
+// services arrive with the draw path (V3).
 [[nodiscard]] std::unique_ptr<IRenderer> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
                                                         IWindow& window,
                                                         RenderableEntityService& renderableEntityService,
@@ -160,7 +161,7 @@ namespace
 {
     if (graphicsApi == GraphicsApi::Vulkan)
     {
-        return std::make_unique<VulkanRenderer>(logger, window);
+        return std::make_unique<VulkanRenderer>(logger, window, memoryStorageService);
     }
 
     return std::make_unique<OpenGLRenderer>(logger, renderableEntityService, sceneManagerService, memoryStorageService);

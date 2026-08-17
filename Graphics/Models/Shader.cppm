@@ -21,6 +21,10 @@ public:
     std::string tessellationEvaluationShaderSource{};
     std::string computeShaderSource{};
     std::string geometryShaderSource{};
+    // Vulkan-dialect sources (assets/Shaders/vulkan/); empty = not provided. The GL
+    // backend ignores them; the Vulkan backend requires both.
+    std::string vulkanVertexShaderSource{};
+    std::string vulkanFragmentShaderSource{};
 };
 
 } // namespace raceengine
