@@ -113,10 +113,16 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     for (const auto& primitive: tinyGltfMesh.primitives)
     {
+        if (primitive.indices < 0)
+        {
+            logger.warn("Skipping non-indexed primitive in mesh {}", tinyGltfMesh.name);
+            continue;
+        }
+
         auto indexAccessor = tinyGltfModel.accessors[primitive.indices];
 
         auto meshPrimitive = MeshPrimitive{
-            .mode = primitive.mode,
+            .mode = primitive.mode == -1 ? TINYGLTF_MODE_TRIANGLES : primitive.mode,
             .material = primitive.material != -1 ?
                         std::optional<Resource<Material>>(model.materials[primitive.material]) : std::nullopt,
             .elementCount = indexAccessor.count,
@@ -165,12 +171,17 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
     logger.info("Processing model: {}", filePath);
     Model model;
 
-    std::map<std::string, Resource<Texture>> textureMap;
+    std::map<int, Resource<Texture>> textureMap;
 
     for (const auto& texture: tinyGltfModel.textures)
     {
+        if (texture.source < 0)
+        {
+            continue;
+        }
+
         auto image = getImageFromIndex(tinyGltfModel, texture.source);
-        textureMap.insert_or_assign(filePath + ":" + image.name, memoryStorageService.textures.add(image));
+        textureMap.insert_or_assign(texture.source, memoryStorageService.textures.add(image));
     }
 
     for (const auto& tinyGltfMaterial: tinyGltfModel.materials)
@@ -183,32 +194,27 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
 
         if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
         {
-            auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
-            albedoTexturePtr = textureMap[filePath + ":" + image.name];
+            albedoTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
         }
 
         if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
         {
-            auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
-            metallicRoughnessTexturePtr = textureMap[filePath + ":" + image.name];
+            metallicRoughnessTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
         }
 
         if (tinyGltfMaterial.normalTexture.index != -1)
         {
-            auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
-            normalTexturePtr = textureMap[filePath + ":" + image.name];
+            normalTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
         }
 
         if (tinyGltfMaterial.occlusionTexture.index != -1)
         {
-            auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
-            occlusionTexturePtr = textureMap[filePath + ":" + image.name];
+            occlusionTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
         }
 
         if (tinyGltfMaterial.emissiveTexture.index != -1)
         {
-            auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
-            emissiveTexturePtr = textureMap[filePath + ":" + image.name];
+            emissiveTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
         }
 
         auto material = memoryStorageService.materials.add(Material{
@@ -242,7 +248,8 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
         });
     }
 
-    for (auto& sceneNode: tinyGltfModel.scenes[tinyGltfModel.defaultScene].nodes)
+    const auto sceneIndex = tinyGltfModel.defaultScene < 0 ? 0 : tinyGltfModel.defaultScene;
+    for (auto& sceneNode: tinyGltfModel.scenes[sceneIndex].nodes)
     {
         processNode(model, tinyGltfModel, tinyGltfModel.nodes[sceneNode], glm::mat4(1.0));
     }

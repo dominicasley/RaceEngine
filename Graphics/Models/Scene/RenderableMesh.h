@@ -23,6 +23,6 @@ struct RenderableMesh {
     ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;
     std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;
     std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations;
-    std::unique_ptr<ozz::animation::SamplingCache> animationCache;
+    std::unique_ptr<ozz::animation::SamplingJob::Context> animationCache;
     std::map<int, int> jointMap;
 };

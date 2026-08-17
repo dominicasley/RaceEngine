@@ -72,7 +72,7 @@ RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeD
 
         ozz::animation::SamplingJob sampling_job;
         sampling_job.animation = animation->get();
-        sampling_job.cache = renderableMesh.animationCache.get();
+        sampling_job.context = renderableMesh.animationCache.get();
         sampling_job.ratio = renderableMesh.animationTime / animation->get()->duration();
         sampling_job.output = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
         sampling_job.Run();
@@ -102,7 +102,7 @@ void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::un
     mesh.skeleton = skeletonKey;
     mesh.animationLocalSpaceTransforms.resize(skeleton->get()->num_soa_joints());
     mesh.animationModelSpaceTransforms.resize(skeleton->get()->num_joints());
-    mesh.animationCache = std::make_unique<ozz::animation::SamplingCache>(skeleton->get()->num_joints());
+    mesh.animationCache = std::make_unique<ozz::animation::SamplingJob::Context>(skeleton->get()->num_joints());
 
     for (auto i = 0; i < skeleton->get()->num_joints(); i++)
     {

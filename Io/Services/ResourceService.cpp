@@ -2,7 +2,7 @@
 
 #include <fstream>
 #include <ozz/base/io/archive.h>
-#include <FreeImage.h>
+#include <stb_image.h>
 
 
 ResourceService::ResourceService(
@@ -89,45 +89,73 @@ Resource<std::unique_ptr<ozz::animation::Animation>> ResourceService::loadAnimat
 
 Resource<Texture> ResourceService::loadTexture(const std::string& filePath) const
 {
-    auto format = FreeImage_GetFileType(filePath.c_str(), 0);
+    int width = 0;
+    int height = 0;
+    int channelsInFile = 0;
 
-    if (format == FIF_UNKNOWN)
+    if (filePath.ends_with(".hdr"))
     {
-        format = FreeImage_GetFIFFromFilename(filePath.c_str());
+        auto* pixels = stbi_loadf(filePath.c_str(), &width, &height, &channelsInFile, 3);
+
+        if (!pixels)
+        {
+            logger.error("Unable to load image with path {}: {}", filePath, stbi_failure_reason());
+            return memoryStorageService.textures.add(Texture {
+                .name = filePath,
+                .format = TextureFormat::Unknown,
+                .pixelDataType = PixelDataType::Float,
+                .width = 0,
+                .height = 0,
+                .bitsPerPixel = 0,
+                .data = {}
+            });
+        }
+
+        const auto byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 * sizeof(float);
+        const auto* bytes = reinterpret_cast<const unsigned char*>(pixels);
+        auto data = std::vector<unsigned char>(bytes, bytes + byteCount);
+
+        stbi_image_free(pixels);
+
+        return memoryStorageService.textures.add(Texture {
+            .name = filePath,
+            .format = TextureFormat::RGB,
+            .pixelDataType = PixelDataType::Float,
+            .width = static_cast<unsigned int>(width),
+            .height = static_cast<unsigned int>(height),
+            .bitsPerPixel = 96,
+            .data = data
+        });
     }
 
-    if (!FreeImage_FIFSupportsReading(format))
+    auto* pixels = stbi_load(filePath.c_str(), &width, &height, &channelsInFile, STBI_rgb_alpha);
+
+    if (!pixels)
     {
-        logger.error("No read support for image format {}: {}", format, filePath);
+        logger.error("Unable to load image with path {}: {}", filePath, stbi_failure_reason());
+        return memoryStorageService.textures.add(Texture {
+            .name = filePath,
+            .format = TextureFormat::Unknown,
+            .pixelDataType = PixelDataType::UnsignedByte,
+            .width = 0,
+            .height = 0,
+            .bitsPerPixel = 0,
+            .data = {}
+        });
     }
 
-    auto image = FreeImage_Load(format, filePath.c_str());
+    const auto byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    auto data = std::vector<unsigned char>(pixels, pixels + byteCount);
 
-    if (!image)
-    {
-        logger.error("Unable to load image with path {}", filePath);
-    }
-
-    auto imageData = FreeImage_GetBits(image);
-    auto size = FreeImage_GetMemorySize(image);
-    auto bitsPerPixel = FreeImage_GetBPP(image);
-    auto imageWidth = FreeImage_GetWidth(image);
-    auto imageHeight = FreeImage_GetHeight(image);
-    auto data = std::vector(imageData, imageData + size);
-
-    FreeImage_Unload(image);
+    stbi_image_free(pixels);
 
     return memoryStorageService.textures.add(Texture {
         .name = filePath,
-        .format = bitsPerPixel == 24 ? TextureFormat::BGR :
-                  bitsPerPixel == 32 ? TextureFormat::BGRA :
-                  bitsPerPixel == 96 ? TextureFormat::RGB :
-                  bitsPerPixel == 128 ? TextureFormat::RGBA :
-                  TextureFormat::Unknown,
-        .pixelDataType = bitsPerPixel == 96 ? PixelDataType::Float : PixelDataType::UnsignedByte,
-        .width = imageWidth,
-        .height = imageHeight,
-        .bitsPerPixel = bitsPerPixel,
+        .format = TextureFormat::RGBA,
+        .pixelDataType = PixelDataType::UnsignedByte,
+        .width = static_cast<unsigned int>(width),
+        .height = static_cast<unsigned int>(height),
+        .bitsPerPixel = 32,
         .data = data
     });
 }

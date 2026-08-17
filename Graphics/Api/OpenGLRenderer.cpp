@@ -1,5 +1,7 @@
 #include "OpenGLRenderer.h"
-#include <GL/gl3w.h>
+#include <glad/gl.h>
+#include <GLFW/glfw3.h>
+#include <stdexcept>
 #include <vector>
 #include <ranges>
 
@@ -17,18 +19,15 @@ OpenGLRenderer::OpenGLRenderer(
 
 bool OpenGLRenderer::init()
 {
-    if (gl3wInit())
+    if (gladLoadGL(glfwGetProcAddress) == 0)
     {
         logger.error("Failed to initialize OpenGL");
-        return false;
+        throw std::runtime_error("Failed to initialize OpenGL");
     }
 
     glClearColor(255.f / 255.f, 255.f / 255.f, 255.f / 255.f, 1.0f);
 
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_TEXTURE_3D);
-    glEnable(GL_TEXTURE_2D);
-    glEnable(GL_TEXTURE_CUBE_MAP);
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
     glEnable(GL_CULL_FACE);
 
@@ -476,8 +475,11 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
 
     auto format = getTextureFormat(texture.format);
     auto type = getTextureDataType(texture.pixelDataType);
+    auto internalFormat = texture.pixelDataType == PixelDataType::Float
+                              ? getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel))
+                              : static_cast<unsigned int>(GL_RGBA);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture.width, texture.height, NULL, format, type, texture.data.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), texture.width, texture.height, NULL, format, type, texture.data.data());
 
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -575,7 +577,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
                 attachmentType = GL_STENCIL_ATTACHMENT;
                 break;
             default:
-                logger.error("Unknown FBO attachment type {}", attachment.type);
+                logger.error("Unknown FBO attachment type {}", static_cast<int>(attachment.type));
                 break;
         }
 
@@ -765,10 +767,6 @@ unsigned int OpenGLRenderer::getTextureFormat(TextureFormat format) const
             return GL_RGB;
         case TextureFormat::RGBA:
             return GL_RGBA;
-        case TextureFormat::BGR:
-            return GL_BGR;
-        case TextureFormat::BGRA:
-            return GL_BGRA;
         case TextureFormat::RGBA16F:
             return GL_RGBA16F;
         case TextureFormat::RGBA32F:

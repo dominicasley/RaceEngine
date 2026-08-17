@@ -8,7 +8,6 @@
 #include <Services/MemoryStorageService.h>
 #include "../../Io/Utility/AccessorUtility.h"
 #include "../Models/Scene/CreateRenderableModelDTO.h"
-#include "../Models/Scene/CreateRenderableSkyboxDTO.h"
 #include "../Models/Scene/RenderableEntity.h"
 #include "../Models/Scene/RenderableMesh.h"
 #include "../Models/Scene/RenderableModel.h"
