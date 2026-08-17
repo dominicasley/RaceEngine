@@ -1,5 +1,37 @@
+module;
 
-#include "CubeMapService.h"
+#include <string>
+
+#include <spdlog/logger.h>
+
+#include <Shared/Services/MemoryStorageService.h>
+#include <Graphics/Models/Scene/CubeMap.h>
+
+export module raceengine.graphics:CubeMapService;
+
+import :OpenGLRenderer;
+
+namespace raceengine
+{
+
+export class CubeMapService
+{
+private:
+    spdlog::logger& logger;
+    OpenGLRenderer& renderer;
+    MemoryStorageService& memoryStorageService;
+
+public:
+    explicit CubeMapService(spdlog::logger& logger, OpenGLRenderer& renderer, MemoryStorageService& memoryStorageService);
+    Resource<CubeMap> create(
+        const std::string& name,
+        const Resource<Texture>& front,
+        const Resource<Texture>& back,
+        const Resource<Texture>& left,
+        const Resource<Texture>& right,
+        const Resource<Texture>& top,
+        const Resource<Texture>& bottom) const;
+};
 
 CubeMapService::CubeMapService(
     spdlog::logger& logger,
@@ -40,3 +72,5 @@ Resource<CubeMap> CubeMapService::create(
         .bottom = bottomTextureKey
     });
 }
+
+} // namespace raceengine

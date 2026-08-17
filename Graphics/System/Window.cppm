@@ -1,8 +1,94 @@
-#include <stdexcept>
-#include "GlfwWindow.h"
+module;
+
+#define GLFW_INCLUDE_VULKAN
 #ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#endif
+
+#include <GLFW/glfw3.h>
+#ifdef _WIN32
+#include <GLFW/glfw3native.h>
 #include <Dwmapi.h>
 #endif
+#include <vulkan/vulkan.h>
+#include <spdlog/logger.h>
+
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+export module raceengine.graphics:Window;
+
+namespace raceengine
+{
+
+export struct WindowState {
+    double mouseX;
+    double mouseY;
+    int windowWidth;
+    int windowHeight;
+};
+
+export struct VulkanWindowRequiredExtensions {
+    uint32_t count;
+    const char** extensions;
+};
+
+export class IWindow
+{
+public:
+    virtual ~IWindow() = default;
+    virtual void makeContextCurrent() = 0;
+    virtual void swapBuffers() const = 0;
+    virtual void setMousePosition(int x, int y) = 0;
+    [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
+    [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
+    [[nodiscard]] virtual bool shouldClose() const = 0;
+    [[nodiscard]] virtual bool keyPressed(int key) const = 0;
+    [[nodiscard]] virtual const WindowState& state() const = 0;
+    [[nodiscard]] virtual std::tuple<double, double> mousePosition() = 0;
+    [[nodiscard]] virtual float delta() const = 0;
+
+    void onResize(std::function<void(int, int)> callback)
+    {
+        resizeCallbacks.push_back(std::move(callback));
+    }
+
+protected:
+    std::vector<std::function<void(int, int)>> resizeCallbacks;
+};
+
+export class GLFWWindow : public IWindow
+{
+private:
+    mutable double _delta;
+    mutable double _frameTime;
+    mutable double _avgFrameRate;
+    mutable int _frameCount;
+
+    WindowState windowState;
+    spdlog::logger& logger;
+    GLFWwindow* window;
+    static void windowResized(GLFWwindow* window, int width, int height);
+    static void cursorPositionChanged(GLFWwindow* window, double x, double y);
+
+public:
+    explicit GLFWWindow(spdlog::logger& logger);
+    ~GLFWWindow();
+    void makeContextCurrent() override;
+    void swapBuffers() const override;
+    void setMousePosition(int x, int y) override ;
+    [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
+    [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
+    [[nodiscard]] bool shouldClose() const override;
+    [[nodiscard]] bool keyPressed(int key) const override;
+    [[nodiscard]] const WindowState& state() const override;
+    [[nodiscard]] std::tuple<double, double> mousePosition() override;
+    [[nodiscard]] float delta() const override;
+};
 
 GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     logger(logger),
@@ -168,3 +254,4 @@ float GLFWWindow::delta() const
     return static_cast<float>(_delta);
 }
 
+} // namespace raceengine

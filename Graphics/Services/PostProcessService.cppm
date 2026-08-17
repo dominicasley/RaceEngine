@@ -1,5 +1,34 @@
+module;
 
-#include "PostProcessService.h"
+#include <string>
+
+#include <spdlog/logger.h>
+
+#include <Shared/Services/MemoryStorageService.h>
+#include <Graphics/Models/Scene/CreateFboDTO.h>
+
+export module raceengine.graphics:PostProcessService;
+
+import :FboService;
+import :Window;
+
+namespace raceengine
+{
+
+export class PostProcessService
+{
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+    FboService& fboService;
+    IWindow& window;
+
+public:
+    explicit PostProcessService(
+        spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
+    [[nodiscard]] Resource<PostProcess> create(const std::string& id, const Resource<Shader>& shader) const;
+    void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment) const;
+    void recreateOutputBuffer(const Resource<PostProcess> & postProcess, int width, int height) const;
+};
 
 PostProcessService::PostProcessService(
     spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
@@ -54,3 +83,5 @@ void PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postP
         memoryStorageService.postProcesses.update(postProcessKey, postProcess);
     }
 }
+
+} // namespace raceengine

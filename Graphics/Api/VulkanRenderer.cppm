@@ -1,7 +1,47 @@
+module;
+
+#include <vulkan/vulkan.h>
+
+#include <cstdint>
 #include <cstring>
-#include <stdexcept>
 #include <iostream>
-#include "VulkanRenderer.h"
+#include <optional>
+#include <stdexcept>
+#include <vector>
+
+export module raceengine.graphics:VulkanRenderer;
+
+import :Window;
+
+namespace raceengine
+{
+
+export struct QueueFamily
+{
+    std::optional<uint32_t> graphicsFamily;
+    std::optional<uint32_t> presentationFamily;
+};
+
+export class VulkanRenderer
+{
+private:
+    VkInstance vkInstance;
+    VkPhysicalDevice vkPhysicalDevice = VK_NULL_HANDLE;
+    VkDevice vkDevice;
+    VkSurfaceKHR vkSurfaceKhr;
+    QueueFamily availableQueueFamilies;
+    IWindow& window;
+
+    const std::vector<const char *> validationLayers = {
+            "VK_LAYER_KHRONOS_validation"
+    };
+
+    void init();
+
+public:
+    explicit VulkanRenderer(const IWindow& window);
+    ~VulkanRenderer();
+};
 
 VulkanRenderer::VulkanRenderer(const IWindow& window) : window(const_cast<IWindow &>(window))
 {
@@ -156,3 +196,5 @@ void VulkanRenderer::init()
         i++;
     }
 }
+
+} // namespace raceengine

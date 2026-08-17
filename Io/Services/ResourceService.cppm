@@ -1,9 +1,55 @@
-#include "ResourceService.h"
+module;
 
+#include <expected>
 #include <fstream>
+#include <future>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <spdlog/logger.h>
+#include <ozz/animation/runtime/animation.h>
+#include <ozz/animation/runtime/skeleton.h>
 #include <ozz/base/io/archive.h>
 #include <stb_image.h>
 
+#include <Io/Services/GLTFService.h>
+#include <Shared/Services/MemoryStorageService.h>
+
+export module raceengine.io:ResourceService;
+
+import raceengine.async;
+
+namespace raceengine
+{
+
+export class ResourceService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+    BackgroundWorkerService& backgroundWorkerService;
+    GLTFService& gltfService;
+
+public:
+    explicit ResourceService(
+        spdlog::logger& logger,
+        MemoryStorageService& memoryStorageService,
+        BackgroundWorkerService& backgroundWorkerService,
+        GLTFService& gltfService);
+    [[nodiscard]] std::expected<std::string, std::string> loadTextFile(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<Model>, std::string> loadModel(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> loadSkeleton(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string> loadAnimation(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<Texture>, std::string> loadTexture(const std::string& filePath) const;
+    [[nodiscard]] AsyncResult<std::string> loadTextFileAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<Model>> loadModelAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<Texture>> loadTextureAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>> loadSkeletonAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>> loadAnimationAsync(std::string filePath) const;
+};
 
 ResourceService::ResourceService(
     spdlog::logger& logger,
@@ -193,3 +239,4 @@ AsyncResult<Resource<Texture>> ResourceService::loadTextureAsync(std::string fil
         [this, filePath = std::move(filePath)] { return loadTexture(filePath); });
 }
 
+} // namespace raceengine

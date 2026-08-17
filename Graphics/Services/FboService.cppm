@@ -1,5 +1,36 @@
+module;
 
-#include "FboService.h"
+#include <ranges>
+#include <vector>
+
+#include <spdlog/logger.h>
+
+#include <Shared/Services/MemoryStorageService.h>
+#include <Graphics/Models/Scene/Fbo.h>
+#include <Graphics/Models/Scene/CreateFboDTO.h>
+
+export module raceengine.graphics:FboService;
+
+import :OpenGLRenderer;
+
+namespace raceengine
+{
+
+export class FboService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+    OpenGLRenderer& renderer;
+
+public:
+    explicit FboService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, OpenGLRenderer& renderer);
+    [[nodiscard]] Resource<Fbo> create(const CreateFboDTO& createFboDTO) const;
+    void recreate(const Resource<Fbo>& fbo) const;
+    void resize(const Resource<Fbo>& fbo, unsigned int width, unsigned int height) const;
+
+    [[nodiscard]] std::vector<Resource<FboAttachment>> getAttachmentsOfType(const Fbo& fbo, FboAttachmentType type) const;
+};
 
 FboService::FboService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, OpenGLRenderer& renderer) :
     logger(logger),
@@ -77,5 +108,4 @@ std::vector<Resource<FboAttachment>> FboService::getAttachmentsOfType(const Fbo&
     return std::vector(attachmentsOfType.begin(), attachmentsOfType.end());
 }
 
-
-
+} // namespace raceengine

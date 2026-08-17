@@ -1,4 +1,46 @@
-#include "CameraService.h"
+module;
+
+#include <spdlog/logger.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <Shared/Services/MemoryStorageService.h>
+#include <Graphics/Models/Scene/Camera.h>
+#include <Graphics/Models/Scene/CreateFboDTO.h>
+
+export module raceengine.graphics:CameraService;
+
+import :FboService;
+import :Window;
+
+namespace raceengine
+{
+
+export class CameraService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+    FboService& fboService;
+    IWindow& window;
+
+public:
+    explicit CameraService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
+    Camera createCamera();
+    void setPosition(Camera& camera, float x, float y, float z) const;
+    void setDirection(Camera& camera, float x, float y, float z) const;
+    void translate(Camera& camera,float x, float y, float z) const;
+    void rotate(Camera& camera, float x, float y, float z) const;
+    void setRoll(Camera& camera, float x, float y, float z) const;
+    void setAspectRatio(Camera& camera, float aspectRatio) const;
+    void recreateOutputBuffer(Camera& camera, int width, int height) const;
+    void setFieldOfView(Camera& camera, float fov) const;
+    void lookAtPoint(Camera& camera, float x, float y, float z) const;
+    void addPostProcess(Camera& camera, const Resource<PostProcess>& postProcess) const;
+    const Fbo& getOutputBuffer(Camera& camera) const;
+    const glm::mat4& updateModelViewProjectionMatrix(Camera& camera) const;
+    const glm::mat4& updateModelViewMatrix(Camera& camera) const;
+};
 
 CameraService::CameraService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
     logger(logger),
@@ -132,3 +174,5 @@ void CameraService::addPostProcess(Camera& camera, const Resource<PostProcess>& 
 const Fbo& CameraService::getOutputBuffer(Camera& camera) const {
     return memoryStorageService.frameBuffers.get(camera.output.value());
 }
+
+} // namespace raceengine

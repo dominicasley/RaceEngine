@@ -1,7 +1,39 @@
-#include "RenderableEntityService.h"
+module;
 
 #include <cmath>
 #include <cstring>
+
+#include <spdlog/logger.h>
+#include <ozz/animation/runtime/skeleton.h>
+#include <ozz/animation/runtime/animation.h>
+
+#include <Shared/Services/MemoryStorageService.h>
+#include <Graphics/Models/Scene/CreateRenderableModelDTO.h>
+#include <Graphics/Models/Scene/RenderableEntity.h>
+#include <Graphics/Models/Scene/RenderableMesh.h>
+#include <Graphics/Models/Scene/RenderableModel.h>
+
+export module raceengine.graphics:RenderableEntityService;
+
+namespace raceengine
+{
+
+export class RenderableEntityService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+
+public:
+    explicit RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
+
+    [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
+    void setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeleton) const;
+    void addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const;
+    void setAnimation(RenderableMesh& mesh, const std::string& animationName) const;
+    void setAnimation(RenderableMesh& mesh, unsigned int animationIndex) const;
+    [[nodiscard]] std::vector<glm::mat4> joints(RenderableMesh& renderableMesh, float frameTimeDelta) const;
+};
 
 RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
     logger(logger),
@@ -131,3 +163,5 @@ void RenderableEntityService::addAnimation(RenderableMesh& mesh, Resource<std::u
 {
     mesh.animations.push_back(animation);
 }
+
+} // namespace raceengine

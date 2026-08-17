@@ -11,25 +11,35 @@ module;
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <stb_image_write.h>
 
-#include "Async/Async.h"
-#include "Game/Game.h"
-#include "Graphics/Graphics.h"
-#include "Io/Io.h"
+#include "Graphics/Models/Scene/CreateRenderableModelDTO.h"
+#include "Graphics/Models/Scene/FboAttachmentType.h"
+#include "Graphics/Models/Scene/Presenter.h"
+#include "Graphics/Models/Scene/Scene.h"
+#include "Graphics/Models/Scene/ShaderDescriptor.h"
+#include "Io/Services/GLTFService.h"
 #include "Shared/Shared.h"
 
 export module raceengine;
 
-export using ::awaitAll;
+export import raceengine.async;
+export import raceengine.game;
+export import raceengine.graphics;
+export import raceengine.io;
+
 export using ::Camera;
 export using ::CreateRenderableModelDTO;
-export using ::Drawable;
-export using ::Entity;
 export using ::FboAttachmentType;
 export using ::Presenter;
 export using ::RenderableModel;
 export using ::Scene;
 export using ::SceneNode;
 export using ::ShaderDescriptor;
+
+// Sandbox code names these unqualified in the global namespace; export import alone
+// only surfaces raceengine::X, so re-alias them globally.
+export using raceengine::awaitAll;
+export using raceengine::Drawable;
+export using raceengine::Entity;
 
 namespace raceengine
 {

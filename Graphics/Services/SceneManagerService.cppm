@@ -1,4 +1,41 @@
-#include "SceneManagerService.h"
+module;
+
+#include <deque>
+
+#include <spdlog/logger.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <Graphics/Models/Scene/Scene.h>
+
+export module raceengine.graphics:SceneManagerService;
+
+namespace raceengine
+{
+
+export class SceneManagerService
+{
+private:
+    spdlog::logger& logger;
+
+    std::deque<Scene> scenes;
+
+public:
+    explicit SceneManagerService(spdlog::logger& logger);
+
+    [[nodiscard]] std::deque<Scene>& getScenes();
+    [[nodiscard]] Scene& getScene(int index);
+    [[nodiscard]] Scene& createScene();
+    [[nodiscard]] SceneNode& createNode(Scene& scene);
+    [[nodiscard]] const glm::mat4& modelMatrix(SceneNode& node) const;
+    void setPosition(SceneNode& node, float x, float y, float z) const;
+    void setDirection(SceneNode& node, float angle, float x, float y, float z) const;
+    void setScale(SceneNode& node, float x, float y, float z) const;
+    void translate(SceneNode& node, float x, float y, float z) const;
+    void rotate(SceneNode& node, float angle, float x, float y, float z) const;
+    void scale(SceneNode& node, float x, float y, float z) const;
+    void setParent(SceneNode& node, SceneNode& parent) const;
+};
 
 SceneManagerService::SceneManagerService(spdlog::logger& logger) :
     logger(logger)
@@ -103,3 +140,5 @@ const glm::mat4& SceneManagerService::modelMatrix(SceneNode& node) const
 
     return node.modelMatrix;
 }
+
+} // namespace raceengine

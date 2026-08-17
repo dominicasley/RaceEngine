@@ -39,29 +39,12 @@ add_library(glad STATIC vendor/glad/src/gl.c)
 target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
 
 add_library (Engine STATIC
-        Graphics/Api/VulkanRenderer.cpp
-        Graphics/Api/VulkanRenderer.h
-        Graphics/Api/OpenGLRenderer.cpp
-        Graphics/Api/OpenGLRenderer.h
         Graphics/Models/Scene/CreateRenderableModelDTO.h
         Graphics/Models/Scene/ShaderDescriptor.h
         Graphics/Models/Scene/Camera.h
         Graphics/Models/Scene/RenderableEntity.h
         Graphics/Models/Scene/Light.h
         Graphics/Models/Scene/Scene.h
-        Graphics/Services/SceneManagerService.cpp
-        Graphics/Services/SceneManagerService.h
-        Graphics/System/GlfwWindow.cpp
-        Graphics/System/GlfwWindow.h
-        Graphics/System/IWindow.h
-        Graphics/Api/VulkanWindowRequiredExtensions.h
-        Graphics/System/WindowState.h
-        Graphics/Services/RenderableEntityService.cpp
-        Graphics/Services/RenderableEntityService.h
-        Graphics/Services/SceneService.cpp
-        Graphics/Services/SceneService.h
-        Graphics/Services/CameraService.cpp
-        Graphics/Services/CameraService.h
         Graphics/Models/Scene/Model.h
         Graphics/Models/Scene/Mesh.h
         Graphics/Models/Scene/MeshBuffer.h
@@ -74,50 +57,47 @@ add_library (Engine STATIC
         Graphics/Models/Scene/VertexIndicesType.h
         Graphics/Models/Scene/SceneNode.h
         Graphics/Models/Scene/RenderableMesh.h
-        Graphics/Services/ShaderService.cpp
-        Graphics/Services/ShaderService.h
         Graphics/Models/Scene/Shader.h
         Graphics/Models/Scene/CubeMap.h
-        Graphics/Services/CubeMapService.cpp
-        Graphics/Services/CubeMapService.h
         Graphics/Models/Scene/RenderableEntityType.h
         Graphics/Models/Scene/RenderableModel.h
         Graphics/Models/Scene/Fbo.h
         Graphics/Models/Scene/FboAttachment.h
         Graphics/Models/Scene/FboAttachmentType.h
         Graphics/Models/Scene/FboType.h
-        Graphics/Services/FboService.cpp
-        Graphics/Services/FboService.h
         Graphics/Models/Scene/CreateFboDTO.h
         Graphics/Models/Scene/CreateFboAttachmentDTO.h
         Graphics/Models/Scene/PostProcess.h
-        Graphics/Services/PostProcessService.cpp
-        Graphics/Services/PostProcessService.h
-        Graphics/Services/PresenterService.cpp
-        Graphics/Services/PresenterService.h
         Graphics/Models/Scene/Presenter.h
-        Io/Services/ResourceService.cpp
-        Io/Services/ResourceService.h
         Io/Services/GLTFService.cpp
         Io/Services/GLTFService.h
         Io/Utility/AccessorUtility.h
-        Async/Models/AsyncResult.h
-        Async/Services/BackgroundWorkerService.cpp
-        Async/Services/BackgroundWorkerService.h
-        Async/Operators/AwaitAll.h
         Shared/Services/MemoryStorageService.cpp
         Shared/Services/MemoryStorageService.h
-        Shared/Types/Resource.h
-        Game/Components/Drawable.h
-        Game/Models/Component.h
-        Game/Models/Entity.h
-        Game/Services/EntityService.cpp
-        Game/Services/EntityService.h)
+        Shared/Types/Resource.h)
 
 target_sources(Engine PUBLIC
         FILE_SET CXX_MODULES
         BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-        FILES Engine.cppm)
+        FILES
+        Engine.cppm
+        Async/Async.cppm
+        Game/Game.cppm
+        Graphics/Graphics.cppm
+        Graphics/System/Window.cppm
+        Graphics/Api/VulkanRenderer.cppm
+        Graphics/Api/OpenGLRenderer.cppm
+        Graphics/Services/SceneManagerService.cppm
+        Graphics/Services/RenderableEntityService.cppm
+        Graphics/Services/FboService.cppm
+        Graphics/Services/ShaderService.cppm
+        Graphics/Services/CubeMapService.cppm
+        Graphics/Services/PresenterService.cppm
+        Graphics/Services/CameraService.cppm
+        Graphics/Services/PostProcessService.cppm
+        Graphics/Services/SceneService.cppm
+        Io/Io.cppm
+        Io/Services/ResourceService.cppm)
 
 target_include_directories(Engine PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
