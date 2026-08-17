@@ -5,13 +5,11 @@ module;
 
 #include <spdlog/logger.h>
 
-#include <Shared/Services/MemoryStorageService.h>
-#include <Graphics/Models/Scene/Fbo.h>
-#include <Graphics/Models/Scene/CreateFboDTO.h>
-
 export module raceengine.graphics:FboService;
 
 import :OpenGLRenderer;
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

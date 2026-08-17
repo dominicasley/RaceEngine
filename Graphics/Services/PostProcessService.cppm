@@ -4,13 +4,12 @@ module;
 
 #include <spdlog/logger.h>
 
-#include <Shared/Services/MemoryStorageService.h>
-#include <Graphics/Models/Scene/CreateFboDTO.h>
-
 export module raceengine.graphics:PostProcessService;
 
 import :FboService;
 import :Window;
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

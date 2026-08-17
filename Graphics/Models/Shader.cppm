@@ -1,8 +1,17 @@
-#pragma once
+module;
 
 #include <string>
 
-struct ShaderDescriptor
+export module raceengine.graphics.models:Shader;
+
+namespace raceengine
+{
+
+export struct Shader {
+    unsigned int gpuResourceId;
+};
+
+export struct ShaderDescriptor
 {
 public:
     std::string vertexShaderSource;
@@ -12,3 +21,5 @@ public:
     std::string computeShaderSource;
     std::string geometryShaderSource;
 };
+
+} // namespace raceengine

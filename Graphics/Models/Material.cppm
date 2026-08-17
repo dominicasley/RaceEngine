@@ -1,14 +1,20 @@
-#pragma once
+module;
+
+#include <optional>
+#include <vector>
 
 #include <glm/glm.hpp>
-#include <optional>
-#include <Shared/Types/Resource.h>
 
-#include "Texture.h"
-#include "CubeMap.h"
-#include "Shader.h"
+export module raceengine.graphics.models:Material;
 
-struct Material
+import raceengine.resource;
+import :Shader;
+import :Texture;
+
+namespace raceengine
+{
+
+export struct Material
 {
     glm::vec4 baseColour;
     float metalness;
@@ -24,3 +30,5 @@ struct Material
     std::optional<Resource<Texture>> environment;
     std::vector<Resource<Texture>> textures;
 };
+
+} // namespace raceengine

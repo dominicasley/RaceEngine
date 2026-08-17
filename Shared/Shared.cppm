@@ -1,24 +1,23 @@
-#pragma once
+module;
 
-#include <mutex>
-#include <thread>
 #include <deque>
-#include <array>
-#include <string>
+#include <memory>
+#include <mutex>
+
 #include <spdlog/logger.h>
-#include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
-#include <Graphics/Models/Scene/Model.h>
-#include <Graphics/Models/Scene/Texture.h>
-#include <Graphics/Models/Scene/CubeMap.h>
-#include <Graphics/Models/Scene/Material.h>
-#include <Graphics/Models/Scene/Shader.h>
-#include <Graphics/Models/Scene/Fbo.h>
-#include <Graphics/Models/Scene/PostProcess.h>
-#include <Shared/Types/Resource.h>
+#include <ozz/animation/runtime/skeleton.h>
+
+export module raceengine.shared;
+
+import raceengine.graphics.models;
+import raceengine.resource;
+
+namespace raceengine
+{
 
 // std::deque backing: growth never relocates elements, so cached Resource<T>::value pointers stay valid; removal would require generational handles.
-template<typename T>
+export template<typename T>
 class MemoryStorage
 {
     mutable std::mutex accessorMutex;
@@ -66,7 +65,7 @@ public:
     };
 };
 
-class MemoryStorageService
+export class MemoryStorageService
 {
 private:
     spdlog::logger& logger;
@@ -87,4 +86,9 @@ public:
     explicit MemoryStorageService(spdlog::logger& logger);
 };
 
+MemoryStorageService::MemoryStorageService(spdlog::logger& logger) : logger(logger)
+{
 
+}
+
+} // namespace raceengine

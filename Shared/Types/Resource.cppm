@@ -1,7 +1,9 @@
-#pragma once
-#include <string>
+export module raceengine.resource;
 
-template<typename T>
+namespace raceengine
+{
+
+export template<typename T>
 class Resource {
 public:
     unsigned long long id;
@@ -11,3 +13,5 @@ public:
         return value;
     }
 };
+
+} // namespace raceengine

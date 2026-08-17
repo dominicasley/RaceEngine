@@ -39,42 +39,7 @@ add_library(glad STATIC vendor/glad/src/gl.c)
 target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
 
 add_library (Engine STATIC
-        Graphics/Models/Scene/CreateRenderableModelDTO.h
-        Graphics/Models/Scene/ShaderDescriptor.h
-        Graphics/Models/Scene/Camera.h
-        Graphics/Models/Scene/RenderableEntity.h
-        Graphics/Models/Scene/Light.h
-        Graphics/Models/Scene/Scene.h
-        Graphics/Models/Scene/Model.h
-        Graphics/Models/Scene/Mesh.h
-        Graphics/Models/Scene/MeshBuffer.h
-        Graphics/Models/Scene/MeshPrimitive.h
-        Graphics/Models/Scene/PrimitiveAttributeType.h
-        Graphics/Models/Scene/Material.h
-        Graphics/Models/Scene/Texture.h
-        Graphics/Models/Scene/TextureFormat.h
-        Graphics/Models/Scene/PixelDataType.h
-        Graphics/Models/Scene/VertexIndicesType.h
-        Graphics/Models/Scene/SceneNode.h
-        Graphics/Models/Scene/RenderableMesh.h
-        Graphics/Models/Scene/Shader.h
-        Graphics/Models/Scene/CubeMap.h
-        Graphics/Models/Scene/RenderableEntityType.h
-        Graphics/Models/Scene/RenderableModel.h
-        Graphics/Models/Scene/Fbo.h
-        Graphics/Models/Scene/FboAttachment.h
-        Graphics/Models/Scene/FboAttachmentType.h
-        Graphics/Models/Scene/FboType.h
-        Graphics/Models/Scene/CreateFboDTO.h
-        Graphics/Models/Scene/CreateFboAttachmentDTO.h
-        Graphics/Models/Scene/PostProcess.h
-        Graphics/Models/Scene/Presenter.h
-        Io/Services/GLTFService.cpp
-        Io/Services/GLTFService.h
-        Io/Utility/AccessorUtility.h
-        Shared/Services/MemoryStorageService.cpp
-        Shared/Services/MemoryStorageService.h
-        Shared/Types/Resource.h)
+        Io/ThirdPartyImpl.cpp)
 
 target_sources(Engine PUBLIC
         FILE_SET CXX_MODULES
@@ -84,6 +49,14 @@ target_sources(Engine PUBLIC
         Async/Async.cppm
         Game/Game.cppm
         Graphics/Graphics.cppm
+        Graphics/Models/Models.cppm
+        Graphics/Models/Dto.cppm
+        Graphics/Models/Fbo.cppm
+        Graphics/Models/Material.cppm
+        Graphics/Models/Mesh.cppm
+        Graphics/Models/Scene.cppm
+        Graphics/Models/Shader.cppm
+        Graphics/Models/Texture.cppm
         Graphics/System/Window.cppm
         Graphics/Api/VulkanRenderer.cppm
         Graphics/Api/OpenGLRenderer.cppm
@@ -97,11 +70,12 @@ target_sources(Engine PUBLIC
         Graphics/Services/PostProcessService.cppm
         Graphics/Services/SceneService.cppm
         Io/Io.cppm
-        Io/Services/ResourceService.cppm)
+        Io/Services/GLTFService.cppm
+        Io/Services/ResourceService.cppm
+        Io/Utility/AccessorUtility.cppm
+        Shared/Shared.cppm
+        Shared/Types/Resource.cppm)
 
-target_include_directories(Engine PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/Shared)
 target_include_directories(Engine SYSTEM PUBLIC
         ${STB_INCLUDE_DIRS}
         ${TINYGLTF_INCLUDE_DIRS}

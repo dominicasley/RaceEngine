@@ -4,14 +4,12 @@ module;
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#include <Shared/Services/MemoryStorageService.h>
-#include <Graphics/Models/Scene/Camera.h>
-#include <Graphics/Models/Scene/CreateFboDTO.h>
-
 export module raceengine.graphics:CameraService;
 
 import :FboService;
 import :Window;
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

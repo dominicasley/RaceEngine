@@ -1,14 +1,52 @@
-#include "GLTFService.h"
-#include "../Utility/AccessorUtility.h"
+module;
 
+#include <map>
+#include <optional>
 #include <set>
+#include <string>
 #include <utility>
+#include <vector>
 
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-
+#include <spdlog/logger.h>
 #include <tiny_gltf.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+
+export module raceengine.io:GLTFService;
+
+import :AccessorUtility;
+import raceengine.graphics.models;
+import raceengine.shared;
+
+// Defined in Io/ThirdPartyImpl.cpp; see the note there for why the loader call
+// cannot live in this unit.
+extern "C++" bool raceengineLoadTinyGltf(
+    tinygltf::Model& model,
+    std::string& error,
+    std::string& warning,
+    const std::string& filePath,
+    bool binary);
+
+namespace raceengine
+{
+
+export class GLTFService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+
+public:
+    explicit GLTFService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
+    [[nodiscard]] Model gltfModelToInternal(const std::string& fileName, const tinygltf::Model& tinyGltfModel) const;
+    [[nodiscard]] std::optional<Model> loadModelFromFile(const std::string& filePath) const;
+    [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
+    [[nodiscard]] TextureFormat toTextureFormat(int format) const;
+    [[nodiscard]] Texture getImageFromIndex(const tinygltf::Model& model, int index) const;
+    [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
+    void processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node &node, const glm::mat4 parentTransform) const;
+};
 
 GLTFService::GLTFService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
     logger(logger),
@@ -19,8 +57,6 @@ GLTFService::GLTFService(spdlog::logger& logger, MemoryStorageService& memorySto
 
 std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath) const
 {
-    tinygltf::TinyGLTF gltfLoader;
-
     bool result;
     std::string error;
     std::string warning;
@@ -29,11 +65,11 @@ std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath)
     auto fileExtension = filePath.substr(filePath.find_last_of('.') + 1);
     if (fileExtension == "gltf")
     {
-        result = gltfLoader.LoadASCIIFromFile(&model, &error, &warning, filePath);
+        result = raceengineLoadTinyGltf(model, error, warning, filePath, false);
     }
     else if (fileExtension == "glb")
     {
-        result = gltfLoader.LoadBinaryFromFile(&model, &error, &warning, filePath);
+        result = raceengineLoadTinyGltf(model, error, warning, filePath, true);
     }
     else
     {
@@ -378,3 +414,5 @@ std::optional<VertexIndicesType> GLTFService::toVertexIndicesType(int componentT
             return {};
     }
 }
+
+} // namespace raceengine

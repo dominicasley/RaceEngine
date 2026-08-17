@@ -6,9 +6,9 @@ module;
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#include <Graphics/Models/Scene/Scene.h>
-
 export module raceengine.graphics:SceneManagerService;
+
+import raceengine.graphics.models;
 
 namespace raceengine
 {

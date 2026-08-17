@@ -16,17 +16,12 @@ module;
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-#include <Shared/Services/MemoryStorageService.h>
-#include <Graphics/Models/Scene/Fbo.h>
-#include <Graphics/Models/Scene/ShaderDescriptor.h>
-#include <Graphics/Models/Scene/PixelDataType.h>
-#include <Graphics/Models/Scene/TextureFormat.h>
-#include <Graphics/Models/Scene/Scene.h>
-
 export module raceengine.graphics:OpenGLRenderer;
 
 import :SceneManagerService;
 import :RenderableEntityService;
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

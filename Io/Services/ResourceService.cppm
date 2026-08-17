@@ -15,12 +15,12 @@ module;
 #include <ozz/base/io/archive.h>
 #include <stb_image.h>
 
-#include <Io/Services/GLTFService.h>
-#include <Shared/Services/MemoryStorageService.h>
-
 export module raceengine.io:ResourceService;
 
+import :GLTFService;
 import raceengine.async;
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

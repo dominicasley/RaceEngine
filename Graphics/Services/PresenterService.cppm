@@ -4,11 +4,10 @@ module;
 
 #include <spdlog/logger.h>
 
-#include <Graphics/Models/Scene/Presenter.h>
-
 export module raceengine.graphics:PresenterService;
 
 import :OpenGLRenderer;
+import raceengine.graphics.models;
 
 namespace raceengine
 {

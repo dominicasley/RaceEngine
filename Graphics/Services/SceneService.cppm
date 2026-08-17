@@ -2,15 +2,11 @@ module;
 
 #include <spdlog/logger.h>
 
-#include <Graphics/Models/Scene/CreateRenderableModelDTO.h>
-#include <Graphics/Models/Scene/RenderableEntity.h>
-#include <Graphics/Models/Scene/RenderableModel.h>
-#include <Graphics/Models/Scene/Scene.h>
-
 export module raceengine.graphics:SceneService;
 
 import :RenderableEntityService;
 import :CameraService;
+import raceengine.graphics.models;
 
 namespace raceengine
 {

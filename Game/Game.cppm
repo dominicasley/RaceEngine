@@ -10,11 +10,11 @@ module;
 
 #include <spdlog/logger.h>
 
-#include <Graphics/Models/Scene/RenderableEntity.h>
-
 // Single interface unit: four tiny declarations and one out-of-line service; partitions
 // would add build-graph nodes without isolating anything.
 export module raceengine.game;
+
+import raceengine.graphics.models;
 
 namespace raceengine
 {

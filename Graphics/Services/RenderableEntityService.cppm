@@ -2,18 +2,24 @@ module;
 
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include <spdlog/logger.h>
+#include <glm/glm.hpp>
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
-
-#include <Shared/Services/MemoryStorageService.h>
-#include <Graphics/Models/Scene/CreateRenderableModelDTO.h>
-#include <Graphics/Models/Scene/RenderableEntity.h>
-#include <Graphics/Models/Scene/RenderableMesh.h>
-#include <Graphics/Models/Scene/RenderableModel.h>
+#include <ozz/animation/runtime/local_to_model_job.h>
+#include <ozz/animation/runtime/sampling_job.h>
+#include <ozz/base/maths/simd_math.h>
+#include <ozz/base/span.h>
 
 export module raceengine.graphics:RenderableEntityService;
+
+import raceengine.graphics.models;
+import raceengine.shared;
 
 namespace raceengine
 {

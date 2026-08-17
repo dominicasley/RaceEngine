@@ -1,13 +1,19 @@
-#pragma once
+module;
 
 #include <cstddef>
 #include <cstring>
 #include <vector>
+
 #include <tiny_gltf.h>
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-class AccessorUtility
+export module raceengine.io:AccessorUtility;
+
+namespace raceengine
+{
+
+export class AccessorUtility
 {
 private:
     template<typename T>
@@ -153,3 +159,5 @@ AccessorUtility::get<std::vector<glm::mat4>>(const tinygltf::Model& model, const
 
     return out;
 }
+
+} // namespace raceengine
