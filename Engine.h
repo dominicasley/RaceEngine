@@ -1,8 +1,11 @@
 #pragma once
-#define BOOST_DI_CFG_CTOR_LIMIT_SIZE 16
+#define BOOST_DI_CFG_CTOR_LIMIT_SIZE 32
 
 #include <boost/di.hpp>
 #include "Bootstrapper.h"
+
+import Game;
+import Physics;
 
 namespace di = boost::di;
 
@@ -27,6 +30,7 @@ public:
     PostProcessService& postProcess;
     PresenterService& presenter;
     EntityService& entity;
+    PhysicsService& physics;
 
     Engine();
     [[nodiscard]] bool running() const;

@@ -1,21 +1,30 @@
-#pragma once
+module;
 
 #include <array>
-#include <spdlog/logger.h>
+#include "vendor/spdlog/include/spdlog/logger.h"
 
-#include "Game/Models/Entity.h"
+export module Game:Services;
 
-class EntityService
+import :Models;
+
+export class EntityService
 {
 private:
     spdlog::logger& logger;
     std::vector<Entity> entities;
 
 public:
-    explicit EntityService(spdlog::logger& logger);
+    explicit EntityService(spdlog::logger& logger) : logger(logger) {
+        entities.reserve(1024);
+    }
 
-    Entity& createEntity();
-    [[nodiscard]] Entity& getEntity(unsigned long long entityId);
+    Entity& createEntity() {
+        return entities.emplace_back(Entity(entities.size()));
+    }
+
+    [[nodiscard]] Entity& getEntity(unsigned long long entityId) {
+        return entities[entityId];
+    }
 
     template<typename T>
     std::shared_ptr<T> addComponent(unsigned long long entityId)

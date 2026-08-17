@@ -16,7 +16,7 @@ Resource<Fbo> FboService::create(const CreateFboDTO& createFboDTO) const
 
         for (auto& attachment: attachmentsDto)
         {
-            attachments.push_back(
+            attachments.emplace_back(
                 memoryStorageService.bufferAttachments.add(FboAttachment{
                     .type = attachment.type,
                     .width = attachment.width,

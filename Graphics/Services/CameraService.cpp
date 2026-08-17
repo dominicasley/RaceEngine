@@ -11,7 +11,6 @@ CameraService::CameraService(spdlog::logger& logger, MemoryStorageService& memor
 Camera CameraService::createCamera()
 {
     auto windowState = window.state();
-
     auto windowWidth = static_cast<unsigned int>(windowState.windowWidth);
     auto windowHeight = static_cast<unsigned int>(windowState.windowHeight);
 
@@ -118,7 +117,7 @@ const glm::mat4& CameraService::updateModelViewMatrix(Camera& camera) const
 const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera& camera) const
 {
     camera.modelViewProjectionMatrix =
-        glm::perspective(glm::radians(camera.fieldOfView), camera.aspectRatio, 1.0f, 5000.0f) *
+        glm::perspective(glm::radians(camera.fieldOfView), camera.aspectRatio, 0.1f, 5000.0f) *
         updateModelViewMatrix(camera);
 
     return camera.modelViewProjectionMatrix;
@@ -126,7 +125,7 @@ const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera& camera) 
 
 void CameraService::addPostProcess(Camera& camera, const Resource<PostProcess>& postProcessKey) const
 {
-    camera.postProcesses.push_back(postProcessKey);
+    camera.postProcesses.emplace_back(postProcessKey);
 }
 
 const Fbo& CameraService::getOutputBuffer(Camera& camera) const {

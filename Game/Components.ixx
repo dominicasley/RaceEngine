@@ -1,17 +1,21 @@
-#pragma once
+module;
 
 #include <string>
-
 #include "Graphics/Graphics.h"
-#include "Game/Models/Component.h"
 
-struct Drawable : public Component {
+export module Game:Components;
+
+import :Models;
+
+export struct Drawable : public Component
+{
 public:
     RenderableEntity& renderableEntity;
     std::optional<std::function<void()>> beforeDraw;
     std::optional<std::function<void()>> afterDraw;
 
-    explicit Drawable(RenderableEntity& _renderableEntity) : renderableEntity(_renderableEntity) {
+    explicit Drawable(RenderableEntity& _renderableEntity) : renderableEntity(_renderableEntity)
+    {
 
     }
 };

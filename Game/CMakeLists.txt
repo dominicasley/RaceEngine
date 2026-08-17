@@ -1,12 +1,11 @@
-﻿set(CMAKE_CXX_STANDARD 20)
-cmake_minimum_required (VERSION 3.8)
+﻿set(CMAKE_CXX_STANDARD 23)
+cmake_minimum_required (VERSION 3.28)
 
 add_library (Game
-        Components/Drawable.h
-        Models/Component.h
-        Models/Entity.h
-        Services/EntityService.cpp
-        Services/EntityService.h)
+        Game.ixx
+        Components.ixx
+        Models.ixx
+        Services.ixx)
 
 target_include_directories(Game PUBLIC "../")
 

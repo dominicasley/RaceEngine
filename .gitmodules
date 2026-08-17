@@ -25,3 +25,6 @@
 [submodule "vendor/freeimage"]
     path = vendor/freeimage
     url = git@github.com:rfratto/FreeImage.git
+[submodule "vendor/physx"]
+	path = vendor/physx
+	url = git@github.com:NVIDIA-Omniverse/PhysX.git

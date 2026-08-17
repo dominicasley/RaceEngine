@@ -18,11 +18,11 @@ private:
 
 public:
     explicit GLTFService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
-    [[nodiscard]] Model gltfModelToInternal(const std::string& fileName, const tinygltf::Model& tinyGltfModel) const;
+    [[nodiscard]] Model gltfModelToInternal(const std::string& fileName, tinygltf::Model& tinyGltfModel) const;
     [[nodiscard]] std::optional<Model> loadModelFromFile(const std::string& filePath) const;
     [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
-    [[nodiscard]] Texture getImageFromIndex(const tinygltf::Model& model, int index) const;
+    [[nodiscard]] Texture getImageFromIndex(tinygltf::Model& model, int index) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
     void processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node &node, const glm::mat4 parentTransform) const;
 };

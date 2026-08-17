@@ -86,7 +86,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints);
                 setProgramUniform(shader->gpuResourceId, "animated", !joints.empty());
 
-                setProgramUniform(shader->gpuResourceId, "textureRepeat", material->repeat);
+                setProgramUniform(shader->gpuResourceId, "textureTransform", material->transform);
 
                 if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != material.id)
                 {
@@ -111,6 +111,22 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
                     setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
                     setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
+                }
+
+
+                for (const auto& attribute : primitive.attributes)
+                {
+                    glBindBuffer(GL_ARRAY_BUFFER, model->meshBuffers[attribute.bufferIndex].gpuId.value());
+
+                    if (attribute.attributeType.has_value())
+                    {
+                        glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()),
+                                              attribute.size,
+                                              attribute.componentType,
+                                              attribute.normalized ? GL_TRUE : GL_FALSE,
+                                              attribute.stride,
+                                              (char*) (NULL + attribute.offset));
+                    }
                 }
 
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(model->meshBuffers[primitive.meshBufferIndex].gpuId.value()));
@@ -246,10 +262,10 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
     {
         auto environment = material->environment.value();
 
-        if (environment->gpuResourceId.has_value())
+        if (environment->gpuResourceId)
         {
             glActiveTexture(GL_TEXTURE5);
-            glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(environment->gpuResourceId.value()));
+            glBindTexture(GL_TEXTURE_CUBE_MAP, static_cast<GLuint>(environment->gpuResourceId));
         }
     }
     else
@@ -274,6 +290,24 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 {
     auto model = memoryStorageService.models.get(modelKey);
 
+    for (auto& meshBuffer : model.meshBuffers)
+    {
+        if (meshBuffer.gpuId.has_value()) {
+            continue;
+        }
+
+        auto& buffer = model.buffers[meshBuffer.bufferIndex];
+
+        GLuint vbo;
+        glGenBuffers(1, &vbo);
+        glBindBuffer(meshBuffer.target, vbo);
+        glBufferData(meshBuffer.target, meshBuffer.length, &buffer.at(0) + meshBuffer.offset, GL_STATIC_DRAW);
+
+        meshBuffer.gpuId = vbo;
+    }
+
+    memoryStorageService.models.update(modelKey, model);
+
     for (const auto& meshKey: model.meshes)
     {
         auto mesh = memoryStorageService.meshes.get(meshKey);
@@ -284,22 +318,6 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
         GLuint vao;
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
-
-        for (auto& buffer : model.meshBuffers)
-        {
-            if (buffer.gpuId.has_value()) {
-                continue;
-            }
-
-            GLuint vbo;
-            glGenBuffers(1, &vbo);
-            glBindBuffer(buffer.target, vbo);
-            glBufferData(buffer.target, buffer.length, &buffer.data.at(0) + buffer.offset, GL_STATIC_DRAW);
-
-            buffer.gpuId = vbo;
-        }
-
-        memoryStorageService.models.update(modelKey, model);
 
         for (const auto& primitive: mesh.meshPrimitives)
         {
@@ -368,9 +386,9 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
         if (material.environment.has_value())
         {
-            auto environment = memoryStorageService.textures.get(material.environment.value());
-            environment.gpuResourceId = createTexture(environment);
-            memoryStorageService.textures.update(material.environment.value(), environment);
+            // auto environment = memoryStorageService.cubeMaps.get(material.environment.value());
+            // environment.gpuResourceId = createTexture(environment);
+            // memoryStorageService.textures.update(material.environment.value(), environment);
         }
 
         for (auto& i: material.textures)
@@ -581,7 +599,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 
         glFramebufferTexture2D(GL_FRAMEBUFFER, attachmentType, GL_TEXTURE_2D, attachmentGpuResourceId, 0);
         attachment.gpuResourceId = attachmentGpuResourceId;
-        attachments.push_back(attachmentType);
+        attachments.emplace_back(attachmentType);
 
         memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
     }

@@ -35,8 +35,8 @@ private:
     std::optional<Resource<Material>> currentlyBoundMaterial;
     unsigned int quadVao;
     std::vector<float> vertices;
-    int viewportWidth;
-    int viewportHeight;
+    int viewportWidth = 1920;
+    int viewportHeight = 1080;
 
 public:
     explicit OpenGLRenderer(

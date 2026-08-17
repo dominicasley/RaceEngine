@@ -43,6 +43,8 @@ Engine::Engine() : app(di::make_injector(
         .to<PresenterService>(),
     di::bind<EntityService>
         .to<EntityService>(),
+    di::bind<PhysicsService>
+        .to<PhysicsService>(),
     di::bind<SceneManagerService>
         .in(di::singleton)
         .to<SceneManagerService>())
@@ -61,7 +63,8 @@ Engine::Engine() : app(di::make_injector(
                    fbo(app.fboService),
                    postProcess(app.postProcessService),
                    entity(app.entityService),
-                   presenter(app.presenterService)
+                   presenter(app.presenterService),
+                   physics(app.physicsService)
 {
 
 }

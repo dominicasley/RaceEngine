@@ -13,4 +13,5 @@ struct MeshPrimitive {
     int componentType;
     int meshBufferIndex;
     std::vector<MeshPrimitiveAttribute> attributes;
+    bool sparseAccessor;
 };

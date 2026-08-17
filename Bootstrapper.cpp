@@ -16,7 +16,8 @@ Bootstrapper::Bootstrapper(
     FboService& fboService,
     PostProcessService& postProcessService,
     PresenterService& presenterService,
-    EntityService& entityService) :
+    EntityService& entityService,
+    PhysicsService& physicsService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     resourceService(resourceService),
@@ -32,7 +33,8 @@ Bootstrapper::Bootstrapper(
     fboService(fboService),
     postProcessService(postProcessService),
     presenterService(presenterService),
-    entityService(entityService)
+    entityService(entityService),
+    physicsService(physicsService)
 {
     renderer.init();
 
@@ -60,6 +62,7 @@ Bootstrapper::Bootstrapper(
 void Bootstrapper::step(float delta)
 {
     backgroundWorkerService.step();
+    physicsService.step();
 
     for (auto& scene : sceneManager.getScenes())
     {

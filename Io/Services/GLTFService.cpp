@@ -85,7 +85,7 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
         return;
     }
 
-    const auto tinyGltfMesh = tinyGltfModel.meshes[node.mesh];
+    const auto& tinyGltfMesh = tinyGltfModel.meshes[node.mesh];
 
     Mesh mesh;
     mesh.name = tinyGltfMesh.name;
@@ -93,7 +93,8 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     if (node.skin != -1)
     {
-        auto skin = tinyGltfModel.skins[node.skin];
+        auto& skin = tinyGltfModel.skins[node.skin];
+
         for (auto j = 0; j < tinyGltfModel.skins[node.skin].joints.size(); j++)
         {
             if (tinyGltfModel.nodes[skin.joints[j]].name.empty())
@@ -113,7 +114,10 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     for (const auto& primitive: tinyGltfMesh.primitives)
     {
-        auto indexAccessor = tinyGltfModel.accessors[primitive.indices];
+        if (primitive.indices < 0)
+            continue;
+
+        auto& indexAccessor = tinyGltfModel.accessors[primitive.indices];
 
         auto meshPrimitive = MeshPrimitive{
             .mode = primitive.mode,
@@ -122,7 +126,8 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             .elementCount = indexAccessor.count,
             .byteOffset = indexAccessor.byteOffset,
             .componentType = indexAccessor.componentType,
-            .meshBufferIndex = indexAccessor.bufferView
+            .meshBufferIndex = indexAccessor.bufferView,
+            .sparseAccessor = indexAccessor.sparse.isSparse
         };
 
         for (auto& attribute: primitive.attributes)
@@ -137,7 +142,7 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             auto accessor = tinyGltfModel.accessors[attribute.second];
             auto byteStride = accessor.ByteStride(tinyGltfModel.bufferViews[accessor.bufferView]);
 
-            meshPrimitive.attributes.push_back(MeshPrimitiveAttribute{
+            meshPrimitive.attributes.emplace_back(MeshPrimitiveAttribute{
                 .size = accessor.type != TINYGLTF_TYPE_SCALAR ? accessor.type : 1,
                 .type = accessor.type,
                 .componentType = accessor.componentType,
@@ -149,10 +154,10 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             });
         }
 
-        mesh.meshPrimitives.push_back(meshPrimitive);
+        mesh.meshPrimitives.emplace_back(meshPrimitive);
     }
 
-    model.meshes.push_back(memoryStorageService.meshes.add(mesh));
+    model.meshes.emplace_back(memoryStorageService.meshes.add(mesh));
 
     for (const auto& child: node.children)
     {
@@ -160,10 +165,44 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
     }
 }
 
-Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygltf::Model& tinyGltfModel) const
+unsigned long long countMeshNodes(const tinygltf::Model& tinyGltfModel, const tinygltf::Node& node, unsigned long long count)
+{
+    if (node.mesh == -1)
+    {
+        for (const auto& child: node.children)
+        {
+            count += countMeshNodes(tinyGltfModel, tinyGltfModel.nodes[child], count);
+        }
+
+        return count;
+    }
+    else
+    {
+        for (const auto& child: node.children)
+        {
+            count += countMeshNodes(tinyGltfModel, tinyGltfModel.nodes[child], count);
+        }
+
+        return ++count;
+    }
+}
+
+Model GLTFService::gltfModelToInternal(const std::string& filePath, tinygltf::Model& tinyGltfModel) const
 {
     logger.info("Processing model: {}", filePath);
+
+
+    unsigned long long meshCount = 0;
+    for (auto& sceneNode: tinyGltfModel.scenes[tinyGltfModel.defaultScene].nodes)
+    {
+        meshCount += countMeshNodes(tinyGltfModel, tinyGltfModel.nodes[sceneNode], 0);
+    }
+
     Model model;
+    model.meshes.reserve(meshCount);
+    model.materials.reserve(tinyGltfModel.materials.size());
+    model.meshBuffers.reserve(tinyGltfModel.bufferViews.size());
+    model.buffers.reserve(tinyGltfModel.buffers.size());
 
     std::map<std::string, Resource<Texture>> textureMap;
 
@@ -181,10 +220,50 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
         std::optional<Resource<Texture>> occlusionTexturePtr;
         std::optional<Resource<Texture>> emissiveTexturePtr;
 
+        auto textureTransform = glm::mat3(1.0f);
+
         if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
         {
             auto image = tinyGltfModel.images[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
             albedoTexturePtr = textureMap[filePath + ":" + image.name];
+
+            if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.extensions.contains("KHR_texture_transform")) {
+                auto& transform = tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.extensions.at("KHR_texture_transform");
+
+                auto offset = glm::vec2(0.0);
+                auto scale = glm::vec2(1.0);
+                auto rotation = 0.0f;
+
+                if (transform.Has("offset")) {
+                    auto& offsetTransform = transform.Get("offset");
+
+                    offset.x = static_cast<float>(offsetTransform.Get(0).GetNumberAsDouble());
+                    offset.y = static_cast<float>(offsetTransform.Get(1).GetNumberAsDouble());
+                }
+
+                if (transform.Has("scale")) {
+                    auto& scaleTransform = transform.Get("scale");
+
+                    scale.x = static_cast<float>(scaleTransform.Get(0).GetNumberAsDouble());
+                    scale.y = static_cast<float>(scaleTransform.Get(1).GetNumberAsDouble());
+                }
+
+                if (transform.Has("rotation")) {
+                    auto& rotationTransform = transform.Get("rotation");
+
+                    rotation = static_cast<float>(rotationTransform.GetNumberAsDouble());
+                }
+
+                auto translationMatrix = glm::mat3(1, 0, 0, 0, 1, 0, offset.x, offset.y, 1);
+                auto rotationMatrix = glm::mat3(
+                    glm::cos(rotation), glm::sin(rotation), 0,
+                    -glm::sin(rotation), glm::cos(rotation), 0,
+                    0, 0, 1
+                );
+                auto scaleMatrix = glm::mat3(scale.x, 0, 0, 0, scale.y, 0, 0, 0, 1);
+
+                textureTransform = translationMatrix * rotationMatrix * scaleMatrix;
+            }
         }
 
         if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
@@ -221,24 +300,29 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
             .metalness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.metallicFactor),
             .roughness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.roughnessFactor),
             .opaque = true,
+            .transform = textureTransform,
             .albedo = albedoTexturePtr,
             .metallicRoughness = metallicRoughnessTexturePtr,
             .normal = normalTexturePtr,
             .occlusion = occlusionTexturePtr,
-            .emissive = emissiveTexturePtr,
+            .emissive = emissiveTexturePtr
         });
 
-        model.materials.push_back(material);
+        model.materials.emplace_back(material);
     }
 
-    for (const auto& bufferView: tinyGltfModel.bufferViews)
+    for (auto& buffer : tinyGltfModel.buffers) {
+        model.buffers.emplace_back(std::move(buffer.data));
+    }
+
+    for (auto& bufferView: tinyGltfModel.bufferViews)
     {
-        model.meshBuffers.push_back(MeshBuffer{
+        model.meshBuffers.emplace_back(MeshBuffer{
             .target = bufferView.target,
             .length = bufferView.byteLength,
             .offset = bufferView.byteOffset,
             .stride = bufferView.byteStride,
-            .data = tinyGltfModel.buffers[bufferView.buffer].data
+            .bufferIndex = bufferView.buffer,
         });
     }
 
@@ -248,6 +332,7 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
     }
 
     logger.info("Processed model: {}", filePath);
+
     return model;
 }
 
@@ -299,19 +384,16 @@ TextureFormat GLTFService::toTextureFormat(int format) const
     }
 }
 
-Texture GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const
+Texture GLTFService::getImageFromIndex(tinygltf::Model& model, int index) const
 {
-    auto image = model.images[index];
-
-    auto width = static_cast<unsigned int>(image.width);
-    auto height = static_cast<unsigned int>(image.height);
+    auto& image = model.images[index];
 
     return Texture {
         .name = image.name,
         .format = toTextureFormat(image.component),
         .pixelDataType = image.bits == 16 ? PixelDataType::UnsignedShort : PixelDataType::UnsignedByte,
-        .width = width,
-        .height = height,
+        .width = static_cast<unsigned int>(image.width),
+        .height = static_cast<unsigned int>(image.height),
         .data = image.image
     };
 }

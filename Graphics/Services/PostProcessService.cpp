@@ -38,7 +38,7 @@ Resource<PostProcess> PostProcessService::create(const std::string& id, const Re
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey, const Resource<FboAttachment>& attachment) const
 {
     auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
-    postProcess.inputs.push_back(attachment);
+    postProcess.inputs.emplace_back(attachment);
 
     memoryStorageService.postProcesses.update(postProcessKey, postProcess);
 }

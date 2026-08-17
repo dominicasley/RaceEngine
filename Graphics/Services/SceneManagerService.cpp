@@ -30,6 +30,11 @@ SceneNode& SceneManagerService::createNode(Scene& scene)
     return e;
 }
 
+void SceneManagerService::setPhysicsScene(Scene& scene, PhysicsScene& physicsScene)
+{
+    scene.physicsScene = physicsScene;
+}
+
 void SceneManagerService::setPosition(SceneNode& node, float x, float y, float z) const
 {
     node.position = glm::vec3(x, y, z);

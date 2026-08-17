@@ -6,6 +6,8 @@
 
 #include "../Models/Scene/Scene.h"
 
+import Physics;
+
 class SceneManagerService
 {
 private:
@@ -30,6 +32,7 @@ public:
     void rotate(SceneNode& node, float angle, float x, float y, float z) const;
     void scale(SceneNode& node, float x, float y, float z) const;
     void setParent(SceneNode& node, SceneNode& parent) const;
+    void setPhysicsScene(Scene& scene, PhysicsScene& physicsScene);
 };
 
 

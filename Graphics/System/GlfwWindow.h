@@ -13,6 +13,7 @@
 class GLFWWindow : public IWindow
 {
 private:
+    mutable double _frameTimeSeconds;
     mutable double _delta;
     mutable double _frameTime;
     mutable double _avgFrameRate;

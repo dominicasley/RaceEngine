@@ -20,20 +20,20 @@
 template<typename T>
 class MemoryStorage
 {
-    std::vector<T> buffer[1024];
-    std::pmr::monotonic_buffer_resource bufferResource;
+    mutable unsigned long long index = 0;
     mutable std::mutex accessorMutex;
-    mutable std::pmr::vector<T> items;
+    mutable std::array<T, 1024> items;
 
 public:
-    explicit MemoryStorage() :
-        bufferResource(buffer, buffer->size()),
-        items(std::pmr::vector<T>(&bufferResource))
-    {
-        items.reserve(1024);
-    }
+    explicit MemoryStorage() = default;
 
     [[nodiscard]] const T& get(const Resource<T>& key) const
+    {
+        std::lock_guard<std::mutex> lock(accessorMutex);
+        return items[key.id];
+    };
+
+    [[nodiscard]] T& get(const Resource<T>& key)
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
         return items[key.id];
@@ -42,7 +42,7 @@ public:
     [[nodiscard]] bool exists(const Resource<T>& key) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        return items.size() > key.id;
+        return index > key.id;
     };
 
     [[nodiscard]] std::optional<Resource<T>> getKeyIfExists(const Resource<T>& key) const
@@ -66,11 +66,12 @@ public:
     Resource<T> add(const T& item) const
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
-        auto value = items.emplace_back(item);
+        items[index] = item;
+        index++;
 
         return Resource<T> {
-            .id = items.size() - 1,
-            .value = &items[items.size() - 1]
+            .id = index - 1,
+            .value = &items[index - 1]
         };
     };
 
@@ -85,11 +86,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(accessorMutex);
 
-        auto value = items.emplace_back(std::move(item)).get();
+        items[index] = std::move(item);
+        index++;
 
         return Resource<T> {
-            .id = items.size() - 1,
-            .value = &items[items.size() - 1]
+            .id = index - 1,
+            .value = &items[index - 1]
         };
     };
 };

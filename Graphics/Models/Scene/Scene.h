@@ -9,6 +9,8 @@
 #include "RenderableEntity.h"
 #include "RenderableModel.h"
 
+import Physics;
+
 struct Scene
 {
     std::pmr::monotonic_buffer_resource cameraBufferResource;
@@ -20,6 +22,8 @@ struct Scene
     std::vector<Light> lightBuffer[1024];
     std::vector<RenderableModel> modelBuffer[1024];
     std::vector<SceneNode> nodeBuffer[1024];
+
+    std::optional<PhysicsScene> physicsScene;
 
     mutable std::pmr::vector<Camera> cameras;
     mutable std::pmr::vector<Light> lights;

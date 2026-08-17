@@ -1,8 +1,8 @@
 ﻿# CMakeList.txt : CMake project for OpenStreetRace, include source and define
 # project specific logic here.
 #
-set(CMAKE_CXX_STANDARD 20)
-cmake_minimum_required (VERSION 3.8)
+set(CMAKE_CXX_STANDARD 23)
+cmake_minimum_required (VERSION 3.28)
 
 # Add source to this project's executable.
 add_library (Graphics
@@ -82,6 +82,7 @@ target_link_libraries(Graphics PUBLIC glfw)
 target_link_libraries(Graphics PUBLIC ozz_animation)
 target_link_libraries(Graphics PUBLIC ozz_base)
 
+target_link_libraries(Graphics PUBLIC Physics)
 target_link_libraries(Graphics PUBLIC Shared)
 target_include_directories(Graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../Shared)
 

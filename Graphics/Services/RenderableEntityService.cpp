@@ -115,5 +115,5 @@ void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::un
 
 void RenderableEntityService::addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const
 {
-    mesh.animations.push_back(animation);
+    mesh.animations.emplace_back(animation);
 }
