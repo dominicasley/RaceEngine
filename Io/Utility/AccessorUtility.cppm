@@ -4,9 +4,9 @@ module;
 #include <cstring>
 #include <vector>
 
-#include <tiny_gltf.h>
-#include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/mat4x4.hpp>
+#include <tiny_gltf.h>
 
 export module raceengine.io:AccessorUtility;
 
@@ -16,7 +16,7 @@ namespace raceengine
 export class AccessorUtility
 {
 private:
-    template<typename T>
+    template <typename T>
     static std::vector<T> readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor);
 
     static size_t componentsPerElement(const tinygltf::Accessor& accessor)
@@ -25,13 +25,11 @@ private:
     }
 
 public:
-    template<typename T>
-    inline static T get(const tinygltf::Model&, const tinygltf::Accessor&)
-    {};
+    template <typename T> inline static T get(const tinygltf::Model&, const tinygltf::Accessor&) {};
 };
 
-template<typename T> inline
-std::vector<T> AccessorUtility::readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <typename T>
+inline std::vector<T> AccessorUtility::readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
     const auto& bufferView = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
     const auto& buffer = model.buffers[static_cast<size_t>(bufferView.buffer)];
@@ -53,9 +51,7 @@ std::vector<T> AccessorUtility::readBytes(const tinygltf::Model& model, const ti
     return out;
 }
 
-
-template<> inline
-float AccessorUtility::get<float>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <> inline float AccessorUtility::get<float>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
     const auto result = readBytes<float>(model, accessor);
 
@@ -67,21 +63,20 @@ float AccessorUtility::get<float>(const tinygltf::Model& model, const tinygltf::
     return result[0];
 }
 
-template<> inline
-std::vector<float>
-AccessorUtility::get<std::vector<float>>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline std::vector<float> AccessorUtility::get<std::vector<float>>(const tinygltf::Model& model,
+                                                                   const tinygltf::Accessor& accessor)
 {
     return readBytes<float>(model, accessor);
 }
 
-template<> inline
-glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model&, const tinygltf::Accessor&)
+template <> inline glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model&, const tinygltf::Accessor&)
 {
     return glm::vec2(1.0f);
 }
 
-template<> inline
-glm::vec3 AccessorUtility::get<glm::vec3>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline glm::vec3 AccessorUtility::get<glm::vec3>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
     const auto result = readBytes<float>(model, accessor);
 
@@ -93,9 +88,9 @@ glm::vec3 AccessorUtility::get<glm::vec3>(const tinygltf::Model& model, const ti
     return glm::make_vec3(result.data());
 }
 
-template<> inline
-std::vector<glm::vec3>
-AccessorUtility::get<std::vector<glm::vec3>>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline std::vector<glm::vec3> AccessorUtility::get<std::vector<glm::vec3>>(const tinygltf::Model& model,
+                                                                           const tinygltf::Accessor& accessor)
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::vec3>();
@@ -109,8 +104,8 @@ AccessorUtility::get<std::vector<glm::vec3>>(const tinygltf::Model& model, const
     return out;
 }
 
-template<> inline
-glm::quat AccessorUtility::get<glm::quat>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline glm::quat AccessorUtility::get<glm::quat>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
     const auto result = readBytes<float>(model, accessor);
 
@@ -122,9 +117,9 @@ glm::quat AccessorUtility::get<glm::quat>(const tinygltf::Model& model, const ti
     return glm::make_quat(result.data());
 }
 
-template<> inline
-std::vector<glm::quat>
-AccessorUtility::get<std::vector<glm::quat>>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline std::vector<glm::quat> AccessorUtility::get<std::vector<glm::quat>>(const tinygltf::Model& model,
+                                                                           const tinygltf::Accessor& accessor)
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::quat>();
@@ -138,15 +133,14 @@ AccessorUtility::get<std::vector<glm::quat>>(const tinygltf::Model& model, const
     return out;
 }
 
-template<> inline
-glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model&, const tinygltf::Accessor&)
+template <> inline glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model&, const tinygltf::Accessor&)
 {
     return glm::vec4(1.0f);
 }
 
-template<> inline
-std::vector<glm::mat4>
-AccessorUtility::get<std::vector<glm::mat4>>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+template <>
+inline std::vector<glm::mat4> AccessorUtility::get<std::vector<glm::mat4>>(const tinygltf::Model& model,
+                                                                           const tinygltf::Accessor& accessor)
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::mat4>();

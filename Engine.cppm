@@ -161,24 +161,26 @@ Engine::Engine() :
     openGlRenderer.init();
     openGlRenderer.setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
 
-    glfwWindow.onResize([&](int width, int height) {
-        logger->info("Window Resized: {}px x {}px", width, height);
-        openGlRenderer.setViewport(width, height);
-
-        for (auto& scene : sceneManagerService.getScenes())
+    glfwWindow.onResize(
+        [&](int width, int height)
         {
-            for (auto& camera : scene.cameras)
-            {
-                cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
-                cameraService.recreateOutputBuffer(camera, width, height);
+            logger->info("Window Resized: {}px x {}px", width, height);
+            openGlRenderer.setViewport(width, height);
 
-                for (auto postProcess : camera.postProcesses)
+            for (auto& scene : sceneManagerService.getScenes())
+            {
+                for (auto& camera : scene.cameras)
                 {
-                    postProcessService.recreateOutputBuffer(postProcess, width, height);
+                    cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
+                    cameraService.recreateOutputBuffer(camera, width, height);
+
+                    for (auto postProcess : camera.postProcesses)
+                    {
+                        postProcessService.recreateOutputBuffer(postProcess, width, height);
+                    }
                 }
             }
-        }
-    });
+        });
 }
 
 bool Engine::running() const

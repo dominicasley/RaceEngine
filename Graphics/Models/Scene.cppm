@@ -15,11 +15,11 @@ module;
 #include <ozz/animation/runtime/local_to_model_job.h>
 #include <ozz/animation/runtime/sampling_job.h>
 #include <ozz/animation/runtime/skeleton.h>
+#include <ozz/base/containers/vector.h>
 #include <ozz/base/maths/simd_math.h>
 #include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/maths/vec_float.h>
 #include <ozz/options/options.h>
-#include <ozz/base/containers/vector.h>
 
 export module raceengine.graphics.models:Scene;
 
@@ -30,7 +30,8 @@ import :Mesh;
 namespace raceengine
 {
 
-export struct SceneNode {
+export struct SceneNode
+{
     SceneNode* parent = nullptr;
     glm::mat4 modelMatrix = glm::mat4(1.0f);
     glm::mat4 rotationMatrix = glm::mat4(1.0f);
@@ -83,10 +84,15 @@ export struct RenderableEntity
     RenderableEntityType type;
     SceneNode& node;
 
-    explicit RenderableEntity(RenderableEntityType type, SceneNode& node) : type(type), node(node) {}
+    explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
+        type(type),
+        node(node)
+    {
+    }
 };
 
-export struct RenderableMesh {
+export struct RenderableMesh
+{
     float animationTime{};
     unsigned int currentAnimationIndex{};
     const Resource<Mesh> mesh;
@@ -106,12 +112,15 @@ export struct RenderableModel : public RenderableEntity
     explicit RenderableModel(SceneNode& node, Resource<Model> model, std::vector<RenderableMesh> meshes) :
         RenderableEntity(RenderableEntityType::Mesh, node),
         model(model),
-        meshes(std::move(meshes)) { }
+        meshes(std::move(meshes))
+    {
+    }
 };
 
 export struct Scene
 {
-    // std::deque: element addresses stay stable under growth; references into these containers rely on it, so no erasing.
+    // std::deque: element addresses stay stable under growth; references into these containers rely on it, so no
+    // erasing.
     std::deque<Camera> cameras;
     std::deque<Light> lights;
     std::deque<RenderableModel> models;

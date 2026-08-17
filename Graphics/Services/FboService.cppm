@@ -24,41 +24,36 @@ public:
     void recreate(const Resource<Fbo>& fbo) const;
     void resize(const Resource<Fbo>& fbo, unsigned int width, unsigned int height) const;
 
-    [[nodiscard]] std::vector<Resource<FboAttachment>> getAttachmentsOfType(const Fbo& fbo, FboAttachmentType type) const;
+    [[nodiscard]] std::vector<Resource<FboAttachment>> getAttachmentsOfType(const Fbo& fbo,
+                                                                            FboAttachmentType type) const;
 };
 
 FboService::FboService(MemoryStorageService& memoryStorageService, OpenGLRenderer& renderer) :
     memoryStorageService(memoryStorageService),
     renderer(renderer)
 {
-
 }
 
 Resource<Fbo> FboService::create(const CreateFboDTO& createFboDTO) const
 {
-    auto createAttachments = [&](const auto& attachmentsDto) {
+    auto createAttachments = [&](const auto& attachmentsDto)
+    {
         std::vector<Resource<FboAttachment>> attachments;
 
-        for (auto& attachment: attachmentsDto)
+        for (auto& attachment : attachmentsDto)
         {
             attachments.push_back(
-                memoryStorageService.bufferAttachments.add(FboAttachment{
-                    .type = attachment.type,
-                    .width = attachment.width,
-                    .height = attachment.height,
-                    .captureFormat = attachment.captureFormat,
-                    .internalFormat = attachment.internalFormat
-                })
-            );
+                memoryStorageService.bufferAttachments.add(FboAttachment{.type = attachment.type,
+                                                                         .width = attachment.width,
+                                                                         .height = attachment.height,
+                                                                         .captureFormat = attachment.captureFormat,
+                                                                         .internalFormat = attachment.internalFormat}));
         }
 
         return attachments;
     };
 
-    auto fbo = Fbo {
-        .type = createFboDTO.type,
-        .attachments = createAttachments(createFboDTO.attachments)
-    };
+    auto fbo = Fbo{.type = createFboDTO.type, .attachments = createAttachments(createFboDTO.attachments)};
 
     fbo.gpuResourceId = renderer.createFbo(fbo);
 
@@ -92,12 +87,12 @@ void FboService::resize(const Resource<Fbo>& fbo, unsigned int width, unsigned i
     recreate(fbo);
 }
 
-
 std::vector<Resource<FboAttachment>> FboService::getAttachmentsOfType(const Fbo& fbo, FboAttachmentType type) const
 {
-    auto attachmentsOfType = fbo.attachments | std::views::filter([&](const auto& attachment) {
-        return memoryStorageService.bufferAttachments.get(attachment).type == type;
-    });
+    auto attachmentsOfType =
+        fbo.attachments |
+        std::views::filter([&](const auto& attachment)
+                           { return memoryStorageService.bufferAttachments.get(attachment).type == type; });
 
     return std::vector(attachmentsOfType.begin(), attachmentsOfType.end());
 }

@@ -22,23 +22,26 @@ export module raceengine.async;
 namespace raceengine
 {
 
-export template<typename T>
-using AsyncResult = std::future<std::expected<T, std::string>>;
+export template <typename T> using AsyncResult = std::future<std::expected<T, std::string>>;
 
-export template<class... Ts>
+export template <class... Ts>
 [[nodiscard]] std::expected<std::tuple<Ts...>, std::string> awaitAll(AsyncResult<Ts>... pending)
 {
     auto results = std::make_tuple(pending.get()...);
 
     auto firstError = std::optional<std::string>();
     std::apply(
-        [&firstError](auto&... result) {
-            ([&] {
-                if (!firstError && !result)
+        [&firstError](auto&... result)
+        {
+            (
+                [&]
                 {
-                    firstError = std::move(result).error();
-                }
-            }(), ...);
+                    if (!firstError && !result)
+                    {
+                        firstError = std::move(result).error();
+                    }
+                }(),
+                ...);
         },
         results);
 
@@ -47,21 +50,17 @@ export template<class... Ts>
         return std::unexpected(std::move(*firstError));
     }
 
-    return std::apply(
-        [](auto&... result) { return std::tuple<Ts...>(std::move(result).value()...); },
-        results);
+    return std::apply([](auto&... result) { return std::tuple<Ts...>(std::move(result).value()...); }, results);
 }
 
 export class BackgroundWorkerService
 {
-    template<class T>
-    struct UnwrapExpected
+    template <class T> struct UnwrapExpected
     {
         using type = T;
     };
 
-    template<class U>
-    struct UnwrapExpected<std::expected<U, std::string>>
+    template <class U> struct UnwrapExpected<std::expected<U, std::string>>
     {
         using type = U;
     };
@@ -78,7 +77,7 @@ public:
     BackgroundWorkerService();
     ~BackgroundWorkerService();
 
-    template<class F>
+    template <class F>
     [[nodiscard]] auto submit(F work) -> AsyncResult<typename UnwrapExpected<std::invoke_result_t<F>>::type>
     {
         using T = typename UnwrapExpected<std::invoke_result_t<F>>::type;
@@ -88,20 +87,22 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(mutex);
-            queue.emplace_back([promise = std::move(promise), work = std::move(work)]() mutable {
-                try
+            queue.emplace_back(
+                [promise = std::move(promise), work = std::move(work)]() mutable
                 {
-                    promise.set_value(work());
-                }
-                catch (const std::exception& e)
-                {
-                    promise.set_value(std::unexpected(e.what()));
-                }
-                catch (...)
-                {
-                    promise.set_value(std::unexpected("unknown error"));
-                }
-            });
+                    try
+                    {
+                        promise.set_value(work());
+                    }
+                    catch (const std::exception& e)
+                    {
+                        promise.set_value(std::unexpected(e.what()));
+                    }
+                    catch (...)
+                    {
+                        promise.set_value(std::unexpected("unknown error"));
+                    }
+                });
         }
 
         wake.notify_one();

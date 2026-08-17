@@ -11,22 +11,9 @@ import raceengine.resource;
 namespace raceengine
 {
 
-export enum class TextureFormat {
-    R,
-    RG,
-    RGB,
-    RGBA,
-    RGBA16F,
-    RGBA32F,
-    DepthComponent,
-    Unknown
-};
+export enum class TextureFormat { R, RG, RGB, RGBA, RGBA16F, RGBA32F, DepthComponent, Unknown };
 
-export enum class PixelDataType {
-    UnsignedShort,
-    UnsignedByte,
-    Float
-};
+export enum class PixelDataType { UnsignedShort, UnsignedByte, Float };
 
 export struct Texture
 {
@@ -40,7 +27,8 @@ export struct Texture
     std::vector<unsigned char> data;
 };
 
-export struct CubeMap {
+export struct CubeMap
+{
     unsigned int gpuResourceId;
     Resource<Texture> front;
     Resource<Texture> back;

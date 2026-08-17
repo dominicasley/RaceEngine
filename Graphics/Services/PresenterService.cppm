@@ -20,12 +20,11 @@ public:
     explicit PresenterService(OpenGLRenderer& renderer);
     void setPresenter(const Presenter& presenter);
     void present() const;
-
 };
 
-PresenterService::PresenterService(OpenGLRenderer& renderer) : renderer(renderer)
+PresenterService::PresenterService(OpenGLRenderer& renderer) :
+    renderer(renderer)
 {
-
 }
 
 void PresenterService::present() const

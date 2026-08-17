@@ -19,20 +19,18 @@ export class PostProcessService
     IWindow& window;
 
 public:
-    explicit PostProcessService(
-        MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
+    explicit PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
     [[nodiscard]] Resource<PostProcess> create(const std::string& id, const Resource<Shader>& shader) const;
     void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment) const;
-    void recreateOutputBuffer(const Resource<PostProcess> & postProcess, int width, int height) const;
+    void recreateOutputBuffer(const Resource<PostProcess>& postProcess, int width, int height) const;
 };
 
-PostProcessService::PostProcessService(
-    MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
+PostProcessService::PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService,
+                                       IWindow& window) :
     memoryStorageService(memoryStorageService),
     fboService(fboService),
     window(window)
 {
-
 }
 
 Resource<PostProcess> PostProcessService::create(const std::string&, const Resource<Shader>& shader) const
@@ -41,25 +39,19 @@ Resource<PostProcess> PostProcessService::create(const std::string&, const Resou
     auto windowWidth = static_cast<unsigned int>(state.windowWidth);
     auto windowHeight = static_cast<unsigned int>(state.windowHeight);
 
-    return memoryStorageService.postProcesses.add(PostProcess{
-        .shader = shader,
-        .output = fboService.create(
-            CreateFboDTO{
-                .type = FboType::Planar,
-                .attachments = {
-                    CreateFboAttachmentDTO{
-                        .width = windowWidth,
-                        .height = windowHeight,
-                        .type = FboAttachmentType::Color,
-                        .captureFormat = TextureFormat::RGBA,
-                        .internalFormat = TextureFormat::RGBA16F
-                    }
-                }
-            })
-    });
+    return memoryStorageService.postProcesses.add(
+        PostProcess{.shader = shader,
+                    .output = fboService.create(CreateFboDTO{
+                        .type = FboType::Planar,
+                        .attachments = {CreateFboAttachmentDTO{.width = windowWidth,
+                                                               .height = windowHeight,
+                                                               .type = FboAttachmentType::Color,
+                                                               .captureFormat = TextureFormat::RGBA,
+                                                               .internalFormat = TextureFormat::RGBA16F}}})});
 }
 
-void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey, const Resource<FboAttachment>& attachment) const
+void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
+                                  const Resource<FboAttachment>& attachment) const
 {
     auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
     postProcess.inputs.push_back(attachment);

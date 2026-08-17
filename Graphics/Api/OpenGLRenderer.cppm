@@ -1,6 +1,8 @@
 module;
 
+// glad must precede GLFW: its include guard stops glfw3.h dragging in the system GL headers.
 #include <glad/gl.h>
+
 #include <GLFW/glfw3.h>
 
 #include <optional>
@@ -12,9 +14,9 @@ module;
 #include <utility>
 #include <vector>
 
-#include <spdlog/logger.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <spdlog/logger.h>
 
 export module raceengine.graphics:OpenGLRenderer;
 
@@ -45,8 +47,7 @@ struct UniformKeyEqual
 {
     using is_transparent = void;
 
-    template<typename L, typename R>
-    [[nodiscard]] bool operator()(const L& lhs, const R& rhs) const
+    template <typename L, typename R> [[nodiscard]] bool operator()(const L& lhs, const R& rhs) const
     {
         return lhs.first == rhs.first && std::string_view(lhs.second) == std::string_view(rhs.second);
     }
@@ -77,11 +78,8 @@ private:
     mutable std::vector<unsigned int> createdFbos;
 
 public:
-    explicit OpenGLRenderer(
-        spdlog::logger& logger,
-        RenderableEntityService& renderableEntityService,
-        SceneManagerService& sceneManagerService,
-        MemoryStorageService& memoryStorageService);
+    explicit OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
+                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~OpenGLRenderer();
 
     bool init();
@@ -93,7 +91,8 @@ public:
     void setViewport(int width, int height);
     std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor);
     [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left, const Texture& right, const Texture& top, const Texture& bottom) const;
+    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
+                                             const Texture& right, const Texture& top, const Texture& bottom) const;
     [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const;
     void deleteFbo(Fbo& fbo) const;
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
@@ -121,32 +120,29 @@ private:
 
 namespace
 {
-    void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity,
-                                            GLsizei, const GLchar* message, const void* userParam)
-    {
-        auto& logger = *static_cast<spdlog::logger*>(const_cast<void*>(userParam));
+void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei,
+                                        const GLchar* message, const void* userParam)
+{
+    auto& logger = *static_cast<spdlog::logger*>(const_cast<void*>(userParam));
 
-        switch (severity)
-        {
-            case GL_DEBUG_SEVERITY_NOTIFICATION:
-                logger.debug("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
-                break;
-            case GL_DEBUG_SEVERITY_LOW:
-            case GL_DEBUG_SEVERITY_MEDIUM:
-                logger.warn("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
-                break;
-            default:
-                logger.error("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
-                break;
-        }
+    switch (severity)
+    {
+    case GL_DEBUG_SEVERITY_NOTIFICATION:
+        logger.debug("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+        break;
+    case GL_DEBUG_SEVERITY_LOW:
+    case GL_DEBUG_SEVERITY_MEDIUM:
+        logger.warn("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+        break;
+    default:
+        logger.error("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+        break;
     }
 }
+} // namespace
 
-OpenGLRenderer::OpenGLRenderer(
-    spdlog::logger& logger,
-    RenderableEntityService& renderableEntityService,
-    SceneManagerService& sceneManagerService,
-    MemoryStorageService& memoryStorageService) :
+OpenGLRenderer::OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
+                               SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
@@ -238,17 +234,19 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    for (auto& entity: scene.models)
+    for (auto& entity : scene.models)
     {
         auto& model = entity.model;
 
         for (auto& mesh : entity.meshes)
         {
-            if (!mesh.mesh->gpuResourceId.has_value()) {
+            if (!mesh.mesh->gpuResourceId.has_value())
+            {
                 upload(model);
             }
 
-            if (!mesh.mesh->gpuResourceId.has_value()) {
+            if (!mesh.mesh->gpuResourceId.has_value())
+            {
                 static auto warnedMissingMeshUpload = false;
                 if (!warnedMissingMeshUpload)
                 {
@@ -265,12 +263,15 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
             const auto joints = renderableEntityService.joints(mesh, delta);
 
-            for (auto& primitive : mesh.mesh->meshPrimitives) {
-                if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value()) {
+            for (auto& primitive : mesh.mesh->meshPrimitives)
+            {
+                if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
+                {
                     continue;
                 }
 
-                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value()) {
+                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value())
+                {
                     static auto warnedMissingMaterial = false;
                     if (!warnedMissingMaterial)
                     {
@@ -301,9 +302,12 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 {
                     bindMaterial(material);
 
-                    if (!material->opaque) {
+                    if (!material->opaque)
+                    {
                         glDisable(GL_CULL_FACE);
-                    } else {
+                    }
+                    else
+                    {
                         glEnable(GL_CULL_FACE);
                     }
 
@@ -316,17 +320,18 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(shader->gpuResourceId, "cameraPosition", camera.position);
                     setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
                     setProgramUniform(shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
-                    setProgramUniform(shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5));
+                    setProgramUniform(shader->gpuResourceId, "lights.diffuse",
+                                      glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5));
                     setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
                     setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
                     setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
                 }
 
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
+                             static_cast<GLuint>(
+                                 model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
 
-                glDrawElements(primitive.mode,
-                               static_cast<GLsizei>(primitive.elementCount),
-                               primitive.componentType,
+                glDrawElements(primitive.mode, static_cast<GLsizei>(primitive.elementCount), primitive.componentType,
                                reinterpret_cast<const void*>(primitive.byteOffset));
             }
         }
@@ -336,7 +341,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    for (const auto& postProcess: camera.postProcesses)
+    for (const auto& postProcess : camera.postProcesses)
     {
         if (postProcess->output.has_value())
         {
@@ -482,7 +487,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 {
     auto model = memoryStorageService.models.get(modelKey);
 
-    for (const auto& meshKey: model.meshes)
+    for (const auto& meshKey : model.meshes)
     {
         auto mesh = memoryStorageService.meshes.get(meshKey);
 
@@ -496,7 +501,8 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
         for (auto& buffer : model.meshBuffers)
         {
-            if (buffer.gpuId.has_value()) {
+            if (buffer.gpuId.has_value())
+            {
                 continue;
             }
 
@@ -514,21 +520,19 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
         memoryStorageService.models.update(modelKey, model);
 
-        for (const auto& primitive: mesh.meshPrimitives)
+        for (const auto& primitive : mesh.meshPrimitives)
         {
             for (const auto& attribute : primitive.attributes)
             {
-                glBindBuffer(GL_ARRAY_BUFFER, model.meshBuffers[static_cast<size_t>(attribute.bufferIndex)].gpuId.value());
+                glBindBuffer(GL_ARRAY_BUFFER,
+                             model.meshBuffers[static_cast<size_t>(attribute.bufferIndex)].gpuId.value());
 
                 if (attribute.attributeType.has_value())
                 {
                     glEnableVertexAttribArray(static_cast<GLuint>(attribute.attributeType.value()));
-                    glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()),
-                                          attribute.size,
-                                          attribute.componentType,
-                                          attribute.normalized ? GL_TRUE : GL_FALSE,
-                                          attribute.stride,
-                                          reinterpret_cast<const void*>(attribute.offset));
+                    glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()), attribute.size,
+                                          attribute.componentType, attribute.normalized ? GL_TRUE : GL_FALSE,
+                                          attribute.stride, reinterpret_cast<const void*>(attribute.offset));
                 }
             }
         }
@@ -539,7 +543,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
         glBindVertexArray(0);
     }
 
-    for (const auto& resource: model.materials)
+    for (const auto& resource : model.materials)
     {
         auto material = memoryStorageService.materials.get(resource);
 
@@ -586,7 +590,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
             memoryStorageService.textures.update(material.environment.value(), environment);
         }
 
-        for (auto& i: material.textures)
+        for (auto& i : material.textures)
         {
             auto texture = memoryStorageService.textures.get(i);
             if (!texture.gpuResourceId.has_value())
@@ -705,7 +709,8 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
                               ? getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel))
                               : static_cast<unsigned int>(GL_RGBA);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), texture.width, texture.height, NULL, format, type, texture.data.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), texture.width, texture.height, NULL, format,
+                 type, texture.data.data());
 
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -717,9 +722,8 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
     return textureId;
 }
 
-unsigned int OpenGLRenderer::createCubeMap(
-    const Texture& front, const Texture& back, const Texture& left, const Texture& right, const Texture& top,
-    const Texture& bottom) const
+unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& back, const Texture& left,
+                                           const Texture& right, const Texture& top, const Texture& bottom) const
 {
     unsigned int textureId;
     glGenTextures(1, &textureId);
@@ -729,18 +733,10 @@ unsigned int OpenGLRenderer::createCubeMap(
     const Texture* textures[] = {&right, &left, &bottom, &top, &front, &back};
     for (auto i = 0; i < 6; i++)
     {
-        glTexImage2D(
-            GL_TEXTURE_CUBE_MAP_POSITIVE_X + i,
-            0,
-            getInternalFormatFromBitsPerPixel(
-                static_cast<int>(textures[i]->bitsPerPixel)),
-            textures[i]->width,
-            textures[i]->height,
-            0,
-            getTextureFormat(textures[i]->format
-            ),
-            getTextureDataType(textures[i]->pixelDataType),
-            textures[i]->data.data());
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0,
+                     getInternalFormatFromBitsPerPixel(static_cast<int>(textures[i]->bitsPerPixel)), textures[i]->width,
+                     textures[i]->height, 0, getTextureFormat(textures[i]->format),
+                     getTextureDataType(textures[i]->pixelDataType), textures[i]->data.data());
     }
 
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -767,7 +763,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
     auto colourAttachmentIndex = 0u;
     std::vector<unsigned int> drawBuffers;
 
-    for (auto& attachmentKey: fbo.attachments)
+    for (auto& attachmentKey : fbo.attachments)
     {
         auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
 
@@ -776,16 +772,8 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
         createdTextures.push_back(attachmentGpuResourceId);
         glBindTexture(GL_TEXTURE_2D, attachmentGpuResourceId);
 
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            getTextureFormat(attachment.internalFormat),
-            attachment.width,
-            attachment.height,
-            0,
-            getTextureFormat(attachment.captureFormat),
-            GL_FLOAT,
-            nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, getTextureFormat(attachment.internalFormat), attachment.width, attachment.height,
+                     0, getTextureFormat(attachment.captureFormat), GL_FLOAT, nullptr);
 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -795,20 +783,20 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
         unsigned int attachmentType = 0;
         switch (attachment.type)
         {
-            case FboAttachmentType::Color:
-                attachmentType = GL_COLOR_ATTACHMENT0 + colourAttachmentIndex;
-                colourAttachmentIndex++;
-                drawBuffers.push_back(attachmentType);
-                break;
-            case FboAttachmentType::Depth:
-                attachmentType = GL_DEPTH_ATTACHMENT;
-                break;
-            case FboAttachmentType::Stencil:
-                attachmentType = GL_STENCIL_ATTACHMENT;
-                break;
-            default:
-                logger.error("Unknown FBO attachment type {}", static_cast<int>(attachment.type));
-                break;
+        case FboAttachmentType::Color:
+            attachmentType = GL_COLOR_ATTACHMENT0 + colourAttachmentIndex;
+            colourAttachmentIndex++;
+            drawBuffers.push_back(attachmentType);
+            break;
+        case FboAttachmentType::Depth:
+            attachmentType = GL_DEPTH_ATTACHMENT;
+            break;
+        case FboAttachmentType::Stencil:
+            attachmentType = GL_STENCIL_ATTACHMENT;
+            break;
+        default:
+            logger.error("Unknown FBO attachment type {}", static_cast<int>(attachment.type));
+            break;
         }
 
         glFramebufferTexture2D(GL_FRAMEBUFFER, attachmentType, GL_TEXTURE_2D, attachmentGpuResourceId, 0);
@@ -825,15 +813,32 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
         const auto* statusName = "unknown status";
         switch (status)
         {
-            case GL_FRAMEBUFFER_UNDEFINED: statusName = "GL_FRAMEBUFFER_UNDEFINED"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: statusName = "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: statusName = "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER: statusName = "GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER: statusName = "GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER"; break;
-            case GL_FRAMEBUFFER_UNSUPPORTED: statusName = "GL_FRAMEBUFFER_UNSUPPORTED"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: statusName = "GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE"; break;
-            case GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS: statusName = "GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS"; break;
-            default: break;
+        case GL_FRAMEBUFFER_UNDEFINED:
+            statusName = "GL_FRAMEBUFFER_UNDEFINED";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER";
+            break;
+        case GL_FRAMEBUFFER_UNSUPPORTED:
+            statusName = "GL_FRAMEBUFFER_UNSUPPORTED";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE";
+            break;
+        case GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS:
+            statusName = "GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS";
+            break;
+        default:
+            break;
         }
 
         logger.error("Framebuffer incomplete: {} (0x{:x})", statusName, status);
@@ -851,7 +856,7 @@ void OpenGLRenderer::deleteFbo(Fbo& fbo) const
         glDeleteFramebuffers(1, &fbo.gpuResourceId.value());
     }
 
-    for (auto& attachmentKey: fbo.attachments)
+    for (auto& attachmentKey : fbo.attachments)
     {
         auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
         if (attachment.gpuResourceId.has_value())
@@ -921,32 +926,27 @@ void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char*
     glProgramUniform1d(programId, getUniformLocation(programId, uniformName), data);
 }
 
-void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec2& data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec2& data)
 {
     glProgramUniform2f(programId, getUniformLocation(programId, uniformName), data.x, data.y);
 }
 
-void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec3& data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec3& data)
 {
     glProgramUniform3f(programId, getUniformLocation(programId, uniformName), data.x, data.y, data.z);
 }
 
-void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec4& data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec4& data)
 {
     glProgramUniform4f(programId, getUniformLocation(programId, uniformName), data.x, data.y, data.z, data.w);
 }
 
-void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat3& data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat3& data)
 {
     glProgramUniformMatrix3fv(programId, getUniformLocation(programId, uniformName), 1, GL_FALSE, &data[0][0]);
 }
 
-void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat4& data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat4& data)
 {
     auto location = getUniformLocation(programId, uniformName);
     glProgramUniformMatrix4fv(programId, location, 1, GL_FALSE, &data[0][0]);
@@ -998,14 +998,14 @@ unsigned int OpenGLRenderer::getTextureDataType(PixelDataType type) const
 {
     switch (type)
     {
-        case PixelDataType::UnsignedByte:
-            return GL_UNSIGNED_BYTE;
-        case PixelDataType::UnsignedShort:
-            return GL_UNSIGNED_SHORT;
-        case PixelDataType::Float:
-            return GL_FLOAT;
-        default:
-            return GL_UNSIGNED_BYTE;
+    case PixelDataType::UnsignedByte:
+        return GL_UNSIGNED_BYTE;
+    case PixelDataType::UnsignedShort:
+        return GL_UNSIGNED_SHORT;
+    case PixelDataType::Float:
+        return GL_FLOAT;
+    default:
+        return GL_UNSIGNED_BYTE;
     }
 }
 
@@ -1013,22 +1013,22 @@ unsigned int OpenGLRenderer::getTextureFormat(TextureFormat format) const
 {
     switch (format)
     {
-        case TextureFormat::R:
-            return GL_RED;
-        case TextureFormat::RG:
-            return GL_RG;
-        case TextureFormat::RGB:
-            return GL_RGB;
-        case TextureFormat::RGBA:
-            return GL_RGBA;
-        case TextureFormat::RGBA16F:
-            return GL_RGBA16F;
-        case TextureFormat::RGBA32F:
-            return GL_RGBA32F;
-        case TextureFormat::DepthComponent:
-            return GL_DEPTH_COMPONENT;
-        default:
-            return GL_RGB;
+    case TextureFormat::R:
+        return GL_RED;
+    case TextureFormat::RG:
+        return GL_RG;
+    case TextureFormat::RGB:
+        return GL_RGB;
+    case TextureFormat::RGBA:
+        return GL_RGBA;
+    case TextureFormat::RGBA16F:
+        return GL_RGBA16F;
+    case TextureFormat::RGBA32F:
+        return GL_RGBA32F;
+    case TextureFormat::DepthComponent:
+        return GL_DEPTH_COMPONENT;
+    default:
+        return GL_RGB;
     }
 }
 
@@ -1036,33 +1036,27 @@ unsigned int OpenGLRenderer::getInternalFormatFromBitsPerPixel(int bitsPerPixel)
 {
     switch (bitsPerPixel)
     {
-        case 128:
-            return GL_RGBA32F;
-        case 96:
-            return GL_RGB32F;
-        case 32:
-            return GL_RGBA;
-        case 24:
-            return GL_RGB;
-        case 16:
-            return GL_RG;
-        case 8:
-            return GL_RED;
-        default:
-            return GL_RGB;
+    case 128:
+        return GL_RGBA32F;
+    case 96:
+        return GL_RGB32F;
+    case 32:
+        return GL_RGBA;
+    case 24:
+        return GL_RGB;
+    case 16:
+        return GL_RG;
+    case 8:
+        return GL_RED;
+    default:
+        return GL_RGB;
     }
 }
 
 void OpenGLRenderer::createQuad()
 {
-    vertices = std::vector<float>({
-        -1.0, -1.0, 1.0, -1.0,
-        1.0, 1.0, 1.0, 1.0,
-        -1.0, 1.0, -1.0, -1.0,
-        0.0, 0.0, 1.0, 0.0,
-        1.0, 1.0, 1.0, 1.0,
-        0.0, 1.0, 0.0, 0.0
-    });
+    vertices = std::vector<float>({-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0,
+                                   0.0,  0.0,  1.0, 0.0,  1.0, 1.0, 1.0, 1.0, 0.0,  1.0, 0.0,  0.0});
 
     glGenVertexArrays(1, &quadVao);
     glBindVertexArray(quadVao);

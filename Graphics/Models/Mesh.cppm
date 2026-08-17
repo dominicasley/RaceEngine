@@ -16,22 +16,12 @@ import :Material;
 namespace raceengine
 {
 
-export enum class PrimitiveAttributeType {
-    Position,
-    TextureCoordinate,
-    Normal,
-    Tangent,
-    Joint,
-    SkinWeight
-};
+export enum class PrimitiveAttributeType { Position, TextureCoordinate, Normal, Tangent, Joint, SkinWeight };
 
-export enum class VertexIndicesType {
-    UnsignedByte,
-    UnsignedShort,
-    UnsignedInt
-};
+export enum class VertexIndicesType { UnsignedByte, UnsignedShort, UnsignedInt };
 
-export struct MeshBuffer {
+export struct MeshBuffer
+{
     int target;
     std::optional<unsigned int> gpuId{};
     size_t length;
@@ -40,7 +30,8 @@ export struct MeshBuffer {
     std::vector<unsigned char> data;
 };
 
-export struct MeshPrimitiveAttribute {
+export struct MeshPrimitiveAttribute
+{
     int size;
     int type;
     int componentType;
@@ -51,7 +42,8 @@ export struct MeshPrimitiveAttribute {
     size_t offset;
 };
 
-export struct MeshPrimitive {
+export struct MeshPrimitive
+{
     int mode;
     std::optional<Resource<Material>> material;
     size_t elementCount;
@@ -61,7 +53,8 @@ export struct MeshPrimitive {
     std::vector<MeshPrimitiveAttribute> attributes{};
 };
 
-export struct Mesh {
+export struct Mesh
+{
     std::string name;
     std::optional<unsigned int> gpuResourceId;
     std::vector<MeshPrimitive> meshPrimitives;
@@ -70,7 +63,8 @@ export struct Mesh {
     glm::mat4 modelMatrix;
 };
 
-export struct Model {
+export struct Model
+{
     std::vector<Resource<Mesh>> meshes;
     std::vector<MeshBuffer> meshBuffers;
     std::vector<Resource<Material>> materials;

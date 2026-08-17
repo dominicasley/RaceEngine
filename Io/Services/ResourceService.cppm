@@ -9,10 +9,10 @@ module;
 #include <utility>
 #include <vector>
 
-#include <spdlog/logger.h>
 #include <ozz/animation/runtime/animation.h>
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/base/io/archive.h>
+#include <spdlog/logger.h>
 #include <stb_image.h>
 
 export module raceengine.io:ResourceService;
@@ -34,28 +34,26 @@ private:
     GLTFService& gltfService;
 
 public:
-    explicit ResourceService(
-        spdlog::logger& logger,
-        MemoryStorageService& memoryStorageService,
-        BackgroundWorkerService& backgroundWorkerService,
-        GLTFService& gltfService);
+    explicit ResourceService(spdlog::logger& logger, MemoryStorageService& memoryStorageService,
+                             BackgroundWorkerService& backgroundWorkerService, GLTFService& gltfService);
     [[nodiscard]] std::expected<std::string, std::string> loadTextFile(const std::string& filePath) const;
     [[nodiscard]] std::expected<Resource<Model>, std::string> loadModel(const std::string& filePath) const;
-    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> loadSkeleton(const std::string& filePath) const;
-    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string> loadAnimation(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string>
+    loadSkeleton(const std::string& filePath) const;
+    [[nodiscard]] std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string>
+    loadAnimation(const std::string& filePath) const;
     [[nodiscard]] std::expected<Resource<Texture>, std::string> loadTexture(const std::string& filePath) const;
     [[nodiscard]] AsyncResult<std::string> loadTextFileAsync(std::string filePath) const;
     [[nodiscard]] AsyncResult<Resource<Model>> loadModelAsync(std::string filePath) const;
     [[nodiscard]] AsyncResult<Resource<Texture>> loadTextureAsync(std::string filePath) const;
-    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>> loadSkeletonAsync(std::string filePath) const;
-    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>> loadAnimationAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>>
+    loadSkeletonAsync(std::string filePath) const;
+    [[nodiscard]] AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>>
+    loadAnimationAsync(std::string filePath) const;
 };
 
-ResourceService::ResourceService(
-    spdlog::logger& logger,
-    MemoryStorageService& memoryStorageService,
-    BackgroundWorkerService& backgroundWorkerService,
-    GLTFService& gltfService) :
+ResourceService::ResourceService(spdlog::logger& logger, MemoryStorageService& memoryStorageService,
+                                 BackgroundWorkerService& backgroundWorkerService, GLTFService& gltfService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
     backgroundWorkerService(backgroundWorkerService),
@@ -99,7 +97,8 @@ std::expected<Resource<Model>, std::string> ResourceService::loadModel(const std
     return memoryStorageService.models.add(std::move(model).value());
 }
 
-std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> ResourceService::loadSkeleton(const std::string& filePath) const
+std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string>
+ResourceService::loadSkeleton(const std::string& filePath) const
 {
     ozz::io::File file(filePath.c_str(), "rb");
 
@@ -120,8 +119,8 @@ std::expected<Resource<std::unique_ptr<ozz::animation::Skeleton>>, std::string> 
     return memoryStorageService.skeletons.add(std::move(skeleton));
 }
 
-
-std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string> ResourceService::loadAnimation(const std::string& filePath) const
+std::expected<Resource<std::unique_ptr<ozz::animation::Animation>>, std::string>
+ResourceService::loadAnimation(const std::string& filePath) const
 {
 
     ozz::io::File file(filePath.c_str(), "rb");
@@ -164,15 +163,13 @@ std::expected<Resource<Texture>, std::string> ResourceService::loadTexture(const
 
         stbi_image_free(pixels);
 
-        return memoryStorageService.textures.add(Texture {
-            .name = filePath,
-            .format = TextureFormat::RGB,
-            .pixelDataType = PixelDataType::Float,
-            .width = static_cast<unsigned int>(width),
-            .height = static_cast<unsigned int>(height),
-            .bitsPerPixel = 96,
-            .data = data
-        });
+        return memoryStorageService.textures.add(Texture{.name = filePath,
+                                                         .format = TextureFormat::RGB,
+                                                         .pixelDataType = PixelDataType::Float,
+                                                         .width = static_cast<unsigned int>(width),
+                                                         .height = static_cast<unsigned int>(height),
+                                                         .bitsPerPixel = 96,
+                                                         .data = data});
     }
 
     auto* pixels = stbi_load(filePath.c_str(), &width, &height, &channelsInFile, STBI_rgb_alpha);
@@ -187,56 +184,50 @@ std::expected<Resource<Texture>, std::string> ResourceService::loadTexture(const
 
     stbi_image_free(pixels);
 
-    return memoryStorageService.textures.add(Texture {
-        .name = filePath,
-        .format = TextureFormat::RGBA,
-        .pixelDataType = PixelDataType::UnsignedByte,
-        .width = static_cast<unsigned int>(width),
-        .height = static_cast<unsigned int>(height),
-        .bitsPerPixel = 32,
-        .data = data
-    });
+    return memoryStorageService.textures.add(Texture{.name = filePath,
+                                                     .format = TextureFormat::RGBA,
+                                                     .pixelDataType = PixelDataType::UnsignedByte,
+                                                     .width = static_cast<unsigned int>(width),
+                                                     .height = static_cast<unsigned int>(height),
+                                                     .bitsPerPixel = 32,
+                                                     .data = data});
 }
-
 
 AsyncResult<std::string> ResourceService::loadTextFileAsync(std::string filePath) const
 {
     logger.info("Loading file: {}", filePath);
 
-    return backgroundWorkerService.submit(
-        [this, filePath = std::move(filePath)] { return loadTextFile(filePath); });
+    return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadTextFile(filePath); });
 }
 
 AsyncResult<Resource<Model>> ResourceService::loadModelAsync(std::string filePath) const
 {
     logger.info("Loading model: {}", filePath);
 
-    return backgroundWorkerService.submit(
-        [this, filePath = std::move(filePath)] { return loadModel(filePath); });
+    return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadModel(filePath); });
 }
 
-AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>> ResourceService::loadSkeletonAsync(std::string filePath) const
+AsyncResult<Resource<std::unique_ptr<ozz::animation::Skeleton>>>
+ResourceService::loadSkeletonAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
-    return backgroundWorkerService.submit(
-        [this, filePath = std::move(filePath)] { return loadSkeleton(filePath); });
+    return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadSkeleton(filePath); });
 }
 
-AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>> ResourceService::loadAnimationAsync(std::string filePath) const
+AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>>
+ResourceService::loadAnimationAsync(std::string filePath) const
 {
     logger.info("Loading skeleton: {}", filePath);
 
-    return backgroundWorkerService.submit(
-        [this, filePath = std::move(filePath)] { return loadAnimation(filePath); });
+    return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadAnimation(filePath); });
 }
 
 AsyncResult<Resource<Texture>> ResourceService::loadTextureAsync(std::string filePath) const
 {
     logger.info("Loading image: {}", filePath);
 
-    return backgroundWorkerService.submit(
-        [this, filePath = std::move(filePath)] { return loadTexture(filePath); });
+    return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadTexture(filePath); });
 }
 
 } // namespace raceengine

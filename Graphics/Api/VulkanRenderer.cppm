@@ -32,9 +32,7 @@ private:
     QueueFamily availableQueueFamilies;
     IWindow& window;
 
-    const std::vector<const char *> validationLayers = {
-            "VK_LAYER_KHRONOS_validation"
-    };
+    const std::vector<const char*> validationLayers = {"VK_LAYER_KHRONOS_validation"};
 
     void init();
 
@@ -43,7 +41,8 @@ public:
     ~VulkanRenderer();
 };
 
-VulkanRenderer::VulkanRenderer(const IWindow& window) : window(const_cast<IWindow &>(window))
+VulkanRenderer::VulkanRenderer(const IWindow& window) :
+    window(const_cast<IWindow&>(window))
 {
     init();
 }

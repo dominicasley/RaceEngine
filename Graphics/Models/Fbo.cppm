@@ -12,18 +12,9 @@ import :Texture;
 namespace raceengine
 {
 
-export enum class FboAttachmentType
-{
-    Color,
-    Depth,
-    Stencil
-};
+export enum class FboAttachmentType { Color, Depth, Stencil };
 
-export enum class FboType
-{
-    Planar,
-    CubeMap
-};
+export enum class FboType { Planar, CubeMap };
 
 export struct FboAttachment
 {
@@ -43,7 +34,8 @@ export struct Fbo
     std::vector<Resource<FboAttachment>> attachments;
 };
 
-export struct PostProcess {
+export struct PostProcess
+{
     Resource<Shader> shader;
     std::optional<Resource<Fbo>> output;
     std::vector<Resource<FboAttachment>> inputs{};

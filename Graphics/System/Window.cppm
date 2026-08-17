@@ -7,11 +7,11 @@ module;
 
 #include <GLFW/glfw3.h>
 #ifdef _WIN32
-#include <GLFW/glfw3native.h>
 #include <Dwmapi.h>
+#include <GLFW/glfw3native.h>
 #endif
-#include <vulkan/vulkan.h>
 #include <spdlog/logger.h>
+#include <vulkan/vulkan.h>
 
 #include <cstdint>
 #include <functional>
@@ -25,14 +25,16 @@ export module raceengine.graphics:Window;
 namespace raceengine
 {
 
-export struct WindowState {
+export struct WindowState
+{
     double mouseX;
     double mouseY;
     int windowWidth;
     int windowHeight;
 };
 
-export struct VulkanWindowRequiredExtensions {
+export struct VulkanWindowRequiredExtensions
+{
     uint32_t count;
     const char** extensions;
 };
@@ -91,7 +93,7 @@ public:
     ~GLFWWindow();
     void makeContextCurrent() override;
     void swapBuffers() const override;
-    void setMousePosition(int x, int y) override ;
+    void setMousePosition(int x, int y) override;
     [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
     [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
@@ -101,7 +103,7 @@ public:
     [[nodiscard]] float delta() const override;
 };
 
-GLFWWindow::GLFWWindow(spdlog::logger &logger) :
+GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     _delta(0),
     _frameTime(0),
     _avgFrameRate(0),
@@ -120,8 +122,8 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
         logger.info("Vulkan support detected");
     }
 
-    //glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    //glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    // glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    // glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
@@ -129,7 +131,7 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
 
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
-    window = glfwCreateWindow(windowState.windowWidth,  windowState.windowHeight, "Quack!", nullptr, nullptr);
+    window = glfwCreateWindow(windowState.windowWidth, windowState.windowHeight, "Quack!", nullptr, nullptr);
 
     if (!window)
     {
@@ -157,13 +159,13 @@ GLFWWindow::~GLFWWindow()
     glfwTerminate();
 }
 
-VkSurfaceKHR GLFWWindow::generateVulkanSurface(const VkInstance &vkInstance)
+VkSurfaceKHR GLFWWindow::generateVulkanSurface(const VkInstance& vkInstance)
 {
     VkSurfaceKHR vkSurfaceKhr;
 
     if (glfwCreateWindowSurface(vkInstance, window, nullptr, &vkSurfaceKhr) != VK_SUCCESS)
     {
-        const char *description;
+        const char* description;
         int code = glfwGetError(&description);
 
         logger.error("{}, {}", code, description);
@@ -179,12 +181,8 @@ VulkanWindowRequiredExtensions GLFWWindow::getRequiredVulkanWindowExtensions()
     uint32_t glfwExtensionCount = 0;
     auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
-    return VulkanWindowRequiredExtensions{
-        glfwExtensionCount,
-        glfwExtensions
-    };
+    return VulkanWindowRequiredExtensions{glfwExtensionCount, glfwExtensions};
 }
-
 
 bool GLFWWindow::shouldClose() const
 {
@@ -215,9 +213,9 @@ void GLFWWindow::makeContextCurrent()
     glfwMakeContextCurrent(window);
 }
 
-void GLFWWindow::windowResized(GLFWwindow *window, int width, int height)
+void GLFWWindow::windowResized(GLFWwindow* window, int width, int height)
 {
-    auto caller = reinterpret_cast<GLFWWindow *>(glfwGetWindowUserPointer(window));
+    auto caller = reinterpret_cast<GLFWWindow*>(glfwGetWindowUserPointer(window));
     caller->windowState.windowWidth = width;
     caller->windowState.windowHeight = height;
 
@@ -237,14 +235,14 @@ void GLFWWindow::setMousePosition(int x, int y)
     glfwSetCursorPos(window, x, y);
 }
 
-const WindowState &GLFWWindow::state() const
+const WindowState& GLFWWindow::state() const
 {
     return windowState;
 }
 
-void GLFWWindow::cursorPositionChanged(GLFWwindow *window, double x, double y)
+void GLFWWindow::cursorPositionChanged(GLFWwindow* window, double x, double y)
 {
-    auto caller = reinterpret_cast<GLFWWindow *>(glfwGetWindowUserPointer(window));
+    auto caller = reinterpret_cast<GLFWWindow*>(glfwGetWindowUserPointer(window));
     caller->windowState.mouseX = x;
     caller->windowState.mouseY = y;
 }

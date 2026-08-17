@@ -27,17 +27,14 @@ public:
     std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
-ShaderService::ShaderService(
-    MemoryStorageService& memoryStorageService,
-    OpenGLRenderer& openGlRenderer) :
+ShaderService::ShaderService(MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer) :
     memoryStorageService(memoryStorageService),
     openGlRenderer(openGlRenderer)
 {
-
 }
 
-std::optional<Resource<Shader>>
-ShaderService::createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor)
+std::optional<Resource<Shader>> ShaderService::createShader(const std::string& name,
+                                                            const ShaderDescriptor& shaderDescriptor)
 {
     auto shaderProgramId = openGlRenderer.createShaderObject(shaderDescriptor);
 
@@ -46,18 +43,14 @@ ShaderService::createShader(const std::string& name, const ShaderDescriptor& sha
         return {};
     }
 
-    const auto shader = memoryStorageService.shaders.add(
-        Shader {
-            .gpuResourceId = shaderProgramId.value()
-        });
+    const auto shader = memoryStorageService.shaders.add(Shader{.gpuResourceId = shaderProgramId.value()});
 
     shaders[name] = shader;
 
     return shader;
 }
 
-std::optional<Resource<Shader>>
-ShaderService::getShaderByName(const std::string& name)
+std::optional<Resource<Shader>> ShaderService::getShaderByName(const std::string& name)
 {
     if (shaders.contains(name))
         return shaders.at(name);

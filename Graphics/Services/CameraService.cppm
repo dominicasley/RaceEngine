@@ -25,7 +25,7 @@ public:
     Camera createCamera();
     void setPosition(Camera& camera, float x, float y, float z) const;
     void setDirection(Camera& camera, float x, float y, float z) const;
-    void translate(Camera& camera,float x, float y, float z) const;
+    void translate(Camera& camera, float x, float y, float z) const;
     void rotate(Camera& camera, float x, float y, float z) const;
     void setRoll(Camera& camera, float x, float y, float z) const;
     void setAspectRatio(Camera& camera, float aspectRatio) const;
@@ -52,33 +52,26 @@ Camera CameraService::createCamera()
     auto windowWidth = static_cast<unsigned int>(windowState.windowWidth);
     auto windowHeight = static_cast<unsigned int>(windowState.windowHeight);
 
-    return Camera {
-        .iso = 6400,
-        .aspectRatio = 16.0f / 9.0f,
-        .aperture = 1.4f,
-        .fieldOfView = 75.f,
-        .direction = glm::vec3(0, 0, 1),
-        .roll = glm::vec3(0, 1, 0),
-        .output = fboService.create(CreateFboDTO {
-            .type = FboType::Planar,
-            .attachments = {
-                CreateFboAttachmentDTO {
-                    .width = windowWidth,
-                    .height = windowHeight,
-                    .type = FboAttachmentType::Color,
-                    .captureFormat = TextureFormat::RGBA,
-                    .internalFormat = TextureFormat::RGBA16F
-                },
-                CreateFboAttachmentDTO {
-                    .width = windowWidth,
-                    .height = windowHeight,
-                    .type = FboAttachmentType::Depth,
-                    .captureFormat = TextureFormat::DepthComponent,
-                    .internalFormat = TextureFormat::DepthComponent
-                },
-            }
-        })
-    };
+    return Camera{.iso = 6400,
+                  .aspectRatio = 16.0f / 9.0f,
+                  .aperture = 1.4f,
+                  .fieldOfView = 75.f,
+                  .direction = glm::vec3(0, 0, 1),
+                  .roll = glm::vec3(0, 1, 0),
+                  .output = fboService.create(
+                      CreateFboDTO{.type = FboType::Planar,
+                                   .attachments = {
+                                       CreateFboAttachmentDTO{.width = windowWidth,
+                                                              .height = windowHeight,
+                                                              .type = FboAttachmentType::Color,
+                                                              .captureFormat = TextureFormat::RGBA,
+                                                              .internalFormat = TextureFormat::RGBA16F},
+                                       CreateFboAttachmentDTO{.width = windowWidth,
+                                                              .height = windowHeight,
+                                                              .type = FboAttachmentType::Depth,
+                                                              .captureFormat = TextureFormat::DepthComponent,
+                                                              .internalFormat = TextureFormat::DepthComponent},
+                                   }})};
 }
 
 void CameraService::setPosition(Camera& camera, float x, float y, float z) const
@@ -166,7 +159,8 @@ void CameraService::addPostProcess(Camera& camera, const Resource<PostProcess>& 
     camera.postProcesses.push_back(postProcessKey);
 }
 
-const Fbo& CameraService::getOutputBuffer(Camera& camera) const {
+const Fbo& CameraService::getOutputBuffer(Camera& camera) const
+{
     return memoryStorageService.frameBuffers.get(camera.output.value());
 }
 

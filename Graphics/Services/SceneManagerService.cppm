@@ -44,7 +44,7 @@ Scene& SceneManagerService::getScene(int index)
 
 Scene& SceneManagerService::createScene()
 {
-    auto& e =  scenes.emplace_back();
+    auto& e = scenes.emplace_back();
     return e;
 }
 

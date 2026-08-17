@@ -7,14 +7,14 @@ module;
 #include <string>
 #include <vector>
 
-#include <spdlog/logger.h>
 #include <glm/glm.hpp>
-#include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
 #include <ozz/animation/runtime/local_to_model_job.h>
 #include <ozz/animation/runtime/sampling_job.h>
+#include <ozz/animation/runtime/skeleton.h>
 #include <ozz/base/maths/simd_math.h>
 #include <ozz/base/span.h>
+#include <spdlog/logger.h>
 
 export module raceengine.graphics:RenderableEntityService;
 
@@ -45,26 +45,25 @@ RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryS
     logger(logger),
     memoryStorageService(memoryStorageService)
 {
-
 }
 
 RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
 {
-    auto createMeshes = [&](const CreateRenderableModelDTO& entityDescriptor) {
+    auto createMeshes = [&](const CreateRenderableModelDTO& entityDescriptor)
+    {
         std::vector<RenderableMesh> meshes;
 
-        for (auto materialKey : entityDescriptor.model->materials) {
+        for (auto materialKey : entityDescriptor.model->materials)
+        {
             auto material = memoryStorageService.materials.get(materialKey);
             material.shader = entityDescriptor.shader;
 
             memoryStorageService.materials.update(materialKey, material);
         }
 
-        for (const auto& meshKey : entityDescriptor.model->meshes) {
-            meshes.emplace_back(RenderableMesh {
-                .mesh = meshKey,
-                .skeleton = std::nullopt
-            });
+        for (const auto& meshKey : entityDescriptor.model->meshes)
+        {
+            meshes.emplace_back(RenderableMesh{.mesh = meshKey, .skeleton = std::nullopt});
         }
 
         return meshes;
@@ -75,7 +74,6 @@ RenderableModel RenderableEntityService::createModel(const CreateRenderableModel
 
 void RenderableEntityService::setAnimation(RenderableMesh&, const std::string&) const
 {
-
 }
 
 void RenderableEntityService::setAnimation(RenderableMesh& mesh, unsigned int animationIndex) const
@@ -94,8 +92,7 @@ glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
     return out;
 }
 
-std::vector<glm::mat4>
-RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeDelta) const
+std::vector<glm::mat4> RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeDelta) const
 {
     auto out = std::vector<glm::mat4>();
 
@@ -105,7 +102,8 @@ RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeD
         auto animation = renderableMesh.animations[renderableMesh.currentAnimationIndex].value;
         auto skeleton = renderableMesh.skeleton.value().value;
 
-        renderableMesh.animationTime = std::fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
+        renderableMesh.animationTime =
+            std::fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
 
         ozz::animation::SamplingJob sampling_job;
         sampling_job.animation = animation->get();
@@ -137,16 +135,16 @@ RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeD
                 continue;
             }
 
-            out[jointIndex] =
-                ozzToMat4(renderableMesh.animationModelSpaceTransforms[i]) *
-                    mesh->inverseBindPoseTransforms[jointIndex];
+            out[jointIndex] = ozzToMat4(renderableMesh.animationModelSpaceTransforms[i]) *
+                              mesh->inverseBindPoseTransforms[jointIndex];
         }
     }
 
     return out;
 }
 
-void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeletonKey) const
+void RenderableEntityService::setSkeleton(RenderableMesh& mesh,
+                                          Resource<std::unique_ptr<ozz::animation::Skeleton>> skeletonKey) const
 {
     auto skeleton = skeletonKey.value;
 
@@ -164,7 +162,8 @@ void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::un
     }
 }
 
-void RenderableEntityService::addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const
+void RenderableEntityService::addAnimation(RenderableMesh& mesh,
+                                           Resource<std::unique_ptr<ozz::animation::Animation>> animation) const
 {
     mesh.animations.push_back(animation);
 }

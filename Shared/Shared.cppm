@@ -15,9 +15,9 @@ import raceengine.resource;
 namespace raceengine
 {
 
-// std::deque backing: growth never relocates elements, so cached Resource<T>::value pointers stay valid; removal would require generational handles.
-export template<typename T>
-class MemoryStorage
+// std::deque backing: growth never relocates elements, so cached Resource<T>::value pointers stay valid; removal would
+// require generational handles.
+export template <typename T> class MemoryStorage
 {
     mutable std::mutex accessorMutex;
     mutable std::deque<T> items;
@@ -40,10 +40,7 @@ public:
         std::lock_guard<std::mutex> lock(accessorMutex);
         T& stored = items.emplace_back(item);
 
-        return Resource<T> {
-            .id = items.size() - 1,
-            .value = &stored
-        };
+        return Resource<T>{.id = items.size() - 1, .value = &stored};
     };
 
     Resource<T> add(T&& item) const
@@ -51,10 +48,7 @@ public:
         std::lock_guard<std::mutex> lock(accessorMutex);
         T& stored = items.emplace_back(std::move(item));
 
-        return Resource<T> {
-            .id = items.size() - 1,
-            .value = &stored
-        };
+        return Resource<T>{.id = items.size() - 1, .value = &stored};
     };
 
     void update(const Resource<T>& resource, T& value) const

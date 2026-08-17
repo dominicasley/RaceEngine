@@ -7,7 +7,8 @@ export module raceengine.graphics.models:Shader;
 namespace raceengine
 {
 
-export struct Shader {
+export struct Shader
+{
     unsigned int gpuResourceId;
 };
 
