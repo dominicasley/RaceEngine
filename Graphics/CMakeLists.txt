@@ -71,10 +71,17 @@ add_library (Graphics
 
 target_include_directories(Graphics PUBLIC "../")
 
-target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
-target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
+if(WIN32)
+    target_include_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
+    target_link_directories(Graphics PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
 
-target_link_libraries(Graphics PUBLIC opengl32)
+    target_link_libraries(Graphics PUBLIC opengl32)
+else()
+    find_package(Vulkan REQUIRED)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(Graphics PUBLIC Vulkan::Vulkan)
+    target_link_libraries(Graphics PUBLIC OpenGL::GL)
+endif()
 target_link_libraries(Graphics PUBLIC spdlog)
 target_link_libraries(Graphics PUBLIC glm)
 target_link_libraries(Graphics PUBLIC gl3w)

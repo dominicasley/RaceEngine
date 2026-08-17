@@ -1,6 +1,8 @@
 #include <stdexcept>
 #include "GlfwWindow.h"
+#ifdef _WIN32
 #include <Dwmapi.h>
+#endif
 
 GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     logger(logger),

@@ -1,5 +1,7 @@
 #include "RenderableEntityService.h"
 
+#include <cstring>
+
 RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService) :
     logger(logger),
     memoryStorageService(memoryStorageService),
@@ -49,12 +51,10 @@ void RenderableEntityService::setAnimation(RenderableMesh& mesh, unsigned int an
 
 glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
 {
-    return glm::mat4({
-     t.cols[0].m128_f32[0], t.cols[0].m128_f32[1], t.cols[0].m128_f32[2], t.cols[0].m128_f32[3],
-     t.cols[1].m128_f32[0], t.cols[1].m128_f32[1], t.cols[1].m128_f32[2], t.cols[1].m128_f32[3],
-     t.cols[2].m128_f32[0], t.cols[2].m128_f32[1], t.cols[2].m128_f32[2], t.cols[2].m128_f32[3],
-     t.cols[3].m128_f32[0], t.cols[3].m128_f32[1], t.cols[3].m128_f32[2], t.cols[3].m128_f32[3]
-    });
+    // Both types are 16 contiguous floats in column-major order.
+    glm::mat4 out;
+    std::memcpy(&out, &t.cols, sizeof(out));
+    return out;
 }
 
 std::vector<glm::mat4>
