@@ -1,7 +1,8 @@
 #pragma once
 
-#include <typeindex>
 #include <map>
+#include <memory>
+#include <typeindex>
 
 #include "Component.h"
 

@@ -3,7 +3,7 @@
 #include <spdlog/logger.h>
 #include <ranges>
 
-#include "Shared/Services/MemoryStorageService.h"
+#include <Shared/Services/MemoryStorageService.h>
 #include "../Models/Scene/Fbo.h"
 #include "../Models/Scene/CreateFboDTO.h"
 #include "../Api/OpenGLRenderer.h"

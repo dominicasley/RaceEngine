@@ -1,7 +1,8 @@
 #pragma once
 
-#include <string>
 #include <optional>
+#include <string>
+#include <vector>
 #include "TextureFormat.h"
 #include "PixelDataType.h"
 

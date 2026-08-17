@@ -8,7 +8,7 @@
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
 
-#include "Shared/Services/MemoryStorageService.h"
+#include <Shared/Services/MemoryStorageService.h>
 #include "GLTFService.h"
 #include "Async/Async.h"
 

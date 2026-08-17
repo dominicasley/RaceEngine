@@ -1,8 +1,10 @@
 #pragma once
 
 #include <spdlog/logger.h>
-#include <map>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -14,8 +16,33 @@
 #include "../Services/SceneManagerService.h"
 #include "../Services/RenderableEntityService.h"
 
-typedef std::pair<unsigned int, std::string> UniformKey;
-typedef std::map<UniformKey, unsigned int> UniformPool;
+struct UniformKeyHash
+{
+    using is_transparent = void;
+
+    [[nodiscard]] size_t operator()(const std::pair<unsigned int, std::string_view>& key) const
+    {
+        return std::hash<unsigned int>{}(key.first) ^ (std::hash<std::string_view>{}(key.second) << 1u);
+    }
+
+    [[nodiscard]] size_t operator()(const std::pair<unsigned int, std::string>& key) const
+    {
+        return (*this)(std::pair<unsigned int, std::string_view>(key.first, key.second));
+    }
+};
+
+struct UniformKeyEqual
+{
+    using is_transparent = void;
+
+    template<typename L, typename R>
+    [[nodiscard]] bool operator()(const L& lhs, const R& rhs) const
+    {
+        return lhs.first == rhs.first && std::string_view(lhs.second) == std::string_view(rhs.second);
+    }
+};
+
+typedef std::unordered_map<std::pair<unsigned int, std::string>, int, UniformKeyHash, UniformKeyEqual> UniformPool;
 
 struct Scene;
 struct Material;
@@ -37,6 +64,7 @@ private:
     std::vector<float> vertices;
     int viewportWidth;
     int viewportHeight;
+    float maxAnisotropy = 1.0f;
 
 public:
     explicit OpenGLRenderer(
@@ -64,19 +92,18 @@ public:
 private:
     void createQuad();
     bool compileShader(unsigned int id, const std::string& source);
-    unsigned int getUniformLocation(unsigned int, const std::string&);
-    void setProgramUniform(unsigned int, const std::string&, int);
-    void setProgramUniform(unsigned int, const std::string&, float data);
-    void setProgramUniform(unsigned int, const std::string&, double data);
-    void setProgramUniform(unsigned int, const std::string&, const glm::vec2& data);
-    void setProgramUniform(unsigned int, const std::string&, const glm::vec3& data);
-    void setProgramUniform(unsigned int, const std::string&, const glm::vec4& data);
-    void setProgramUniform(unsigned int, const std::string&, const glm::mat3& data);
-    void setProgramUniform(unsigned int, const std::string&, const glm::mat4& data);
-    void setProgramUniform(unsigned int, const std::string&, const std::vector<glm::vec2>& data);
-    void setProgramUniform(unsigned int, const std::string&, const std::vector<glm::vec3>& data);
-    void setProgramUniform(unsigned int, const std::string&, const std::vector<glm::vec4>& data);
-    void setProgramUniform(unsigned int, const std::string&, const std::vector<glm::mat3>& data);
-    void setProgramUniform(unsigned int, const std::string&, const std::vector<glm::mat4>& data);
+    int getUniformLocation(unsigned int, const char*);
+    void setProgramUniform(unsigned int, const char*, int);
+    void setProgramUniform(unsigned int, const char*, float data);
+    void setProgramUniform(unsigned int, const char*, double data);
+    void setProgramUniform(unsigned int, const char*, const glm::vec2& data);
+    void setProgramUniform(unsigned int, const char*, const glm::vec3& data);
+    void setProgramUniform(unsigned int, const char*, const glm::vec4& data);
+    void setProgramUniform(unsigned int, const char*, const glm::mat3& data);
+    void setProgramUniform(unsigned int, const char*, const glm::mat4& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::vec2>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::vec3>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::vec4>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat3>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat4>& data);
 };
-

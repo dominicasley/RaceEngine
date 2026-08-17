@@ -4,7 +4,7 @@
 #include <optional>
 #include <vector>
 #include <tiny_gltf.h>
-#include "Shared/Services/MemoryStorageService.h"
+#include <Shared/Services/MemoryStorageService.h>
 #include "Graphics/Models/Scene/Model.h"
 #include "Graphics/Models/Scene/TextureFormat.h"
 #include "Graphics/Models/Scene/Material.h"

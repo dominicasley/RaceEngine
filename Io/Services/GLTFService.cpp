@@ -1,6 +1,9 @@
 #include "GLTFService.h"
 #include "../Utility/AccessorUtility.h"
 
+#include <set>
+#include <utility>
+
 #define TINYGLTF_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -237,14 +240,49 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
         model.materials.push_back(material);
     }
 
-    for (const auto& bufferView: tinyGltfModel.bufferViews)
+    // bufferView.target is optional in glTF; infer it from usage when absent:
+    // views referenced by primitive indices are element array buffers, everything else uploads as a vertex buffer.
+    std::set<int> indexBufferViews;
+    for (const auto& tinyGltfMesh: tinyGltfModel.meshes)
     {
+        for (const auto& primitive: tinyGltfMesh.primitives)
+        {
+            if (primitive.indices < 0)
+            {
+                continue;
+            }
+
+            const auto bufferView = tinyGltfModel.accessors[static_cast<size_t>(primitive.indices)].bufferView;
+            if (bufferView >= 0)
+            {
+                indexBufferViews.insert(bufferView);
+            }
+        }
+    }
+
+    for (auto i = 0; std::cmp_less(i, tinyGltfModel.bufferViews.size()); i++)
+    {
+        const auto& bufferView = tinyGltfModel.bufferViews[static_cast<size_t>(i)];
+
+        auto target = bufferView.target;
+        if (target == 0)
+        {
+            target = indexBufferViews.contains(i)
+                         ? TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER
+                         : TINYGLTF_TARGET_ARRAY_BUFFER;
+        }
+
+        // Store only this view's slice of the binary blob; accessor byte offsets are
+        // relative to the bufferView, so they keep working against the sliced data.
+        const auto& blob = tinyGltfModel.buffers[static_cast<size_t>(bufferView.buffer)].data;
+        const auto sliceBegin = blob.begin() + static_cast<std::ptrdiff_t>(bufferView.byteOffset);
+
         model.meshBuffers.push_back(MeshBuffer{
-            .target = bufferView.target,
+            .target = target,
             .length = bufferView.byteLength,
-            .offset = bufferView.byteOffset,
+            .offset = 0,
             .stride = bufferView.byteStride,
-            .data = tinyGltfModel.buffers[bufferView.buffer].data
+            .data = std::vector<unsigned char>(sliceBegin, sliceBegin + static_cast<std::ptrdiff_t>(bufferView.byteLength))
         });
     }
 

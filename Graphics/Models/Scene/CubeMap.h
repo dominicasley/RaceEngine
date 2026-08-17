@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Shared/Types/Resource.h>
+
 #include "Texture.h"
 
 struct CubeMap {

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstddef>
+#include <optional>
+#include <vector>
+
 struct MeshBuffer {
     int target;
     std::optional<unsigned int> gpuId;

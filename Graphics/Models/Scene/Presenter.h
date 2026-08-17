@@ -1,6 +1,8 @@
 #pragma once
 
-#include "Texture.h"
+#include <Shared/Types/Resource.h>
+
+#include "FboAttachment.h"
 #include "Shader.h"
 
 struct Presenter

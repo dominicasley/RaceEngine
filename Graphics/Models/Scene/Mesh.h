@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <optional>
+#include <glm/glm.hpp>
 #include "MeshBuffer.h"
 #include "MeshPrimitive.h"
 

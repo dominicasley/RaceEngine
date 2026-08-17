@@ -27,7 +27,7 @@ public:
     template<typename T, class... Types>
     std::shared_ptr<T> addComponent(Entity& entity, Types&&... args)
     {
-        auto component = std::make_shared<T>(args...);
+        auto component = std::make_shared<T>(std::forward<Types>(args)...);
         entity.components[std::type_index(typeid(*component))] = component;
 
         return component;

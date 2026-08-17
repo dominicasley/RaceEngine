@@ -34,15 +34,18 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
     window = glfwCreateWindow(windowState.windowWidth,  windowState.windowHeight, "Quack!", nullptr, nullptr);
+
+    if (!window)
+    {
+        logger.error("GLFW failed to create a window!");
+        glfwTerminate();
+        throw std::runtime_error("GLFW failed to create a window!");
+    }
+
     glfwSetWindowPos(window, 150, 150);
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, windowResized);
     glfwSetCursorPosCallback(window, cursorPositionChanged);
-
-    if (!window)
-    {
-        glfwTerminate();
-    }
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -50,6 +53,11 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
 
 GLFWWindow::~GLFWWindow()
 {
+    if (window)
+    {
+        glfwDestroyWindow(window);
+    }
+
     glfwTerminate();
 }
 

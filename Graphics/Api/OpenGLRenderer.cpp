@@ -5,15 +5,38 @@
 #include <vector>
 #include <ranges>
 
+namespace
+{
+    void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity,
+                                            GLsizei, const GLchar* message, const void* userParam)
+    {
+        auto& logger = *static_cast<spdlog::logger*>(const_cast<void*>(userParam));
+
+        switch (severity)
+        {
+            case GL_DEBUG_SEVERITY_NOTIFICATION:
+                logger.debug("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+                break;
+            case GL_DEBUG_SEVERITY_LOW:
+            case GL_DEBUG_SEVERITY_MEDIUM:
+                logger.warn("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+                break;
+            default:
+                logger.error("GL debug message [source 0x{:x}, type 0x{:x}, id {}]: {}", source, type, id, message);
+                break;
+        }
+    }
+}
+
 OpenGLRenderer::OpenGLRenderer(
     spdlog::logger& logger,
     RenderableEntityService& renderableEntityService,
     SceneManagerService& sceneManagerService,
     MemoryStorageService& memoryStorageService) :
     logger(logger),
+    memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
-    sceneManagerService(sceneManagerService),
-    memoryStorageService(memoryStorageService)
+    sceneManagerService(sceneManagerService)
 {
 }
 
@@ -24,6 +47,15 @@ bool OpenGLRenderer::init()
         logger.error("Failed to initialize OpenGL");
         throw std::runtime_error("Failed to initialize OpenGL");
     }
+
+    if (glDebugMessageCallback != nullptr)
+    {
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glDebugMessageCallback(glDebugMessageHandler, &logger);
+    }
+
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAnisotropy);
 
     glClearColor(255.f / 255.f, 255.f / 255.f, 255.f / 255.f, 1.0f);
 
@@ -43,9 +75,23 @@ bool OpenGLRenderer::init()
 
 void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 {
+    currentlyBoundMaterial.reset();
+
     if (camera.output.has_value())
     {
-        glBindFramebuffer(GL_FRAMEBUFFER, camera.output.value()->gpuResourceId.value());
+        if (camera.output.value()->gpuResourceId.has_value())
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, camera.output.value()->gpuResourceId.value());
+        }
+        else
+        {
+            static auto warnedMissingCameraOutput = false;
+            if (!warnedMissingCameraOutput)
+            {
+                logger.warn("Camera output framebuffer has no GPU resource; drawing to default framebuffer");
+                warnedMissingCameraOutput = true;
+            }
+        }
     }
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -60,19 +106,41 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 upload(model);
             }
 
+            if (!mesh.mesh->gpuResourceId.has_value()) {
+                static auto warnedMissingMeshUpload = false;
+                if (!warnedMissingMeshUpload)
+                {
+                    logger.warn("Skipping mesh without a GPU resource: {}", mesh.mesh->name);
+                    warnedMissingMeshUpload = true;
+                }
+
+                continue;
+            }
+
             glBindVertexArray(static_cast<GLuint>(mesh.mesh->gpuResourceId.value()));
 
             auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
 
+            const auto joints = renderableEntityService.joints(mesh, delta);
+
             for (auto& primitive : mesh.mesh->meshPrimitives) {
-                if (!model->meshBuffers[primitive.meshBufferIndex].gpuId.has_value()) {
+                if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value()) {
+                    continue;
+                }
+
+                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value()) {
+                    static auto warnedMissingMaterial = false;
+                    if (!warnedMissingMaterial)
+                    {
+                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh.mesh->name);
+                        warnedMissingMaterial = true;
+                    }
+
                     continue;
                 }
 
                 auto material = primitive.material.value();
                 auto shader = material->shader.value();
-
-                const auto joints = renderableEntityService.joints(mesh, delta);
 
                 setProgramUniform(shader->gpuResourceId, "localToScreen4x4Matrix",
                                   camera.modelViewProjectionMatrix * entityModelMatrix);
@@ -112,7 +180,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
                 }
 
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(model->meshBuffers[primitive.meshBufferIndex].gpuId.value()));
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
 
                 glDrawElements(primitive.mode,
                                static_cast<GLsizei>(primitive.elementCount),
@@ -206,15 +274,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
 
     if (material->emissive.has_value())
     {
-        auto emissive = memoryStorageService.textures.get(material->emissive.value());
+        auto emissive = material->emissive.value();
 
-        if (emissive.gpuResourceId.has_value())
+        if (emissive->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE3);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(emissive.gpuResourceId.value()));
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(emissive->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", true);
         }
-
     }
     else
     {
@@ -254,10 +321,10 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
     else
     {
         glActiveTexture(GL_TEXTURE5);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     }
 
-    for (auto i = 0; i < material->textures.size(); i++)
+    for (auto i = 0u; i < material->textures.size(); i++)
     {
         auto texture = material->textures[i];
 
@@ -292,10 +359,13 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
             GLuint vbo;
             glGenBuffers(1, &vbo);
-            glBindBuffer(buffer.target, vbo);
-            glBufferData(buffer.target, buffer.length, &buffer.data.at(0) + buffer.offset, GL_STATIC_DRAW);
+            glBindBuffer(static_cast<GLenum>(buffer.target), vbo);
+            glBufferData(static_cast<GLenum>(buffer.target), static_cast<GLsizeiptr>(buffer.data.size()),
+                         buffer.data.data(), GL_STATIC_DRAW);
 
             buffer.gpuId = vbo;
+            buffer.data.clear();
+            buffer.data.shrink_to_fit();
         }
 
         memoryStorageService.models.update(modelKey, model);
@@ -304,7 +374,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
         {
             for (const auto& attribute : primitive.attributes)
             {
-                glBindBuffer(GL_ARRAY_BUFFER, model.meshBuffers[attribute.bufferIndex].gpuId.value());
+                glBindBuffer(GL_ARRAY_BUFFER, model.meshBuffers[static_cast<size_t>(attribute.bufferIndex)].gpuId.value());
 
                 if (attribute.attributeType.has_value())
                 {
@@ -439,17 +509,23 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     glLinkProgram(programId);
 
     auto result = GL_FALSE;
-    GLint infoLogLength;
+    GLint infoLogLength = 0;
     glGetProgramiv(programId, GL_LINK_STATUS, &result);
     glGetProgramiv(programId, GL_INFO_LOG_LENGTH, &infoLogLength);
 
     if (infoLogLength > 1)
     {
-        std::vector<char> errorMessage(infoLogLength + 1);
-        glGetProgramInfoLog(programId, infoLogLength, nullptr, &errorMessage[0]);
-        logger.error("shader link error: {}", std::string(errorMessage.begin(), errorMessage.end()));
+        std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
+        glGetProgramInfoLog(programId, infoLogLength, nullptr, infoLog.data());
 
-        return {};
+        if (result == GL_TRUE)
+        {
+            logger.warn("shader link log: {}", infoLog.data());
+        }
+        else
+        {
+            logger.error("shader link error: {}", infoLog.data());
+        }
     }
 
     glDeleteShader(vertexShaderId);
@@ -459,15 +535,18 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     glDeleteShader(computeShaderId);
     glDeleteShader(geometryShaderId);
 
+    if (result != GL_TRUE)
+    {
+        glDeleteProgram(programId);
+        return {};
+    }
+
     return programId;
 }
 
 unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
 {
     unsigned int textureId;
-
-    GLfloat fLargest;
-    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &fLargest);
 
     glGenTextures(1, &textureId);
     glBindTexture(GL_TEXTURE_2D, textureId);
@@ -484,7 +563,7 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameterf(GL_TEXTURE_2D, GL_MAX_TEXTURE_MAX_ANISOTROPY, fLargest);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, maxAnisotropy);
 
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -536,8 +615,8 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
     glGenFramebuffers(1, &fboGpuResourceId);
     glBindFramebuffer(GL_FRAMEBUFFER, fboGpuResourceId);
 
-    auto colourAttachmentIndex = 0;
-    std::vector<unsigned int> attachments;
+    auto colourAttachmentIndex = 0u;
+    std::vector<unsigned int> drawBuffers;
 
     for (auto& attachmentKey: fbo.attachments)
     {
@@ -569,6 +648,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
             case FboAttachmentType::Color:
                 attachmentType = GL_COLOR_ATTACHMENT0 + colourAttachmentIndex;
                 colourAttachmentIndex++;
+                drawBuffers.push_back(attachmentType);
                 break;
             case FboAttachmentType::Depth:
                 attachmentType = GL_DEPTH_ATTACHMENT;
@@ -583,12 +663,32 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 
         glFramebufferTexture2D(GL_FRAMEBUFFER, attachmentType, GL_TEXTURE_2D, attachmentGpuResourceId, 0);
         attachment.gpuResourceId = attachmentGpuResourceId;
-        attachments.push_back(attachmentType);
 
         memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
     }
 
-    glDrawBuffers(static_cast<GLsizei>(attachments.size()), attachments.data());
+    glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
+
+    const auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        const auto* statusName = "unknown status";
+        switch (status)
+        {
+            case GL_FRAMEBUFFER_UNDEFINED: statusName = "GL_FRAMEBUFFER_UNDEFINED"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: statusName = "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: statusName = "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER: statusName = "GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER: statusName = "GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER"; break;
+            case GL_FRAMEBUFFER_UNSUPPORTED: statusName = "GL_FRAMEBUFFER_UNSUPPORTED"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: statusName = "GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE"; break;
+            case GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS: statusName = "GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS"; break;
+            default: break;
+        }
+
+        logger.error("Framebuffer incomplete: {} (0x{:x})", statusName, status);
+    }
+
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     return fboGpuResourceId;
@@ -613,124 +713,128 @@ void OpenGLRenderer::deleteFbo(Fbo& fbo) const
 
 bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
 {
-    auto vertexShader = source.c_str();
-    glShaderSource(id, 1, &vertexShader, nullptr);
+    auto shaderSource = source.c_str();
+    glShaderSource(id, 1, &shaderSource, nullptr);
     glCompileShader(id);
 
     auto result = GL_FALSE;
-    GLint infoLogLength;
+    GLint infoLogLength = 0;
     glGetShaderiv(id, GL_COMPILE_STATUS, &result);
     glGetShaderiv(id, GL_INFO_LOG_LENGTH, &infoLogLength);
 
     if (infoLogLength > 1)
     {
-        std::vector<char> errorMessage(infoLogLength + 1);
-        glGetShaderInfoLog(id, infoLogLength, nullptr, &errorMessage[0]);
-        logger.error("Shader compile error: {}", errorMessage.data());
+        std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
+        glGetShaderInfoLog(id, infoLogLength, nullptr, infoLog.data());
 
-        return false;
+        if (result == GL_TRUE)
+        {
+            logger.warn("Shader compile log: {}", infoLog.data());
+        }
+        else
+        {
+            logger.error("Shader compile error: {}", infoLog.data());
+        }
     }
 
-    return true;
+    return result == GL_TRUE;
 }
 
-unsigned int OpenGLRenderer::getUniformLocation(unsigned int programId, const std::string& uniformName)
+int OpenGLRenderer::getUniformLocation(const unsigned int programId, const char* uniformName)
 {
-    unsigned int propertyLocation;
-    const auto result = uniformPool.find(UniformKey(programId, uniformName));
+    const auto key = std::pair<unsigned int, std::string_view>(programId, uniformName);
+    const auto result = uniformPool.find(key);
 
     if (result != uniformPool.end())
     {
-        propertyLocation = result->second;
+        return result->second;
     }
-    else
-    {
-        propertyLocation = glGetUniformLocation(programId, uniformName.c_str());
-        uniformPool[UniformKey(programId, uniformName)] = propertyLocation;
-    }
+
+    const auto propertyLocation = glGetUniformLocation(programId, uniformName);
+    uniformPool.emplace(std::pair<unsigned int, std::string>(programId, uniformName), propertyLocation);
 
     return propertyLocation;
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const int value)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const int value)
 {
     glProgramUniform1i(programId, getUniformLocation(programId, uniformName), value);
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const float data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const float data)
 {
     glProgramUniform1f(programId, getUniformLocation(programId, uniformName), data);
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const double data)
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const double data)
 {
     glProgramUniform1d(programId, getUniformLocation(programId, uniformName), data);
 }
 
 void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const glm::vec2& data)
+OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec2& data)
 {
     glProgramUniform2f(programId, getUniformLocation(programId, uniformName), data.x, data.y);
 }
 
 void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const glm::vec3& data)
+OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec3& data)
 {
     glProgramUniform3f(programId, getUniformLocation(programId, uniformName), data.x, data.y, data.z);
 }
 
 void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const glm::vec4& data)
+OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::vec4& data)
 {
     glProgramUniform4f(programId, getUniformLocation(programId, uniformName), data.x, data.y, data.z, data.w);
 }
 
 void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const glm::mat3& data)
+OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat3& data)
 {
     glProgramUniformMatrix3fv(programId, getUniformLocation(programId, uniformName), 1, GL_FALSE, &data[0][0]);
 }
 
 void
-OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName, const glm::mat4& data)
+OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName, const glm::mat4& data)
 {
     auto location = getUniformLocation(programId, uniformName);
     glProgramUniformMatrix4fv(programId, location, 1, GL_FALSE, &data[0][0]);
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName,
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::vec2>& data)
 {
     glProgramUniform2fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
-                        (float*) data.data());
+                        reinterpret_cast<const float*>(data.data()));
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName,
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::vec3>& data)
 {
     glProgramUniform3fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
-                        (float*) data.data());
+                        reinterpret_cast<const float*>(data.data()));
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName,
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::vec4>& data)
 {
     glProgramUniform4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
-                        (float*) data.data());
+                        reinterpret_cast<const float*>(data.data()));
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName,
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::mat3>& data)
 {
     glProgramUniformMatrix3fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
-                              GL_FALSE, (float*) data.data());
+                              GL_FALSE, reinterpret_cast<const float*>(data.data()));
 }
 
-void OpenGLRenderer::setProgramUniform(const unsigned int programId, const std::string& uniformName,
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::mat4>& data)
 {
     glProgramUniformMatrix4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
-                              GL_FALSE, (float*) data.data());
+                              GL_FALSE, reinterpret_cast<const float*>(data.data()));
 }
 
 void OpenGLRenderer::setViewport(int width, int height)

@@ -2,7 +2,7 @@
 
 #include <spdlog/logger.h>
 
-#include "Shared/Services/MemoryStorageService.h"
+#include <Shared/Services/MemoryStorageService.h>
 #include "../Models/Scene/CubeMap.h"
 #include "../Api/OpenGLRenderer.h"
 

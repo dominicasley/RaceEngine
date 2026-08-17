@@ -11,7 +11,7 @@ FboService::FboService(spdlog::logger& logger, MemoryStorageService& memoryStora
 
 Resource<Fbo> FboService::create(const CreateFboDTO& createFboDTO) const
 {
-    auto createAttachments = [&](auto attachmentsDto) {
+    auto createAttachments = [&](const auto& attachmentsDto) {
         std::vector<Resource<FboAttachment>> attachments;
 
         for (auto& attachment: attachmentsDto)

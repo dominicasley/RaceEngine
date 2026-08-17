@@ -60,7 +60,7 @@ void CameraService::translate(Camera& camera, float x, float y, float z) const
 
 void CameraService::setDirection(Camera& camera, float x, float y, float z) const
 {
-    if (x == camera.position.x && y == camera.position.y && z == camera.position.z)
+    if (x == camera.direction.x && y == camera.direction.y && z == camera.direction.z)
         return;
 
     camera.direction.x = x;
@@ -70,7 +70,7 @@ void CameraService::setDirection(Camera& camera, float x, float y, float z) cons
 
 void CameraService::rotate(Camera& camera, float x, float y, float z) const
 {
-    if (x == camera.position.x && y == camera.position.y && z == camera.position.z)
+    if (x == camera.direction.x && y == camera.direction.y && z == camera.direction.z)
         return;
 
     camera.direction.x += x;

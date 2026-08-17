@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstddef>
+#include <optional>
+#include <vector>
+
 #include "PrimitiveAttributeType.h"
 #include "VertexIndicesType.h"
 #include "Material.h"

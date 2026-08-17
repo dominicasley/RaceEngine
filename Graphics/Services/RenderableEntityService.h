@@ -4,8 +4,7 @@
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
 
-#include <Services/MemoryStorageService.h>
-#include "../../Io/Utility/AccessorUtility.h"
+#include <Shared/Services/MemoryStorageService.h>
 #include "../Models/Scene/CreateRenderableModelDTO.h"
 #include "../Models/Scene/RenderableEntity.h"
 #include "../Models/Scene/RenderableMesh.h"

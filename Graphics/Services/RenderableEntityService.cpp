@@ -1,5 +1,6 @@
 #include "RenderableEntityService.h"
 
+#include <cmath>
 #include <cstring>
 
 RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
@@ -63,11 +64,11 @@ RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeD
 
     if (!renderableMesh.animations.empty())
     {
-        auto mesh = renderableMesh.mesh;
+        const auto& mesh = renderableMesh.mesh;
         auto animation = renderableMesh.animations[renderableMesh.currentAnimationIndex].value;
         auto skeleton = renderableMesh.skeleton.value().value;
 
-        renderableMesh.animationTime = fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
+        renderableMesh.animationTime = std::fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
 
         ozz::animation::SamplingJob sampling_job;
         sampling_job.animation = animation->get();
@@ -83,11 +84,25 @@ RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeD
         ltm_job.Run();
 
         out.resize(renderableMesh.animationModelSpaceTransforms.size());
-        for (auto i = 0; i < renderableMesh.animationModelSpaceTransforms.size(); i++)
+        for (size_t i = 0; i < renderableMesh.animationModelSpaceTransforms.size(); i++)
         {
-            out[renderableMesh.jointMap[i]] =
+            const auto mapping = renderableMesh.jointMap.find(static_cast<int>(i));
+            if (mapping == renderableMesh.jointMap.end())
+            {
+                logger.warn("No joint mapping for ozz joint {} in mesh {}; skipping", i, mesh->name);
+                continue;
+            }
+
+            const auto jointIndex = static_cast<size_t>(mapping->second);
+            if (jointIndex >= out.size() || jointIndex >= mesh->inverseBindPoseTransforms.size())
+            {
+                logger.warn("Joint index {} out of range for mesh {}; skipping", jointIndex, mesh->name);
+                continue;
+            }
+
+            out[jointIndex] =
                 ozzToMat4(renderableMesh.animationModelSpaceTransforms[i]) *
-                    mesh->inverseBindPoseTransforms[renderableMesh.jointMap[i]];
+                    mesh->inverseBindPoseTransforms[jointIndex];
         }
     }
 
@@ -103,9 +118,9 @@ void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::un
     mesh.animationModelSpaceTransforms.resize(skeleton->get()->num_joints());
     mesh.animationCache = std::make_unique<ozz::animation::SamplingJob::Context>(skeleton->get()->num_joints());
 
+    const auto& m = memoryStorageService.meshes.get(mesh.mesh);
     for (auto i = 0; i < skeleton->get()->num_joints(); i++)
     {
-        auto m = memoryStorageService.meshes.get(mesh.mesh);
         auto ozzJointName = skeleton->get()->joint_names()[i];
 
         mesh.jointMap[i] = m.skin.at(ozzJointName);

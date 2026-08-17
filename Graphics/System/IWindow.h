@@ -10,6 +10,7 @@
 class IWindow
 {
 public:
+    virtual ~IWindow() = default;
     virtual void makeContextCurrent() = 0;
     virtual void swapBuffers() const = 0;
     virtual void setMousePosition(int x, int y) = 0;

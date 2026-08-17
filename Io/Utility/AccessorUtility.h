@@ -1,46 +1,47 @@
 #pragma once
 
+#include <cstddef>
+#include <cstring>
 #include <vector>
 #include <tiny_gltf.h>
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <spdlog/spdlog.h>
 
 class AccessorUtility
 {
 private:
     template<typename T>
-    static std::vector<std::vector<T>> readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor);
+    static std::vector<T> readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor);
+
+    static size_t componentsPerElement(const tinygltf::Accessor& accessor)
+    {
+        return static_cast<size_t>(tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type)));
+    }
 
 public:
     template<typename T>
-    inline static T get(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+    inline static T get(const tinygltf::Model&, const tinygltf::Accessor&)
     {};
 };
 
 template<typename T> inline
-std::vector<std::vector<T>> AccessorUtility::readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+std::vector<T> AccessorUtility::readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
-    auto accessorOffset = accessor.byteOffset;
-    auto stride = accessor.ByteStride(model.bufferViews[accessor.bufferView]);
-    auto offset = model.bufferViews[accessor.bufferView].byteOffset;
+    const auto& bufferView = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
+    const auto& buffer = model.buffers[static_cast<size_t>(bufferView.buffer)];
 
-    auto out = std::vector<std::vector<T>>(accessor.count);
-    const auto buffer = model.buffers[model.bufferViews[accessor.bufferView].buffer];
+    const auto stride = static_cast<size_t>(accessor.ByteStride(bufferView));
+    const auto components = componentsPerElement(accessor);
+    const auto elementBytes =
+        static_cast<size_t>(tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType))) *
+        components;
+    const auto base = bufferView.byteOffset + accessor.byteOffset;
 
-    for (auto i = 0; i < accessor.count; i++)
+    auto out = std::vector<T>(accessor.count * components);
+
+    for (size_t i = 0; i < accessor.count; i++)
     {
-        auto start = buffer.data.begin() + accessorOffset + offset + i * stride;
-        auto chunk = std::vector<unsigned char>(start, start +
-                                                       tinygltf::GetComponentSizeInBytes(accessor.componentType) *
-                                                       tinygltf::GetNumComponentsInType(accessor.type));
-
-        auto typedChunk = std::vector<T>(tinygltf::GetNumComponentsInType(accessor.type));
-        memcpy(typedChunk.data(), chunk.data(),
-               static_cast<size_t>(tinygltf::GetComponentSizeInBytes(accessor.componentType) *
-                                   tinygltf::GetNumComponentsInType(accessor.type)));
-
-        out[i] = typedChunk;
+        std::memcpy(out.data() + i * components, buffer.data.data() + base + i * stride, elementBytes);
     }
 
     return out;
@@ -57,29 +58,18 @@ float AccessorUtility::get<float>(const tinygltf::Model& model, const tinygltf::
         return 0.0f;
     }
 
-    return result[0][0];
+    return result[0];
 }
 
 template<> inline
 std::vector<float>
 AccessorUtility::get<std::vector<float>>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
-    const auto results = readBytes<float>(model, accessor);
-    auto out = std::vector<float>();
-
-    for (auto floatSet : results)
-    {
-        for (auto f : floatSet)
-        {
-            out.push_back(f);
-        }
-    }
-
-    return out;
+    return readBytes<float>(model, accessor);
 }
 
 template<> inline
-glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model&, const tinygltf::Accessor&)
 {
     return glm::vec2(1.0f);
 }
@@ -89,12 +79,12 @@ glm::vec3 AccessorUtility::get<glm::vec3>(const tinygltf::Model& model, const ti
 {
     const auto result = readBytes<float>(model, accessor);
 
-    if (result.empty())
+    if (result.size() < 3)
     {
         return glm::vec3(0.0f);
     }
 
-    return glm::make_vec3(result[0].data());
+    return glm::make_vec3(result.data());
 }
 
 template<> inline
@@ -103,10 +93,11 @@ AccessorUtility::get<std::vector<glm::vec3>>(const tinygltf::Model& model, const
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::vec3>();
+    out.reserve(results.size() / 3);
 
-    for (auto vectorSet : results)
+    for (size_t i = 0; i + 3 <= results.size(); i += 3)
     {
-        out.push_back(glm::make_vec3(vectorSet.data()));
+        out.push_back(glm::make_vec3(results.data() + i));
     }
 
     return out;
@@ -117,12 +108,12 @@ glm::quat AccessorUtility::get<glm::quat>(const tinygltf::Model& model, const ti
 {
     const auto result = readBytes<float>(model, accessor);
 
-    if (result.empty())
+    if (result.size() < 4)
     {
         return glm::quat();
     }
 
-    return glm::make_quat(result[0].data());
+    return glm::make_quat(result.data());
 }
 
 template<> inline
@@ -131,17 +122,18 @@ AccessorUtility::get<std::vector<glm::quat>>(const tinygltf::Model& model, const
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::quat>();
+    out.reserve(results.size() / 4);
 
-    for (auto m4 : results)
+    for (size_t i = 0; i + 4 <= results.size(); i += 4)
     {
-        out.push_back(glm::make_quat(m4.data()));
+        out.push_back(glm::make_quat(results.data() + i));
     }
 
     return out;
 }
 
 template<> inline
-glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
+glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model&, const tinygltf::Accessor&)
 {
     return glm::vec4(1.0f);
 }
@@ -152,10 +144,11 @@ AccessorUtility::get<std::vector<glm::mat4>>(const tinygltf::Model& model, const
 {
     const auto results = readBytes<float>(model, accessor);
     auto out = std::vector<glm::mat4>();
+    out.reserve(results.size() / 16);
 
-    for (auto m4 : results)
+    for (size_t i = 0; i + 16 <= results.size(); i += 16)
     {
-        out.push_back(glm::make_mat4(m4.data()));
+        out.push_back(glm::make_mat4(results.data() + i));
     }
 
     return out;
