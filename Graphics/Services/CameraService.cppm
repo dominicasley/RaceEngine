@@ -1,6 +1,5 @@
 module;
 
-#include <spdlog/logger.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -17,13 +16,12 @@ namespace raceengine
 export class CameraService
 {
 private:
-    spdlog::logger& logger;
     MemoryStorageService& memoryStorageService;
     FboService& fboService;
     IWindow& window;
 
 public:
-    explicit CameraService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
+    explicit CameraService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
     Camera createCamera();
     void setPosition(Camera& camera, float x, float y, float z) const;
     void setDirection(Camera& camera, float x, float y, float z) const;
@@ -40,8 +38,7 @@ public:
     const glm::mat4& updateModelViewMatrix(Camera& camera) const;
 };
 
-CameraService::CameraService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
-    logger(logger),
+CameraService::CameraService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
     memoryStorageService(memoryStorageService),
     fboService(fboService),
     window(window)

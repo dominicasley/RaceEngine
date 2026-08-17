@@ -29,6 +29,7 @@ export using raceengine::CreateRenderableModelDTO;
 export using raceengine::Drawable;
 export using raceengine::Entity;
 export using raceengine::FboAttachmentType;
+export using raceengine::Key;
 export using raceengine::Presenter;
 export using raceengine::RenderableModel;
 export using raceengine::Scene;
@@ -145,21 +146,17 @@ namespace raceengine
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
     glfwWindow(*logger),
-    memoryStorageService(*logger),
-    backgroundWorkerService(*logger),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
     renderableEntityService(*logger, memoryStorageService),
-    sceneManagerService(*logger),
     openGlRenderer(*logger, renderableEntityService, sceneManagerService, memoryStorageService),
-    fboService(*logger, memoryStorageService, openGlRenderer),
-    shaderService(*logger, memoryStorageService, openGlRenderer),
-    cubeMapService(*logger, openGlRenderer, memoryStorageService),
-    postProcessService(*logger, memoryStorageService, fboService, glfwWindow),
-    presenterService(*logger, openGlRenderer),
-    cameraService(*logger, memoryStorageService, fboService, glfwWindow),
-    sceneService(*logger, renderableEntityService, cameraService),
-    entityService(*logger)
+    fboService(memoryStorageService, openGlRenderer),
+    shaderService(memoryStorageService, openGlRenderer),
+    cubeMapService(openGlRenderer, memoryStorageService),
+    postProcessService(memoryStorageService, fboService, glfwWindow),
+    presenterService(openGlRenderer),
+    cameraService(memoryStorageService, fboService, glfwWindow),
+    sceneService(renderableEntityService, cameraService)
 {
     openGlRenderer.init();
     openGlRenderer.setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);

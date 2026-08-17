@@ -2,9 +2,9 @@ set(CMAKE_CXX_STANDARD 23)
 cmake_minimum_required (VERSION 3.28)
 
 # Warning/sanitizer flags ride an INTERFACE carrier so vendored code stays untouched.
-# -Werror arrives once the first-party warning count reaches zero.
 add_library(raceengine_warnings INTERFACE)
 target_compile_options(raceengine_warnings INTERFACE
+        -Werror
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
         -Wold-style-cast -Wnon-virtual-dtor -Woverloaded-virtual
         -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough)

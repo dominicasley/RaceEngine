@@ -33,7 +33,7 @@ export enum class VertexIndicesType {
 
 export struct MeshBuffer {
     int target;
-    std::optional<unsigned int> gpuId;
+    std::optional<unsigned int> gpuId{};
     size_t length;
     size_t offset;
     size_t stride;
@@ -58,7 +58,7 @@ export struct MeshPrimitive {
     size_t byteOffset;
     int componentType;
     int meshBufferIndex;
-    std::vector<MeshPrimitiveAttribute> attributes;
+    std::vector<MeshPrimitiveAttribute> attributes{};
 };
 
 export struct Mesh {

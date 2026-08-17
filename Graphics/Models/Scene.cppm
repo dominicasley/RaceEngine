@@ -60,17 +60,17 @@ export struct Camera
     unsigned int iso;
     float aspectRatio;
     float aperture;
-    float exposure;
+    float exposure{};
     float fieldOfView;
-    float nearClippingPlane;
-    float farClippingPlane;
-    glm::vec3 position;
+    float nearClippingPlane{};
+    float farClippingPlane{};
+    glm::vec3 position{};
     glm::vec3 direction;
     glm::vec3 roll;
-    glm::mat4 modelViewProjectionMatrix;
-    glm::mat4 modelViewMatrix;
+    glm::mat4 modelViewProjectionMatrix{};
+    glm::mat4 modelViewMatrix{};
     std::optional<Resource<Fbo>> output;
-    std::vector<Resource<PostProcess>> postProcesses;
+    std::vector<Resource<PostProcess>> postProcesses{};
 };
 
 export enum class RenderableEntityType {
@@ -87,15 +87,15 @@ export struct RenderableEntity
 };
 
 export struct RenderableMesh {
-    float animationTime;
-    unsigned int currentAnimationIndex;
+    float animationTime{};
+    unsigned int currentAnimationIndex{};
     const Resource<Mesh> mesh;
-    ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms;
-    ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms;
+    ozz::vector<ozz::math::SoaTransform> animationLocalSpaceTransforms{};
+    ozz::vector<ozz::math::Float4x4> animationModelSpaceTransforms{};
     std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;
-    std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations;
-    std::unique_ptr<ozz::animation::SamplingJob::Context> animationCache;
-    std::map<int, int> jointMap;
+    std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations{};
+    std::unique_ptr<ozz::animation::SamplingJob::Context> animationCache{};
+    std::map<int, int> jointMap{};
 };
 
 export struct RenderableModel : public RenderableEntity

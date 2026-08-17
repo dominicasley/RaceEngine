@@ -73,7 +73,7 @@ RenderableModel RenderableEntityService::createModel(const CreateRenderableModel
     return RenderableModel(entityDescriptor.node, entityDescriptor.model, createMeshes(entityDescriptor));
 }
 
-void RenderableEntityService::setAnimation(RenderableMesh& mesh, const std::string& animationName) const
+void RenderableEntityService::setAnimation(RenderableMesh&, const std::string&) const
 {
 
 }
@@ -83,7 +83,6 @@ void RenderableEntityService::setAnimation(RenderableMesh& mesh, unsigned int an
     if (mesh.animations.size() > animationIndex)
     {
         mesh.currentAnimationIndex = animationIndex;
-        const auto animation = mesh.animations[animationIndex];
     }
 }
 
@@ -152,14 +151,14 @@ void RenderableEntityService::setSkeleton(RenderableMesh& mesh, Resource<std::un
     auto skeleton = skeletonKey.value;
 
     mesh.skeleton = skeletonKey;
-    mesh.animationLocalSpaceTransforms.resize(skeleton->get()->num_soa_joints());
-    mesh.animationModelSpaceTransforms.resize(skeleton->get()->num_joints());
+    mesh.animationLocalSpaceTransforms.resize(static_cast<size_t>(skeleton->get()->num_soa_joints()));
+    mesh.animationModelSpaceTransforms.resize(static_cast<size_t>(skeleton->get()->num_joints()));
     mesh.animationCache = std::make_unique<ozz::animation::SamplingJob::Context>(skeleton->get()->num_joints());
 
     const auto& m = memoryStorageService.meshes.get(mesh.mesh);
     for (auto i = 0; i < skeleton->get()->num_joints(); i++)
     {
-        auto ozzJointName = skeleton->get()->joint_names()[i];
+        auto ozzJointName = skeleton->get()->joint_names()[static_cast<size_t>(i)];
 
         mesh.jointMap[i] = m.skin.at(ozzJointName);
     }

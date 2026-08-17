@@ -2,8 +2,6 @@ module;
 
 #include <optional>
 
-#include <spdlog/logger.h>
-
 export module raceengine.graphics:PresenterService;
 
 import :OpenGLRenderer;
@@ -15,19 +13,17 @@ namespace raceengine
 export class PresenterService
 {
 private:
-    spdlog::logger& logger;
     OpenGLRenderer& renderer;
     std::optional<Presenter> presenter;
 
 public:
-    explicit PresenterService(spdlog::logger& logger, OpenGLRenderer& renderer);
+    explicit PresenterService(OpenGLRenderer& renderer);
     void setPresenter(const Presenter& presenter);
     void present() const;
 
 };
 
-PresenterService::PresenterService(spdlog::logger& logger, OpenGLRenderer& renderer) : logger(logger),
-                                                                                       renderer(renderer)
+PresenterService::PresenterService(OpenGLRenderer& renderer) : renderer(renderer)
 {
 
 }

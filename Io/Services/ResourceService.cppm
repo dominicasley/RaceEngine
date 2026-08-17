@@ -74,7 +74,7 @@ std::expected<std::string, std::string> ResourceService::loadTextFile(const std:
     }
 
     fileStream.seekg(0, std::ios::end);
-    output.reserve(fileStream.tellg());
+    output.reserve(static_cast<size_t>(fileStream.tellg()));
     fileStream.seekg(0, std::ios::beg);
 
     output.assign((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());

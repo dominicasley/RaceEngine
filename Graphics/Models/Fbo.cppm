@@ -28,26 +28,26 @@ export enum class FboType
 export struct FboAttachment
 {
     FboAttachmentType type;
-    std::optional<unsigned int> gpuResourceId;
+    std::optional<unsigned int> gpuResourceId{};
     unsigned int width;
     unsigned int height;
     TextureFormat captureFormat;
     TextureFormat internalFormat;
-    std::vector<unsigned char> data;
+    std::vector<unsigned char> data{};
 };
 
 export struct Fbo
 {
     FboType type;
-    std::optional<unsigned int> gpuResourceId;
+    std::optional<unsigned int> gpuResourceId{};
     std::vector<Resource<FboAttachment>> attachments;
 };
 
 export struct PostProcess {
     Resource<Shader> shader;
     std::optional<Resource<Fbo>> output;
-    std::vector<Resource<FboAttachment>> inputs;
-    std::vector<Resource<FboAttachment>> attachments;
+    std::vector<Resource<FboAttachment>> inputs{};
+    std::vector<Resource<FboAttachment>> attachments{};
 };
 
 export struct Presenter

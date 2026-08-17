@@ -2,7 +2,6 @@ module;
 
 #include <deque>
 
-#include <spdlog/logger.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -16,13 +15,9 @@ namespace raceengine
 export class SceneManagerService
 {
 private:
-    spdlog::logger& logger;
-
     std::deque<Scene> scenes;
 
 public:
-    explicit SceneManagerService(spdlog::logger& logger);
-
     [[nodiscard]] std::deque<Scene>& getScenes();
     [[nodiscard]] Scene& getScene(int index);
     [[nodiscard]] Scene& createScene();
@@ -37,11 +32,6 @@ public:
     void setParent(SceneNode& node, SceneNode& parent) const;
 };
 
-SceneManagerService::SceneManagerService(spdlog::logger& logger) :
-    logger(logger)
-{
-}
-
 std::deque<Scene>& SceneManagerService::getScenes()
 {
     return scenes;
@@ -49,7 +39,7 @@ std::deque<Scene>& SceneManagerService::getScenes()
 
 Scene& SceneManagerService::getScene(int index)
 {
-    return scenes.at(index);
+    return scenes.at(static_cast<size_t>(index));
 }
 
 Scene& SceneManagerService::createScene()

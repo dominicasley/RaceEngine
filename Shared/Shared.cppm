@@ -4,7 +4,6 @@ module;
 #include <memory>
 #include <mutex>
 
-#include <spdlog/logger.h>
 #include <ozz/animation/runtime/animation.h>
 #include <ozz/animation/runtime/skeleton.h>
 
@@ -67,9 +66,6 @@ public:
 
 export class MemoryStorageService
 {
-private:
-    spdlog::logger& logger;
-
 public:
     const MemoryStorage<Model> models;
     const MemoryStorage<Mesh> meshes;
@@ -82,13 +78,6 @@ public:
     const MemoryStorage<PostProcess> postProcesses;
     const MemoryStorage<std::unique_ptr<ozz::animation::Skeleton>> skeletons;
     const MemoryStorage<std::unique_ptr<ozz::animation::Animation>> animations;
-
-    explicit MemoryStorageService(spdlog::logger& logger);
 };
-
-MemoryStorageService::MemoryStorageService(spdlog::logger& logger) : logger(logger)
-{
-
-}
 
 } // namespace raceengine

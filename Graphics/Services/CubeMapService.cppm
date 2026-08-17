@@ -2,8 +2,6 @@ module;
 
 #include <string>
 
-#include <spdlog/logger.h>
-
 export module raceengine.graphics:CubeMapService;
 
 import :OpenGLRenderer;
@@ -16,12 +14,11 @@ namespace raceengine
 export class CubeMapService
 {
 private:
-    spdlog::logger& logger;
     OpenGLRenderer& renderer;
     MemoryStorageService& memoryStorageService;
 
 public:
-    explicit CubeMapService(spdlog::logger& logger, OpenGLRenderer& renderer, MemoryStorageService& memoryStorageService);
+    explicit CubeMapService(OpenGLRenderer& renderer, MemoryStorageService& memoryStorageService);
     Resource<CubeMap> create(
         const std::string& name,
         const Resource<Texture>& front,
@@ -33,10 +30,8 @@ public:
 };
 
 CubeMapService::CubeMapService(
-    spdlog::logger& logger,
     OpenGLRenderer& renderer,
     MemoryStorageService& memoryStorageService) :
-    logger(logger),
     renderer(renderer),
     memoryStorageService(memoryStorageService)
 {
@@ -44,7 +39,7 @@ CubeMapService::CubeMapService(
 }
 
 Resource<CubeMap> CubeMapService::create(
-    const std::string& name,
+    const std::string&,
     const Resource<Texture>& frontTextureKey,
     const Resource<Texture>& backTextureKey,
     const Resource<Texture>& leftTextureKey,

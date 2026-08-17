@@ -8,8 +8,6 @@ module;
 #include <typeindex>
 #include <utility>
 
-#include <spdlog/logger.h>
-
 // Single interface unit: four tiny declarations and one out-of-line service; partitions
 // would add build-graph nodes without isolating anything.
 export module raceengine.game;
@@ -51,12 +49,9 @@ public:
 export class EntityService
 {
 private:
-    spdlog::logger& logger;
     std::deque<Entity> entities;
 
 public:
-    explicit EntityService(spdlog::logger& logger);
-
     Entity& createEntity();
     [[nodiscard]] Entity& getEntity(unsigned long long entityId);
 
@@ -106,10 +101,6 @@ module :private;
 
 namespace raceengine
 {
-
-EntityService::EntityService(
-    spdlog::logger& logger): logger(logger) {
-}
 
 Entity& EntityService::createEntity()
 {

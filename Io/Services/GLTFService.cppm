@@ -108,7 +108,10 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
                                              glm::vec3(node.translation[0], node.translation[1], node.translation[2])) : glm::mat4(1.0f)) *
                                         (node.rotation.size() == 4 ?
                                          glm::mat4_cast(
-                                             glm::quat(node.rotation[3], node.rotation[0], node.rotation[1], node.rotation[2])) : glm::mat4(1.0f)) *
+                                             glm::quat(static_cast<float>(node.rotation[3]),
+                                                       static_cast<float>(node.rotation[0]),
+                                                       static_cast<float>(node.rotation[1]),
+                                                       static_cast<float>(node.rotation[2]))) : glm::mat4(1.0f)) *
                                         (node.scale.size() == 3 ?
                                          glm::scale(
                                              glm::mat4(1.0f),
@@ -118,13 +121,13 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
     {
         for (const auto& child: node.children)
         {
-            processNode(model, tinyGltfModel, tinyGltfModel.nodes[child], transform);
+            processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(child)], transform);
         }
 
         return;
     }
 
-    const auto tinyGltfMesh = tinyGltfModel.meshes[node.mesh];
+    const auto tinyGltfMesh = tinyGltfModel.meshes[static_cast<size_t>(node.mesh)];
 
     Mesh mesh;
     mesh.name = tinyGltfMesh.name;
@@ -132,22 +135,23 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     if (node.skin != -1)
     {
-        auto skin = tinyGltfModel.skins[node.skin];
-        for (auto j = 0; j < tinyGltfModel.skins[node.skin].joints.size(); j++)
+        auto skin = tinyGltfModel.skins[static_cast<size_t>(node.skin)];
+        for (size_t j = 0; j < skin.joints.size(); j++)
         {
-            if (tinyGltfModel.nodes[skin.joints[j]].name.empty())
+            const auto jointNodeIndex = static_cast<size_t>(skin.joints[j]);
+            if (tinyGltfModel.nodes[jointNodeIndex].name.empty())
             {
-                mesh.skin["node_" + std::to_string(skin.joints[j])] = j;
+                mesh.skin["node_" + std::to_string(skin.joints[j])] = static_cast<int>(j);
             }
             else
             {
-                mesh.skin[tinyGltfModel.nodes[skin.joints[j]].name] = j;
+                mesh.skin[tinyGltfModel.nodes[jointNodeIndex].name] = static_cast<int>(j);
             }
         }
 
         mesh.inverseBindPoseTransforms = AccessorUtility::get<std::vector<glm::mat4>>(
             tinyGltfModel,
-            tinyGltfModel.accessors[skin.inverseBindMatrices]);
+            tinyGltfModel.accessors[static_cast<size_t>(skin.inverseBindMatrices)]);
     }
 
     for (const auto& primitive: tinyGltfMesh.primitives)
@@ -158,12 +162,12 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             continue;
         }
 
-        auto indexAccessor = tinyGltfModel.accessors[primitive.indices];
+        auto indexAccessor = tinyGltfModel.accessors[static_cast<size_t>(primitive.indices)];
 
         auto meshPrimitive = MeshPrimitive{
             .mode = primitive.mode == -1 ? TINYGLTF_MODE_TRIANGLES : primitive.mode,
             .material = primitive.material != -1 ?
-                        std::optional<Resource<Material>>(model.materials[primitive.material]) : std::nullopt,
+                        std::optional<Resource<Material>>(model.materials[static_cast<size_t>(primitive.material)]) : std::nullopt,
             .elementCount = indexAccessor.count,
             .byteOffset = indexAccessor.byteOffset,
             .componentType = indexAccessor.componentType,
@@ -179,8 +183,8 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
                 continue;
             }
 
-            auto accessor = tinyGltfModel.accessors[attribute.second];
-            auto byteStride = accessor.ByteStride(tinyGltfModel.bufferViews[accessor.bufferView]);
+            auto accessor = tinyGltfModel.accessors[static_cast<size_t>(attribute.second)];
+            auto byteStride = accessor.ByteStride(tinyGltfModel.bufferViews[static_cast<size_t>(accessor.bufferView)]);
 
             meshPrimitive.attributes.push_back(MeshPrimitiveAttribute{
                 .size = accessor.type != TINYGLTF_TYPE_SCALAR ? accessor.type : 1,
@@ -201,7 +205,7 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     for (const auto& child: node.children)
     {
-        processNode(model, tinyGltfModel, tinyGltfModel.nodes[child], transform);
+        processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(child)], transform);
     }
 }
 
@@ -233,27 +237,27 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
 
         if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
         {
-            albedoTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index].source];
+            albedoTexturePtr = textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index)].source];
         }
 
         if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
         {
-            metallicRoughnessTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index].source];
+            metallicRoughnessTexturePtr = textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index)].source];
         }
 
         if (tinyGltfMaterial.normalTexture.index != -1)
         {
-            normalTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.normalTexture.index].source];
+            normalTexturePtr = textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.normalTexture.index)].source];
         }
 
         if (tinyGltfMaterial.occlusionTexture.index != -1)
         {
-            occlusionTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.occlusionTexture.index].source];
+            occlusionTexturePtr = textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.occlusionTexture.index)].source];
         }
 
         if (tinyGltfMaterial.emissiveTexture.index != -1)
         {
-            emissiveTexturePtr = textureMap[tinyGltfModel.textures[tinyGltfMaterial.emissiveTexture.index].source];
+            emissiveTexturePtr = textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.emissiveTexture.index)].source];
         }
 
         auto material = memoryStorageService.materials.add(Material{
@@ -323,9 +327,9 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
     }
 
     const auto sceneIndex = tinyGltfModel.defaultScene < 0 ? 0 : tinyGltfModel.defaultScene;
-    for (auto& sceneNode: tinyGltfModel.scenes[sceneIndex].nodes)
+    for (auto& sceneNode: tinyGltfModel.scenes[static_cast<size_t>(sceneIndex)].nodes)
     {
-        processNode(model, tinyGltfModel, tinyGltfModel.nodes[sceneNode], glm::mat4(1.0));
+        processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(sceneNode)], glm::mat4(1.0));
     }
 
     logger.info("Processed model: {}", filePath);
@@ -382,7 +386,7 @@ TextureFormat GLTFService::toTextureFormat(int format) const
 
 Texture GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const
 {
-    auto image = model.images[index];
+    auto image = model.images[static_cast<size_t>(index)];
 
     auto width = static_cast<unsigned int>(image.width);
     auto height = static_cast<unsigned int>(image.height);

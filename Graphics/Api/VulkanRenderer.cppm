@@ -182,8 +182,7 @@ void VulkanRenderer::init()
 
     vkSurfaceKhr = window.generateVulkanSurface(vkInstance);
 
-    i = 0;
-    for (const auto& queueFamily : queueFamilies)
+    for (i = 0; i < queueFamilyCount; i++)
     {
         VkBool32 presentationSupport = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(vkPhysicalDevice, i, vkSurfaceKhr, &presentationSupport);
@@ -192,8 +191,6 @@ void VulkanRenderer::init()
         {
             availableQueueFamilies.presentationFamily = i;
         }
-
-        i++;
     }
 }
 

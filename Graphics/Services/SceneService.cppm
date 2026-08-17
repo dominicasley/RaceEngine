@@ -1,7 +1,3 @@
-module;
-
-#include <spdlog/logger.h>
-
 export module raceengine.graphics:SceneService;
 
 import :RenderableEntityService;
@@ -14,13 +10,11 @@ namespace raceengine
 export class SceneService
 {
 private:
-    spdlog::logger& logger;
     RenderableEntityService& renderableEntityService;
     CameraService& cameraService;
 
 public:
     explicit SceneService(
-        spdlog::logger& logger,
         RenderableEntityService& renderableEntityService,
         CameraService& cameraService);
     void update(Scene& scene, float delta) const;
@@ -32,17 +26,15 @@ public:
 };
 
 SceneService::SceneService(
-    spdlog::logger& logger,
     RenderableEntityService& renderableEntityService,
     CameraService& cameraService) :
-    logger(logger),
     renderableEntityService(renderableEntityService),
     cameraService(cameraService)
 {
 
 }
 
-void SceneService::update(Scene& scene, float delta) const
+void SceneService::update(Scene&, float) const
 {
 
 }

@@ -37,6 +37,17 @@ export struct VulkanWindowRequiredExtensions {
     const char** extensions;
 };
 
+export enum class Key : int {
+    W = GLFW_KEY_W,
+    A = GLFW_KEY_A,
+    S = GLFW_KEY_S,
+    D = GLFW_KEY_D,
+    Escape = GLFW_KEY_ESCAPE,
+    Space = GLFW_KEY_SPACE,
+    LeftShift = GLFW_KEY_LEFT_SHIFT,
+    LeftControl = GLFW_KEY_LEFT_CONTROL
+};
+
 export class IWindow
 {
 public:
@@ -47,7 +58,7 @@ public:
     [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
     [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
     [[nodiscard]] virtual bool shouldClose() const = 0;
-    [[nodiscard]] virtual bool keyPressed(int key) const = 0;
+    [[nodiscard]] virtual bool keyPressed(Key key) const = 0;
     [[nodiscard]] virtual const WindowState& state() const = 0;
     [[nodiscard]] virtual std::tuple<double, double> mousePosition() = 0;
     [[nodiscard]] virtual float delta() const = 0;
@@ -84,19 +95,19 @@ public:
     [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
     [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
-    [[nodiscard]] bool keyPressed(int key) const override;
+    [[nodiscard]] bool keyPressed(Key key) const override;
     [[nodiscard]] const WindowState& state() const override;
     [[nodiscard]] std::tuple<double, double> mousePosition() override;
     [[nodiscard]] float delta() const override;
 };
 
 GLFWWindow::GLFWWindow(spdlog::logger &logger) :
-    logger(logger),
     _delta(0),
     _frameTime(0),
     _avgFrameRate(0),
     _frameCount(0),
-    windowState({0, 0, 0, 0})
+    windowState({0, 0, 0, 0}),
+    logger(logger)
 {
     if (!glfwInit())
     {
@@ -115,7 +126,6 @@ GLFWWindow::GLFWWindow(spdlog::logger &logger) :
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 32);
 
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
@@ -217,9 +227,9 @@ void GLFWWindow::windowResized(GLFWwindow *window, int width, int height)
     }
 }
 
-bool GLFWWindow::keyPressed(int key) const
+bool GLFWWindow::keyPressed(Key key) const
 {
-    return glfwGetKey(window, key) == GLFW_PRESS;
+    return glfwGetKey(window, static_cast<int>(key)) == GLFW_PRESS;
 }
 
 void GLFWWindow::setMousePosition(int x, int y)

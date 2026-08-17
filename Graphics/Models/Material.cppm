@@ -21,14 +21,14 @@ export struct Material
     float roughness;
     bool opaque = true;
     glm::vec2 repeat = glm::vec2(1.0f);
-    std::optional<Resource<Shader>> shader;
+    std::optional<Resource<Shader>> shader{};
     std::optional<Resource<Texture>> albedo;
     std::optional<Resource<Texture>> metallicRoughness;
     std::optional<Resource<Texture>> normal;
     std::optional<Resource<Texture>> occlusion;
     std::optional<Resource<Texture>> emissive;
-    std::optional<Resource<Texture>> environment;
-    std::vector<Resource<Texture>> textures;
+    std::optional<Resource<Texture>> environment{};
+    std::vector<Resource<Texture>> textures{};
 };
 
 } // namespace raceengine

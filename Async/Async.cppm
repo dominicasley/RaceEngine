@@ -17,8 +17,6 @@ module;
 #include <utility>
 #include <vector>
 
-#include <spdlog/logger.h>
-
 export module raceengine.async;
 
 namespace raceengine
@@ -68,7 +66,6 @@ export class BackgroundWorkerService
         using type = U;
     };
 
-    spdlog::logger& logger;
     std::mutex mutex;
     std::condition_variable_any wake;
     std::deque<std::move_only_function<void()>> queue;
@@ -78,7 +75,7 @@ export class BackgroundWorkerService
     void pump(const std::stop_token& stopToken);
 
 public:
-    explicit BackgroundWorkerService(spdlog::logger& logger);
+    BackgroundWorkerService();
     ~BackgroundWorkerService();
 
     template<class F>
@@ -120,7 +117,7 @@ module :private;
 namespace raceengine
 {
 
-BackgroundWorkerService::BackgroundWorkerService(spdlog::logger& logger) : logger(logger)
+BackgroundWorkerService::BackgroundWorkerService()
 {
     const auto workerCount = std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
 

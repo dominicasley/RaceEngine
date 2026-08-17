@@ -68,6 +68,13 @@ private:
     int viewportWidth;
     int viewportHeight;
     float maxAnisotropy = 1.0f;
+    // Owned GL object ids, appended at the creation sites and released in the destructor.
+    // The destructor runs while the GLFW context is still current (see Engine member order).
+    std::vector<unsigned int> createdPrograms;
+    std::vector<unsigned int> createdVaos;
+    std::vector<unsigned int> createdVbos;
+    mutable std::vector<unsigned int> createdTextures;
+    mutable std::vector<unsigned int> createdFbos;
 
 public:
     explicit OpenGLRenderer(
@@ -75,6 +82,7 @@ public:
         RenderableEntityService& renderableEntityService,
         SceneManagerService& sceneManagerService,
         MemoryStorageService& memoryStorageService);
+    ~OpenGLRenderer();
 
     bool init();
     void draw(Scene& scene, Camera& camera, float delta);
@@ -144,6 +152,34 @@ OpenGLRenderer::OpenGLRenderer(
     renderableEntityService(renderableEntityService),
     sceneManagerService(sceneManagerService)
 {
+}
+
+OpenGLRenderer::~OpenGLRenderer()
+{
+    for (const auto programId : createdPrograms)
+    {
+        glDeleteProgram(programId);
+    }
+
+    if (!createdVaos.empty())
+    {
+        glDeleteVertexArrays(static_cast<GLsizei>(createdVaos.size()), createdVaos.data());
+    }
+
+    if (!createdVbos.empty())
+    {
+        glDeleteBuffers(static_cast<GLsizei>(createdVbos.size()), createdVbos.data());
+    }
+
+    if (!createdTextures.empty())
+    {
+        glDeleteTextures(static_cast<GLsizei>(createdTextures.size()), createdTextures.data());
+    }
+
+    if (!createdFbos.empty())
+    {
+        glDeleteFramebuffers(static_cast<GLsizei>(createdFbos.size()), createdFbos.data());
+    }
 }
 
 bool OpenGLRenderer::init()
@@ -280,7 +316,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(shader->gpuResourceId, "cameraPosition", camera.position);
                     setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
                     setProgramUniform(shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
-                    setProgramUniform(shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859 * 2.5f, 1.2973 * 2.5f, 1.3 * 2.5f));
+                    setProgramUniform(shader->gpuResourceId, "lights.diffuse", glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5));
                     setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
                     setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
                     setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
@@ -291,7 +327,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 glDrawElements(primitive.mode,
                                static_cast<GLsizei>(primitive.elementCount),
                                primitive.componentType,
-                               (char*)(NULL + primitive.byteOffset));
+                               reinterpret_cast<const void*>(primitive.byteOffset));
             }
         }
 
@@ -456,6 +492,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
         GLuint vao;
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
+        createdVaos.push_back(vao);
 
         for (auto& buffer : model.meshBuffers)
         {
@@ -465,6 +502,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
             GLuint vbo;
             glGenBuffers(1, &vbo);
+            createdVbos.push_back(vbo);
             glBindBuffer(static_cast<GLenum>(buffer.target), vbo);
             glBufferData(static_cast<GLenum>(buffer.target), static_cast<GLsizeiptr>(buffer.data.size()),
                          buffer.data.data(), GL_STATIC_DRAW);
@@ -490,7 +528,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
                                           attribute.componentType,
                                           attribute.normalized ? GL_TRUE : GL_FALSE,
                                           attribute.stride,
-                                          (char*) (NULL + attribute.offset));
+                                          reinterpret_cast<const void*>(attribute.offset));
                 }
             }
         }
@@ -647,6 +685,8 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
         return {};
     }
 
+    createdPrograms.push_back(programId);
+
     return programId;
 }
 
@@ -655,6 +695,7 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
     unsigned int textureId;
 
     glGenTextures(1, &textureId);
+    createdTextures.push_back(textureId);
     glBindTexture(GL_TEXTURE_2D, textureId);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
@@ -682,6 +723,7 @@ unsigned int OpenGLRenderer::createCubeMap(
 {
     unsigned int textureId;
     glGenTextures(1, &textureId);
+    createdTextures.push_back(textureId);
     glBindTexture(GL_TEXTURE_CUBE_MAP, textureId);
 
     const Texture* textures[] = {&right, &left, &bottom, &top, &front, &back};
@@ -691,7 +733,7 @@ unsigned int OpenGLRenderer::createCubeMap(
             GL_TEXTURE_CUBE_MAP_POSITIVE_X + i,
             0,
             getInternalFormatFromBitsPerPixel(
-                textures[i]->bitsPerPixel),
+                static_cast<int>(textures[i]->bitsPerPixel)),
             textures[i]->width,
             textures[i]->height,
             0,
@@ -719,6 +761,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 {
     unsigned int fboGpuResourceId;
     glGenFramebuffers(1, &fboGpuResourceId);
+    createdFbos.push_back(fboGpuResourceId);
     glBindFramebuffer(GL_FRAMEBUFFER, fboGpuResourceId);
 
     auto colourAttachmentIndex = 0u;
@@ -730,6 +773,7 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 
         unsigned int attachmentGpuResourceId;
         glGenTextures(1, &attachmentGpuResourceId);
+        createdTextures.push_back(attachmentGpuResourceId);
         glBindTexture(GL_TEXTURE_2D, attachmentGpuResourceId);
 
         glTexImage2D(
@@ -1022,16 +1066,18 @@ void OpenGLRenderer::createQuad()
 
     glGenVertexArrays(1, &quadVao);
     glBindVertexArray(quadVao);
+    createdVaos.push_back(quadVao);
 
     GLuint vertexBuffer;
     glGenBuffers(1, &vertexBuffer);
+    createdVbos.push_back(vertexBuffer);
     glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
     glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
 
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, (void*) (12 * sizeof(float)));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, reinterpret_cast<const void*>(12 * sizeof(float)));
 
     glBindVertexArray(0);
 }
@@ -1044,13 +1090,13 @@ void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shader,
 
     glUseProgram(shader->gpuResourceId);
 
-    for (auto i = 0; i < attachments.size(); i++)
+    for (size_t i = 0; i < attachments.size(); i++)
     {
         auto attachment = attachments[i];
 
         if (attachment->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE0 + i);
+            glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(i));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(attachment->gpuResourceId.value()));
         }
     }

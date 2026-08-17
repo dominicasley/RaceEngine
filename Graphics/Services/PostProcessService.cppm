@@ -2,8 +2,6 @@ module;
 
 #include <string>
 
-#include <spdlog/logger.h>
-
 export module raceengine.graphics:PostProcessService;
 
 import :FboService;
@@ -16,22 +14,20 @@ namespace raceengine
 
 export class PostProcessService
 {
-    spdlog::logger& logger;
     MemoryStorageService& memoryStorageService;
     FboService& fboService;
     IWindow& window;
 
 public:
     explicit PostProcessService(
-        spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
+        MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
     [[nodiscard]] Resource<PostProcess> create(const std::string& id, const Resource<Shader>& shader) const;
     void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment) const;
     void recreateOutputBuffer(const Resource<PostProcess> & postProcess, int width, int height) const;
 };
 
 PostProcessService::PostProcessService(
-    spdlog::logger& logger, MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
-    logger(logger),
+    MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window) :
     memoryStorageService(memoryStorageService),
     fboService(fboService),
     window(window)
@@ -39,7 +35,7 @@ PostProcessService::PostProcessService(
 
 }
 
-Resource<PostProcess> PostProcessService::create(const std::string& id, const Resource<Shader>& shader) const
+Resource<PostProcess> PostProcessService::create(const std::string&, const Resource<Shader>& shader) const
 {
     auto state = window.state();
     auto windowWidth = static_cast<unsigned int>(state.windowWidth);

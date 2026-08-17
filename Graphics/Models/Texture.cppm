@@ -31,12 +31,12 @@ export enum class PixelDataType {
 export struct Texture
 {
     std::string name;
-    std::optional<unsigned int> gpuResourceId;
+    std::optional<unsigned int> gpuResourceId{};
     TextureFormat format;
     PixelDataType pixelDataType;
     unsigned int width;
     unsigned int height;
-    unsigned int bitsPerPixel;
+    unsigned int bitsPerPixel{};
     std::vector<unsigned char> data;
 };
 

@@ -4,8 +4,6 @@ module;
 #include <optional>
 #include <string>
 
-#include <spdlog/logger.h>
-
 export module raceengine.graphics:ShaderService;
 
 import :OpenGLRenderer;
@@ -18,23 +16,20 @@ namespace raceengine
 export class ShaderService
 {
 private:
-    spdlog::logger& logger;
     MemoryStorageService& memoryStorageService;
     OpenGLRenderer& openGlRenderer;
 
     std::map<std::string, Resource<Shader>> shaders;
 
 public:
-    explicit ShaderService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer);
+    explicit ShaderService(MemoryStorageService& memoryStorageService, OpenGLRenderer& openGlRenderer);
     std::optional<Resource<Shader>> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
     std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
 ShaderService::ShaderService(
-    spdlog::logger& logger,
     MemoryStorageService& memoryStorageService,
     OpenGLRenderer& openGlRenderer) :
-    logger(logger),
     memoryStorageService(memoryStorageService),
     openGlRenderer(openGlRenderer)
 {
