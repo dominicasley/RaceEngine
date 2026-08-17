@@ -1,13 +1,15 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <vector>
 #include <vulkan/vulkan.h>
 #include "../System/IWindow.h"
 
 struct QueueFamily
 {
-    uint32_t graphicsFamily;
-    uint32_t presentationFamily;
+    std::optional<uint32_t> graphicsFamily;
+    std::optional<uint32_t> presentationFamily;
 };
 
 class VulkanRenderer

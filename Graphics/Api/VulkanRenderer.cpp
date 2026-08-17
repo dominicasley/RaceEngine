@@ -1,3 +1,4 @@
+#include <cstring>
 #include <stdexcept>
 #include <iostream>
 #include "VulkanRenderer.h"
@@ -26,13 +27,31 @@ void VulkanRenderer::init()
 
     auto requiredWindowExtensions = window.getRequiredVulkanWindowExtensions();
 
+    uint32_t availableLayerCount = 0;
+    vkEnumerateInstanceLayerProperties(&availableLayerCount, nullptr);
+    std::vector<VkLayerProperties> availableLayers(availableLayerCount);
+    vkEnumerateInstanceLayerProperties(&availableLayerCount, availableLayers.data());
+
+    std::vector<const char*> enabledLayers;
+    for (const auto* requestedLayer : validationLayers)
+    {
+        for (const auto& availableLayer : availableLayers)
+        {
+            if (std::strcmp(availableLayer.layerName, requestedLayer) == 0)
+            {
+                enabledLayers.push_back(requestedLayer);
+                break;
+            }
+        }
+    }
+
     VkInstanceCreateInfo vkInstanceCreateInfo = {};
     vkInstanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     vkInstanceCreateInfo.pApplicationInfo = &vkApplicationInfo;
     vkInstanceCreateInfo.enabledExtensionCount = requiredWindowExtensions.count;
     vkInstanceCreateInfo.ppEnabledExtensionNames = requiredWindowExtensions.extensions;
-    vkInstanceCreateInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
-    vkInstanceCreateInfo.ppEnabledLayerNames = validationLayers.data();
+    vkInstanceCreateInfo.enabledLayerCount = static_cast<uint32_t>(enabledLayers.size());
+    vkInstanceCreateInfo.ppEnabledLayerNames = enabledLayers.data();
 
     auto result = vkCreateInstance(&vkInstanceCreateInfo, nullptr, &vkInstance);
 
@@ -67,13 +86,23 @@ void VulkanRenderer::init()
         }
     }
 
+    if (vkPhysicalDevice == VK_NULL_HANDLE)
+    {
+        vkPhysicalDevice = devices.front();
+    }
+
+    if (vkPhysicalDevice == VK_NULL_HANDLE)
+    {
+        throw std::runtime_error("No compatible devices found\n");
+    }
+
     uint32_t queueFamilyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(vkPhysicalDevice, &queueFamilyCount, nullptr);
 
     std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
     vkGetPhysicalDeviceQueueFamilyProperties(vkPhysicalDevice, &queueFamilyCount, queueFamilies.data());
 
-    auto i = 0;
+    uint32_t i = 0;
     for (const auto& queueFamily : queueFamilies)
     {
         if (queueFamily.queueCount > 0 && queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT)
@@ -84,10 +113,15 @@ void VulkanRenderer::init()
         i++;
     }
 
+    if (!availableQueueFamilies.graphicsFamily.has_value())
+    {
+        throw std::runtime_error("No graphics queue family found\n");
+    }
+
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo vkDeviceQueueCreateInfo = {};
     vkDeviceQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    vkDeviceQueueCreateInfo.queueFamilyIndex = availableQueueFamilies.graphicsFamily;
+    vkDeviceQueueCreateInfo.queueFamilyIndex = availableQueueFamilies.graphicsFamily.value();
     vkDeviceQueueCreateInfo.queueCount = 1;
     vkDeviceQueueCreateInfo.pQueuePriorities = &queuePriority;
 
@@ -121,6 +155,4 @@ void VulkanRenderer::init()
 
         i++;
     }
-
-    window.makeContextCurrent();
 }
