@@ -4,7 +4,6 @@
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/animation/runtime/animation.h>
 
-#include "AnimationService.h"
 #include <Services/MemoryStorageService.h>
 #include "../../Io/Utility/AccessorUtility.h"
 #include "../Models/Scene/CreateRenderableModelDTO.h"
@@ -17,10 +16,9 @@ class RenderableEntityService
 private:
     spdlog::logger& logger;
     MemoryStorageService& memoryStorageService;
-    AnimationService& animationService;
 
 public:
-    explicit RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService);
+    explicit RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
 
     [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
     void setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeleton) const;

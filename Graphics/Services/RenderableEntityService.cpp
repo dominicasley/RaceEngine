@@ -2,10 +2,9 @@
 
 #include <cstring>
 
-RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService, AnimationService& animationService) :
+RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
     logger(logger),
-    memoryStorageService(memoryStorageService),
-    animationService(animationService)
+    memoryStorageService(memoryStorageService)
 {
 
 }

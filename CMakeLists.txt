@@ -40,7 +40,6 @@ target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
 
 add_library (Engine STATIC
         "Engine.h" "Engine.cpp"
-        "Bootstrapper.cpp" "Bootstrapper.h"
         Graphics/Api/VulkanRenderer.cpp
         Graphics/Api/VulkanRenderer.h
         Graphics/Api/OpenGLRenderer.cpp
@@ -64,8 +63,6 @@ add_library (Engine STATIC
         Graphics/Services/SceneService.h
         Graphics/Services/CameraService.cpp
         Graphics/Services/CameraService.h
-        Graphics/Services/AnimationService.cpp
-        Graphics/Services/AnimationService.h
         Graphics/Models/Scene/Model.h
         Graphics/Models/Scene/Mesh.h
         Graphics/Models/Scene/MeshBuffer.h
@@ -125,7 +122,6 @@ target_include_directories(Engine PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/Shared)
 target_include_directories(Engine SYSTEM PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/di-header
         ${STB_INCLUDE_DIRS}
         ${TINYGLTF_INCLUDE_DIRS}
         ${ozz_animation_SOURCE_DIR}/include)
