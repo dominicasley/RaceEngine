@@ -14,6 +14,7 @@ module;
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <tuple>
@@ -87,6 +88,9 @@ private:
     WindowState windowState;
     spdlog::logger& logger;
     GraphicsApi graphicsApi;
+    // Frame capture reports a fixed cursor and ignores warps, so mouse-look games hold
+    // their spawn view and a capture is reproducible whatever the physical mouse does.
+    bool frameCaptureActive;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
@@ -113,7 +117,8 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     _frameCount(0),
     windowState({0, 0, 0, 0}),
     logger(logger),
-    graphicsApi(graphicsApi)
+    graphicsApi(graphicsApi),
+    frameCaptureActive(std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
 {
     if (!glfwInit())
     {
@@ -247,6 +252,11 @@ bool GLFWWindow::keyPressed(Key key) const
 
 void GLFWWindow::setMousePosition(int x, int y)
 {
+    if (frameCaptureActive)
+    {
+        return;
+    }
+
     glfwSetCursorPos(window, x, y);
 }
 
@@ -265,7 +275,19 @@ void GLFWWindow::cursorPositionChanged(GLFWwindow* window, double x, double y)
 std::tuple<double, double> GLFWWindow::mousePosition()
 {
     double x, y;
-    glfwGetCursorPos(window, &x, &y);
+
+    if (frameCaptureActive)
+    {
+        // Controllers steer from the change between samples, so a constant reads as no
+        // movement at all: the capture renders the spawn view however the mouse moves.
+        x = windowState.windowWidth / 2.0;
+        y = windowState.windowHeight / 2.0;
+    }
+    else
+    {
+        glfwGetCursorPos(window, &x, &y);
+    }
+
     windowState.mouseX = x;
     windowState.mouseY = y;
 
