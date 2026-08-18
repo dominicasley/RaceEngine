@@ -1,72 +1,105 @@
-﻿set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 23)
 cmake_minimum_required (VERSION 3.28)
 
-set(CMAKE_CXX_SCAN_FOR_MODULES ON)
-
-string(
-        APPEND _opts
-        "$<IF:$<CXX_COMPILER_ID:MSVC>,"
-        "/W4;$<$<CONFIG:RELEASE>:/O2>,"
-        "-Wall;-Wextra;-Werror;"
-        "$<$<CONFIG:RELEASE>:-O3>"
-        "$<$<CXX_COMPILER_ID:Clang>:-stdlib=libc++>"
-        ">"
-)
-
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/vendor/FreeImage/bin/FreeImage.dll DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/../OpenStreetRace/bin/)
-
-add_library (Engine
-        "Engine.h" "Engine.cpp"
-        "Bootstrapper.cpp" "Bootstrapper.h")
-
-target_include_directories(Engine PUBLIC "vendor/di/include")
-
-if (NOT TARGET spdlog)
-    add_subdirectory(vendor/spdlog)
+# Warning/sanitizer flags ride an INTERFACE carrier so vendored code stays untouched.
+add_library(raceengine_warnings INTERFACE)
+target_compile_options(raceengine_warnings INTERFACE
+        -Werror
+        -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+        -Wold-style-cast -Wnon-virtual-dtor -Woverloaded-virtual
+        -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough)
+option(RACEENGINE_SANITIZE "Build first-party code with ASan+UBSan" OFF)
+if(RACEENGINE_SANITIZE)
+    target_compile_options(raceengine_warnings INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(raceengine_warnings INTERFACE -fsanitize=address,undefined)
 endif()
 
-add_subdirectory(vendor/gl3w vendor/gl3w)
-add_subdirectory(vendor/glm vendor/glm)
-add_subdirectory(vendor/glfw vendor/glfw)
+find_package(spdlog CONFIG REQUIRED)
+find_package(glm CONFIG REQUIRED)
+find_package(glfw3 CONFIG REQUIRED)
+find_package(Vulkan REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_package(unofficial-shaderc CONFIG REQUIRED)
+find_path(STB_INCLUDE_DIRS "stb_image.h" REQUIRED)
+find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h" REQUIRED)
 
-set(ozz_build_samples OFF)
-set(ozz_build_tests OFF)
-set(ozz_build_howtos OFF)
-set(ozz_build_gltf OFF)
-add_subdirectory(vendor/ozz-animation vendor/ozz-animation)
+include(FetchContent)
+set(ozz_build_tools OFF CACHE BOOL "" FORCE)
+set(ozz_build_samples OFF CACHE BOOL "" FORCE)
+set(ozz_build_tests OFF CACHE BOOL "" FORCE)
+set(ozz_build_howtos OFF CACHE BOOL "" FORCE)
+set(ozz_build_gltf OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+        ozz_animation
+        GIT_REPOSITORY https://github.com/guillaumeblanc/ozz-animation
+        GIT_TAG 0.17.0
+        GIT_SHALLOW TRUE
+        PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchOzzCMakeMinimum.cmake)
+FetchContent_MakeAvailable(ozz_animation)
 
-target_link_libraries(Engine PUBLIC spdlog)
-target_link_libraries(Engine PRIVATE opengl32)
-target_link_libraries(Engine PUBLIC glm)
-target_link_libraries(Engine PRIVATE gl3w)
+add_library(glad STATIC vendor/glad/src/gl.c)
+target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
+
+add_library (Engine STATIC
+        Io/ThirdPartyImpl.cpp)
+
+target_sources(Engine PUBLIC
+        FILE_SET CXX_MODULES
+        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+        FILES
+        Engine.cppm
+        Async/Async.cppm
+        Game/Game.cppm
+        Graphics/Graphics.cppm
+        Graphics/Models/Models.cppm
+        Graphics/Models/Dto.cppm
+        Graphics/Models/Fbo.cppm
+        Graphics/Models/Material.cppm
+        Graphics/Models/Mesh.cppm
+        Graphics/Models/Scene.cppm
+        Graphics/Models/Shader.cppm
+        Graphics/Models/Texture.cppm
+        Graphics/System/Window.cppm
+        Graphics/Api/GraphicsApi.cppm
+        Graphics/Api/IRenderer.cppm
+        Graphics/Api/VulkanRenderer.cppm
+        Graphics/Api/OpenGLRenderer.cppm
+        Graphics/Services/SceneManagerService.cppm
+        Graphics/Services/RenderableEntityService.cppm
+        Graphics/Services/FboService.cppm
+        Graphics/Services/ShaderService.cppm
+        Graphics/Services/CubeMapService.cppm
+        Graphics/Services/PresenterService.cppm
+        Graphics/Services/CameraService.cppm
+        Graphics/Services/PostProcessService.cppm
+        Graphics/Services/SceneService.cppm
+        Io/Io.cppm
+        Io/Services/GLTFService.cppm
+        Io/Services/ResourceService.cppm
+        Io/Utility/AccessorUtility.cppm
+        Shared/Shared.cppm
+        Shared/Types/Resource.cppm)
+
+target_include_directories(Engine SYSTEM PUBLIC
+        ${STB_INCLUDE_DIRS}
+        ${TINYGLTF_INCLUDE_DIRS}
+        ${ozz_animation_SOURCE_DIR}/include)
+
+target_compile_definitions(Engine PUBLIC GLM_ENABLE_EXPERIMENTAL)
+
+target_link_libraries(Engine PUBLIC spdlog::spdlog)
+target_link_libraries(Engine PUBLIC glm::glm)
 target_link_libraries(Engine PUBLIC glfw)
+target_link_libraries(Engine PUBLIC Vulkan::Vulkan)
+target_link_libraries(Engine PRIVATE GPUOpen::VulkanMemoryAllocator)
+target_link_libraries(Engine PRIVATE unofficial::shaderc::shaderc)
+target_link_libraries(Engine PUBLIC ozz_animation ozz_base)
+target_link_libraries(Engine PRIVATE glad)
+if(WIN32)
+    target_link_libraries(Engine PRIVATE opengl32)
+else()
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(Engine PRIVATE OpenGL::GL)
+endif()
 
-target_include_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Include")
-target_link_directories(Engine PUBLIC "C:/VulkanSDK/1.2.131.2/Lib")
-target_include_directories(Engine PRIVATE vendor/tinygltf)
-target_link_directories(Engine PUBLIC vendor/physx/physx/bin/win.x86_64.vc143.mt/release)
-
-project ("Graphics")
-add_subdirectory("Graphics")
-
-project ("Io")
-add_subdirectory("Io")
-
-project ("Async")
-add_subdirectory("Async")
-
-project ("Shared")
-add_subdirectory("Shared")
-
-project ("Game")
-add_subdirectory("Game")
-
-project ("Physics")
-add_subdirectory("Physics")
-
-target_link_libraries(Engine PUBLIC Game)
-target_link_libraries(Engine PUBLIC Physics)
-target_link_libraries(Engine PUBLIC Graphics)
-target_link_libraries(Engine PUBLIC Io)
-target_link_libraries(Engine PUBLIC Async)
-target_link_libraries(Engine PUBLIC Shared)
+target_link_libraries(Engine PRIVATE raceengine_warnings)

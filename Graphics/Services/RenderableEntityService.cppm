@@ -1,0 +1,171 @@
+module;
+
+#include <cmath>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+#include <ozz/animation/runtime/animation.h>
+#include <ozz/animation/runtime/local_to_model_job.h>
+#include <ozz/animation/runtime/sampling_job.h>
+#include <ozz/animation/runtime/skeleton.h>
+#include <ozz/base/maths/simd_math.h>
+#include <ozz/base/span.h>
+#include <spdlog/logger.h>
+
+export module raceengine.graphics:RenderableEntityService;
+
+import raceengine.graphics.models;
+import raceengine.shared;
+
+namespace raceengine
+{
+
+export class RenderableEntityService
+{
+private:
+    spdlog::logger& logger;
+    MemoryStorageService& memoryStorageService;
+
+public:
+    explicit RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
+
+    [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
+    void setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeleton) const;
+    void addAnimation(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Animation>> animation) const;
+    void setAnimation(RenderableMesh& mesh, const std::string& animationName) const;
+    void setAnimation(RenderableMesh& mesh, unsigned int animationIndex) const;
+    [[nodiscard]] std::vector<glm::mat4> joints(RenderableMesh& renderableMesh, float frameTimeDelta) const;
+};
+
+RenderableEntityService::RenderableEntityService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
+    logger(logger),
+    memoryStorageService(memoryStorageService)
+{
+}
+
+RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
+{
+    auto createMeshes = [&](const CreateRenderableModelDTO& entityDescriptor)
+    {
+        std::vector<RenderableMesh> meshes;
+
+        for (auto materialKey : entityDescriptor.model->materials)
+        {
+            auto material = memoryStorageService.materials.get(materialKey);
+            material.shader = entityDescriptor.shader;
+
+            memoryStorageService.materials.update(materialKey, material);
+        }
+
+        for (const auto& meshKey : entityDescriptor.model->meshes)
+        {
+            meshes.emplace_back(RenderableMesh{.mesh = meshKey, .skeleton = std::nullopt});
+        }
+
+        return meshes;
+    };
+
+    return RenderableModel(entityDescriptor.node, entityDescriptor.model, createMeshes(entityDescriptor));
+}
+
+void RenderableEntityService::setAnimation(RenderableMesh&, const std::string&) const
+{
+}
+
+void RenderableEntityService::setAnimation(RenderableMesh& mesh, unsigned int animationIndex) const
+{
+    if (mesh.animations.size() > animationIndex)
+    {
+        mesh.currentAnimationIndex = animationIndex;
+    }
+}
+
+glm::mat4 ozzToMat4(const ozz::math::Float4x4& t)
+{
+    // Both types are 16 contiguous floats in column-major order.
+    glm::mat4 out;
+    std::memcpy(&out, &t.cols, sizeof(out));
+    return out;
+}
+
+std::vector<glm::mat4> RenderableEntityService::joints(RenderableMesh& renderableMesh, float frameTimeDelta) const
+{
+    auto out = std::vector<glm::mat4>();
+
+    if (!renderableMesh.animations.empty())
+    {
+        const auto& mesh = renderableMesh.mesh;
+        auto animation = renderableMesh.animations[renderableMesh.currentAnimationIndex].value;
+        auto skeleton = renderableMesh.skeleton.value().value;
+
+        renderableMesh.animationTime =
+            std::fmod(renderableMesh.animationTime + frameTimeDelta, animation->get()->duration());
+
+        ozz::animation::SamplingJob sampling_job;
+        sampling_job.animation = animation->get();
+        sampling_job.context = renderableMesh.animationCache.get();
+        sampling_job.ratio = renderableMesh.animationTime / animation->get()->duration();
+        sampling_job.output = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
+        sampling_job.Run();
+
+        ozz::animation::LocalToModelJob ltm_job;
+        ltm_job.skeleton = skeleton->get();
+        ltm_job.input = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
+        ltm_job.output = ozz::make_span(renderableMesh.animationModelSpaceTransforms);
+        ltm_job.Run();
+
+        out.resize(renderableMesh.animationModelSpaceTransforms.size());
+        for (size_t i = 0; i < renderableMesh.animationModelSpaceTransforms.size(); i++)
+        {
+            const auto mapping = renderableMesh.jointMap.find(static_cast<int>(i));
+            if (mapping == renderableMesh.jointMap.end())
+            {
+                logger.warn("No joint mapping for ozz joint {} in mesh {}; skipping", i, mesh->name);
+                continue;
+            }
+
+            const auto jointIndex = static_cast<size_t>(mapping->second);
+            if (jointIndex >= out.size() || jointIndex >= mesh->inverseBindPoseTransforms.size())
+            {
+                logger.warn("Joint index {} out of range for mesh {}; skipping", jointIndex, mesh->name);
+                continue;
+            }
+
+            out[jointIndex] = ozzToMat4(renderableMesh.animationModelSpaceTransforms[i]) *
+                              mesh->inverseBindPoseTransforms[jointIndex];
+        }
+    }
+
+    return out;
+}
+
+void RenderableEntityService::setSkeleton(RenderableMesh& mesh,
+                                          Resource<std::unique_ptr<ozz::animation::Skeleton>> skeletonKey) const
+{
+    auto skeleton = skeletonKey.value;
+
+    mesh.skeleton = skeletonKey;
+    mesh.animationLocalSpaceTransforms.resize(static_cast<size_t>(skeleton->get()->num_soa_joints()));
+    mesh.animationModelSpaceTransforms.resize(static_cast<size_t>(skeleton->get()->num_joints()));
+    mesh.animationCache = std::make_unique<ozz::animation::SamplingJob::Context>(skeleton->get()->num_joints());
+
+    const auto& m = memoryStorageService.meshes.get(mesh.mesh);
+    for (auto i = 0; i < skeleton->get()->num_joints(); i++)
+    {
+        auto ozzJointName = skeleton->get()->joint_names()[static_cast<size_t>(i)];
+
+        mesh.jointMap[i] = m.skin.at(ozzJointName);
+    }
+}
+
+void RenderableEntityService::addAnimation(RenderableMesh& mesh,
+                                           Resource<std::unique_ptr<ozz::animation::Animation>> animation) const
+{
+    mesh.animations.push_back(animation);
+}
+
+} // namespace raceengine
