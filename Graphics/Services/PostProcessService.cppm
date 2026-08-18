@@ -1,5 +1,6 @@
 module;
 
+#include <expected>
 #include <string>
 
 export module raceengine.graphics:PostProcessService;
@@ -20,9 +21,11 @@ export class PostProcessService
 
 public:
     explicit PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
-    [[nodiscard]] Resource<PostProcess> create(const std::string& id, const Resource<Shader>& shader) const;
+    [[nodiscard]] std::expected<Resource<PostProcess>, std::string> create(const std::string& id,
+                                                                           const Resource<Shader>& shader) const;
     void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment) const;
-    void recreateOutputBuffer(const Resource<PostProcess>& postProcess, int width, int height) const;
+    [[nodiscard]] std::expected<void, std::string> recreateOutputBuffer(const Resource<PostProcess>& postProcess,
+                                                                        int width, int height) const;
 };
 
 PostProcessService::PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService,
@@ -33,21 +36,27 @@ PostProcessService::PostProcessService(MemoryStorageService& memoryStorageServic
 {
 }
 
-Resource<PostProcess> PostProcessService::create(const std::string&, const Resource<Shader>& shader) const
+std::expected<Resource<PostProcess>, std::string> PostProcessService::create(const std::string& id,
+                                                                             const Resource<Shader>& shader) const
 {
     auto state = window.state();
     auto windowWidth = static_cast<unsigned int>(state.windowWidth);
     auto windowHeight = static_cast<unsigned int>(state.windowHeight);
 
-    return memoryStorageService.postProcesses.add(
-        PostProcess{.shader = shader,
-                    .output = fboService.create(CreateFboDTO{
-                        .type = FboType::Planar,
-                        .attachments = {CreateFboAttachmentDTO{.width = windowWidth,
-                                                               .height = windowHeight,
-                                                               .type = FboAttachmentType::Color,
-                                                               .captureFormat = TextureFormat::RGBA,
-                                                               .internalFormat = TextureFormat::RGBA16F}}})});
+    const auto output = fboService.create(
+        CreateFboDTO{.type = FboType::Planar,
+                     .attachments = {CreateFboAttachmentDTO{.width = windowWidth,
+                                                            .height = windowHeight,
+                                                            .type = FboAttachmentType::Color,
+                                                            .captureFormat = TextureFormat::RGBA,
+                                                            .internalFormat = TextureFormat::RGBA16F}}});
+
+    if (!output)
+    {
+        return std::unexpected("post process '" + id + "' has no output buffer: " + output.error());
+    }
+
+    return memoryStorageService.postProcesses.add(PostProcess{.shader = shader, .output = output.value()});
 }
 
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
@@ -59,16 +68,26 @@ void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
     memoryStorageService.postProcesses.update(postProcessKey, postProcess);
 }
 
-void PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postProcessKey, int width, int height) const
+std::expected<void, std::string> PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postProcessKey,
+                                                                          int width, int height) const
 {
     auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
 
-    if (postProcess.output.has_value())
+    if (!postProcess.output.has_value())
     {
-        fboService.resize(postProcess.output.value(), static_cast<unsigned int>(width),
-                          static_cast<unsigned int>(height));
-        memoryStorageService.postProcesses.update(postProcessKey, postProcess);
+        return {};
     }
+
+    const auto resized = fboService.resize(postProcess.output.value(), static_cast<unsigned int>(width),
+                                           static_cast<unsigned int>(height));
+    if (!resized)
+    {
+        return std::unexpected(resized.error());
+    }
+
+    memoryStorageService.postProcesses.update(postProcessKey, postProcess);
+
+    return {};
 }
 
 } // namespace raceengine

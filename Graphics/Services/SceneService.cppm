@@ -1,3 +1,10 @@
+module;
+
+#include <expected>
+#include <functional>
+#include <string>
+#include <utility>
+
 export module raceengine.graphics:SceneService;
 
 import :RenderableEntityService;
@@ -20,7 +27,9 @@ public:
                           SceneManagerService& sceneManagerService);
     void update(Scene& scene, float delta) const;
     [[nodiscard]] RenderableModel& createEntity(Scene& scene, const CreateRenderableModelDTO& entityDescriptor) const;
-    [[nodiscard]] Camera& createCamera(Scene& scene) const;
+    // The camera is owned by the scene's deque, so what a successful call hands back is a
+    // reference into it; reference_wrapper is what lets that ride in an expected.
+    [[nodiscard]] std::expected<std::reference_wrapper<Camera>, std::string> createCamera(Scene& scene) const;
     [[nodiscard]] Light& createLight(Scene& scene) const;
     [[nodiscard]] RenderableModel& getModel(Scene& scene, unsigned int index) const;
     [[nodiscard]] Camera& getCamera(Scene& scene, unsigned int index) const;
@@ -58,9 +67,15 @@ RenderableModel& SceneService::createEntity(Scene& scene, const CreateRenderable
     return scene.models.emplace_back(renderableEntityService.createModel(entityDescriptor));
 }
 
-Camera& SceneService::createCamera(Scene& scene) const
+std::expected<std::reference_wrapper<Camera>, std::string> SceneService::createCamera(Scene& scene) const
 {
-    return scene.cameras.emplace_back(cameraService.createCamera());
+    auto camera = cameraService.createCamera();
+    if (!camera)
+    {
+        return std::unexpected(camera.error());
+    }
+
+    return std::ref(scene.cameras.emplace_back(std::move(camera).value()));
 }
 
 Light& SceneService::createLight(Scene& scene) const

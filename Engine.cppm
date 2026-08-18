@@ -2,8 +2,10 @@ module;
 
 #include <algorithm>
 #include <cstdlib>
+#include <expected>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,7 +68,10 @@ private:
     // unique_ptr for backend selection, but the declaration position is still load-bearing:
     // the GL renderer's destructor issues GL deletes that need the GLFW context current, so
     // this member must keep destroying before glfwWindow — same slot the value member had.
-    std::unique_ptr<IRenderer> renderer;
+    //
+    // This is the only member declared as the whole device: every service below takes the one
+    // seam it uses, so a service cannot reach the frame or the factory it has no business in.
+    std::unique_ptr<IRenderBackend> renderer;
     FboService fboService;
     ShaderService shaderService;
     CubeMapService cubeMapService;
@@ -198,11 +203,11 @@ namespace
 // selectGraphicsApi before the window existed. Both backends take the same services: the
 // storage service to write GPU ids back through their Resources, and the scene services
 // the draw path reads node transforms and joint matrices from.
-[[nodiscard]] std::unique_ptr<IRenderer> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
-                                                        IWindow& window,
-                                                        RenderableEntityService& renderableEntityService,
-                                                        SceneManagerService& sceneManagerService,
-                                                        MemoryStorageService& memoryStorageService)
+[[nodiscard]] std::unique_ptr<IRenderBackend> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
+                                                             IWindow& window,
+                                                             RenderableEntityService& renderableEntityService,
+                                                             SceneManagerService& sceneManagerService,
+                                                             MemoryStorageService& memoryStorageService)
 {
     if (graphicsApi == GraphicsApi::Vulkan)
     {
@@ -232,7 +237,14 @@ Engine::Engine() :
     cameraService(memoryStorageService, fboService, glfwWindow),
     sceneService(renderableEntityService, cameraService, sceneManagerService)
 {
-    renderer->init();
+    // An engine whose device would not come up has nothing left to do: every service below
+    // was built against it, and there is no second backend to fall back to.
+    if (const auto initialised = renderer->init(); !initialised)
+    {
+        logger->error("Renderer initialisation failed: {}", initialised.error());
+        throw std::runtime_error("Renderer initialisation failed: " + initialised.error());
+    }
+
     renderer->setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
 
     glfwWindow.onResize(
@@ -246,11 +258,25 @@ Engine::Engine() :
                 for (auto& camera : scene.cameras)
                 {
                     cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
-                    cameraService.recreateOutputBuffer(camera, width, height);
+
+                    // This runs inside a GLFW callback, so there is no caller to return the
+                    // failure to and no frame boundary to abandon it at: an unrebuilt buffer
+                    // is reported and the next resize gets another attempt. Throwing here
+                    // would unwind through C frames instead.
+                    if (const auto recreated = cameraService.recreateOutputBuffer(camera, width, height); !recreated)
+                    {
+                        logger->error("Camera output buffer was not rebuilt at {}x{}: {}", width, height,
+                                      recreated.error());
+                    }
 
                     for (auto postProcess : camera.postProcesses)
                     {
-                        postProcessService.recreateOutputBuffer(postProcess, width, height);
+                        if (const auto recreated = postProcessService.recreateOutputBuffer(postProcess, width, height);
+                            !recreated)
+                        {
+                            logger->error("Post-process output buffer was not rebuilt at {}x{}: {}", width, height,
+                                          recreated.error());
+                        }
                     }
                 }
             }
@@ -327,32 +353,39 @@ void Engine::step()
         }
     }
 
-    // Drawable's hooks bracket the scene passes rather than the individual draw call: a
-    // model is submitted from inside IRenderer::draw, which takes the whole scene, and the
-    // renderers cannot reach a Drawable without raceengine.graphics importing
-    // raceengine.game and inverting the module graph. Once per frame around every pass that
-    // could draw the entity is the strongest guarantee this layering can express.
-    entityService.beforeDraw();
-
-    for (auto& scene : sceneManagerService.getScenes())
+    // The frame is the composition root's, start to finish: it opens once, every camera of
+    // every scene records its view into it, the presenter records the pass that reaches the
+    // screen, and one endFrame submits and presents the lot. Nothing below opens a frame of
+    // its own, which is what makes N cameras N views inside one present rather than N
+    // presents of which the first N-1 are empty.
+    //
+    // A backend that cannot open a frame — a swapchain gone out of date, a minimised window —
+    // records nothing this step and skips the close, which is the one path with no present.
+    if (renderer->beginFrame())
     {
-        for (auto& camera : scene.cameras)
+        for (auto& scene : sceneManagerService.getScenes())
         {
-            renderer->draw(scene, camera, delta);
+            for (auto& camera : scene.cameras)
+            {
+                renderer->recordView(scene, camera, delta);
+            }
         }
+
+        presenterService.record();
+
+        renderer->endFrame();
     }
 
-    entityService.afterDraw();
-
-    presenterService.present();
-
-    // Before the swap: the back buffer's contents are undefined once it has been swapped,
-    // so a capture taken afterwards reads whatever the driver happened to leave there.
+    // After the present and before the swap: the capture reads what this frame put on screen,
+    // and on GL the back buffer's contents are undefined once it has been swapped.
     dumpFrameIfRequested();
 
     glfwWindow.swapBuffers();
 }
 
+// The frame gate's exit code is the whole result: it says a PNG of frame 120 exists on disk.
+// A capture that reported a failure has written nothing, so exiting 0 would hand the gate a
+// stale file — or no file — and call it a pass.
 void Engine::dumpFrameIfRequested()
 {
     static const char* dumpPath = std::getenv("RACEENGINE_DUMP_FRAME");
@@ -367,7 +400,12 @@ void Engine::dumpFrameIfRequested()
         return;
     }
 
-    renderer->captureFrame(dumpPath);
+    if (const auto captured = renderer->captureFrame(dumpPath); !captured)
+    {
+        logger->error("Frame capture to {} failed: {}", dumpPath, captured.error());
+        std::exit(1);
+    }
+
     std::exit(0);
 }
 

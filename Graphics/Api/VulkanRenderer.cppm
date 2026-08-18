@@ -13,8 +13,8 @@ module;
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <limits>
 #include <optional>
 #include <span>
@@ -28,7 +28,7 @@ module;
 export module raceengine.graphics:VulkanRenderer;
 
 import :GraphicsApi;
-import :IRenderer;
+import :IRenderBackend;
 import :RenderContract;
 import :RenderableEntityService;
 import :SceneManagerService;
@@ -47,6 +47,10 @@ constexpr const char* validationLayerName = "VK_LAYER_KHRONOS_validation";
 // DrawData is ~8.5 KiB per draw; a few hundred draws per frame covers the sandbox scene
 // with generous headroom while keeping the ring under 5 MiB per frame in flight.
 constexpr uint32_t drawDataRingSlots = 512;
+// FrameData is per view, not per frame: Engine::step records every camera into one command
+// buffer, so a single slot would have the last camera's view matrix and position shading all
+// of them. 16 views in a frame is far past a split-screen game's needs at 352 bytes each.
+constexpr uint32_t frameDataRingSlots = 16;
 
 // Pool sizing: fixed and generous beats grow-on-demand here — the game's realistic
 // ceiling is a few hundred materials (7 descriptors each) plus per-frame frame/draw sets
@@ -682,7 +686,7 @@ void transitionImage(const VkCommandBuffer commandBuffer, const VkImage image, c
 
 } // namespace
 
-export class VulkanRenderer : public IRenderer
+export class VulkanRenderer : public IRenderBackend
 {
 private:
     static constexpr uint32_t framesInFlight = 2;
@@ -702,6 +706,9 @@ private:
         VkDescriptorSet frameDataSet = VK_NULL_HANDLE;
         VkDescriptorSet drawDataSet = VK_NULL_HANDLE;
         uint32_t drawDataSlotsUsed = 0;
+        uint32_t frameDataSlotsUsed = 0;
+        // Byte offset of the view currently being recorded; every draw in that view binds it.
+        VkDeviceSize frameDataOffset = 0;
     };
 
     struct ShaderObject
@@ -814,6 +821,7 @@ private:
     VkCommandPool uploadCommandPool = VK_NULL_HANDLE;
     VkSampler attachmentSampler = VK_NULL_HANDLE;
     VkDeviceSize drawDataStride = 0;
+    VkDeviceSize frameDataStride = 0;
     VkSurfaceFormatKHR surfaceFormat{};
     VkExtent2D swapchainExtent{};
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -847,14 +855,16 @@ private:
     unsigned int dummyCubeMapId = 0;
     BufferResource dummyVertexBuffer{};
     std::optional<unsigned int> sceneEnvironmentImageId;
-    // Frame recording state: draw() opens the frame and records the scene and post
-    // passes, drawFullScreenQuad() records the swapchain pass and closes it.
+    // Frame recording state. The frame belongs to Engine::step: beginFrame acquires the
+    // image and opens the command buffer, recordView and recordPresent only record into it,
+    // and endFrame is the one place that submits and presents.
     bool frameOpen = false;
     bool swapchainPassRecorded = false;
     uint32_t currentImageIndex = 0;
     std::optional<PresentPass> lastPresentPass;
     mutable bool mipGenerationUnavailableLogged = false;
     bool drawDataRingExhaustedLogged = false;
+    bool frameDataRingExhaustedLogged = false;
     bool missingCameraOutputLogged = false;
     bool missingMeshUploadLogged = false;
     bool missingMaterialLogged = false;
@@ -874,17 +884,24 @@ public:
                             SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~VulkanRenderer() override;
 
-    bool init() override;
-    void draw(Scene& scene, Camera& camera, float delta) override;
-    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const override;
+    [[nodiscard]] std::expected<void, std::string> init() override;
     void setViewport(int width, int height) override;
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                             const Texture& right, const Texture& top,
-                                             const Texture& bottom) const override;
-    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const override;
-    void deleteFbo(Fbo& fbo) const override;
-    void captureFrame(const std::string& path) override;
+
+    [[nodiscard]] bool beginFrame() override;
+    void recordView(Scene& scene, Camera& camera, float delta) override;
+    void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) override;
+    void endFrame() override;
+
+    [[nodiscard]] std::expected<unsigned int, std::string>
+    createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createCubeMap(const Texture& front, const Texture& back,
+                                                                         const Texture& left, const Texture& right,
+                                                                         const Texture& top,
+                                                                         const Texture& bottom) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createFbo(const Fbo& fbo) override;
+    void deleteFbo(Fbo& fbo) override;
+
+    [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
 private:
     void createInstance();
@@ -897,8 +914,10 @@ private:
     void createFrameResources();
     void createDescriptorInfrastructure();
     void recreateSwapchainIfNeeded();
-    [[nodiscard]] bool beginFrame();
-    bool endFrame(VkBuffer captureBuffer);
+    // The body of endFrame, with the capture readback the debug seam needs threaded through:
+    // captureFrame replays a frame of its own and has to copy the presented image out of it.
+    // Returns whether a frame was actually submitted and presented.
+    bool submitAndPresent(VkBuffer captureBuffer);
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
     void recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader, const glm::mat4& entityModelMatrix,
@@ -906,7 +925,6 @@ private:
                     VkFormat depthFormat);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
-    void presentAndCloseFrame(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
     void transitionTracked(VkCommandBuffer commandBuffer, unsigned int imageId, VkImageLayout newLayout);
     void upload(const Resource<Model>& modelKey);
@@ -934,6 +952,7 @@ private:
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
     void destroyImageResource(unsigned int id) const;
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
+    [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
 
 VulkanRenderer::VulkanRenderer(spdlog::logger& logger, IWindow& window,
@@ -1098,8 +1117,11 @@ VulkanRenderer::~VulkanRenderer()
     }
 }
 
-bool VulkanRenderer::init()
+std::expected<void, std::string> VulkanRenderer::init()
 {
+    // The bring-up steps report through `ensure`, which throws: converting here is what turns
+    // "this machine has no usable Vulkan device" into something the composition root decides
+    // about, rather than an exception escaping a constructor body.
     try
     {
         requestedExtent = VkExtent2D{static_cast<uint32_t>(std::max(window.state().windowWidth, 0)),
@@ -1113,13 +1135,11 @@ bool VulkanRenderer::init()
         createSwapchain();
         createFrameResources();
         createDescriptorInfrastructure();
-        return true;
+        return {};
     }
     catch (const std::exception& exception)
     {
-        // Engine ignores the return value, so an unusable backend must not limp on.
-        logger.error("Vulkan renderer initialisation aborted: {}", exception.what());
-        throw;
+        return std::unexpected(exception.what());
     }
 }
 
@@ -1599,9 +1619,11 @@ void VulkanRenderer::createDescriptorInfrastructure()
         return layout;
     };
 
-    // Scene set 0: FrameData UBO, read by both stages (vulkan-abi.md).
-    const std::array frameBindings = {VkDescriptorSetLayoutBinding{
-        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    // Scene set 0: FrameData UBO, read by both stages (vulkan-abi.md). Dynamic-offset like
+    // set 2, because the frame holds one of these per view rather than one in total.
+    const std::array frameBindings = {
+        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+                                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     frameDataSetLayout = makeSetLayout(frameBindings);
 
     // Scene set 1: MaterialData UBO at binding 0, then one sampler per material texture slot
@@ -1679,11 +1701,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
 
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
     drawDataStride = (sizeof(DrawDataUbo) + alignment - 1) / alignment * alignment;
+    frameDataStride = (sizeof(FrameDataUbo) + alignment - 1) / alignment * alignment;
 
     for (auto& frame : frames)
     {
-        createHostVisibleUniformBuffer(sizeof(FrameDataUbo), frame.frameDataBuffer, frame.frameDataAllocation,
-                                       frame.frameDataMapped);
+        createHostVisibleUniformBuffer(frameDataStride * frameDataRingSlots, frame.frameDataBuffer,
+                                       frame.frameDataAllocation, frame.frameDataMapped);
         createHostVisibleUniformBuffer(drawDataStride * drawDataRingSlots, frame.drawDataBuffer,
                                        frame.drawDataAllocation, frame.drawDataMapped);
 
@@ -1698,6 +1721,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         frame.frameDataSet = sets[0];
         frame.drawDataSet = sets[1];
 
+        // Dynamic UBO range is one FrameData; the bound offset walks the ring per view.
         const VkDescriptorBufferInfo frameDataInfo{frame.frameDataBuffer, 0, sizeof(FrameDataUbo)};
         // Dynamic UBO range is one DrawData; the bound offset walks the ring per draw.
         const VkDescriptorBufferInfo drawDataInfo{frame.drawDataBuffer, 0, sizeof(DrawDataUbo)};
@@ -1707,7 +1731,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         writes[0].dstSet = frame.frameDataSet;
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[0].pBufferInfo = &frameDataInfo;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1].dstSet = frame.drawDataSet;
@@ -1747,11 +1771,6 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
 
 bool VulkanRenderer::beginFrame()
 {
-    if (frameOpen)
-    {
-        return true;
-    }
-
     recreateSwapchainIfNeeded();
     if (swapchain == VK_NULL_HANDLE)
     {
@@ -1761,9 +1780,11 @@ bool VulkanRenderer::beginFrame()
     auto& frame = frames[frameIndex];
     ensure(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, waitForever), "vkWaitForFences");
 
-    // The fence guarantees the GPU is done with this slot's DrawData ring; reset it for
-    // the draws recorded this frame.
+    // The fence guarantees the GPU is done with this slot's uniform rings; reset both for
+    // the views and draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
+    frame.frameDataSlotsUsed = 0;
+    frame.frameDataOffset = 0;
 
     const auto acquireResult =
         vkAcquireNextImageKHR(device, swapchain, waitForever, frame.imageAvailable, VK_NULL_HANDLE, &currentImageIndex);
@@ -1827,7 +1848,12 @@ void VulkanRenderer::recordClearOnlySwapchainPass()
     swapchainPassRecorded = true;
 }
 
-bool VulkanRenderer::endFrame(const VkBuffer captureBuffer)
+void VulkanRenderer::endFrame()
+{
+    static_cast<void>(submitAndPresent(VK_NULL_HANDLE));
+}
+
+bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
 {
     if (!frameOpen)
     {
@@ -1921,49 +1947,21 @@ bool VulkanRenderer::endFrame(const VkBuffer captureBuffer)
     return true;
 }
 
-void VulkanRenderer::draw(Scene& scene, Camera& camera, float delta)
+// One view into the open frame. Every view records into the same command buffer, so N
+// cameras produce N scene passes and still reach the screen through the single present
+// endFrame issues.
+void VulkanRenderer::recordView(Scene& scene, Camera& camera, const float delta)
 {
-    // draw() opens the frame; the presenter's fullscreen pass closes it. A frame still
-    // open here belongs to a step that never presented (no presenter, or a second camera),
-    // so it is finished as recorded before this one starts.
-    if (frameOpen)
-    {
-        endFrame(VK_NULL_HANDLE);
-    }
-
-    if (!beginFrame())
-    {
-        return;
-    }
-
     recordScenePass(scene, camera, delta);
 }
 
-void VulkanRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
-                                        const Resource<FboAttachment>& attachmentKey) const
+void VulkanRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
 {
-    // IRenderer declares this const for the GL backend, where a fullscreen quad is a pure
-    // draw. On Vulkan it is the frame's closing pass: it records, submits and presents.
-    // The renderer is never held by const reference (Engine owns it through a non-const
-    // unique_ptr, PresenterService through a non-const reference), so the cast is defined.
-    const_cast<VulkanRenderer*>(this)->presentAndCloseFrame(shaderKey, attachmentKey);
-}
-
-void VulkanRenderer::presentAndCloseFrame(const Resource<Shader>& shaderKey,
-                                          const Resource<FboAttachment>& attachmentKey)
-{
-    if (!beginFrame())
-    {
-        return;
-    }
-
     const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
     if (attachment.gpuResourceId.has_value())
     {
         recordPresentPass(shaderKey->gpuResourceId, attachment.gpuResourceId.value());
     }
-
-    endFrame(VK_NULL_HANDLE);
 }
 
 bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsigned int attachmentImageId)
@@ -2104,7 +2102,16 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         lightLimitLogged = true;
     }
 
-    std::memcpy(frame.frameDataMapped, &frameData, sizeof(frameData));
+    // Its own slot in the ring, kept until the frame is submitted: the next view records into
+    // the same command buffer, and a shared slot would have its camera shade this one's draws.
+    const auto frameDataSlot = allocateFrameDataSlot();
+    if (!frameDataSlot.has_value())
+    {
+        return;
+    }
+
+    frame.frameDataOffset = frameDataSlot.value();
+    std::memcpy(static_cast<char*>(frame.frameDataMapped) + frame.frameDataOffset, &frameData, sizeof(frameData));
 
     transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (depthImageId.has_value())
@@ -2174,6 +2181,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     {
         auto& model = entity.model;
 
+        // Around the entity's submission, which on this backend is where its commands are
+        // recorded: the same point in the frame GL calls them at.
+        if (entity.beforeDraw.has_value())
+        {
+            (*entity.beforeDraw)();
+        }
+
         for (auto& mesh : entity.meshes)
         {
             if (!mesh.mesh->gpuResourceId.has_value())
@@ -2223,6 +2237,11 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                 recordDraw(primitive, entity.shader, entityModelMatrix, camera, joints, colorImage.format, depthFormat);
                 recordedDraws++;
             }
+        }
+
+        if (entity.afterDraw.has_value())
+        {
+            (*entity.afterDraw)();
         }
     }
 
@@ -2388,9 +2407,13 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<S
                          bound->second.indexType);
 
     const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet};
-    const auto dynamicOffset = static_cast<uint32_t>(slot.value());
+    // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then
+    // set 2's draw slot.
+    const std::array dynamicOffsets = {static_cast<uint32_t>(frame.frameDataOffset),
+                                       static_cast<uint32_t>(slot.value())};
     vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout, 0,
-                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 1, &dynamicOffset);
+                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
+                            static_cast<uint32_t>(dynamicOffsets.size()), dynamicOffsets.data());
 
     vkCmdDrawIndexed(frame.commandBuffer, bound->second.indexCount, 1, 0, 0, 0);
 }
@@ -3161,16 +3184,11 @@ VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const 
 
 void VulkanRenderer::setViewport(const int width, const int height)
 {
-    // The resize callback calls this before it recreates the camera and post-process
-    // framebuffers, so a frame still open here (a step with no presenter pass) is closed
-    // now rather than left holding command references to images about to be destroyed.
-    if (frameOpen)
-    {
-        endFrame(VK_NULL_HANDLE);
-    }
-
-    // Resize callbacks fire inside glfwPollEvents mid-step; recreation happens lazily at
-    // the next draw, so only the requested extent is recorded here.
+    // Recording the extent is all this does. It used to have to close an open frame first,
+    // because the resize callback destroys the framebuffers a half-recorded command buffer
+    // still names — but the callback fires from glfwPollEvents, which the window pumps after
+    // Engine::step has already closed the frame it opened. Recreation stays lazy: the next
+    // beginFrame rebuilds the swapchain if this extent no longer matches it.
     requestedExtent = VkExtent2D{static_cast<uint32_t>(std::max(width, 0)), static_cast<uint32_t>(std::max(height, 0))};
 }
 
@@ -3191,6 +3209,26 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
 
     const auto offset = static_cast<VkDeviceSize>(frame.drawDataSlotsUsed) * drawDataStride;
     frame.drawDataSlotsUsed++;
+    return offset;
+}
+
+std::optional<VkDeviceSize> VulkanRenderer::allocateFrameDataSlot()
+{
+    auto& frame = frames[frameIndex];
+    if (frame.frameDataSlotsUsed >= frameDataRingSlots)
+    {
+        if (!frameDataRingExhaustedLogged)
+        {
+            logger.warn("Vulkan frame-data ring exhausted: {} slots of {} bytes; views beyond the ring are skipped "
+                        "for the rest of the frame",
+                        frameDataRingSlots, frameDataStride);
+            frameDataRingExhaustedLogged = true;
+        }
+        return std::nullopt;
+    }
+
+    const auto offset = static_cast<VkDeviceSize>(frame.frameDataSlotsUsed) * frameDataStride;
+    frame.frameDataSlotsUsed++;
     return offset;
 }
 
@@ -3336,46 +3374,53 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     return pipeline;
 }
 
-std::optional<unsigned int> VulkanRenderer::createShaderObject(const ShaderDescriptor& shaderDescriptor)
+std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(const ShaderDescriptor& shaderDescriptor)
 {
-    if (shaderDescriptor.vulkanVertexShaderSource.empty() || shaderDescriptor.vulkanFragmentShaderSource.empty())
+    try
     {
-        // Expected per vulkan-abi.md: a descriptor without the Vulkan dialect cannot
-        // produce a shader object on this backend.
-        logger.error("Vulkan backend cannot create a shader object: the descriptor is missing "
-                     "vulkanVertexShaderSource and/or vulkanFragmentShaderSource");
-        return std::nullopt;
-    }
+        if (shaderDescriptor.vulkanVertexShaderSource.empty() || shaderDescriptor.vulkanFragmentShaderSource.empty())
+        {
+            // Expected per vulkan-abi.md: a descriptor without the Vulkan dialect cannot
+            // produce a shader object on this backend.
+            return std::unexpected("the shader descriptor carries no vulkanVertexShaderSource and/or "
+                                   "vulkanFragmentShaderSource, which this backend cannot substitute");
+        }
 
-    const auto vertexSpirv =
-        compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
-    const auto fragmentSpirv =
-        compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
-    if (!vertexSpirv.has_value() || !fragmentSpirv.has_value())
+        const auto vertexSpirv =
+            compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
+        const auto fragmentSpirv =
+            compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
+        if (!vertexSpirv.has_value() || !fragmentSpirv.has_value())
+        {
+            return std::unexpected("the Vulkan-dialect sources did not compile to SPIR-V");
+        }
+
+        ShaderObject shaderObject;
+        shaderObject.vertexModule = createShaderModule(vertexSpirv.value());
+        shaderObject.fragmentModule = createShaderModule(fragmentSpirv.value());
+        shaderObject.vertexInputLocations = spirvVertexInputLocations(vertexSpirv.value());
+        shaderObject.fullscreen = shaderObject.vertexInputLocations.empty();
+
+        if (shaderObject.fullscreen)
+        {
+            shaderObject.swapchainTargetPipeline =
+                buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
+        }
+
+        const auto id = nextResourceId++;
+        shaderObjects.emplace(id, shaderObject);
+
+        logger.info("Vulkan shader object {} ready: vertex {} + fragment {} SPIR-V words; {}", id, vertexSpirv->size(),
+                    fragmentSpirv->size(),
+                    shaderObject.fullscreen
+                        ? "swapchain fullscreen pipeline built; offscreen targets build on first use"
+                        : "scene pipeline awaits vertex input from the draw path");
+        return id;
+    }
+    catch (const std::exception& exception)
     {
-        return std::nullopt;
+        return std::unexpected(exception.what());
     }
-
-    ShaderObject shaderObject;
-    shaderObject.vertexModule = createShaderModule(vertexSpirv.value());
-    shaderObject.fragmentModule = createShaderModule(fragmentSpirv.value());
-    shaderObject.vertexInputLocations = spirvVertexInputLocations(vertexSpirv.value());
-    shaderObject.fullscreen = shaderObject.vertexInputLocations.empty();
-
-    if (shaderObject.fullscreen)
-    {
-        shaderObject.swapchainTargetPipeline =
-            buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
-    }
-
-    const auto id = nextResourceId++;
-    shaderObjects.emplace(id, shaderObject);
-
-    logger.info("Vulkan shader object {} ready: vertex {} + fragment {} SPIR-V words; {}", id, vertexSpirv->size(),
-                fragmentSpirv->size(),
-                shaderObject.fullscreen ? "swapchain fullscreen pipeline built; offscreen targets build on first use"
-                                        : "scene pipeline awaits vertex input from the draw path");
-    return id;
 }
 
 VkCommandBuffer VulkanRenderer::beginUploadCommands() const
@@ -3655,28 +3700,36 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     return id;
 }
 
-unsigned int VulkanRenderer::createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                           const Texture& right, const Texture& top, const Texture& bottom) const
+std::expected<unsigned int, std::string> VulkanRenderer::createCubeMap(const Texture& front, const Texture& back,
+                                                                       const Texture& left, const Texture& right,
+                                                                       const Texture& top, const Texture& bottom)
 {
-    // GL uploads {right,left,bottom,top,front,back} onto +X..-Z with bottom deliberately
-    // on POSITIVE_Y; Vulkan cube layers 0..5 are +X..-Z under the same sampling
-    // convention, so the identical assignment preserves lookup parity (V4 adjudicates).
-    const std::array faces = {&right, &left, &bottom, &top, &front, &back};
-    const auto id = createSampledImage(faces, true);
-
-    // The GPU owns the texels now; shed the CPU copies the way the GL path sheds staged
-    // mesh buffers. The storage deque's elements are non-const objects, so the cast is
-    // defined behaviour.
-    for (const auto* face : faces)
+    try
     {
-        auto& texture = const_cast<Texture&>(*face);
-        texture.data.clear();
-        texture.data.shrink_to_fit();
-    }
+        // GL uploads {right,left,bottom,top,front,back} onto +X..-Z with bottom deliberately
+        // on POSITIVE_Y; Vulkan cube layers 0..5 are +X..-Z under the same sampling
+        // convention, so the identical assignment preserves lookup parity (V4 adjudicates).
+        const std::array faces = {&right, &left, &bottom, &top, &front, &back};
+        const auto id = createSampledImage(faces, true);
 
-    logger.info("Vulkan cube map {} uploaded: 6 faces {}x{}, {} mip levels", id, right.width, right.height,
-                imageResources.at(id).mipLevels);
-    return id;
+        // The GPU owns the texels now; shed the CPU copies the way the GL path sheds staged
+        // mesh buffers. The storage deque's elements are non-const objects, so the cast is
+        // defined behaviour.
+        for (const auto* face : faces)
+        {
+            auto& texture = const_cast<Texture&>(*face);
+            texture.data.clear();
+            texture.data.shrink_to_fit();
+        }
+
+        logger.info("Vulkan cube map {} uploaded: 6 faces {}x{}, {} mip levels", id, right.width, right.height,
+                    imageResources.at(id).mipLevels);
+        return id;
+    }
+    catch (const std::exception& exception)
+    {
+        return std::unexpected(exception.what());
+    }
 }
 
 void VulkanRenderer::destroyImageResource(const unsigned int id) const
@@ -3712,110 +3765,118 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
     imageResources.erase(entry);
 }
 
-unsigned int VulkanRenderer::createFbo(const Fbo& fbo) const
+std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fbo)
 {
-    FboResource fboResource;
-    auto loggedWidth = 0u;
-    auto loggedHeight = 0u;
-
-    for (const auto& attachmentKey : fbo.attachments)
+    try
     {
-        auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+        FboResource fboResource;
+        auto loggedWidth = 0u;
+        auto loggedHeight = 0u;
 
-        VkImageUsageFlags usage;
-        VkImageAspectFlags aspect;
-        switch (attachment.type)
+        for (const auto& attachmentKey : fbo.attachments)
         {
-        case FboAttachmentType::Color:
-            usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-            break;
-        case FboAttachmentType::Depth:
-            usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-            break;
-        default:
-        {
-            static auto warnedUnsupportedAttachment = false;
-            if (!warnedUnsupportedAttachment)
+            auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+
+            VkImageUsageFlags usage;
+            VkImageAspectFlags aspect;
+            switch (attachment.type)
             {
-                logger.warn("Vulkan framebuffers support Color and Depth attachments only; skipping type {}",
-                            static_cast<int>(attachment.type));
-                warnedUnsupportedAttachment = true;
+            case FboAttachmentType::Color:
+                usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                break;
+            case FboAttachmentType::Depth:
+                usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+                break;
+            default:
+            {
+                static auto warnedUnsupportedAttachment = false;
+                if (!warnedUnsupportedAttachment)
+                {
+                    logger.warn("Vulkan framebuffers support Color and Depth attachments only; skipping type {}",
+                                static_cast<int>(attachment.type));
+                    warnedUnsupportedAttachment = true;
+                }
+                continue;
             }
-            continue;
+            }
+
+            // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no
+            // Vulkan equivalent is a model the backend cannot serve, not a runtime condition.
+            const auto requestedFormat = attachmentFormat(attachment.internalFormat);
+            if (!requestedFormat.has_value())
+            {
+                throw std::runtime_error("FboAttachment::internalFormat " +
+                                         std::to_string(static_cast<int>(attachment.internalFormat)) +
+                                         " has no Vulkan format");
+            }
+            const auto format = requestedFormat.value();
+
+            // A minimised window reports 0x0; a 1x1 image keeps the resource valid until the
+            // next real resize arrives.
+            const auto width = std::max(attachment.width, 1u);
+            const auto height = std::max(attachment.height, 1u);
+            loggedWidth = width;
+            loggedHeight = height;
+
+            VkImageCreateInfo imageInfo{};
+            imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = format;
+            imageInfo.extent = VkExtent3D{width, height, 1};
+            imageInfo.mipLevels = 1;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = usage;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo allocationCreateInfo{};
+            allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+            VkImage image = VK_NULL_HANDLE;
+            VmaAllocation allocation = nullptr;
+            ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
+                   "vmaCreateImage");
+
+            VkImageViewCreateInfo viewInfo{};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = format;
+            viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, 1, 0, 1};
+
+            VkImageView view = VK_NULL_HANDLE;
+            ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+            const auto attachmentId = nextResourceId++;
+            imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1,
+                                                               width, height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
+            fboResource.attachmentIds.push_back(attachmentId);
+
+            // Observable contract shared with GL: every attachment's id is written back
+            // through its Resource.
+            attachment.gpuResourceId = attachmentId;
+            memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
         }
-        }
 
-        // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no
-        // Vulkan equivalent is a model the backend cannot serve, not a runtime condition.
-        const auto requestedFormat = attachmentFormat(attachment.internalFormat);
-        if (!requestedFormat.has_value())
-        {
-            throw std::runtime_error("FboAttachment::internalFormat " +
-                                     std::to_string(static_cast<int>(attachment.internalFormat)) +
-                                     " has no Vulkan format");
-        }
-        const auto format = requestedFormat.value();
+        const auto id = nextResourceId++;
+        const auto attachmentCount = fboResource.attachmentIds.size();
+        fboResources.emplace(id, std::move(fboResource));
 
-        // A minimised window reports 0x0; a 1x1 image keeps the resource valid until the
-        // next real resize arrives.
-        const auto width = std::max(attachment.width, 1u);
-        const auto height = std::max(attachment.height, 1u);
-        loggedWidth = width;
-        loggedHeight = height;
-
-        VkImageCreateInfo imageInfo{};
-        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = format;
-        imageInfo.extent = VkExtent3D{width, height, 1};
-        imageInfo.mipLevels = 1;
-        imageInfo.arrayLayers = 1;
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = usage;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        VmaAllocationCreateInfo allocationCreateInfo{};
-        allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-
-        VkImage image = VK_NULL_HANDLE;
-        VmaAllocation allocation = nullptr;
-        ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
-               "vmaCreateImage");
-
-        VkImageViewCreateInfo viewInfo{};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = image;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = format;
-        viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, 1, 0, 1};
-
-        VkImageView view = VK_NULL_HANDLE;
-        ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
-
-        const auto attachmentId = nextResourceId++;
-        imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1, width,
-                                                           height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
-        fboResource.attachmentIds.push_back(attachmentId);
-
-        // Observable contract shared with GL: every attachment's id is written back
-        // through its Resource.
-        attachment.gpuResourceId = attachmentId;
-        memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
+        logger.info("Vulkan framebuffer {} ready: {} attachment(s), {}x{}", id, attachmentCount, loggedWidth,
+                    loggedHeight);
+        return id;
     }
-
-    const auto id = nextResourceId++;
-    const auto attachmentCount = fboResource.attachmentIds.size();
-    fboResources.emplace(id, std::move(fboResource));
-
-    logger.info("Vulkan framebuffer {} ready: {} attachment(s), {}x{}", id, attachmentCount, loggedWidth, loggedHeight);
-    return id;
+    catch (const std::exception& exception)
+    {
+        return std::unexpected(exception.what());
+    }
 }
 
-void VulkanRenderer::deleteFbo(Fbo& fbo) const
+void VulkanRenderer::deleteFbo(Fbo& fbo)
 {
     if (device == VK_NULL_HANDLE)
     {
@@ -3841,107 +3902,107 @@ void VulkanRenderer::deleteFbo(Fbo& fbo) const
     }
 }
 
-void VulkanRenderer::captureFrame(const std::string& path)
+std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string& path)
 {
-    // Engine calls this after the presenter closed the frame; a frame still open would be
-    // a caller-order change, and finishing it keeps the swapchain consistent either way.
-    if (frameOpen)
+    try
     {
-        endFrame(VK_NULL_HANDLE);
-    }
-
-    recreateSwapchainIfNeeded();
-    if (swapchain == VK_NULL_HANDLE)
-    {
-        logger.warn("Vulkan frame capture skipped: no swapchain (window minimised?)");
-        return;
-    }
-
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VmaAllocation allocation = nullptr;
-    VmaAllocationInfo allocationInfo{};
-    auto width = 0u;
-    auto height = 0u;
-    VkDeviceSize byteCount = 0;
-
-    // A presented swapchain image may not be touched until it is reacquired, so the
-    // capture acquires a fresh image and replays the presenter's pass onto it: the HDR
-    // attachment it samples is a persistent image that still holds the presented frame,
-    // which makes the readback identical rather than merely similar.
-    auto presented = false;
-    for (auto attempt = 0; attempt < 2 && !presented; attempt++)
-    {
-        if (!beginFrame())
+        // Engine calls this after endFrame presented, so no frame is open here: the capture
+        // opens one of its own below.
+        recreateSwapchainIfNeeded();
+        if (swapchain == VK_NULL_HANDLE)
         {
-            continue;
+            return std::unexpected("there is no swapchain to read back from (window minimised?)");
         }
 
-        if (buffer == VK_NULL_HANDLE)
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VmaAllocationInfo allocationInfo{};
+        auto width = 0u;
+        auto height = 0u;
+        VkDeviceSize byteCount = 0;
+
+        // A presented swapchain image may not be touched until it is reacquired, so the
+        // capture acquires a fresh image and replays the presenter's pass onto it: the HDR
+        // attachment it samples is a persistent image that still holds the presented frame,
+        // which makes the readback identical rather than merely similar.
+        auto presented = false;
+        for (auto attempt = 0; attempt < 2 && !presented; attempt++)
         {
-            width = swapchainExtent.width;
-            height = swapchainExtent.height;
-            byteCount = static_cast<VkDeviceSize>(width) * height * 4;
+            if (!beginFrame())
+            {
+                continue;
+            }
 
-            VkBufferCreateInfo bufferInfo{};
-            bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bufferInfo.size = byteCount;
-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (buffer == VK_NULL_HANDLE)
+            {
+                width = swapchainExtent.width;
+                height = swapchainExtent.height;
+                byteCount = static_cast<VkDeviceSize>(width) * height * 4;
 
-            VmaAllocationCreateInfo allocationCreateInfo{};
-            allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-            allocationCreateInfo.flags =
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+                VkBufferCreateInfo bufferInfo{};
+                bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bufferInfo.size = byteCount;
+                bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-            ensure(
-                vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation, &allocationInfo),
-                "vmaCreateBuffer");
+                VmaAllocationCreateInfo allocationCreateInfo{};
+                allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+                allocationCreateInfo.flags =
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+                ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation,
+                                       &allocationInfo),
+                       "vmaCreateBuffer");
+            }
+
+            if (lastPresentPass.has_value())
+            {
+                recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
+            }
+
+            presented = submitAndPresent(buffer);
+        }
+        ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+
+        if (!presented || buffer == VK_NULL_HANDLE)
+        {
+            if (buffer != VK_NULL_HANDLE)
+            {
+                vmaDestroyBuffer(allocator, buffer, allocation);
+            }
+
+            return std::unexpected("no swapchain image could be acquired to replay the present pass onto");
         }
 
-        if (lastPresentPass.has_value())
+        ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
+
+        auto pixels = std::vector<unsigned char>(static_cast<size_t>(byteCount));
+        std::memcpy(pixels.data(), allocationInfo.pMappedData, pixels.size());
+        vmaDestroyBuffer(allocator, buffer, allocation);
+
+        if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_UNORM || surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB)
         {
-            recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
+            for (size_t pixelStart = 0; pixelStart < pixels.size(); pixelStart += 4)
+            {
+                std::swap(pixels[pixelStart], pixels[pixelStart + 2]);
+            }
         }
 
-        presented = endFrame(buffer);
+        // Vulkan images are already top-down; rows go straight out.
+        const auto rowBytes = static_cast<int>(width) * 4;
+        if (stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height), 4, pixels.data(),
+                           rowBytes) == 0)
+        {
+            return std::unexpected("stb_image_write could not write the frame dump to " + path);
+        }
+
+        logger.info("Frame dump written to {}", path);
+        return {};
     }
-    ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
-
-    if (!presented || buffer == VK_NULL_HANDLE)
+    catch (const std::exception& exception)
     {
-        if (buffer != VK_NULL_HANDLE)
-        {
-            vmaDestroyBuffer(allocator, buffer, allocation);
-        }
-
-        logger.warn("Vulkan frame capture skipped: no swapchain image available");
-        return;
+        return std::unexpected(exception.what());
     }
-
-    ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
-
-    auto pixels = std::vector<unsigned char>(static_cast<size_t>(byteCount));
-    std::memcpy(pixels.data(), allocationInfo.pMappedData, pixels.size());
-    vmaDestroyBuffer(allocator, buffer, allocation);
-
-    if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_UNORM || surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB)
-    {
-        for (size_t pixelStart = 0; pixelStart < pixels.size(); pixelStart += 4)
-        {
-            std::swap(pixels[pixelStart], pixels[pixelStart + 2]);
-        }
-    }
-
-    // Vulkan images are already top-down; rows go straight out.
-    const auto rowBytes = static_cast<int>(width) * 4;
-    if (stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height), 4, pixels.data(), rowBytes) ==
-        0)
-    {
-        logger.error("Failed to write frame dump to {}", path);
-        std::exit(1);
-    }
-
-    logger.info("Frame dump written to {}", path);
 }
 
 } // namespace raceengine

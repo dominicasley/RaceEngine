@@ -1,12 +1,13 @@
 module;
 
+#include <expected>
 #include <map>
 #include <optional>
 #include <string>
 
 export module raceengine.graphics:ShaderService;
 
-import :IRenderer;
+import :IGpuResourceFactory;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -17,30 +18,33 @@ export class ShaderService
 {
 private:
     MemoryStorageService& memoryStorageService;
-    IRenderer& renderer;
+    IGpuResourceFactory& gpuResourceFactory;
 
     std::map<std::string, Resource<Shader>> shaders;
 
 public:
-    explicit ShaderService(MemoryStorageService& memoryStorageService, IRenderer& renderer);
-    std::optional<Resource<Shader>> createShader(const std::string& name, const ShaderDescriptor& shaderDescriptor);
-    std::optional<Resource<Shader>> getShaderByName(const std::string& name);
+    explicit ShaderService(MemoryStorageService& memoryStorageService, IGpuResourceFactory& gpuResourceFactory);
+    [[nodiscard]] std::expected<Resource<Shader>, std::string> createShader(const std::string& name,
+                                                                            const ShaderDescriptor& shaderDescriptor);
+    // A name nothing was registered under is a lookup miss, not a failed operation: the
+    // caller asked whether a shader exists and the answer is no.
+    [[nodiscard]] std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
-ShaderService::ShaderService(MemoryStorageService& memoryStorageService, IRenderer& renderer) :
+ShaderService::ShaderService(MemoryStorageService& memoryStorageService, IGpuResourceFactory& gpuResourceFactory) :
     memoryStorageService(memoryStorageService),
-    renderer(renderer)
+    gpuResourceFactory(gpuResourceFactory)
 {
 }
 
-std::optional<Resource<Shader>> ShaderService::createShader(const std::string& name,
-                                                            const ShaderDescriptor& shaderDescriptor)
+std::expected<Resource<Shader>, std::string> ShaderService::createShader(const std::string& name,
+                                                                         const ShaderDescriptor& shaderDescriptor)
 {
-    auto shaderProgramId = renderer.createShaderObject(shaderDescriptor);
+    const auto shaderProgramId = gpuResourceFactory.createShaderObject(shaderDescriptor);
 
-    if (!shaderProgramId.has_value())
+    if (!shaderProgramId)
     {
-        return {};
+        return std::unexpected("shader '" + name + "' was not created: " + shaderProgramId.error());
     }
 
     const auto shader = memoryStorageService.shaders.add(Shader{.gpuResourceId = shaderProgramId.value()});

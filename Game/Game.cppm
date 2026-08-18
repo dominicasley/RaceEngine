@@ -50,14 +50,17 @@ export struct Drawable : public Component
 {
 public:
     RenderableEntity& renderableEntity;
-    // Invoked around the scene passes of the frame that draws this entity, not around its
-    // individual draw call: submission happens inside the renderer, which cannot see a
-    // Drawable without raceengine.graphics depending on raceengine.game.
-    std::optional<std::function<void()>> beforeDraw;
-    std::optional<std::function<void()>> afterDraw;
+    // Views onto the renderable's own hooks, not copies of them: a game assigns through the
+    // component it owns, and the backend reads them off the entity it is already submitting.
+    // That is what puts them around the individual draw call rather than around the whole
+    // frame — the renderer never has to see a Drawable, so the module graph stays as it is.
+    std::optional<std::function<void()>>& beforeDraw;
+    std::optional<std::function<void()>>& afterDraw;
 
     explicit Drawable(RenderableEntity& _renderableEntity) :
-        renderableEntity(_renderableEntity)
+        renderableEntity(_renderableEntity),
+        beforeDraw(_renderableEntity.beforeDraw),
+        afterDraw(_renderableEntity.afterDraw)
     {
     }
 };
@@ -71,8 +74,6 @@ public:
     Entity& createEntity();
     [[nodiscard]] Entity& getEntity(unsigned long long entityId);
     void update(float delta);
-    void beforeDraw() const;
-    void afterDraw() const;
 
     template <typename T> std::shared_ptr<T> addComponent(unsigned long long entityId)
     {
@@ -154,36 +155,6 @@ void EntityService::update(float delta)
             if (auto* behaviour = dynamic_cast<Behaviour*>(component.second.get()))
             {
                 behaviour->update(delta);
-            }
-        }
-    }
-}
-
-void EntityService::beforeDraw() const
-{
-    for (const auto& entity : entities)
-    {
-        for (const auto& component : entity.components)
-        {
-            if (const auto* drawable = dynamic_cast<const Drawable*>(component.second.get());
-                drawable != nullptr && drawable->beforeDraw.has_value())
-            {
-                (*drawable->beforeDraw)();
-            }
-        }
-    }
-}
-
-void EntityService::afterDraw() const
-{
-    for (const auto& entity : entities)
-    {
-        for (const auto& component : entity.components)
-        {
-            if (const auto* drawable = dynamic_cast<const Drawable*>(component.second.get());
-                drawable != nullptr && drawable->afterDraw.has_value())
-            {
-                (*drawable->afterDraw)();
             }
         }
     }

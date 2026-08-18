@@ -1,6 +1,7 @@
 module;
 
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -92,6 +93,13 @@ export struct RenderableEntity
 {
     RenderableEntityType type;
     SceneNode& node;
+    // Called by the backend immediately around this entity's submission, once per view that
+    // draws it. The hooks live on the renderable rather than on the game's Drawable component
+    // because this module is the one both sides already depend on: a renderer that had to see
+    // a Drawable would make raceengine.graphics import raceengine.game and invert the module
+    // graph. Drawable holds them as a view, so a game still writes them through its component.
+    std::optional<std::function<void()>> beforeDraw;
+    std::optional<std::function<void()>> afterDraw;
 
     explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
         type(type),

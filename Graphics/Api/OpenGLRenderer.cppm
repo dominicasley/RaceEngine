@@ -5,11 +5,10 @@ module;
 
 #include <GLFW/glfw3.h>
 
-#include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <optional>
 #include <ranges>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -24,7 +23,7 @@ module;
 export module raceengine.graphics:OpenGLRenderer;
 
 import :GraphicsApi;
-import :IRenderer;
+import :IRenderBackend;
 import :RenderContract;
 import :SceneManagerService;
 import :RenderableEntityService;
@@ -61,7 +60,7 @@ struct UniformKeyEqual
 
 typedef std::unordered_map<std::pair<unsigned int, std::string>, int, UniformKeyHash, UniformKeyEqual> UniformPool;
 
-export class OpenGLRenderer : public IRenderer
+export class OpenGLRenderer : public IRenderBackend
 {
 private:
     UniformPool uniformPool;
@@ -81,33 +80,45 @@ private:
     std::vector<unsigned int> createdPrograms;
     std::vector<unsigned int> createdVaos;
     std::vector<unsigned int> createdVbos;
-    mutable std::vector<unsigned int> createdTextures;
-    mutable std::vector<unsigned int> createdFbos;
+    std::vector<unsigned int> createdTextures;
+    std::vector<unsigned int> createdFbos;
+    // Whether this frame recorded a present pass. GL has no swapchain to acquire, so the
+    // frame is bookkeeping only — but the fallback it drives is real: a frame with no
+    // presenter leaves the window showing the clear colour rather than whatever the driver
+    // left in the back buffer, which is what Vulkan's clear-only pass already guaranteed.
+    bool presentRecorded = false;
 
 public:
     explicit OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
                             SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~OpenGLRenderer() override;
 
-    bool init() override;
-    void draw(Scene& scene, Camera& camera, float delta) override;
-    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const override;
+    [[nodiscard]] std::expected<void, std::string> init() override;
     void setViewport(int width, int height) override;
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                             const Texture& right, const Texture& top,
-                                             const Texture& bottom) const override;
-    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const override;
-    void deleteFbo(Fbo& fbo) const override;
-    void captureFrame(const std::string& path) override;
+
+    [[nodiscard]] bool beginFrame() override;
+    void recordView(Scene& scene, Camera& camera, float delta) override;
+    void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) override;
+    void endFrame() override;
+
+    [[nodiscard]] std::expected<unsigned int, std::string>
+    createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createCubeMap(const Texture& front, const Texture& back,
+                                                                         const Texture& left, const Texture& right,
+                                                                         const Texture& top,
+                                                                         const Texture& bottom) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createFbo(const Fbo& fbo) override;
+    void deleteFbo(Fbo& fbo) override;
+
+    [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
 private:
     void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
     void bindMaterial(const Resource<Material>& material, const Resource<Shader>& shader);
     void uploadLights(unsigned int programId, const Scene& scene);
     void upload(const Resource<Model>& model);
-    void uploadTexture(const Resource<Texture>& texture) const;
-    [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
+    void uploadTexture(const Resource<Texture>& texture);
+    [[nodiscard]] unsigned int createTexture(const Texture& texture);
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
     [[nodiscard]] unsigned int getInternalFormatFromBitsPerPixel(int bitsPerPixel) const;
@@ -225,12 +236,11 @@ OpenGLRenderer::~OpenGLRenderer()
     }
 }
 
-bool OpenGLRenderer::init()
+std::expected<void, std::string> OpenGLRenderer::init()
 {
     if (gladLoadGL(glfwGetProcAddress) == 0)
     {
-        logger.error("Failed to initialize OpenGL");
-        throw std::runtime_error("Failed to initialize OpenGL");
+        return std::unexpected("glad could not load the OpenGL entry points from the GLFW context");
     }
 
     if (glDebugMessageCallback != nullptr)
@@ -255,10 +265,33 @@ bool OpenGLRenderer::init()
 
     createQuad();
 
+    return {};
+}
+
+// GL has no image to acquire and no command buffer to open: the context is always ready, so
+// the frame exists to say when it started and to let endFrame see whether anything presented.
+bool OpenGLRenderer::beginFrame()
+{
+    presentRecorded = false;
     return true;
 }
 
-void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
+// Nothing to submit — GL commands went to the driver as they were issued — and nothing to
+// present either: the buffer swap belongs to the window, which owns the surface. What is
+// left is the frame's guarantee that something reached the back buffer.
+void OpenGLRenderer::endFrame()
+{
+    if (presentRecorded)
+    {
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, viewportWidth, viewportHeight);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 {
     currentlyBoundMaterial.reset();
 
@@ -268,11 +301,16 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
         sceneEnvironmentGpuId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
     }
 
+    // The pass states its own target and its own state instead of inheriting either. A view
+    // is one of N recorded into the same frame, so what the previous view left bound — the
+    // default framebuffer, or culling switched off by its last non-opaque material — says
+    // nothing about what this one needs.
+    auto target = 0u;
     if (camera.output.has_value())
     {
         if (camera.output.value()->gpuResourceId.has_value())
         {
-            glBindFramebuffer(GL_FRAMEBUFFER, camera.output.value()->gpuResourceId.value());
+            target = camera.output.value()->gpuResourceId.value();
         }
         else
         {
@@ -285,11 +323,22 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
         }
     }
 
+    glBindFramebuffer(GL_FRAMEBUFFER, target);
+    glViewport(0, 0, viewportWidth, viewportHeight);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     for (auto& entity : scene.models)
     {
         auto& model = entity.model;
+
+        if (entity.beforeDraw.has_value())
+        {
+            (*entity.beforeDraw)();
+        }
 
         for (auto& mesh : entity.meshes)
         {
@@ -404,26 +453,40 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
         }
 
         glBindVertexArray(0);
+
+        if (entity.afterDraw.has_value())
+        {
+            (*entity.afterDraw)();
+        }
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
+    // Each link of the chain binds the buffer it writes; a post-process with no output of its
+    // own writes the default framebuffer, which is what it did when it inherited the binding
+    // the scene pass left behind.
     for (const auto& postProcess : camera.postProcesses)
     {
-        if (postProcess->output.has_value())
+        auto postProcessTarget = 0u;
+        if (postProcess->output.has_value() && postProcess->output.value()->gpuResourceId.has_value())
         {
-            auto frameBuffer = postProcess->output.value();
-
-            if (frameBuffer->gpuResourceId.has_value())
-            {
-                glBindFramebuffer(GL_FRAMEBUFFER, frameBuffer->gpuResourceId.value());
-            }
+            postProcessTarget = postProcess->output.value()->gpuResourceId.value();
         }
 
-        drawFullScreenQuad(postProcess->shader, postProcess->inputs);
+        glBindFramebuffer(GL_FRAMEBUFFER, postProcessTarget);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        drawFullScreenQuad(postProcess->shader, postProcess->inputs);
     }
+}
+
+// The frame's last pass. It binds the default framebuffer itself rather than relying on a
+// view having left it bound, which is what made the presenter depend on a scene pass running
+// first.
+void OpenGLRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey});
+
+    presentRecorded = true;
 }
 
 // A scene with no lights uploads lightCount 0: both shader loops then contribute nothing and
@@ -685,7 +748,7 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
     }
 }
 
-void OpenGLRenderer::uploadTexture(const Resource<Texture>& textureKey) const
+void OpenGLRenderer::uploadTexture(const Resource<Texture>& textureKey)
 {
     // MemoryStorage hands out const references to non-const elements; writing the id and
     // dropping the pixels in place avoids copying a multi-megabyte payload through get/update
@@ -704,7 +767,7 @@ void OpenGLRenderer::uploadTexture(const Resource<Texture>& textureKey) const
     texture.data.shrink_to_fit();
 }
 
-std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
+std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
 {
     const auto programId = glCreateProgram();
     const auto vertexShaderId = glCreateShader(GL_VERTEX_SHADER);
@@ -770,18 +833,18 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     glGetProgramiv(programId, GL_LINK_STATUS, &result);
     glGetProgramiv(programId, GL_INFO_LOG_LENGTH, &infoLogLength);
 
+    std::string linkLog;
     if (infoLogLength > 1)
     {
         std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
         glGetProgramInfoLog(programId, infoLogLength, nullptr, infoLog.data());
+        linkLog = infoLog.data();
 
+        // A log on a program that linked is a driver remark, not a failure; only the failing
+        // case is reported to the caller, so a warning here is the whole story.
         if (result == GL_TRUE)
         {
-            logger.warn("shader link log: {}", infoLog.data());
-        }
-        else
-        {
-            logger.error("shader link error: {}", infoLog.data());
+            logger.warn("shader link log: {}", linkLog);
         }
     }
 
@@ -795,7 +858,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     if (result != GL_TRUE)
     {
         glDeleteProgram(programId);
-        return {};
+        return std::unexpected("the GL program did not link" + (linkLog.empty() ? std::string() : ": " + linkLog));
     }
 
     createdPrograms.push_back(programId);
@@ -803,7 +866,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     return programId;
 }
 
-unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
+unsigned int OpenGLRenderer::createTexture(const Texture& texture)
 {
     unsigned int textureId;
 
@@ -847,8 +910,9 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
     return textureId;
 }
 
-unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                           const Texture& right, const Texture& top, const Texture& bottom) const
+std::expected<unsigned int, std::string> OpenGLRenderer::createCubeMap(const Texture& front, const Texture& back,
+                                                                       const Texture& left, const Texture& right,
+                                                                       const Texture& top, const Texture& bottom)
 {
     unsigned int textureId;
     glGenTextures(1, &textureId);
@@ -888,7 +952,7 @@ unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& 
     return textureId;
 }
 
-unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
+std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fbo)
 {
     unsigned int fboGpuResourceId;
     glGenFramebuffers(1, &fboGpuResourceId);
@@ -943,6 +1007,8 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
     glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
 
     const auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     if (status != GL_FRAMEBUFFER_COMPLETE)
     {
         const auto* statusName = "unknown status";
@@ -976,15 +1042,14 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
             break;
         }
 
-        logger.error("Framebuffer incomplete: {} (0x{:x})", statusName, status);
+        return std::unexpected(std::string("the framebuffer is incomplete: ") + statusName + " (" +
+                               std::to_string(status) + ")");
     }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     return fboGpuResourceId;
 }
 
-void OpenGLRenderer::deleteFbo(Fbo& fbo) const
+void OpenGLRenderer::deleteFbo(Fbo& fbo)
 {
     // GL recycles a deleted name immediately, and createFbo regenerates these objects right
     // after this returns: an id left in the tracking vectors would make the destructor delete
@@ -1146,7 +1211,7 @@ void OpenGLRenderer::setViewport(int width, int height)
     glViewport(0, 0, width, height);
 }
 
-void OpenGLRenderer::captureFrame(const std::string& path)
+std::expected<void, std::string> OpenGLRenderer::captureFrame(const std::string& path)
 {
     // viewportWidth/Height track the window size: set from the window state at startup
     // and updated by the resize callback before any capture can run.
@@ -1172,11 +1237,11 @@ void OpenGLRenderer::captureFrame(const std::string& path)
 
     if (stbi_write_png(path.c_str(), width, height, 4, pixels.data(), static_cast<int>(rowBytes)) == 0)
     {
-        logger.error("Failed to write frame dump to {}", path);
-        std::exit(1);
+        return std::unexpected("stb_image_write could not write the frame dump to " + path);
     }
 
     logger.info("Frame dump written to {}", path);
+    return {};
 }
 
 unsigned int OpenGLRenderer::getTextureDataType(PixelDataType type) const
@@ -1282,12 +1347,6 @@ void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shader,
 
     glBindVertexArray(quadVao);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 4));
-}
-
-void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
-                                        const Resource<FboAttachment>& attachmentKey) const
-{
-    drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey});
 }
 
 } // namespace raceengine

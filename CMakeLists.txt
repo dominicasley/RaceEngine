@@ -62,7 +62,10 @@ target_sources(Engine PUBLIC
         Graphics/System/Window.cppm
         Graphics/Api/GraphicsApi.cppm
         Graphics/Api/RenderContract.cppm
-        Graphics/Api/IRenderer.cppm
+        Graphics/Api/IFrameRecorder.cppm
+        Graphics/Api/IGpuResourceFactory.cppm
+        Graphics/Api/IFrameCapture.cppm
+        Graphics/Api/IRenderBackend.cppm
         Graphics/Api/VulkanRenderer.cppm
         Graphics/Api/OpenGLRenderer.cppm
         Graphics/Services/SceneManagerService.cppm

@@ -1,5 +1,8 @@
 module;
 
+#include <expected>
+#include <string>
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -22,7 +25,7 @@ private:
 
 public:
     explicit CameraService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
-    Camera createCamera();
+    [[nodiscard]] std::expected<Camera, std::string> createCamera();
     void setPosition(Camera& camera, float x, float y, float z) const;
     void setDirection(Camera& camera, float x, float y, float z) const;
     void translate(Camera& camera, float x, float y, float z) const;
@@ -30,7 +33,7 @@ public:
     void setRoll(Camera& camera, float x, float y, float z) const;
     void setAspectRatio(Camera& camera, float aspectRatio) const;
     void setClippingPlanes(Camera& camera, float nearPlane, float farPlane) const;
-    void recreateOutputBuffer(Camera& camera, int width, int height) const;
+    [[nodiscard]] std::expected<void, std::string> recreateOutputBuffer(Camera& camera, int width, int height) const;
     void setFieldOfView(Camera& camera, float fov) const;
     void lookAtPoint(Camera& camera, float x, float y, float z) const;
     void addPostProcess(Camera& camera, const Resource<PostProcess>& postProcess) const;
@@ -46,12 +49,34 @@ CameraService::CameraService(MemoryStorageService& memoryStorageService, FboServ
 {
 }
 
-Camera CameraService::createCamera()
+std::expected<Camera, std::string> CameraService::createCamera()
 {
     auto windowState = window.state();
 
     auto windowWidth = static_cast<unsigned int>(windowState.windowWidth);
     auto windowHeight = static_cast<unsigned int>(windowState.windowHeight);
+
+    // A camera is the render target it draws into; one that could not get its buffers is not a
+    // camera with a missing field, so it is not handed back at all.
+    const auto output =
+        fboService.create(CreateFboDTO{.type = FboType::Planar,
+                                       .attachments = {
+                                           CreateFboAttachmentDTO{.width = windowWidth,
+                                                                  .height = windowHeight,
+                                                                  .type = FboAttachmentType::Color,
+                                                                  .captureFormat = TextureFormat::RGBA,
+                                                                  .internalFormat = TextureFormat::RGBA16F},
+                                           CreateFboAttachmentDTO{.width = windowWidth,
+                                                                  .height = windowHeight,
+                                                                  .type = FboAttachmentType::Depth,
+                                                                  .captureFormat = TextureFormat::DepthComponent,
+                                                                  .internalFormat = TextureFormat::DepthComponent},
+                                       }});
+
+    if (!output)
+    {
+        return std::unexpected("the camera has no output buffer: " + output.error());
+    }
 
     // The clipping planes default to the values the projection used to hardcode, so wiring the
     // fields changes no frame; a game that wants a different depth range now has one to set.
@@ -63,20 +88,7 @@ Camera CameraService::createCamera()
                   .farClippingPlane = 5000.0f,
                   .direction = glm::vec3(0, 0, 1),
                   .roll = glm::vec3(0, 1, 0),
-                  .output = fboService.create(
-                      CreateFboDTO{.type = FboType::Planar,
-                                   .attachments = {
-                                       CreateFboAttachmentDTO{.width = windowWidth,
-                                                              .height = windowHeight,
-                                                              .type = FboAttachmentType::Color,
-                                                              .captureFormat = TextureFormat::RGBA,
-                                                              .internalFormat = TextureFormat::RGBA16F},
-                                       CreateFboAttachmentDTO{.width = windowWidth,
-                                                              .height = windowHeight,
-                                                              .type = FboAttachmentType::Depth,
-                                                              .captureFormat = TextureFormat::DepthComponent,
-                                                              .internalFormat = TextureFormat::DepthComponent},
-                                   }})};
+                  .output = output.value()};
 }
 
 void CameraService::setPosition(Camera& camera, float x, float y, float z) const
@@ -129,12 +141,12 @@ void CameraService::setClippingPlanes(Camera& camera, float nearPlane, float far
     camera.farClippingPlane = farPlane;
 }
 
-void CameraService::recreateOutputBuffer(Camera& camera, int width, int height) const
+std::expected<void, std::string> CameraService::recreateOutputBuffer(Camera& camera, int width, int height) const
 {
     auto windowWidth = static_cast<unsigned int>(width);
     auto windowHeight = static_cast<unsigned int>(height);
 
-    fboService.resize(camera.output.value(), windowWidth, windowHeight);
+    return fboService.resize(camera.output.value(), windowWidth, windowHeight);
 }
 
 void CameraService::lookAtPoint(Camera& camera, float x, float y, float z) const
