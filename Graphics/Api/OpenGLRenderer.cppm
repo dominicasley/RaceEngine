@@ -307,7 +307,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints);
                 setProgramUniform(shader->gpuResourceId, "animated", !joints.empty());
 
-                setProgramUniform(shader->gpuResourceId, "textureRepeat", material->repeat);
+                setProgramUniform(shader->gpuResourceId, "textureTransform", material->transform);
 
                 if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != material.id)
                 {

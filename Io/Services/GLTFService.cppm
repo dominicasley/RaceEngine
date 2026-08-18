@@ -39,6 +39,7 @@ public:
     [[nodiscard]] std::optional<Model> loadModelFromFile(const std::string& filePath) const;
     [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
+    [[nodiscard]] glm::mat3 toTextureTransform(const tinygltf::TextureInfo& textureInfo) const;
     [[nodiscard]] Texture getImageFromIndex(const tinygltf::Model& model, int index) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
     void processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node& node,
@@ -272,6 +273,10 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
             .metalness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.metallicFactor),
             .roughness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.roughnessFactor),
             .opaque = true,
+            // One material-wide transform, read from the base colour reference. The extension is
+            // per texture reference, so a material transforming its maps differently is flattened
+            // to whatever base colour asks for.
+            .transform = toTextureTransform(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture),
             .albedo = albedoTexturePtr,
             .metallicRoughness = metallicRoughnessTexturePtr,
             .normal = normalTexturePtr,
@@ -382,6 +387,42 @@ TextureFormat GLTFService::toTextureFormat(int format) const
     default:
         return TextureFormat::RGBA;
     }
+}
+
+// KHR_texture_transform. tinygltf::Value::Get asserts on the wrong container type and yields a
+// null Value (numeric 0) for an absent key, so every lookup is typed and length-checked first.
+glm::mat3 GLTFService::toTextureTransform(const tinygltf::TextureInfo& textureInfo) const
+{
+    const auto extension = textureInfo.extensions.find("KHR_texture_transform");
+    if (extension == textureInfo.extensions.end() || !extension->second.IsObject())
+    {
+        return glm::mat3(1.0f);
+    }
+
+    const auto& transform = extension->second;
+    const auto readPair = [&transform](const std::string& key, const glm::vec2 fallback)
+    {
+        const auto& value = transform.Get(key);
+        if (!value.IsArray() || value.ArrayLen() < 2)
+        {
+            return fallback;
+        }
+
+        return glm::vec2(static_cast<float>(value.Get(0).GetNumberAsDouble()),
+                         static_cast<float>(value.Get(1).GetNumberAsDouble()));
+    };
+
+    const auto offset = readPair("offset", glm::vec2(0.0f));
+    const auto scale = readPair("scale", glm::vec2(1.0f));
+    const auto rotation = static_cast<float>(transform.Get("rotation").GetNumberAsDouble());
+
+    // Spec order translate * rotate * scale, written as glm takes columns.
+    const auto translation = glm::mat3(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, offset.x, offset.y, 1.0f);
+    const auto rotate = glm::mat3(glm::cos(rotation), glm::sin(rotation), 0.0f, -glm::sin(rotation), glm::cos(rotation),
+                                  0.0f, 0.0f, 0.0f, 1.0f);
+    const auto stretch = glm::mat3(scale.x, 0.0f, 0.0f, 0.0f, scale.y, 0.0f, 0.0f, 0.0f, 1.0f);
+
+    return translation * rotate * stretch;
 }
 
 Texture GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const

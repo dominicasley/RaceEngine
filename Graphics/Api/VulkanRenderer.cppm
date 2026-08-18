@@ -88,15 +88,19 @@ static_assert(offsetof(DrawDataUbo, animated) == 256);
 static_assert(offsetof(DrawDataUbo, jointTransforms) == 272);
 
 // Set 1 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
+// textureTransform carries a 3x3 UV transform in a mat4 slot: std140 pads a mat3's columns to
+// 16 bytes each, which glm::mat3 (three packed vec3s) does not, so a mat3 member would not map.
 struct MaterialDataUbo
 {
     glm::vec4 baseColour;
-    glm::vec4 repeatRoughMetal;
+    glm::vec4 roughMetal;
     glm::ivec4 useTextures;
     glm::ivec4 useTextures2;
+    glm::mat4 textureTransform;
 };
 
-static_assert(sizeof(MaterialDataUbo) == 64);
+static_assert(sizeof(MaterialDataUbo) == 128);
+static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
 
 // CameraService keeps the GL depth convention (z in -w..w); Vulkan clips against 0..w.
 // Column-major glm: z' = 0.5z + 0.5w (vulkan-abi.md).
@@ -2667,7 +2671,8 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 
     MaterialDataUbo materialData{};
     materialData.baseColour = material.baseColour;
-    materialData.repeatRoughMetal = glm::vec4(material.repeat, material.roughness, material.metalness);
+    materialData.roughMetal = glm::vec4(material.roughness, material.metalness, 0.0f, 0.0f);
+    materialData.textureTransform = glm::mat4(material.transform);
     materialData.useTextures = glm::ivec4(diffuse.has_value() ? 1 : 0, normal.has_value() ? 1 : 0,
                                           specular.has_value() ? 1 : 0, emissive.has_value() ? 1 : 0);
     materialData.useTextures2 = glm::ivec4(occlusion.has_value() ? 1 : 0, 0, 0, 0);

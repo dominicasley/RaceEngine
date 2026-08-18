@@ -20,7 +20,8 @@ export struct Material
     float metalness;
     float roughness;
     bool opaque = true;
-    glm::vec2 repeat = glm::vec2(1.0f);
+    // KHR_texture_transform: homogeneous 2D UV transform, applied as (transform * vec3(uv, 1)).xy.
+    glm::mat3 transform = glm::mat3(1.0f);
     std::optional<Resource<Shader>> shader{};
     std::optional<Resource<Texture>> albedo;
     std::optional<Resource<Texture>> metallicRoughness;
