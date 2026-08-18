@@ -227,31 +227,6 @@ module :private;
 namespace raceengine
 {
 
-namespace
-{
-
-// Renderer backend factory for the composition root; the api was already resolved by
-// selectGraphicsApi before the window existed. Both backends take the same services: the
-// storage service to write GPU ids back through their Resources, and the scene services
-// the draw path reads node transforms and joint matrices from.
-[[nodiscard]] std::unique_ptr<IRenderBackend> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
-                                                             FrameDiagnostics& frameDiagnostics, IWindow& window,
-                                                             RenderableEntityService& renderableEntityService,
-                                                             SceneManagerService& sceneManagerService,
-                                                             MemoryStorageService& memoryStorageService)
-{
-    if (graphicsApi == GraphicsApi::Vulkan)
-    {
-        return std::make_unique<VulkanRenderer>(logger, frameDiagnostics, window, renderableEntityService,
-                                                sceneManagerService, memoryStorageService);
-    }
-
-    return std::make_unique<OpenGLRenderer>(logger, frameDiagnostics, renderableEntityService, sceneManagerService,
-                                            memoryStorageService);
-}
-
-} // namespace
-
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
     frameDiagnostics(*logger),
@@ -260,7 +235,7 @@ Engine::Engine() :
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
     renderableEntityService(memoryStorageService, frameDiagnostics),
-    renderer(createRenderer(graphicsApi, *logger, frameDiagnostics, glfwWindow, renderableEntityService,
+    renderer(createRenderer(graphicsApi, *logger, frameDiagnostics, glfwWindow, glfwWindow, renderableEntityService,
                             sceneManagerService, memoryStorageService)),
     fboService(memoryStorageService, *renderer),
     shaderService(memoryStorageService, *renderer),

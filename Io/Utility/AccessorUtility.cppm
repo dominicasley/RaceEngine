@@ -11,7 +11,11 @@ module;
 #include <glm/mat4x4.hpp>
 #include <tiny_gltf.h>
 
-export module raceengine.io:AccessorUtility;
+// Its own module rather than a partition of raceengine.io, so that raceengine.io can use it
+// without re-exporting it: glTF byte-slicing is the loader's business and a game importing
+// raceengine has no reason to be able to name AccessorUtility::get. A module can be imported by
+// name where a partition cannot, which is what keeps the engine's own tests able to reach it.
+export module raceengine.io.accessor;
 
 namespace raceengine
 {

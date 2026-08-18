@@ -73,8 +73,6 @@ public:
     // the run is unattended, and on the first call after either changes — a controller that
     // steers from this can never be handed a jump it did not earn.
     [[nodiscard]] virtual std::tuple<double, double> mouseDelta() = 0;
-    [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
-    [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
     [[nodiscard]] virtual bool shouldClose() const = 0;
     [[nodiscard]] virtual bool keyPressed(Key key) const = 0;
     [[nodiscard]] virtual const WindowState& state() const = 0;
@@ -90,7 +88,25 @@ protected:
     std::vector<std::function<void(int, int)>> resizeCallbacks;
 };
 
-export class GLFWWindow : public IWindow
+// The window's Vulkan half, kept off IWindow for the same reason the renderer's three seams are
+// not one interface: IWindow is what Engine::window() hands the game, and a game has no business
+// being able to make a VkSurfaceKHR. Only the Vulkan backend takes this, and only the
+// composition root — which owns the concrete window — is in a position to hand it over.
+export class IVulkanSurfaceSource
+{
+public:
+    IVulkanSurfaceSource() = default;
+    IVulkanSurfaceSource(const IVulkanSurfaceSource&) = delete;
+    IVulkanSurfaceSource(IVulkanSurfaceSource&&) = delete;
+    IVulkanSurfaceSource& operator=(const IVulkanSurfaceSource&) = delete;
+    IVulkanSurfaceSource& operator=(IVulkanSurfaceSource&&) = delete;
+    virtual ~IVulkanSurfaceSource() = default;
+
+    [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
+    [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
+};
+
+export class GLFWWindow : public IWindow, public IVulkanSurfaceSource
 {
 private:
     mutable double _delta;

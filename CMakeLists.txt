@@ -67,6 +67,11 @@ target_sources(Engine PUBLIC
         Graphics/Api/IGpuResourceFactory.cppm
         Graphics/Api/IFrameCapture.cppm
         Graphics/Api/IRenderBackend.cppm
+        Graphics/Api/RenderBackendFactory.cppm
+        # Implementation partitions: they produce BMIs like any other module unit, so CMake
+        # needs them in the module file set, but nothing outside raceengine.graphics can import
+        # them and no consumer's module map names them.
+        Graphics/Api/RenderBackendFactoryImpl.cppm
         Graphics/Api/VulkanRenderer.cppm
         Graphics/Api/OpenGLRenderer.cppm
         Graphics/Services/SceneManagerService.cppm
@@ -82,7 +87,7 @@ target_sources(Engine PUBLIC
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm
-        Io/Utility/AccessorUtility.cppm
+        Io/Utility/AccessorUtility.cppm # module raceengine.io.accessor, not a partition of raceengine.io
         Shared/Shared.cppm
         Shared/Types/Resource.cppm)
 
@@ -109,3 +114,12 @@ else()
 endif()
 
 target_link_libraries(Engine PRIVATE raceengine_warnings)
+
+# Unit tests. They construct services directly against fakes and never open a device, a window or
+# a display, which is the point: the shell gates in scripts/ need a GPU and these must not.
+# Built as part of `all` so that `cmake --build <dir>` followed by `ctest --test-dir <dir>` works
+# without a second build step; -DRACEENGINE_BUILD_TESTS=OFF drops the target entirely.
+option(RACEENGINE_BUILD_TESTS "Build the RaceEngine unit tests" ON)
+if(RACEENGINE_BUILD_TESTS)
+    add_subdirectory(Tests)
+endif()

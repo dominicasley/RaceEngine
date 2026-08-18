@@ -16,7 +16,7 @@ module;
 
 export module raceengine.io:GLTFService;
 
-import :AccessorUtility;
+import raceengine.io.accessor;
 import raceengine.graphics.models;
 import raceengine.shared;
 

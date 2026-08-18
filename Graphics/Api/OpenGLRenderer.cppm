@@ -20,7 +20,11 @@ module;
 #include <spdlog/logger.h>
 #include <stb_image_write.h>
 
-export module raceengine.graphics:OpenGLRenderer;
+// An implementation partition, not an interface one: naming it `export module` put the whole
+// backend — and glad and GLFW with it — into the interface closure of raceengine.graphics, and
+// so into every translation unit that imports raceengine. Only :RenderBackendFactoryImpl imports
+// this, and nothing outside this module can.
+module raceengine.graphics:OpenGLRenderer;
 
 import :FrameDiagnostics;
 import :GraphicsApi;
@@ -61,7 +65,7 @@ struct UniformKeyEqual
 
 typedef std::unordered_map<std::pair<unsigned int, std::string>, int, UniformKeyHash, UniformKeyEqual> UniformPool;
 
-export class OpenGLRenderer : public IRenderBackend
+class OpenGLRenderer : public IRenderBackend
 {
 private:
     UniformPool uniformPool;

@@ -25,7 +25,11 @@ module;
 #include <utility>
 #include <vector>
 
-export module raceengine.graphics:VulkanRenderer;
+// An implementation partition, not an interface one: naming it `export module` put the whole
+// backend — and `vulkan/vulkan.h`, `vk_mem_alloc.h` and shaderc with it — into the interface
+// closure of raceengine.graphics, and so into every translation unit that imports raceengine.
+// Only :RenderBackendFactoryImpl imports this, and nothing outside this module can.
+module raceengine.graphics:VulkanRenderer;
 
 import :FrameDiagnostics;
 import :GraphicsApi;
@@ -687,7 +691,7 @@ void transitionImage(const VkCommandBuffer commandBuffer, const VkImage image, c
 
 } // namespace
 
-export class VulkanRenderer : public IRenderBackend
+class VulkanRenderer : public IRenderBackend
 {
 private:
     static constexpr uint32_t framesInFlight = 2;
@@ -820,6 +824,9 @@ private:
     // FrameDiagnostics for why the sites do not throttle themselves any more.
     FrameDiagnostics& diagnostics;
     IWindow& window;
+    // The window's Vulkan half, taken separately: the same object as `window`, through the seam
+    // that carries surface creation. IWindow does not, because IWindow is what the game holds.
+    IVulkanSurfaceSource& surfaceSource;
     MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
     SceneManagerService& sceneManagerService;
@@ -898,8 +905,8 @@ private:
 
 public:
     explicit VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
-                            RenderableEntityService& renderableEntityService, SceneManagerService& sceneManagerService,
-                            MemoryStorageService& memoryStorageService);
+                            IVulkanSurfaceSource& surfaceSource, RenderableEntityService& renderableEntityService,
+                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~VulkanRenderer() override;
 
     [[nodiscard]] std::expected<void, std::string> init() override;
@@ -988,11 +995,12 @@ private:
 };
 
 VulkanRenderer::VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
-                               RenderableEntityService& renderableEntityService,
+                               IVulkanSurfaceSource& surfaceSource, RenderableEntityService& renderableEntityService,
                                SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
     diagnostics(diagnostics),
     window(window),
+    surfaceSource(surfaceSource),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
     sceneManagerService(sceneManagerService)
@@ -1166,7 +1174,7 @@ std::expected<void, std::string> VulkanRenderer::init()
                                      static_cast<uint32_t>(std::max(window.state().windowHeight, 0))};
         createInstance();
         createDebugMessenger();
-        surface = window.generateVulkanSurface(instance);
+        surface = surfaceSource.generateVulkanSurface(instance);
         selectPhysicalDevice();
         createDevice();
         createAllocator();
@@ -1195,7 +1203,7 @@ void VulkanRenderer::createInstance()
     validationLayerEnabled = std::ranges::any_of(availableLayers, [](const VkLayerProperties& layer)
                                                  { return std::strcmp(layer.layerName, validationLayerName) == 0; });
 
-    const auto requiredWindowExtensions = window.getRequiredVulkanWindowExtensions();
+    const auto requiredWindowExtensions = surfaceSource.getRequiredVulkanWindowExtensions();
     // The extension list pointer is GLFW-owned static storage; copy before appending.
     std::vector<const char*> extensions(requiredWindowExtensions.extensions,
                                         requiredWindowExtensions.extensions + requiredWindowExtensions.count);

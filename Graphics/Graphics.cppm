@@ -8,10 +8,12 @@ export import :IFrameRecorder;
 export import :IGpuResourceFactory;
 export import :IFrameCapture;
 export import :IRenderBackend;
-export import :VulkanRenderer;
+// The concrete backends are deliberately absent: :VulkanRenderer and :OpenGLRenderer are
+// implementation partitions, reachable only through createRenderer below. Exporting them put
+// vulkan/vulkan.h, vk_mem_alloc.h, shaderc, glad and GLFW into every importer's closure.
+export import :RenderBackendFactory;
 export import :SceneManagerService;
 export import :RenderableEntityService;
-export import :OpenGLRenderer;
 export import :FboService;
 export import :ShaderService;
 export import :CubeMapService;
