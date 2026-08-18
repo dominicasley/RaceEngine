@@ -87,6 +87,9 @@ private:
     // ResourceService up above the renderer — loading needs neither.
     AssetService assetService;
     CameraService cameraService;
+    // Builds and moves the cascade cameras, so it needs the service that builds cameras and
+    // nothing else — the depth targets are cameras like any other.
+    ShadowService shadowService;
     SceneService sceneService;
     EntityService entityService;
     // Simulation clock and the game's tick subscribers. Neither depends on a service, so
@@ -179,6 +182,11 @@ public:
         return cameraService;
     }
 
+    [[nodiscard]] ShadowService& shadow()
+    {
+        return shadowService;
+    }
+
     [[nodiscard]] ShaderService& shader()
     {
         return shaderService;
@@ -244,6 +252,7 @@ Engine::Engine() :
     presenterService(*renderer),
     assetService(*logger, memoryStorageService, *renderer, sceneManagerService),
     cameraService(memoryStorageService, fboService, glfwWindow),
+    shadowService(cameraService),
     sceneService(renderableEntityService, cameraService, sceneManagerService)
 {
     // An engine whose device would not come up has nothing left to do: every service below
@@ -273,6 +282,15 @@ Engine::Engine() :
 
                 for (auto& camera : scenePtr->cameras)
                 {
+                    // A camera that owns a target of its own resolution is not following the
+                    // window: a 2048x2048 shadow cascade rebuilt at the window's size would lose
+                    // the resolution it was asked for, and its framing is not the window's aspect
+                    // either. Its post-process chain is its own for the same reason.
+                    if (!camera.tracksWindowSize)
+                    {
+                        continue;
+                    }
+
                     cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
 
                     // This runs inside a GLFW callback, so there is no caller to return the
@@ -375,6 +393,10 @@ void Engine::step()
             continue;
         }
 
+        // Before the matrices, not after: refitting a cascade *is* choosing the position,
+        // direction and orthographic volume its matrix is then built from.
+        shadowService.update(*scenePtr);
+
         for (auto& camera : scenePtr->cameras)
         {
             cameraService.updateModelViewProjectionMatrix(camera);
@@ -391,16 +413,28 @@ void Engine::step()
     // records nothing this step and skips the close, which is the one path with no present.
     if (renderer->beginFrame())
     {
-        for (auto& scenePtr : sceneManagerService.getScenes())
+        // Twice over the same cameras rather than once, in role order: a shadow cascade produces
+        // the depth map the scene cameras sample, and a producer recorded after its consumer is
+        // read before it is written (see CameraRole). Two passes rather than a sort because the
+        // order is two fixed groups, and a sort would allocate inside the frame to say so.
+        for (const auto role : {CameraRole::ShadowCascade, CameraRole::Scene})
         {
-            if (!scenePtr)
+            for (auto& scenePtr : sceneManagerService.getScenes())
             {
-                continue;
-            }
+                if (!scenePtr)
+                {
+                    continue;
+                }
 
-            for (auto& camera : scenePtr->cameras)
-            {
-                renderer->recordView(*scenePtr, camera, delta);
+                for (auto& camera : scenePtr->cameras)
+                {
+                    if (camera.role != role)
+                    {
+                        continue;
+                    }
+
+                    renderer->recordView(*scenePtr, camera, delta);
+                }
             }
         }
 

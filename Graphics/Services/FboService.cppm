@@ -45,12 +45,13 @@ std::expected<Resource<Fbo>, std::string> FboService::create(const CreateFboDTO&
 
         for (auto& attachment : attachmentsDto)
         {
-            attachments.push_back(
-                memoryStorageService.bufferAttachments.add(FboAttachment{.type = attachment.type,
-                                                                         .width = attachment.width,
-                                                                         .height = attachment.height,
-                                                                         .captureFormat = attachment.captureFormat,
-                                                                         .internalFormat = attachment.internalFormat}));
+            attachments.push_back(memoryStorageService.bufferAttachments.add(
+                FboAttachment{.type = attachment.type,
+                              .width = attachment.width,
+                              .height = attachment.height,
+                              .captureFormat = attachment.captureFormat,
+                              .internalFormat = attachment.internalFormat,
+                              .depthComparison = attachment.depthComparison}));
         }
 
         return attachments;

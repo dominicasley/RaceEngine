@@ -48,10 +48,11 @@ export enum class FrameDiagnostic : size_t {
     UnsupportedIndexType,
     UnsupportedTextureLayout,
     MipGenerationUnavailable,
+    ShadowCascadeUnavailable,
+    ViewShaderUnavailable,
 };
 
-export inline constexpr size_t frameDiagnosticCount =
-    static_cast<size_t>(FrameDiagnostic::MipGenerationUnavailable) + 1;
+export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::ViewShaderUnavailable) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -71,7 +72,7 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
     case FrameDiagnostic::PrimitiveNotUploaded:
         return "primitive(s) with no GPU binding";
     case FrameDiagnostic::MissingCameraOutput:
-        return "camera(s) whose output framebuffer has no colour target";
+        return "camera(s) whose output framebuffer has no colour or depth target";
     case FrameDiagnostic::JointLimitExceeded:
         return "draw(s) supplying more joints than the shader array holds";
     case FrameDiagnostic::LightLimitExceeded:
@@ -98,6 +99,10 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "texture(s) carrying less pixel data than their declared layout needs";
     case FrameDiagnostic::MipGenerationUnavailable:
         return "sampled image(s) uploaded without mips, the format having no linear blit";
+    case FrameDiagnostic::ShadowCascadeUnavailable:
+        return "view(s) shading lit, the cascade depth map they asked for having no target";
+    case FrameDiagnostic::ViewShaderUnavailable:
+        return "view(s) recording nothing, the shader they draw every entity with being unloaded";
     }
 
     return "skipped item(s) of an unnamed kind";

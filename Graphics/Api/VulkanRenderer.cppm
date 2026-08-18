@@ -36,6 +36,7 @@ import :GraphicsApi;
 import :IRenderBackend;
 import :RenderContract;
 import :RenderableEntityService;
+import :ShadowCascades;
 import :SceneManagerService;
 import :Window;
 import raceengine.graphics.models;
@@ -81,12 +82,34 @@ struct FrameDataUbo
     glm::vec4 cameraPosition;
     glm::ivec4 lightCount;
     std::array<LightUbo, maxLights> lights;
+    // The cascades. Per view rather than per frame only because the block is: every view of a
+    // frame is handed the same values, and a second binding would buy nothing but a second
+    // descriptor. shadowMatrices take world space straight to a shadow-map lookup — the backend's
+    // depth convention and the negative-viewport y flip are already folded in
+    // (shadowLookupCorrection), so the GLSL holds no convention of its own.
+    std::array<glm::mat4, shadowCascadeCount> shadowMatrices;
+    // Per cascade, in cascade order: where it ends along the view axis, the world size of one of
+    // its texels, and normalised depth per world unit along the light. The last two are the whole
+    // bias budget, which is why the shader needs no per-cascade tuning.
+    glm::vec4 shadowSplits;
+    glm::vec4 shadowTexelWorldSize;
+    glm::vec4 shadowDepthScale;
+    // x = cascades in use (0 = the view shades lit), y = which light they shadow.
+    glm::ivec4 shadowParams;
 };
 
+// Four split distances, four texel sizes and four depth scales ride in one vec4 each, which is
+// what bounds the cascade count rather than any GPU limit.
+static_assert(shadowCascadeCount <= 4);
 static_assert(sizeof(LightUbo) == 64);
-static_assert(sizeof(FrameDataUbo) == 352);
+static_assert(sizeof(FrameDataUbo) == 672);
 static_assert(offsetof(FrameDataUbo, lightCount) == 80);
 static_assert(offsetof(FrameDataUbo, lights) == 96);
+static_assert(offsetof(FrameDataUbo, shadowMatrices) == 352);
+static_assert(offsetof(FrameDataUbo, shadowSplits) == 608);
+static_assert(offsetof(FrameDataUbo, shadowTexelWorldSize) == 624);
+static_assert(offsetof(FrameDataUbo, shadowDepthScale) == 640);
+static_assert(offsetof(FrameDataUbo, shadowParams) == 656);
 
 // Set 2 binding 0, dynamic-offset (vulkan-abi.md); ring-buffered per frame in flight.
 struct DrawDataUbo
@@ -190,6 +213,7 @@ static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
     case TextureFormat::RGBA32F:
         return VK_FORMAT_R32G32B32A32_SFLOAT;
     case TextureFormat::DepthComponent:
+    case TextureFormat::DepthComponent32F:
         return VK_FORMAT_D32_SFLOAT;
     default:
         return std::nullopt;
@@ -767,9 +791,33 @@ private:
         VkDescriptorSet set = VK_NULL_HANDLE;
     };
 
+    // One pipeline a primitive has been drawn with, and the vertex buffers that pipeline is fed.
+    //
+    // The two belong together and may not be separated. A pipeline consumes exactly the locations
+    // its vertex shader declares (see scenePipeline), so which of the primitive's buffers land at
+    // which binding index — and how many dummy bindings follow them — is a property of the
+    // *shader*, not of the primitive: a mesh whose attributes are authored NORMAL-first feeds
+    // binding 0 from its position buffer under a depth-only shader and from its normal buffer
+    // under a shading one. Holding one buffer list per primitive meant the last pipeline built for
+    // it decided what every pipeline for it was fed, and a shadow cascade recorded after any
+    // shading view then read its positions out of the normal buffer: unit-length vectors, so the
+    // whole world collapsed onto one texel at the centre of the depth map and every fragment
+    // sampled it as lit.
+    struct ResolvedPipeline
+    {
+        unsigned int shaderId = 0;
+        VkCullModeFlags cullMode = 0;
+        VkFormat colorFormat = VK_FORMAT_UNDEFINED;
+        VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+        // VK_NULL_HANDLE is a build that failed and is not retried.
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::vector<VkBuffer> boundBuffers;
+        std::vector<VkDeviceSize> boundOffsets;
+    };
+
     // The Vulkan counterpart of the GL path's per-primitive VAO: everything a draw needs
-    // that does not change once the primitive is uploaded. pipeline/boundBuffers resolve
-    // on the first draw because they also depend on the material's shader.
+    // that does not change once the primitive is uploaded. The pipeline and the buffers it is
+    // fed resolve on first use, because they also depend on the shader the *view* draws with.
     struct PrimitiveBinding
     {
         VertexInputDescription input;
@@ -782,10 +830,12 @@ private:
         uint32_t indexCount = 0;
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         bool drawable = false;
-        bool resolved = false;
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        std::vector<VkBuffer> boundBuffers;
-        std::vector<VkDeviceSize> boundOffsets;
+        // One entry per (shader, cull mode, target formats) this primitive has been drawn with:
+        // the whole of what a pipeline's identity adds to the primitive's own vertex input. A
+        // vector rather than a map because a primitive is drawn through two or three of these in a
+        // frame — its material's shader on screen and a cascade's depth shader — and a linear scan
+        // over three entries costs less than hashing the tuple.
+        std::vector<ResolvedPipeline> pipelines;
     };
 
     // What the presenter drew last: captureFrame replays exactly this pass onto a freshly
@@ -847,6 +897,7 @@ private:
     VkDescriptorSetLayout frameDataSetLayout = VK_NULL_HANDLE;  // scene set 0
     VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;   // scene set 1
     VkDescriptorSetLayout drawDataSetLayout = VK_NULL_HANDLE;   // scene set 2, dynamic
+    VkDescriptorSetLayout shadowSetLayout = VK_NULL_HANDLE;     // scene set 3
     VkDescriptorSetLayout fullscreenSetLayout = VK_NULL_HANDLE; // fullscreen set 0
     VkPipelineLayout scenePipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout fullscreenPipelineLayout = VK_NULL_HANDLE;
@@ -879,6 +930,10 @@ private:
     // scene environment is the fallback binding, so it is part of the set's identity.
     std::unordered_map<uint64_t, MaterialResource> materialResources;
     mutable std::unordered_map<unsigned int, VkDescriptorSet> attachmentSets;
+    // Cascade sets, keyed by the whole tuple of depth image ids. A vector rather than a map
+    // because there is one live entry in practice and `<map>` in a second global module fragment
+    // breaks the sandbox link on clang-19 (see CLAUDE.md).
+    mutable std::vector<std::pair<std::array<unsigned int, shadowCascadeCount>, VkDescriptorSet>> shadowSets;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
     // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
     // the target's format: the format comes from FboAttachment::internalFormat, which is not
@@ -886,6 +941,8 @@ private:
     std::unordered_map<uint64_t, VkPipeline> offscreenPipelines;
     unsigned int dummyTextureId = 0;
     unsigned int dummyCubeMapId = 0;
+    unsigned int dummyShadowMapId = 0;
+    mutable VkDescriptorSet dummyShadowSet = VK_NULL_HANDLE;
     BufferResource dummyVertexBuffer{};
     std::optional<unsigned int> sceneEnvironmentImageId;
     // Frame recording state. The frame belongs to Engine::step: beginFrame acquires the
@@ -950,7 +1007,8 @@ private:
     void recordScenePass(Scene& scene, Camera& camera, float delta);
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
-                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat);
+                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat,
+                    VkDescriptorSet shadowDescriptors);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
@@ -963,8 +1021,23 @@ private:
     [[nodiscard]] std::optional<unsigned int> uploadTexture(const Resource<Texture>& textureKey);
     [[nodiscard]] VkDescriptorSet materialSet(const Resource<Material>& materialKey, unsigned int environmentImageId);
     [[nodiscard]] VkDescriptorSet attachmentSet(unsigned int imageId);
-    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode,
-                                           VkFormat colorFormat, VkFormat depthFormat);
+    // The set 3 the scene pipelines bind. Given the cascades' depth images it caches one set per
+    // tuple; given none it hands back the fallback, because a sampler2DShadow the pipeline
+    // statically uses must have a descriptor whether or not the shader's cascade count says to
+    // read it.
+    [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds);
+    [[nodiscard]] VkDescriptorSet fallbackShadowSet();
+    [[nodiscard]] unsigned int dummyShadowMap();
+    // The cascades' depth images in cascade order, or nothing if any of them is missing: a
+    // partially resolved set would leave one binding naming an image from a previous scene.
+    [[nodiscard]] std::optional<std::array<unsigned int, shadowCascadeCount>>
+    shadowCascadeImages(const Scene& scene) const;
+    // The pipeline this primitive is drawn with in this view, together with the vertex buffers
+    // that pipeline expects. Borrowed from the binding's own cache and valid until the next call
+    // for the same primitive, which is one draw's worth — recordDraw uses it and lets it go.
+    [[nodiscard]] const ResolvedPipeline* scenePipeline(unsigned int shaderId, PrimitiveBinding& binding,
+                                                        VkCullModeFlags cullMode, VkFormat colorFormat,
+                                                        VkFormat depthFormat);
     [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
@@ -981,6 +1054,14 @@ private:
     [[nodiscard]] VkCommandBuffer beginUploadCommands() const;
     void finishUploadCommands(VkCommandBuffer commandBuffer) const;
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
+    // The sampler an FboAttachment::depthComparison asks for. GL sets the same two pieces of
+    // state on the texture object; here they belong to a sampler, so the image carries one of its
+    // own rather than sharing `attachmentSampler` — which is what ImageResource::sampler is for
+    // and what attachmentSet already prefers whenever it is set.
+    //
+    // Linear filtering is what turns a comparison fetch into a 2x2 percentage-closer one, and for
+    // depth formats it is a capability rather than a guarantee, so the device is asked.
+    [[nodiscard]] VkSampler createComparisonSampler(VkFormat format) const;
     void destroyImageResource(unsigned int id) const;
     // Hands one GPU object to the retirement queue with the submission count it becomes safe at.
     void retire(RetiredResource resource) const;
@@ -1123,7 +1204,8 @@ VulkanRenderer::~VulkanRenderer()
     {
         vkDestroyPipelineLayout(device, fullscreenPipelineLayout, nullptr);
     }
-    for (const auto layout : {frameDataSetLayout, materialSetLayout, drawDataSetLayout, fullscreenSetLayout})
+    for (const auto layout :
+         {frameDataSetLayout, materialSetLayout, drawDataSetLayout, shadowSetLayout, fullscreenSetLayout})
     {
         if (layout != VK_NULL_HANDLE)
         {
@@ -1690,6 +1772,17 @@ void VulkanRenderer::createDescriptorInfrastructure()
                                                                   VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
     drawDataSetLayout = makeSetLayout(drawBindings);
 
+    // Scene set 3: one combined sampler per cascade, read by the fragment stage only. A set of
+    // its own rather than a tail of set 1 because the cascades are per frame: writing them into
+    // every material set would mean rewriting every material set when a cascade target is rebuilt.
+    // One binding holding an array of shadowCascadeCount samplers, not that many bindings: the
+    // shader declares `sampler2DShadow shadowMaps[SHADOW_CASCADES]`, and a resource declared as an
+    // array must be backed by a binding whose descriptorCount covers its whole length.
+    const std::array shadowBindings = {
+        VkDescriptorSetLayoutBinding{shadowMapBinding(GraphicsApi::Vulkan), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                     shadowCascadeCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    shadowSetLayout = makeSetLayout(shadowBindings);
+
     // Fullscreen passes use their own single-set layout: one combined sampler.
     const std::array fullscreenBindings = {VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                                                         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
@@ -1707,7 +1800,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         return layout;
     };
 
-    const std::array sceneSetLayouts = {frameDataSetLayout, materialSetLayout, drawDataSetLayout};
+    const std::array sceneSetLayouts = {frameDataSetLayout, materialSetLayout, drawDataSetLayout, shadowSetLayout};
     scenePipelineLayout = makePipelineLayout(sceneSetLayouts);
     const std::array fullscreenSetLayouts = {fullscreenSetLayout};
     fullscreenPipelineLayout = makePipelineLayout(fullscreenSetLayouts);
@@ -2202,10 +2295,33 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         }
     }
 
-    if (!colorImageId.has_value() || !imageResources.contains(colorImageId.value()))
+    // A camera renders into whatever its framebuffer carries. Colour and depth is the pair every
+    // on-screen camera has; a depth-only target — a shadow cascade, a depth pre-pass — records a
+    // rendering info with no colour attachment at all, which is something dynamic rendering
+    // expresses directly and the pipeline has to be told (see scenePipeline). What is not a
+    // camera is a framebuffer with neither.
+    const auto hasColor = colorImageId.has_value() && imageResources.contains(colorImageId.value());
+    const auto hasDepth = depthImageId.has_value() && imageResources.contains(depthImageId.value());
+
+    if (!hasColor && !hasDepth)
     {
         diagnostics.record(FrameDiagnostic::MissingCameraOutput,
                            [] { return std::string("the scene pass records nothing"); });
+
+        return;
+    }
+
+    // The view's own shader, if it has one, resolved once: it is constant for the whole view, and
+    // a view that cannot get it must record nothing rather than fall back to the entities' own —
+    // those write colour, and this target may have no colour attachment to write. Checked before
+    // anything is recorded, so an abandoned view leaves no half-open rendering behind it.
+    const auto* viewShader =
+        camera.overrideShader.has_value() ? memoryStorageService.shaders.find(camera.overrideShader.value()) : nullptr;
+
+    if (camera.overrideShader.has_value() && viewShader == nullptr)
+    {
+        diagnostics.record(FrameDiagnostic::ViewShaderUnavailable,
+                           [&] { return "shader slot " + std::to_string(camera.overrideShader->index); });
 
         return;
     }
@@ -2235,6 +2351,42 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
+    // A cascade is a producer and samples nothing; only the views that shade read the maps, and a
+    // cascade sampling its own attachment while rendering into it would be a feedback loop.
+    const auto shading = camera.role == CameraRole::Scene;
+    const auto cascadeImages = shading ? shadowCascadeImages(scene) : std::nullopt;
+    auto shadowDescriptors = cascadeImages.has_value() ? shadowSet(cascadeImages.value()) : VK_NULL_HANDLE;
+
+    if (shadowDescriptors != VK_NULL_HANDLE)
+    {
+        const auto correction = shadowLookupCorrection(GraphicsApi::Vulkan);
+
+        for (auto cascade = 0u; cascade < shadowCascadeCount; cascade++)
+        {
+            const auto& slice = scene.shadows.cascades[cascade];
+            const auto index = static_cast<int>(cascade);
+            frameData.shadowMatrices[cascade] = correction * slice.camera->modelViewProjectionMatrix;
+            frameData.shadowSplits[index] = slice.splitDistance;
+            frameData.shadowTexelWorldSize[index] = slice.texelWorldSize;
+            frameData.shadowDepthScale[index] = slice.depthPerWorldUnit;
+        }
+
+        frameData.shadowParams =
+            glm::ivec4(static_cast<int>(shadowCascadeCount), static_cast<int>(scene.shadows.lightIndex), 0, 0);
+    }
+    else
+    {
+        // Zero cascades is what tells the shader to shade lit; the set still has to be bound,
+        // because the pipeline statically uses the samplers in it (see fallbackShadowSet).
+        shadowDescriptors = fallbackShadowSet();
+
+        if (shading && !scene.shadows.cascades.empty())
+        {
+            diagnostics.record(FrameDiagnostic::ShadowCascadeUnavailable,
+                               [] { return std::string("no Vulkan depth image for one of the cascades"); });
+        }
+    }
+
     if (declaredLights > maxLights)
     {
         diagnostics.record(FrameDiagnostic::LightLimitExceeded,
@@ -2256,16 +2408,24 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     frame.frameDataOffset = frameDataSlot.value();
     std::memcpy(static_cast<char*>(frame.frameDataMapped) + frame.frameDataOffset, &frameData, sizeof(frameData));
 
-    transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (depthImageId.has_value())
+    if (hasColor)
+    {
+        transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    if (hasDepth)
     {
         transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
     }
 
     // Copied, not referenced: the lazy uploads below insert into imageResources, and a
     // rehash would leave a reference into it dangling.
-    const auto colorImage = imageResources.at(colorImageId.value());
-    const VkExtent2D extent{colorImage.width, colorImage.height};
+    const auto colorImage = hasColor ? imageResources.at(colorImageId.value()) : ImageResource{};
+    const auto depthImage = hasDepth ? imageResources.at(depthImageId.value()) : ImageResource{};
+    // The extent is the target's, whichever attachment the target has: a depth-only camera is
+    // sized by its depth image exactly as a normal one is by its colour image.
+    const auto& extentSource = hasColor ? colorImage : depthImage;
+    const VkExtent2D extent{extentSource.width, extentSource.height};
 
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2278,26 +2438,25 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView = depthImage.view;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
-    // A camera with no depth attachment renders depth-less, which the pipeline has to be told.
-    auto depthFormat = VK_FORMAT_UNDEFINED;
-    if (depthImageId.has_value())
-    {
-        const auto& depthImage = imageResources.at(depthImageId.value());
-        depthAttachment.imageView = depthImage.view;
-        depthFormat = depthImage.format;
-    }
+
+    // A camera with no colour attachment renders colour-less and one with no depth attachment
+    // renders depth-less; either way the pipeline has to be told, so both formats are what the
+    // attachments actually bound report, and VK_FORMAT_UNDEFINED means "not bound".
+    const auto colorFormat = hasColor ? colorImage.format : VK_FORMAT_UNDEFINED;
+    const auto depthFormat = hasDepth ? depthImage.format : VK_FORMAT_UNDEFINED;
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, extent};
     renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &colorAttachment;
-    if (depthImageId.has_value())
+    renderingInfo.colorAttachmentCount = hasColor ? 1u : 0u;
+    renderingInfo.pColorAttachments = hasColor ? &colorAttachment : nullptr;
+    if (hasDepth)
     {
         renderingInfo.pDepthAttachment = &depthAttachment;
     }
@@ -2327,6 +2486,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     auto recordedDraws = 0u;
     for (auto& entity : scene.models)
     {
+        // The depth pass draws casters. A skybox in the map fills it at the near plane and puts
+        // the whole world in shadow.
+        if (!shading && !entity.castsShadow)
+        {
+            continue;
+        }
+
         const auto* model = memoryStorageService.models.find(entity.model);
         const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
         if (model == nullptr || instanceShader == nullptr)
@@ -2337,9 +2503,10 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             continue;
         }
 
-        // The instance's shader, not the material's: materials live in shared storage, so two
-        // renderables built from one model would otherwise restyle each other.
-        const auto shaderId = instanceShader->gpuResourceId;
+        // The view's shader where it has one, otherwise the instance's — not the material's:
+        // materials live in shared storage, so two renderables built from one model would
+        // otherwise restyle each other.
+        const auto shaderId = viewShader != nullptr ? viewShader->gpuResourceId : instanceShader->gpuResourceId;
 
         // Around the entity's submission, which on this backend is where its commands are
         // recorded: the same point in the frame GL calls them at.
@@ -2406,7 +2573,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                 }
 
                 recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
-                           joints, colorImage.format, depthFormat);
+                           joints, colorFormat, depthFormat, shadowDescriptors);
                 recordedDraws++;
             }
         }
@@ -2419,7 +2586,21 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     vkCmdEndRendering(frame.commandBuffer);
 
-    transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Every attachment this view wrote ends the pass readable. The colour one has always moved
+    // here because the post chain and the presenter sample it; the depth one moves too, and that
+    // move is the whole of what "Vulkan can sample a depth attachment" needed — the image already
+    // carried SAMPLED usage, and the tracked layout is what emits the barrier and what puts it
+    // back to DEPTH_ATTACHMENT_OPTIMAL at the top of the next view that draws into it. Nothing
+    // samples the depth yet; the layout is what makes sampling it possible.
+    if (hasColor)
+    {
+        transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    if (hasDepth)
+    {
+        transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
 
     for (const auto& postProcessKey : camera.postProcesses)
     {
@@ -2504,10 +2685,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     if (!drawSummaryLogged && recordedDraws > 0)
     {
-        logger.info("Vulkan scene pass recorded: {} draw(s) into {}x{} RGBA16F, {} post-process pass(es), {} scene "
+        const auto* attachments = hasColor ? (hasDepth ? "colour and depth" : "colour only") : "depth only";
+
+        logger.info("Vulkan scene pass recorded: {} draw(s) into {}x{} ({}), {} post-process pass(es), {} scene "
                     "pipeline(s), {} material set(s)",
-                    recordedDraws, extent.width, extent.height, camera.postProcesses.size(), scenePipelines.size(),
-                    materialResources.size());
+                    recordedDraws, extent.width, extent.height, attachments, camera.postProcesses.size(),
+                    scenePipelines.size(), materialResources.size());
         drawSummaryLogged = true;
     }
 }
@@ -2518,7 +2701,7 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
                                 const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
-                                const VkFormat depthFormat)
+                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -2534,8 +2717,11 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
 
     const VkCullModeFlags cullMode = material.opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
-    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
-    if (pipeline == VK_NULL_HANDLE)
+    // Borrowed, and used before anything else can resolve a pipeline for this primitive: the
+    // buffers to feed it are part of the same entry, and nothing between here and the draw
+    // resolves one.
+    const auto* resolved = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
+    if (resolved->pipeline == VK_NULL_HANDLE)
     {
         diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
                            [&] { return "shader object " + std::to_string(shaderId); });
@@ -2556,6 +2742,16 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     if (!imageResources.contains(environmentImageId))
     {
         environmentImageId = dummyCubeMap();
+    }
+
+    if (shadowDescriptors == VK_NULL_HANDLE)
+    {
+        // shadowSet/fallbackShadowSet counted the pool exhaustion; this draw is what it costs. The
+        // set is not optional: the scene pipelines statically use the samplers in it.
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("no shadow cascade set to bind for this view"); });
+
+        return;
     }
 
     const auto set = materialSet(materialKey, environmentImageId);
@@ -2604,18 +2800,20 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
         std::memcpy(target + offsetof(DrawDataUbo, jointTransforms), joints.data(), jointCount * sizeof(glm::mat4));
     }
 
-    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, resolved->pipeline);
 
-    if (!bound->second.boundBuffers.empty())
+    // This pipeline's own buffer list, not the primitive's: which buffer lands at which binding
+    // index follows the shader's declared locations (see ResolvedPipeline).
+    if (!resolved->boundBuffers.empty())
     {
-        vkCmdBindVertexBuffers(frame.commandBuffer, 0, static_cast<uint32_t>(bound->second.boundBuffers.size()),
-                               bound->second.boundBuffers.data(), bound->second.boundOffsets.data());
+        vkCmdBindVertexBuffers(frame.commandBuffer, 0, static_cast<uint32_t>(resolved->boundBuffers.size()),
+                               resolved->boundBuffers.data(), resolved->boundOffsets.data());
     }
 
     vkCmdBindIndexBuffer(frame.commandBuffer, bound->second.indexBuffer, bound->second.indexOffset,
                          bound->second.indexType);
 
-    const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet};
+    const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet, shadowDescriptors};
     // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then
     // set 2's draw slot.
     const std::array dynamicOffsets = {static_cast<uint32_t>(frame.frameDataOffset),
@@ -3039,6 +3237,193 @@ unsigned int VulkanRenderer::dummyCubeMap()
     return dummyCubeMapId;
 }
 
+// A 1x1 depth image holding the far value, with a comparison sampler.
+//
+// GL can leave a shadow unit unbound whenever the shader's cascade count says not to read it,
+// because GL only faults on what a fragment actually samples. Vulkan does not: a descriptor a
+// pipeline *statically* uses must be there whether the branch runs or not, so a scene with no
+// cascades still needs something valid in set 3. Cleared to 1.0 so that a LESS_OR_EQUAL compare
+// against it answers "nothing was in front of this" even if some future shader does read it.
+unsigned int VulkanRenderer::dummyShadowMap()
+{
+    if (dummyShadowMapId != 0)
+    {
+        return dummyShadowMapId;
+    }
+
+    constexpr auto format = VK_FORMAT_D32_SFLOAT;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = VkExtent3D{1, 1, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocationCreateInfo{};
+    allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
+           "vmaCreateImage");
+
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    const auto commandBuffer = beginUploadCommands();
+    transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COPY_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, range);
+    const VkClearDepthStencilValue clearValue{1.0f, 0};
+    vkCmdClearDepthStencilImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &range);
+    transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, range);
+    finishUploadCommands(commandBuffer);
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange = range;
+
+    VkImageView view = VK_NULL_HANDLE;
+    ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+    dummyShadowMapId = nextResourceId++;
+    imageResources.emplace(dummyShadowMapId,
+                           ImageResource{image, allocation, view, createComparisonSampler(format), format, 1, 1, 1,
+                                         VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+
+    return dummyShadowMapId;
+}
+
+VkDescriptorSet VulkanRenderer::fallbackShadowSet()
+{
+    if (dummyShadowSet != VK_NULL_HANDLE)
+    {
+        return dummyShadowSet;
+    }
+
+    std::array<unsigned int, shadowCascadeCount> images{};
+    images.fill(dummyShadowMap());
+    dummyShadowSet = shadowSet(images);
+
+    return dummyShadowSet;
+}
+
+// Keyed by the whole tuple of depth image ids, so a rebuilt cascade target gets a new set rather
+// than a stale view. Linear scan over a list that holds one entry in a running game, and the one
+// the fallback added.
+VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds)
+{
+    for (const auto& [key, set] : shadowSets)
+    {
+        if (key == imageIds)
+        {
+            return set;
+        }
+    }
+
+    std::array<VkDescriptorImageInfo, shadowCascadeCount> imageInfos{};
+    for (auto cascade = 0u; cascade < shadowCascadeCount; cascade++)
+    {
+        const auto image = imageResources.find(imageIds[cascade]);
+        if (image == imageResources.end() || image->second.sampler == VK_NULL_HANDLE)
+        {
+            // No comparison sampler means the attachment was not created with
+            // DepthComparison::LessOrEqual, and a plain sampler bound where the shader declares a
+            // sampler2DShadow is undefined — worse than shading lit.
+            return VK_NULL_HANDLE;
+        }
+
+        imageInfos[cascade] =
+            VkDescriptorImageInfo{image->second.sampler, image->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    }
+
+    VkDescriptorSetAllocateInfo setAllocateInfo{};
+    setAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setAllocateInfo.descriptorPool = descriptorPool;
+    setAllocateInfo.descriptorSetCount = 1;
+    setAllocateInfo.pSetLayouts = &shadowSetLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
+    {
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("the descriptor pool has no room for a shadow cascade set"); });
+
+        return VK_NULL_HANDLE;
+    }
+
+    // One write covering the binding's whole array: the cascades are consecutive elements of a
+    // single binding, so imageInfos is handed over in one go rather than a write per cascade.
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = shadowMapBinding(GraphicsApi::Vulkan);
+    write.dstArrayElement = 0;
+    write.descriptorCount = shadowCascadeCount;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = imageInfos.data();
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+    shadowSets.emplace_back(imageIds, set);
+
+    return set;
+}
+
+std::optional<std::array<unsigned int, shadowCascadeCount>>
+VulkanRenderer::shadowCascadeImages(const Scene& scene) const
+{
+    if (scene.shadows.cascades.size() != shadowCascadeCount)
+    {
+        return std::nullopt;
+    }
+
+    std::array<unsigned int, shadowCascadeCount> images{};
+
+    for (auto cascade = 0u; cascade < shadowCascadeCount; cascade++)
+    {
+        const auto* cascadeCamera = scene.shadows.cascades[cascade].camera;
+        const auto* output = cascadeCamera == nullptr || !cascadeCamera->output.has_value()
+                                 ? nullptr
+                                 : memoryStorageService.frameBuffers.find(cascadeCamera->output.value());
+        if (output == nullptr)
+        {
+            return std::nullopt;
+        }
+
+        std::optional<unsigned int> depthImage;
+        for (const auto& attachmentKey : output->attachments)
+        {
+            const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachment != nullptr && attachment->type == FboAttachmentType::Depth)
+            {
+                depthImage = attachment->gpuResourceId;
+                break;
+            }
+        }
+
+        if (!depthImage.has_value() || !imageResources.contains(depthImage.value()))
+        {
+            return std::nullopt;
+        }
+
+        images[cascade] = depthImage.value();
+    }
+
+    return images;
+}
+
 // Keyed by the material's slot index and the environment it is bound against. The index is
 // enough because releaseMaterial() drops every entry for a slot when that slot is released, so a
 // recycled index never finds the previous material's descriptors waiting for it.
@@ -3195,17 +3580,34 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
     return set;
 }
 
-VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding,
-                                         const VkCullModeFlags cullMode, const VkFormat colorFormat,
-                                         const VkFormat depthFormat)
+const VulkanRenderer::ResolvedPipeline*
+VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding, const VkCullModeFlags cullMode,
+                              const VkFormat colorFormat, const VkFormat depthFormat)
 {
-    // A primitive's material — and so its shader and cull mode — never changes after load,
-    // so one resolution per primitive is enough and a failed build is not retried.
-    if (binding.resolved)
+    // The whole of what a pipeline's identity adds to the primitive's own vertex input: the
+    // shader, the cull mode its material asked for, and the two formats of the target it is drawn
+    // into. The shader has to be in the key because a view may override it — a shadow cascade
+    // draws the same primitives through a depth-only shader — and the buffer list cached with the
+    // entry is the shader's, not the primitive's. A failed build is not retried: the miss below
+    // caches a VK_NULL_HANDLE pipeline too.
+    const auto matches = [&](const ResolvedPipeline& candidate)
     {
-        return binding.pipeline;
+        return candidate.shaderId == shaderId && candidate.cullMode == cullMode &&
+               candidate.colorFormat == colorFormat && candidate.depthFormat == depthFormat;
+    };
+
+    if (const auto resolved = std::ranges::find_if(binding.pipelines, matches); resolved != binding.pipelines.end())
+    {
+        return &*resolved;
     }
-    binding.resolved = true;
+
+    ResolvedPipeline entry{.shaderId = shaderId,
+                           .cullMode = cullMode,
+                           .colorFormat = colorFormat,
+                           .depthFormat = depthFormat,
+                           .pipeline = VK_NULL_HANDLE,
+                           .boundBuffers = {},
+                           .boundOffsets = {}};
 
     const auto shader = shaderObjects.find(shaderId);
     if (shader == shaderObjects.end() || shader->second.fullscreen)
@@ -3213,15 +3615,15 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
         diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
                            [&] { return "shader object " + std::to_string(shaderId) + " is not a scene shader"; });
 
-        return VK_NULL_HANDLE;
+        binding.pipelines.push_back(std::move(entry));
+
+        return &binding.pipelines.back();
     }
 
     // Exactly the locations the vertex shader declares are fed, no more: a bound attribute
     // the shader never reads is work the driver has to discard, and Vulkan reports it.
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attributes;
-    binding.boundBuffers.clear();
-    binding.boundOffsets.clear();
 
     for (const auto& attribute : binding.input.attributes)
     {
@@ -3241,8 +3643,8 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
         pipelineAttribute.binding = bindingIndex;
         attributes.push_back(pipelineAttribute);
 
-        binding.boundBuffers.push_back(binding.vertexBuffers[attribute.binding]);
-        binding.boundOffsets.push_back(binding.vertexOffsets[attribute.binding]);
+        entry.boundBuffers.push_back(binding.vertexBuffers[attribute.binding]);
+        entry.boundOffsets.push_back(binding.vertexOffsets[attribute.binding]);
     }
 
     // Vulkan rejects a vertex shader input that the pipeline does not feed; GL simply
@@ -3260,8 +3662,8 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
         bindings.push_back(VkVertexInputBindingDescription{bindingIndex, 0, VK_VERTEX_INPUT_RATE_VERTEX});
         attributes.push_back(
             VkVertexInputAttributeDescription{location, bindingIndex, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
-        binding.boundBuffers.push_back(dummyVertexBuffer.buffer);
-        binding.boundOffsets.push_back(0);
+        entry.boundBuffers.push_back(dummyVertexBuffer.buffer);
+        entry.boundOffsets.push_back(0);
     }
 
     // The pipeline's rendering formats are part of its identity, so they are part of the key:
@@ -3270,11 +3672,12 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
                      std::to_string(static_cast<int>(binding.topology)) + "|" +
                      std::to_string(static_cast<int>(colorFormat)) + "+" +
                      std::to_string(static_cast<int>(depthFormat)) + "|" + binding.signature;
-    const auto cachedPipeline = scenePipelines.find(key);
-    if (cachedPipeline != scenePipelines.end())
+    if (const auto cachedPipeline = scenePipelines.find(key); cachedPipeline != scenePipelines.end())
     {
-        binding.pipeline = cachedPipeline->second;
-        return binding.pipeline;
+        entry.pipeline = cachedPipeline->second;
+        binding.pipelines.push_back(std::move(entry));
+
+        return &binding.pipelines.back();
     }
 
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
@@ -3340,10 +3743,14 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
+    // A depth-only target has no colour attachment to blend into, and one blend state per colour
+    // attachment is the rule, so the count is zero for both this and the rendering info below.
+    const auto colorAttachmentCount = colorFormat == VK_FORMAT_UNDEFINED ? 0u : 1u;
+
     VkPipelineColorBlendStateCreateInfo colorBlend{};
     colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &blendAttachment;
+    colorBlend.attachmentCount = colorAttachmentCount;
+    colorBlend.pAttachments = colorAttachmentCount == 0 ? nullptr : &blendAttachment;
 
     const std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamicState{};
@@ -3353,8 +3760,8 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
 
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachmentFormats = &colorFormat;
+    renderingInfo.colorAttachmentCount = colorAttachmentCount;
+    renderingInfo.pColorAttachmentFormats = colorAttachmentCount == 0 ? nullptr : &colorFormat;
     renderingInfo.depthAttachmentFormat = depthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -3384,12 +3791,16 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
                                       std::to_string(static_cast<int>(createResult));
                            });
 
-        return VK_NULL_HANDLE;
+        binding.pipelines.push_back(std::move(entry));
+
+        return &binding.pipelines.back();
     }
 
     scenePipelines.emplace(key, pipeline);
-    binding.pipeline = pipeline;
-    return pipeline;
+    entry.pipeline = pipeline;
+    binding.pipelines.push_back(std::move(entry));
+
+    return &binding.pipelines.back();
 }
 
 VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const VkFormat colorFormat)
@@ -3969,6 +4380,37 @@ std::expected<unsigned int, std::string> VulkanRenderer::createCubeMap(const Tex
 
 // The image leaves the registry now — nothing may name it again — and is destroyed later, when
 // the frames that could still be sampling it have completed. See retire().
+VkSampler VulkanRenderer::createComparisonSampler(const VkFormat format) const
+{
+    VkFormatProperties formatProperties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProperties);
+    const auto filter =
+        (formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0
+            ? VK_FILTER_LINEAR
+            : VK_FILTER_NEAREST;
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = filter;
+    samplerInfo.minFilter = filter;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    // Clamped to an opaque white border rather than to the edge, and GL's comparison attachments
+    // are given the same border: a lookup outside the map must read "nothing was in front of
+    // this", which for a depth comparison is the far value, and clamping to the edge would smear
+    // whatever the border texel happens to hold across everything beyond the target.
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    samplerInfo.compareEnable = VK_TRUE;
+    samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
+
+    return sampler;
+}
+
 void VulkanRenderer::destroyImageResource(const unsigned int id) const
 {
     const auto entry = imageResources.find(id);
@@ -3988,6 +4430,29 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
         retired.descriptorSet = cachedSet->second;
         attachmentSets.erase(cachedSet);
     }
+
+    // A cascade set names up to shadowCascadeCount views, so one destroyed image invalidates every
+    // set that mentions it — on the same schedule and for the same reason as the fullscreen set
+    // above. The next frame that asks for a set with a live tuple builds a new one.
+    std::erase_if(shadowSets,
+                  [&](const auto& entry)
+                  {
+                      if (std::ranges::find(entry.first, id) == entry.first.end())
+                      {
+                          return false;
+                      }
+
+                      RetiredResource retiredSet;
+                      retiredSet.descriptorSet = entry.second;
+                      retire(retiredSet);
+
+                      if (entry.second == dummyShadowSet)
+                      {
+                          dummyShadowSet = VK_NULL_HANDLE;
+                      }
+
+                      return true;
+                  });
 
     const auto& resource = entry->second;
     retired.sampler = resource.sampler;
@@ -4086,9 +4551,18 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             VkImageView view = VK_NULL_HANDLE;
             ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
+            // Only a depth attachment that asked for it: a comparison sampler bound where the
+            // shader declares a plain sampler is undefined, so this is opt-in on both backends.
+            VkSampler sampler = VK_NULL_HANDLE;
+            if (attachment.type == FboAttachmentType::Depth &&
+                attachment.depthComparison == DepthComparison::LessOrEqual)
+            {
+                sampler = createComparisonSampler(format);
+            }
+
             const auto attachmentId = nextResourceId++;
-            imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1,
-                                                               width, height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
+            imageResources.emplace(attachmentId, ImageResource{image, allocation, view, sampler, format, 1, width,
+                                                               height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
             fboResource.attachmentIds.push_back(attachmentId);
 
             // Observable contract shared with GL: every attachment's id is written back
@@ -4240,16 +4714,20 @@ void VulkanRenderer::releaseShaderObject(const unsigned int shaderId)
                       return true;
                   });
 
-    // A primitive binding caches the pipeline it resolved to. Any binding that resolved to one of
-    // these has to resolve again — a model still drawing with a released shader is a caller bug,
-    // but it must not be a dangling VkPipeline.
+    // A primitive binding caches what it resolved to, one entry per shader and target shape it has
+    // been drawn with. Any entry naming one of these pipelines has to resolve again — a model still
+    // drawing with a released shader is a caller bug, but it must not be a dangling VkPipeline —
+    // and so does any entry naming the released shader id, whose pipeline may never have built:
+    // shader ids are handed out from a counter this release returns nothing to, but an entry that
+    // outlived its shader is a cache of an answer nobody can check.
     for (auto& [id, binding] : primitiveBindings)
     {
-        if (std::ranges::find(destroyedPipelines, binding.pipeline) != destroyedPipelines.end())
-        {
-            binding.pipeline = VK_NULL_HANDLE;
-            binding.resolved = false;
-        }
+        std::erase_if(binding.pipelines,
+                      [&](const ResolvedPipeline& resolved)
+                      {
+                          return resolved.shaderId == shaderId ||
+                                 std::ranges::find(destroyedPipelines, resolved.pipeline) != destroyedPipelines.end();
+                      });
     }
 
     for (const auto pipeline : destroyedPipelines)

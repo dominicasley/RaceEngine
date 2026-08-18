@@ -11,7 +11,12 @@ import raceengine.resource;
 namespace raceengine
 {
 
-export enum class TextureFormat { R, RG, RGB, RGBA, RGBA16F, RGBA32F, DepthComponent, Unknown };
+// DepthComponent leaves the depth precision to the driver — GL's unsized GL_DEPTH_COMPONENT is
+// usually 24-bit fixed point, where Vulkan has no unsized formats and picks D32_SFLOAT. That is
+// harmless for a depth *test* and not harmless for a depth map a shader compares against: the same
+// bias would clear the quantisation on one backend and not the other. DepthComponent32F names the
+// precision, so both backends store the same bits and one bias serves both.
+export enum class TextureFormat { R, RG, RGB, RGBA, RGBA16F, RGBA32F, DepthComponent, DepthComponent32F, Unknown };
 
 export enum class PixelDataType { UnsignedShort, UnsignedByte, Float };
 
