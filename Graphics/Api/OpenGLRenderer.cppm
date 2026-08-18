@@ -5,6 +5,7 @@ module;
 
 #include <GLFW/glfw3.h>
 
+#include <array>
 #include <cstring>
 #include <expected>
 #include <optional>
@@ -30,6 +31,7 @@ import :FrameDiagnostics;
 import :GraphicsApi;
 import :IRenderBackend;
 import :RenderContract;
+import :ShadowCascades;
 import :SceneManagerService;
 import :RenderableEntityService;
 import raceengine.graphics.models;
@@ -78,6 +80,10 @@ private:
     SceneManagerService& sceneManagerService;
     std::optional<Resource<Material>> currentlyBoundMaterial;
     std::optional<unsigned int> sceneEnvironmentGpuId;
+    // Per view, like the two above: whether this view's shadow units actually hold the scene's
+    // cascades. A sampler2DShadow reading a unit that holds no comparison texture is undefined, so
+    // this is what the shader's cascade count is derived from rather than the scene's own.
+    bool shadowCascadesBound = false;
     unsigned int quadVao;
     std::vector<float> vertices;
     int viewportWidth;
@@ -131,6 +137,14 @@ private:
                                           const std::vector<Resource<FboAttachment>>& textures) const;
     void bindMaterial(const Material& material, unsigned int programId);
     void uploadLights(unsigned int programId, const Scene& scene);
+    // The cascade matrices and the per-cascade texel/depth scales the fragment stage biases with.
+    // Separate from the texture binds below because the uniforms belong to a program and the binds
+    // belong to the context: one runs per program the view uses, the other once per view.
+    void uploadShadows(unsigned int programId, const Scene& scene);
+    // Binds each cascade's depth attachment to its contract texture unit. Reports whether every
+    // cascade was there, so the caller can tell the shader to shade lit rather than sample a unit
+    // holding whatever the last view left in it.
+    [[nodiscard]] bool bindShadowCascades(const Scene& scene);
     void upload(const Resource<Model>& model);
     void uploadMaterialTextures(const Resource<Material>& material);
     void uploadTexture(const Resource<Texture>& texture);
@@ -386,8 +400,40 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    // A cascade is a producer and samples nothing; only the views that shade need the maps bound,
+    // and binding a cascade's own attachment while rendering into it would be a feedback loop.
+    const auto shading = camera.role == CameraRole::Scene;
+    shadowCascadesBound = shading && bindShadowCascades(scene);
+
+    if (shading && !scene.shadows.cascades.empty() && !shadowCascadesBound)
+    {
+        diagnostics.record(FrameDiagnostic::ShadowCascadeUnavailable,
+                           [] { return std::string("no GL depth texture for one of the cascades"); });
+    }
+
+    // The view's own program, if it has one, resolved once: it is constant for the whole view, and
+    // a view that cannot get it must record nothing rather than fall back to the entities' own —
+    // those write colour, and this target may have no colour attachment to write.
+    const auto* viewShader =
+        camera.overrideShader.has_value() ? memoryStorageService.shaders.find(camera.overrideShader.value()) : nullptr;
+
+    if (camera.overrideShader.has_value() && viewShader == nullptr)
+    {
+        diagnostics.record(FrameDiagnostic::ViewShaderUnavailable,
+                           [&] { return "shader slot " + std::to_string(camera.overrideShader->index); });
+
+        return;
+    }
+
     for (auto& entity : scene.models)
     {
+        // The depth pass draws casters. A skybox in the map fills it at the near plane and puts
+        // the whole world in shadow.
+        if (!shading && !entity.castsShadow)
+        {
+            continue;
+        }
+
         // One resolution per entity for the whole nest below. A stale handle here — the model was
         // unloaded while its renderable is still in the scene — is what an entity with nothing
         // left to draw looks like, and skipping it is the only correct answer: the slot it names
@@ -402,9 +448,10 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
             continue;
         }
 
-        // The instance's shader, not the material's: materials live in shared storage, so two
-        // renderables built from one model would otherwise restyle each other.
-        const auto programId = instanceShader->gpuResourceId;
+        // The view's shader where it has one, otherwise the instance's — not the material's:
+        // materials live in shared storage, so two renderables built from one model would
+        // otherwise restyle each other.
+        const auto programId = viewShader != nullptr ? viewShader->gpuResourceId : instanceShader->gpuResourceId;
 
         if (entity.beforeDraw.has_value())
         {
@@ -511,6 +558,7 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
                     setProgramUniform(programId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
 
                     uploadLights(programId, scene);
+                    uploadShadows(programId, scene);
                 }
 
                 if (!primitive.gpuVao.has_value())
@@ -624,6 +672,93 @@ void OpenGLRenderer::uploadLights(const unsigned int programId, const Scene& sce
     }
 
     setProgramUniform(programId, "lightCount", static_cast<int>(uploaded));
+}
+
+// Every cascade's depth attachment on its contract texture unit, or nothing at all: a partially
+// bound set would leave a sampler2DShadow reading a unit holding whatever the previous view left
+// there, which for a comparison sampler is undefined rather than merely wrong.
+bool OpenGLRenderer::bindShadowCascades(const Scene& scene)
+{
+    if (scene.shadows.cascades.size() != shadowCascadeCount)
+    {
+        return false;
+    }
+
+    std::array<unsigned int, shadowCascadeCount> textures{};
+
+    for (auto index = 0u; index < shadowCascadeCount; index++)
+    {
+        const auto* cascadeCamera = scene.shadows.cascades[index].camera;
+        const auto* output = cascadeCamera == nullptr || !cascadeCamera->output.has_value()
+                                 ? nullptr
+                                 : memoryStorageService.frameBuffers.find(cascadeCamera->output.value());
+        if (output == nullptr)
+        {
+            return false;
+        }
+
+        std::optional<unsigned int> depthTexture;
+        for (const auto& attachmentKey : output->attachments)
+        {
+            const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachment != nullptr && attachment->type == FboAttachmentType::Depth)
+            {
+                depthTexture = attachment->gpuResourceId;
+                break;
+            }
+        }
+
+        if (!depthTexture.has_value())
+        {
+            return false;
+        }
+
+        textures[index] = depthTexture.value();
+    }
+
+    for (auto index = 0u; index < shadowCascadeCount; index++)
+    {
+        glActiveTexture(static_cast<GLenum>(GL_TEXTURE0) + shadowMapBinding(GraphicsApi::OpenGL) + index);
+        glBindTexture(GL_TEXTURE_2D, textures[index]);
+    }
+
+    return true;
+}
+
+// The cascade matrices in the form the shader wants them: world space straight to a shadow-map
+// lookup, so the GLSL is one multiply and a divide and holds no convention of its own.
+void OpenGLRenderer::uploadShadows(const unsigned int programId, const Scene& scene)
+{
+    if (!shadowCascadesBound)
+    {
+        setProgramUniform(programId, "shadowCascadeCount", 0);
+
+        return;
+    }
+
+    const auto correction = shadowLookupCorrection(GraphicsApi::OpenGL);
+
+    std::vector<glm::mat4> matrices;
+    matrices.reserve(shadowCascadeCount);
+    auto splits = glm::vec4(0.0f);
+    auto texelWorldSize = glm::vec4(0.0f);
+    auto depthScale = glm::vec4(0.0f);
+
+    for (auto index = 0u; index < shadowCascadeCount; index++)
+    {
+        const auto& cascade = scene.shadows.cascades[index];
+        matrices.push_back(correction * cascade.camera->modelViewProjectionMatrix);
+        splits[static_cast<int>(index)] = cascade.splitDistance;
+        texelWorldSize[static_cast<int>(index)] = cascade.texelWorldSize;
+        depthScale[static_cast<int>(index)] = cascade.depthPerWorldUnit;
+    }
+
+    setProgramUniform(programId, "shadowMatrices", matrices);
+    setProgramUniform(programId, "shadowSplits", splits);
+    setProgramUniform(programId, "shadowTexelWorldSize", texelWorldSize);
+    setProgramUniform(programId, "shadowDepthScale", depthScale);
+    setProgramUniform(programId, "shadowCascadeCount", static_cast<int>(shadowCascadeCount));
+    setProgramUniform(programId, "shadowLightIndex", static_cast<int>(scene.shadows.lightIndex));
 }
 
 void OpenGLRenderer::bindMaterial(const Material& material, const unsigned int programId)
@@ -1468,6 +1603,10 @@ unsigned int OpenGLRenderer::getTextureFormat(TextureFormat format) const
         return GL_RGBA32F;
     case TextureFormat::DepthComponent:
         return GL_DEPTH_COMPONENT;
+    case TextureFormat::DepthComponent32F:
+        // Sized on purpose: it is the internal format of a map a shader compares against, and the
+        // unsized enum above lets the driver pick the precision (see TextureFormat).
+        return GL_DEPTH_COMPONENT32F;
     default:
         return GL_RGB;
     }

@@ -62,6 +62,7 @@ target_sources(Engine PUBLIC
         Graphics/System/Window.cppm
         Graphics/Api/GraphicsApi.cppm
         Graphics/Api/RenderContract.cppm
+        Graphics/Api/ShadowCascades.cppm
         Graphics/Api/FrameDiagnostics.cppm
         Graphics/Api/IFrameRecorder.cppm
         Graphics/Api/IGpuResourceFactory.cppm
@@ -83,6 +84,7 @@ target_sources(Engine PUBLIC
         Graphics/Services/CameraService.cppm
         Graphics/Services/PostProcessService.cppm
         Graphics/Services/SceneService.cppm
+        Graphics/Services/ShadowService.cppm
         Graphics/Services/AssetService.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm

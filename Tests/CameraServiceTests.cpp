@@ -160,7 +160,10 @@ TEST_CASE("a depth-only camera gets one depth attachment at its own resolution",
     const auto attachments = fixture.attachmentsOf(camera.value());
     REQUIRE(attachments.size() == 1);
     REQUIRE(attachments.front().type == FboAttachmentType::Depth);
-    REQUIRE(attachments.front().internalFormat == TextureFormat::DepthComponent);
+    // Sized, not the driver's choice: this is a map a shader compares against, and GL's unsized
+    // GL_DEPTH_COMPONENT is usually 24-bit fixed where Vulkan has to pick D32_SFLOAT. One bias
+    // cannot clear both quantisations, so the precision is named (TextureFormat).
+    REQUIRE(attachments.front().internalFormat == TextureFormat::DepthComponent32F);
 
     // Sized independently of the window, which is the whole point: the window here is 1920x1080.
     REQUIRE(attachments.front().width == 2048);

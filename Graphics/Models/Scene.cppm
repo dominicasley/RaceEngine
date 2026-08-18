@@ -53,9 +53,10 @@ export struct SceneNode
 
 // What the light's geometry is. A point light radiates from `position` and attenuates; a
 // directional light has no position that matters and casts along `direction` from infinitely far
-// away, which is the light a cascaded shadow map is a shadow map *of*. Nothing reads this yet:
-// both backends still upload position and the four terms below exactly as before, so declaring a
-// light directional changes no shading until the maths that reads it lands.
+// away, which is the light a cascaded shadow map is a shadow map *of*. `direction` is what the
+// cascades are fitted against; shading still reads `position` as the direction *towards* the
+// light, exactly as it always has, so the two must be opposites of each other for a shadow to land
+// where the shading says it should.
 export enum class LightType { Point, Directional };
 
 export struct Light
@@ -91,6 +92,13 @@ export struct OrthographicVolume
     float top = 1.0f;
 };
 
+// What the frame does with a camera's view. Scene is the ordinary case and the default. A
+// ShadowCascade camera *produces* a depth map that Scene cameras sample, so the frame records
+// every one of them before any Scene camera whatever order they were appended to the scene in — a
+// depth target sampled by a view recorded earlier in the same command buffer would be read before
+// it was written, and on Vulkan the layout barrier would be on the wrong side of the read.
+export enum class CameraRole { Scene, ShadowCascade };
+
 export struct Camera
 {
     unsigned int iso;
@@ -98,6 +106,11 @@ export struct Camera
     float aperture;
     float exposure{};
     float fieldOfView;
+    CameraRole role = CameraRole::Scene;
+    // The shader every draw in this view uses instead of the entity's own. A cascade renders
+    // depth and nothing else, and depth does not vary by material, so one shader serves the whole
+    // pass; a camera without one shades each entity as that entity asked to be shaded.
+    std::optional<Resource<Shader>> overrideShader{};
     CameraProjection projection = CameraProjection::Perspective;
     // Read only when `projection` is Orthographic; `fieldOfView` and `aspectRatio` are read only
     // when it is Perspective. Both sets are kept rather than unioned so switching a camera back
@@ -135,6 +148,10 @@ export struct RenderableEntity
     // graph. Drawable holds them as a view, so a game still writes them through its component.
     std::optional<std::function<void()>> beforeDraw;
     std::optional<std::function<void()>> afterDraw;
+    // Whether a shadow cascade's depth pass draws this entity. False for anything that is scenery
+    // rather than geometry: a skybox drawn into a cascade fills the whole map at the near plane
+    // and puts the entire world in shadow, which is the first thing a shadow map does wrong.
+    bool castsShadow = true;
 
     explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
         type(type),
@@ -179,6 +196,47 @@ export struct RenderableModel : public RenderableEntity
     }
 };
 
+// One slice of the shadow-casting light's frustum, and the camera that draws it.
+//
+// The camera is a raw pointer into `Scene::cameras` for the same reason `RenderableEntity::node`
+// is a reference into `Scene::nodes`: the scene's deques are add-only and the scene is the unit of
+// teardown, so an address inside one is valid exactly as long as the scene is. No generational
+// handle reaches inside a scene.
+export struct ShadowCascade
+{
+    Camera* camera = nullptr;
+    // Where this cascade stops, as a distance along the view camera's axis. The fragment shader
+    // picks its cascade by comparing against these.
+    float splitDistance = 0.0f;
+    // World units per shadow-map texel, and normalised depth per world unit along the light axis.
+    // The whole bias budget is expressed in these two, so no cascade needs tuning of its own.
+    float texelWorldSize = 1.0f;
+    float depthPerWorldUnit = 1.0f;
+};
+
+// A scene's cascaded shadow map. Empty `cascades` means the scene casts no shadow, which is a
+// legitimate scene rather than a failure — both backends then shade with the lit result.
+export struct ShadowCascades
+{
+    // The light the cascades follow and the camera whose frustum they split. Pointers into the
+    // scene's own deques, on the same terms as ShadowCascade::camera.
+    Light* light = nullptr;
+    Camera* viewCamera = nullptr;
+    // Which light index the shaders should apply the shadow to — the position of `light` in
+    // Scene::lights, which is the order both backends upload them in.
+    unsigned int lightIndex = 0;
+    unsigned int resolution = 0;
+    // How far from the eye the cascades reach. Beyond it a fragment is lit: there is no map to
+    // ask, and the alternative — treating "outside the map" as shadowed — paints the far half of
+    // the world black.
+    float distance = 0.0f;
+    // The split scheme's blend, and how far behind a slice a cascade still catches casters. Kept
+    // here rather than only in the DTO because the refit runs every frame and needs both.
+    float lambda = 0.5f;
+    float casterExtent = 0.0f;
+    std::vector<ShadowCascade> cascades{};
+};
+
 export struct Scene
 {
     // std::deque, and add-only *within a scene*: SceneNode::parent, RenderableEntity::node and a
@@ -192,6 +250,7 @@ export struct Scene
     std::deque<SceneNode> nodes;
 
     std::optional<Resource<CubeMap>> environment{};
+    ShadowCascades shadows{};
 };
 
 } // namespace raceengine

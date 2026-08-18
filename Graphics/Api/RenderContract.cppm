@@ -29,6 +29,39 @@ export inline constexpr uint32_t maxLights = 4;
 // The clear colour every colour target of either backend is cleared to.
 export inline constexpr std::array<float, 4> clearColour = {1.0f, 1.0f, 1.0f, 1.0f};
 
+// How many slices the shadow-casting light's view frustum is split into. Four, because four is
+// where the practical split scheme stops buying resolution for this camera's 1..2000 range — the
+// nearest slice is already sub-metre per texel at 2048 — and because four split distances ride in
+// one vec4, so the frame block gains no ragged tail. Raising it needs a wider split field, which
+// the static_assert in the Vulkan backend states.
+export inline constexpr uint32_t shadowCascadeCount = 4;
+
+// Percentage-closer filtering: taps at (2r+1)^2 on a one-texel grid. r = 1 gives nine taps, and
+// each tap is *already* a 2x2 percentage-closer average because the comparison sampler filters
+// linearly — so nine taps cover a 4x4 texel neighbourhood with tent weighting. r = 2 would
+// quadruple the cost for a softness that is not visible at this cascade resolution.
+export inline constexpr uint32_t shadowPcfRadius = 1;
+
+// The bias budget, in shadow-map texels of the cascade the fragment landed in. Stated here rather
+// than in the two dialects because a shadow that acnes on one backend and peter-pans on the other
+// is exactly the divergence a hand-copied constant produces. Both are texel counts, so they scale
+// with the cascade automatically and no cascade needs its own tuning:
+//  - the normal offset moves the sample point off the surface *sideways*, which is what removes
+//    acne without detaching the contact point,
+//  - the depth bias is the depth a surface at slope tan(theta) crosses over that many texels,
+//    clamped so a grazing surface cannot ask for an unbounded one.
+export inline constexpr uint32_t shadowNormalOffsetTexels = 3;
+export inline constexpr uint32_t shadowSlopeBiasTexels = 3;
+export inline constexpr uint32_t shadowConstantBiasTexels = 1;
+export inline constexpr uint32_t shadowMaxSlope = 8;
+
+// The last tenth of a cascade cross-fades into the next one, and the last tenth of the shadow
+// distance fades to fully lit. Both are the same problem — a discontinuity in filter width and
+// bias reads as a line drawn across the ground — and the second is why a fragment past the last
+// cascade is lit rather than shadowed.
+export inline constexpr uint32_t shadowCascadeBlendPercent = 10;
+export inline constexpr uint32_t shadowDistanceFadePercent = 10;
+
 // Material texture slots in shader-declaration order.
 export enum class MaterialTextureSlot : uint32_t {
     Diffuse,
@@ -68,6 +101,22 @@ static_assert(attributeLocation(PrimitiveAttributeType::SkinWeight) == 5);
 export inline constexpr uint32_t frameDescriptorSet = 0;
 export inline constexpr uint32_t materialDescriptorSet = 1;
 export inline constexpr uint32_t drawDescriptorSet = 2;
+// The cascades get a set of their own rather than a tail of set 1: they are per *frame*, and
+// writing them into every material set would mean rewriting every material set whenever a cascade
+// target is rebuilt.
+export inline constexpr uint32_t shadowDescriptorSet = 3;
+
+// GL has one texture-unit namespace for the whole program, so the cascades sit past every material
+// slot; Vulkan gives them a set to themselves, so they start at binding 0 there. Eight rather than
+// materialTextureSlotCount (6) because bindMaterial hands Material::textures the units above the
+// named slots — that vector is empty for every asset in this tree, and a material carrying three
+// or more extra textures would be the collision this gap exists to make unlikely.
+export inline constexpr uint32_t glShadowMapTextureUnit = 8;
+
+export [[nodiscard]] constexpr uint32_t shadowMapBinding(const GraphicsApi api)
+{
+    return api == GraphicsApi::Vulkan ? 0u : glShadowMapTextureUnit;
+}
 
 export struct ShaderMacro
 {
@@ -75,7 +124,7 @@ export struct ShaderMacro
     uint32_t value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 17;
+export inline constexpr size_t shaderContractMacroCount = 27;
 
 export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
 shaderContractMacros(const GraphicsApi api)
@@ -98,6 +147,16 @@ shaderContractMacros(const GraphicsApi api)
         {"SET_FRAME", frameDescriptorSet},
         {"SET_MATERIAL", materialDescriptorSet},
         {"SET_DRAW", drawDescriptorSet},
+        {"SET_SHADOW", shadowDescriptorSet},
+        {"SHADOW_CASCADES", shadowCascadeCount},
+        {"SHADOW_MAP_BINDING", shadowMapBinding(api)},
+        {"SHADOW_PCF_RADIUS", shadowPcfRadius},
+        {"SHADOW_NORMAL_OFFSET_TEXELS", shadowNormalOffsetTexels},
+        {"SHADOW_SLOPE_BIAS_TEXELS", shadowSlopeBiasTexels},
+        {"SHADOW_CONSTANT_BIAS_TEXELS", shadowConstantBiasTexels},
+        {"SHADOW_MAX_SLOPE", shadowMaxSlope},
+        {"SHADOW_BLEND_PERCENT", shadowCascadeBlendPercent},
+        {"SHADOW_FADE_PERCENT", shadowDistanceFadePercent},
     }};
 }
 

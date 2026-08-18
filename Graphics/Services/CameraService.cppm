@@ -105,11 +105,17 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
 
     if (wantsDepth)
     {
+        // A depth-only target is one a shader is going to compare against, so its precision is
+        // named rather than left to the driver — see TextureFormat::DepthComponent32F. A camera
+        // that also has colour is using its depth buffer as a depth *test*, where the driver's
+        // choice has always been fine and changing it would move pixels for nothing.
+        const auto depthFormat = wantsColour ? TextureFormat::DepthComponent : TextureFormat::DepthComponent32F;
+
         attachments.push_back(CreateFboAttachmentDTO{.width = createCameraDTO.width,
                                                      .height = createCameraDTO.height,
                                                      .type = FboAttachmentType::Depth,
                                                      .captureFormat = TextureFormat::DepthComponent,
-                                                     .internalFormat = TextureFormat::DepthComponent,
+                                                     .internalFormat = depthFormat,
                                                      .depthComparison = createCameraDTO.depthComparison});
     }
 
@@ -128,6 +134,8 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
                   .aspectRatio = 16.0f / 9.0f,
                   .aperture = 1.4f,
                   .fieldOfView = 75.f,
+                  .role = createCameraDTO.role,
+                  .overrideShader = createCameraDTO.overrideShader,
                   .tracksWindowSize = false,
                   .nearClippingPlane = 1.0f,
                   .farClippingPlane = 5000.0f,
