@@ -90,19 +90,15 @@ void CameraService::translate(Camera& camera, float x, float y, float z) const
 
 void CameraService::setDirection(Camera& camera, float x, float y, float z) const
 {
-    if (x == camera.direction.x && y == camera.direction.y && z == camera.direction.z)
-        return;
-
     camera.direction.x = x;
     camera.direction.y = y;
     camera.direction.z = z;
 }
 
+// x, y and z are a delta applied to the current direction, not a direction: there is no
+// predicate over them that says the camera would not move, so this writes unconditionally.
 void CameraService::rotate(Camera& camera, float x, float y, float z) const
 {
-    if (x == camera.direction.x && y == camera.direction.y && z == camera.direction.z)
-        return;
-
     camera.direction.x += x;
     camera.direction.y += y;
     camera.direction.z += z;

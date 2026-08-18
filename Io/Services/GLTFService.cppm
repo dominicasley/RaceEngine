@@ -145,8 +145,17 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             }
         }
 
-        mesh.inverseBindPoseTransforms = AccessorUtility::get<std::vector<glm::mat4>>(
-            tinyGltfModel, tinyGltfModel.accessors[static_cast<size_t>(skin.inverseBindMatrices)]);
+        // inverseBindMatrices is optional (-1); the spec then defines every joint's inverse
+        // bind matrix as the identity, which is what the skinning path expects to find.
+        if (skin.inverseBindMatrices >= 0 && std::cmp_less(skin.inverseBindMatrices, tinyGltfModel.accessors.size()))
+        {
+            mesh.inverseBindPoseTransforms = AccessorUtility::get<std::vector<glm::mat4>>(
+                tinyGltfModel, tinyGltfModel.accessors[static_cast<size_t>(skin.inverseBindMatrices)]);
+        }
+        else
+        {
+            mesh.inverseBindPoseTransforms.assign(skin.joints.size(), glm::mat4(1.0f));
+        }
     }
 
     for (const auto& primitive : tinyGltfMesh.primitives)
@@ -158,6 +167,15 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
         }
 
         auto indexAccessor = tinyGltfModel.accessors[static_cast<size_t>(primitive.indices)];
+
+        // meshBufferIndex indexes model.meshBuffers, which is built one entry per bufferView:
+        // an index accessor with no bufferView (-1, legal glTF) has no geometry to draw.
+        if (indexAccessor.bufferView < 0 ||
+            std::cmp_greater_equal(indexAccessor.bufferView, tinyGltfModel.bufferViews.size()))
+        {
+            logger.warn("Skipping primitive whose index accessor has no buffer view in mesh {}", tinyGltfMesh.name);
+            continue;
+        }
 
         auto meshPrimitive = MeshPrimitive{
             .mode = primitive.mode == -1 ? TINYGLTF_MODE_TRIANGLES : primitive.mode,
@@ -179,6 +197,16 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             }
 
             auto accessor = tinyGltfModel.accessors[static_cast<size_t>(attribute.second)];
+
+            // bufferView is optional on an accessor (-1 for a sparse or zero-filled one); both
+            // the stride lookup here and bufferIndex below index by it.
+            if (accessor.bufferView < 0 ||
+                std::cmp_greater_equal(accessor.bufferView, tinyGltfModel.bufferViews.size()))
+            {
+                logger.warn("Skipping attribute {} with no buffer view in mesh {}", attribute.first, tinyGltfMesh.name);
+                continue;
+            }
+
             auto byteStride = accessor.ByteStride(tinyGltfModel.bufferViews[static_cast<size_t>(accessor.bufferView)]);
 
             meshPrimitive.attributes.push_back(MeshPrimitiveAttribute{
@@ -331,8 +359,18 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
                            sliceBegin, sliceBegin + static_cast<std::ptrdiff_t>(bufferView.byteLength))});
     }
 
-    const auto sceneIndex = tinyGltfModel.defaultScene < 0 ? 0 : tinyGltfModel.defaultScene;
-    for (auto& sceneNode : tinyGltfModel.scenes[static_cast<size_t>(sceneIndex)].nodes)
+    if (tinyGltfModel.scenes.empty())
+    {
+        logger.warn("Model {} contains no scenes; it contributes materials and buffers but no meshes", filePath);
+        return model;
+    }
+
+    // defaultScene is optional (-1) and only meaningful as an index into scenes.
+    const auto defaultScene = tinyGltfModel.defaultScene;
+    const auto sceneIndex = defaultScene >= 0 && std::cmp_less(defaultScene, tinyGltfModel.scenes.size())
+                                ? static_cast<size_t>(defaultScene)
+                                : size_t{0};
+    for (auto& sceneNode : tinyGltfModel.scenes[sceneIndex].nodes)
     {
         processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(sceneNode)], glm::mat4(1.0));
     }

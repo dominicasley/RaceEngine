@@ -101,8 +101,9 @@ public:
 
 private:
     void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
-    void bindMaterial(const Resource<Material>& material);
+    void bindMaterial(const Resource<Material>& material, const Resource<Shader>& shader);
     void upload(const Resource<Model>& model);
+    void uploadTexture(const Resource<Texture>& texture) const;
     [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
@@ -123,10 +124,15 @@ private:
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::vec4>& data);
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat3>& data);
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat4>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat4>& data, size_t count);
 };
 
 namespace
 {
+// Parity with the GL shaders' jointTransformationMatrixes[MAX_JOINTS] and Vulkan's
+// DrawDataUbo::jointTransforms (vulkan-abi.md).
+constexpr size_t maxJoints = 128;
+
 void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei,
                                         const GLchar* message, const void* userParam)
 {
@@ -272,7 +278,22 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
             auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
 
-            const auto joints = renderableEntityService.joints(mesh, delta);
+            // Bound by reference into the mesh's palette buffer: copying it here would undo the
+            // per-frame allocation the service avoids. The clamp limits the upload count instead.
+            const auto& joints = renderableEntityService.joints(mesh, delta);
+            const auto jointCount = std::min(joints.size(), maxJoints);
+
+            if (joints.size() > maxJoints)
+            {
+                static auto warnedJointLimit = false;
+                if (!warnedJointLimit)
+                {
+                    logger.warn("The GL joint uniform array holds at most {} joints; {} were supplied and the rest are "
+                                "ignored",
+                                maxJoints, joints.size());
+                    warnedJointLimit = true;
+                }
+            }
 
             for (auto& primitive : mesh.mesh->meshPrimitives)
             {
@@ -294,7 +315,9 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                 }
 
                 auto material = primitive.material.value();
-                auto shader = material->shader.value();
+                // The instance's shader, not the material's: materials live in shared storage, so
+                // two renderables built from one model would otherwise restyle each other.
+                auto shader = entity.shader;
 
                 setProgramUniform(shader->gpuResourceId, "localToScreen4x4Matrix",
                                   camera.modelViewProjectionMatrix * entityModelMatrix);
@@ -304,14 +327,14 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
                 setProgramUniform(shader->gpuResourceId, "normalMatrix",
                                   glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))));
-                setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints);
+                setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints, jointCount);
                 setProgramUniform(shader->gpuResourceId, "animated", !joints.empty());
 
                 setProgramUniform(shader->gpuResourceId, "textureTransform", material->transform);
 
                 if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != material.id)
                 {
-                    bindMaterial(material);
+                    bindMaterial(material, shader);
 
                     if (!material->opaque)
                     {
@@ -373,10 +396,8 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
     }
 }
 
-void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
+void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Resource<Shader>& shader)
 {
-    auto shader = material->shader.value();
-
     glUseProgram(shader->gpuResourceId);
 
     if (material->albedo.has_value())
@@ -531,6 +552,12 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 
         memoryStorageService.models.update(modelKey, model);
 
+        // draw()'s "already uploaded" sentinel. Nothing binds it — each primitive owns its VAO
+        // in gpuVao — but it has to be assigned outside the loop below: GLTFService drops
+        // non-indexed primitives, so meshPrimitives can be empty, and an unset sentinel makes
+        // draw() re-enter upload() on every frame.
+        auto uploadedSentinel = 0u;
+
         for (auto& primitive : mesh.meshPrimitives)
         {
             GLuint vao;
@@ -558,64 +585,53 @@ void OpenGLRenderer::upload(const Resource<Model>& modelKey)
                 static_cast<GLuint>(model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
 
             primitive.gpuVao = vao;
-            mesh.gpuResourceId = vao;
+            uploadedSentinel = vao;
 
             glBindVertexArray(0);
         }
 
+        mesh.gpuResourceId = uploadedSentinel;
+
         memoryStorageService.meshes.update(meshKey, mesh);
     }
 
-    for (const auto& resource : model.materials)
+    for (const auto& materialKey : model.materials)
     {
-        auto material = memoryStorageService.materials.get(resource);
+        const auto& material = memoryStorageService.materials.get(materialKey);
 
-        if (material.albedo.has_value() && memoryStorageService.textures.exists(material.albedo.value()))
+        for (const auto& textureKey :
+             {material.albedo, material.normal, material.metallicRoughness, material.emissive, material.occlusion})
         {
-            auto albedo = memoryStorageService.textures.get(material.albedo.value());
-            albedo.gpuResourceId = createTexture(albedo);
-            memoryStorageService.textures.update(material.albedo.value(), albedo);
-        }
-
-        if (material.normal.has_value() && memoryStorageService.textures.exists(material.normal.value()))
-        {
-            auto normal = memoryStorageService.textures.get(material.normal.value());
-            normal.gpuResourceId = createTexture(normal);
-            memoryStorageService.textures.update(material.normal.value(), normal);
-        }
-
-        if (material.metallicRoughness.has_value() &&
-            memoryStorageService.textures.exists(material.metallicRoughness.value()))
-        {
-            auto metallicRoughness = memoryStorageService.textures.get(material.metallicRoughness.value());
-            metallicRoughness.gpuResourceId = createTexture(metallicRoughness);
-            memoryStorageService.textures.update(material.metallicRoughness.value(), metallicRoughness);
-        }
-
-        if (material.emissive.has_value() && memoryStorageService.textures.exists(material.emissive.value()))
-        {
-            auto emissive = memoryStorageService.textures.get(material.emissive.value());
-            emissive.gpuResourceId = createTexture(emissive);
-            memoryStorageService.textures.update(material.emissive.value(), emissive);
-        }
-
-        if (material.occlusion.has_value() && memoryStorageService.textures.exists(material.occlusion.value()))
-        {
-            auto occlusion = memoryStorageService.textures.get(material.occlusion.value());
-            occlusion.gpuResourceId = createTexture(occlusion);
-            memoryStorageService.textures.update(material.occlusion.value(), occlusion);
-        }
-
-        for (auto& i : material.textures)
-        {
-            auto texture = memoryStorageService.textures.get(i);
-            if (!texture.gpuResourceId.has_value())
+            if (textureKey.has_value() && memoryStorageService.textures.exists(textureKey.value()))
             {
-                texture.gpuResourceId = createTexture(texture);
-                memoryStorageService.textures.update(i, texture);
+                uploadTexture(textureKey.value());
             }
         }
+
+        for (const auto& textureKey : material.textures)
+        {
+            uploadTexture(textureKey);
+        }
     }
+}
+
+void OpenGLRenderer::uploadTexture(const Resource<Texture>& textureKey) const
+{
+    // MemoryStorage hands out const references to non-const elements; writing the id and
+    // dropping the pixels in place avoids copying a multi-megabyte payload through get/update
+    // (same justification as VulkanRenderer::uploadTexture).
+    auto& texture = const_cast<Texture&>(memoryStorageService.textures.get(textureKey));
+
+    if (texture.gpuResourceId.has_value())
+    {
+        return;
+    }
+
+    texture.gpuResourceId = createTexture(texture);
+
+    // The GPU owns the texels now; shed the CPU copy the way the mesh buffers above do.
+    texture.data.clear();
+    texture.data.shrink_to_fit();
 }
 
 std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
@@ -766,6 +782,16 @@ unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& 
 
     glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
 
+    // The GPU owns the texels now; shed the CPU copies the way the mesh buffer upload does.
+    // MemoryStorage's elements are non-const objects, so the cast is defined behaviour
+    // (same justification as VulkanRenderer::createCubeMap).
+    for (const auto* face : textures)
+    {
+        auto& texture = const_cast<Texture&>(*face);
+        texture.data.clear();
+        texture.data.shrink_to_fit();
+    }
+
     return textureId;
 }
 
@@ -867,9 +893,14 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
 
 void OpenGLRenderer::deleteFbo(Fbo& fbo) const
 {
+    // GL recycles a deleted name immediately, and createFbo regenerates these objects right
+    // after this returns: an id left in the tracking vectors would make the destructor delete
+    // whatever live object inherited the name.
     if (fbo.gpuResourceId.has_value())
     {
         glDeleteFramebuffers(1, &fbo.gpuResourceId.value());
+        std::erase(createdFbos, fbo.gpuResourceId.value());
+        fbo.gpuResourceId.reset();
     }
 
     for (auto& attachmentKey : fbo.attachments)
@@ -878,6 +909,10 @@ void OpenGLRenderer::deleteFbo(Fbo& fbo) const
         if (attachment.gpuResourceId.has_value())
         {
             glDeleteTextures(1, &attachment.gpuResourceId.value());
+            std::erase(createdTextures, attachment.gpuResourceId.value());
+            attachment.gpuResourceId.reset();
+
+            memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
         }
     }
 }
@@ -999,7 +1034,15 @@ void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char*
 void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::mat4>& data)
 {
-    glProgramUniformMatrix4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
+    setProgramUniform(programId, uniformName, data, data.size());
+}
+
+// Uploading fewer elements than the vector holds is how the joint palette is clamped to the
+// shader's array bound without copying it.
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
+                                       const std::vector<glm::mat4>& data, const size_t count)
+{
+    glProgramUniformMatrix4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(count),
                               GL_FALSE, reinterpret_cast<const float*>(data.data()));
 }
 

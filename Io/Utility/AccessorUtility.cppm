@@ -2,6 +2,7 @@ module;
 
 #include <cstddef>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include <glm/gtc/type_ptr.hpp>
@@ -25,21 +26,65 @@ private:
     }
 
 public:
-    template <typename T> inline static T get(const tinygltf::Model&, const tinygltf::Accessor&) {};
+    // Only the specializations below are readable; anything else is a caller mistake rather
+    // than a runtime failure, so it is rejected at compile time instead of silently
+    // returning an indeterminate value.
+    template <typename T> [[nodiscard]] inline static T get(const tinygltf::Model&, const tinygltf::Accessor&)
+    {
+        static_assert(false, "AccessorUtility::get is only defined for the specializations in this unit");
+    }
 };
 
+// Every index below comes from the file and glTF allows -1 for an absent one, so each is
+// range-checked before use: unchecked, a -1 becomes SIZE_MAX. A malformed accessor yields no
+// elements, which every caller already treats as "no data" — get<T> has no error channel.
 template <typename T>
 inline std::vector<T> AccessorUtility::readBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
+    if (accessor.bufferView < 0 || std::cmp_greater_equal(accessor.bufferView, model.bufferViews.size()))
+    {
+        return {};
+    }
+
     const auto& bufferView = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
+    if (bufferView.buffer < 0 || std::cmp_greater_equal(bufferView.buffer, model.buffers.size()))
+    {
+        return {};
+    }
+
     const auto& buffer = model.buffers[static_cast<size_t>(bufferView.buffer)];
 
-    const auto stride = static_cast<size_t>(accessor.ByteStride(bufferView));
+    const auto byteStride = accessor.ByteStride(bufferView);
+    const auto componentBytes = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType));
+    if (byteStride <= 0 || componentBytes <= 0 || accessor.count == 0)
+    {
+        return {};
+    }
+
+    const auto stride = static_cast<size_t>(byteStride);
     const auto components = componentsPerElement(accessor);
-    const auto elementBytes =
-        static_cast<size_t>(tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType))) *
-        components;
+    const auto elementBytes = static_cast<size_t>(componentBytes) * components;
     const auto base = bufferView.byteOffset + accessor.byteOffset;
+
+    // The destination slot per element is components * sizeof(T); a component type wider than
+    // T would otherwise overrun it.
+    if (elementBytes > components * sizeof(T))
+    {
+        return {};
+    }
+
+    // Written as subtraction and division so an accessor claiming an absurd count or offset
+    // cannot overflow the arithmetic that is meant to catch it.
+    const auto available = buffer.data.size();
+    if (base > available || elementBytes > available - base)
+    {
+        return {};
+    }
+
+    if (accessor.count > (available - base - elementBytes) / stride + 1)
+    {
+        return {};
+    }
 
     auto out = std::vector<T>(accessor.count * components);
 
@@ -70,9 +115,17 @@ inline std::vector<float> AccessorUtility::get<std::vector<float>>(const tinyglt
     return readBytes<float>(model, accessor);
 }
 
-template <> inline glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model&, const tinygltf::Accessor&)
+template <>
+inline glm::vec2 AccessorUtility::get<glm::vec2>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
-    return glm::vec2(1.0f);
+    const auto result = readBytes<float>(model, accessor);
+
+    if (result.size() < 2)
+    {
+        return glm::vec2(0.0f);
+    }
+
+    return glm::make_vec2(result.data());
 }
 
 template <>
@@ -133,9 +186,17 @@ inline std::vector<glm::quat> AccessorUtility::get<std::vector<glm::quat>>(const
     return out;
 }
 
-template <> inline glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model&, const tinygltf::Accessor&)
+template <>
+inline glm::vec4 AccessorUtility::get<glm::vec4>(const tinygltf::Model& model, const tinygltf::Accessor& accessor)
 {
-    return glm::vec4(1.0f);
+    const auto result = readBytes<float>(model, accessor);
+
+    if (result.size() < 4)
+    {
+        return glm::vec4(0.0f);
+    }
+
+    return glm::make_vec4(result.data());
 }
 
 template <>

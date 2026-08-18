@@ -26,6 +26,7 @@ export module raceengine.graphics.models:Scene;
 import raceengine.resource;
 import :Fbo;
 import :Mesh;
+import :Shader;
 import :Texture;
 
 namespace raceengine
@@ -102,17 +103,27 @@ export struct RenderableMesh
     std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;
     std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations{};
     std::unique_ptr<ozz::animation::SamplingJob::Context> animationCache{};
+    // ozz joint index -> glTF skin joint index, validated against both when the skeleton is set
+    // so the per-frame palette build needs no lookup guards.
     std::map<int, int> jointMap{};
+    // Joint palette, rebuilt in place every frame by RenderableEntityService::joints so the draw
+    // path does not allocate one vector per mesh per frame.
+    std::vector<glm::mat4> jointTransforms{};
 };
 
 export struct RenderableModel : public RenderableEntity
 {
     Resource<Model> model;
+    // The shader this instance was created with. Materials live in shared storage, so the
+    // choice cannot be written through to them without one instance rewriting another's.
+    Resource<Shader> shader;
     std::vector<RenderableMesh> meshes;
 
-    explicit RenderableModel(SceneNode& node, Resource<Model> model, std::vector<RenderableMesh> meshes) :
+    explicit RenderableModel(SceneNode& node, Resource<Model> model, Resource<Shader> shader,
+                             std::vector<RenderableMesh> meshes) :
         RenderableEntity(RenderableEntityType::Mesh, node),
         model(model),
+        shader(shader),
         meshes(std::move(meshes))
     {
     }

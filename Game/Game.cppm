@@ -5,6 +5,8 @@ module;
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <typeindex>
 #include <utility>
 
@@ -85,9 +87,17 @@ public:
         return getComponent<T>(getEntity(entityId));
     }
 
+    // Returns null when the entity carries no T. find, not operator[]: a miss through
+    // operator[] inserts a null component and hands it back, so reading mutates the entity.
     template <typename T> [[nodiscard]] std::shared_ptr<T> getComponent(Entity& entity)
     {
-        return static_pointer_cast<T>(entity.components[std::type_index(typeid(T))]);
+        const auto component = entity.components.find(std::type_index(typeid(T)));
+        if (component == entity.components.end())
+        {
+            return nullptr;
+        }
+
+        return std::static_pointer_cast<T>(component->second);
     }
 };
 
@@ -103,8 +113,17 @@ Entity& EntityService::createEntity()
     return entities.emplace_back(Entity(entities.size()));
 }
 
+// Ids are dense indices handed out by createEntity and nothing is ever removed, so an id this
+// service never issued is a caller bug, not a runtime condition: it is reported as one instead
+// of indexing the deque out of bounds.
 Entity& EntityService::getEntity(unsigned long long entityId)
 {
+    if (entityId >= entities.size())
+    {
+        throw std::out_of_range("No entity with id " + std::to_string(entityId) + "; " +
+                                std::to_string(entities.size()) + " entities exist");
+    }
+
     return entities[entityId];
 }
 

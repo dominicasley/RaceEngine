@@ -41,15 +41,21 @@ export class Engine
 private:
     // Declaration order IS initialization order and reverse-destruction order:
     // each member may only depend on members declared above it.
+    //
+    // The worker pool inverts that edge: it does not depend on the services below it, it
+    // *executes code belonging to* them, so it has to stop and join before they are
+    // destroyed — which means being declared after every service whose work it runs.
+    // ResourceService takes it by reference before it is constructed, which is fine: the
+    // reference is only stored, and no job can be submitted until the Engine is built.
     std::shared_ptr<spdlog::logger> logger;
     // Resolved before the window: the window's client API and the renderer factory both
     // depend on the selection (member init order is the mechanism).
     GraphicsApi graphicsApi;
     GLFWWindow glfwWindow;
     MemoryStorageService memoryStorageService;
-    BackgroundWorkerService backgroundWorkerService;
     GLTFService gltfService;
     ResourceService resourceService;
+    BackgroundWorkerService backgroundWorkerService;
     RenderableEntityService renderableEntityService;
     SceneManagerService sceneManagerService;
     // unique_ptr for backend selection, but the declaration position is still load-bearing:
@@ -176,7 +182,7 @@ Engine::Engine() :
     glfwWindow(*logger, graphicsApi),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
-    renderableEntityService(*logger, memoryStorageService),
+    renderableEntityService(memoryStorageService),
     renderer(createRenderer(graphicsApi, *logger, glfwWindow, renderableEntityService, sceneManagerService,
                             memoryStorageService)),
     fboService(memoryStorageService, *renderer),
@@ -238,9 +244,12 @@ void Engine::step()
     }
 
     presenterService.present();
-    glfwWindow.swapBuffers();
 
+    // Before the swap: the back buffer's contents are undefined once it has been swapped,
+    // so a capture taken afterwards reads whatever the driver happened to leave there.
     dumpFrameIfRequested();
+
+    glfwWindow.swapBuffers();
 }
 
 void Engine::dumpFrameIfRequested()

@@ -811,8 +811,8 @@ private:
     bool endFrame(VkBuffer captureBuffer);
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
-    void recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix, const Camera& camera,
-                    const std::vector<glm::mat4>& joints);
+    void recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader, const glm::mat4& entityModelMatrix,
+                    const Camera& camera, const std::vector<glm::mat4>& joints);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
     void presentAndCloseFrame(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey);
@@ -2054,7 +2054,9 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             }
 
             const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
-            const auto joints = renderableEntityService.joints(mesh, delta);
+            // Bound by reference into the mesh's palette buffer; copying undoes the per-frame
+            // allocation the service avoids.
+            const auto& joints = renderableEntityService.joints(mesh, delta);
 
             for (const auto& primitive : mesh.mesh->meshPrimitives)
             {
@@ -2079,7 +2081,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                     continue;
                 }
 
-                recordDraw(primitive, entityModelMatrix, camera, joints);
+                recordDraw(primitive, entity.shader, entityModelMatrix, camera, joints);
                 recordedDraws++;
             }
         }
@@ -2153,8 +2155,9 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
 }
 
-void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix,
-                                const Camera& camera, const std::vector<glm::mat4>& joints)
+void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader,
+                                const glm::mat4& entityModelMatrix, const Camera& camera,
+                                const std::vector<glm::mat4>& joints)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -2163,7 +2166,9 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4&
     }
 
     const auto material = primitive.material.value();
-    const auto shaderId = material->shader.value()->gpuResourceId;
+    // The instance's shader, not the material's: materials live in shared storage, so two
+    // renderables built from one model would otherwise restyle each other.
+    const auto shaderId = shader->gpuResourceId;
     const VkCullModeFlags cullMode = material->opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
     const auto pipeline = scenePipeline(shaderId, bound->second, cullMode);
@@ -2498,13 +2503,21 @@ void VulkanRenderer::upload(const Resource<Model>& modelKey)
 
         memoryStorageService.models.update(modelKey, model);
 
+        // draw()'s "already uploaded" sentinel. Nothing looks the id up — each primitive owns
+        // its binding in gpuVao — but it has to be assigned outside the loop below: GLTFService
+        // drops non-indexed primitives, so meshPrimitives can be empty, and an unset sentinel
+        // makes draw() re-enter upload() on every frame.
+        auto uploadedSentinel = 0u;
+
         for (auto& primitive : mesh.meshPrimitives)
         {
             const auto id = nextResourceId++;
             primitiveBindings.emplace(id, makePrimitiveBinding(model, primitive));
             primitive.gpuVao = id;
-            mesh.gpuResourceId = id;
+            uploadedSentinel = id;
         }
+
+        mesh.gpuResourceId = uploadedSentinel;
 
         memoryStorageService.meshes.update(meshKey, mesh);
     }
@@ -2546,7 +2559,13 @@ std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture
     // MemoryStorage hands out const references to non-const elements; writing the id back
     // in place keeps the GL-visible contract without copying a multi-megabyte payload
     // through get/update (same justification as createCubeMap's face clearing).
-    const_cast<Texture&>(texture).gpuResourceId = id;
+    auto& uploaded = const_cast<Texture&>(texture);
+    uploaded.gpuResourceId = id;
+
+    // The GPU owns the texels now; shed the CPU copy the way upload() sheds mesh buffers.
+    uploaded.data.clear();
+    uploaded.data.shrink_to_fit();
+
     return id;
 }
 
