@@ -27,6 +27,7 @@ module;
 
 export module raceengine.graphics:VulkanRenderer;
 
+import :FrameDiagnostics;
 import :GraphicsApi;
 import :IRenderBackend;
 import :RenderContract;
@@ -815,6 +816,9 @@ private:
 
     // Declaration order is dependency order; the destructor tears down in reverse.
     spdlog::logger& logger;
+    // Every skipped draw, view or pass is counted here instead of at a per-site boolean; see
+    // FrameDiagnostics for why the sites do not throttle themselves any more.
+    FrameDiagnostics& diagnostics;
     IWindow& window;
     MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
@@ -888,26 +892,14 @@ private:
     // to, and it only advances in submitAndPresent — the one place that submits.
     uint64_t submittedFrames = 0;
     mutable std::vector<RetiredResource> retiredResources;
-    mutable bool mipGenerationUnavailableLogged = false;
-    bool drawDataRingExhaustedLogged = false;
-    bool frameDataRingExhaustedLogged = false;
-    bool missingCameraOutputLogged = false;
-    bool missingMeshUploadLogged = false;
-    bool missingMaterialLogged = false;
-    bool unsupportedIndexTypeLogged = false;
-    bool unsupportedTopologyLogged = false;
-    bool unsupportedTextureLayoutLogged = false;
-    bool jointLimitLogged = false;
-    bool lightLimitLogged = false;
-    bool scenePipelineUnavailableLogged = false;
-    bool fullscreenPipelineUnavailableLogged = false;
-    bool descriptorSetUnavailableLogged = false;
-    bool missingPostProcessTargetLogged = false;
+    // Not a diagnostic: the one-shot info line that says the backend reached a recorded scene
+    // pass, which the smoke gate reads. Nothing is skipped when it fires.
     bool drawSummaryLogged = false;
 
 public:
-    explicit VulkanRenderer(spdlog::logger& logger, IWindow& window, RenderableEntityService& renderableEntityService,
-                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
+    explicit VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
+                            RenderableEntityService& renderableEntityService, SceneManagerService& sceneManagerService,
+                            MemoryStorageService& memoryStorageService);
     ~VulkanRenderer() override;
 
     [[nodiscard]] std::expected<void, std::string> init() override;
@@ -969,8 +961,11 @@ private:
     [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
-    [[nodiscard]] std::optional<std::vector<uint32_t>> compileToSpirv(const std::string& source,
-                                                                      shaderc_shader_kind kind, const char* stageName);
+    // Reports shaderc's own message rather than logging it: createShaderObject already has an
+    // error channel, and a source that will not compile is the whole reason it has nothing to
+    // hand back.
+    [[nodiscard]] std::expected<std::vector<uint32_t>, std::string>
+    compileToSpirv(const std::string& source, shaderc_shader_kind kind, const char* stageName);
     [[nodiscard]] VkShaderModule createShaderModule(const std::vector<uint32_t>& spirv) const;
     [[nodiscard]] VkPipeline buildFullscreenPipeline(VkShaderModule vertexModule, VkShaderModule fragmentModule,
                                                      VkFormat colorFormat) const;
@@ -992,10 +987,11 @@ private:
     [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
 
-VulkanRenderer::VulkanRenderer(spdlog::logger& logger, IWindow& window,
+VulkanRenderer::VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
                                RenderableEntityService& renderableEntityService,
                                SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
+    diagnostics(diagnostics),
     window(window),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
@@ -2102,13 +2098,14 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
     if (shader == shaderObjects.end() || shader->second.swapchainTargetPipeline == VK_NULL_HANDLE ||
         !imageResources.contains(attachmentImageId))
     {
-        if (!fullscreenPipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan presenter pass skipped: shader {} has no swapchain pipeline or attachment image {} is "
-                        "unknown; presenting the clear colour",
-                        shaderId, attachmentImageId);
-            fullscreenPipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::PresentPassSkipped,
+                           [&]
+                           {
+                               return "shader object " + std::to_string(shaderId) +
+                                      " has no swapchain pipeline, or attachment image " +
+                                      std::to_string(attachmentImageId) + " is unknown";
+                           });
+
         return false;
     }
 
@@ -2116,6 +2113,10 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
     // must leave the image untouched so the clear fallback can still take it.
     if (attachmentSet(attachmentImageId) == VK_NULL_HANDLE)
     {
+        diagnostics.record(
+            FrameDiagnostic::PresentPassSkipped,
+            [&] { return "attachment image " + std::to_string(attachmentImageId) + " has no descriptor set"; });
+
         return false;
     }
 
@@ -2195,11 +2196,9 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     if (!colorImageId.has_value() || !imageResources.contains(colorImageId.value()))
     {
-        if (!missingCameraOutputLogged)
-        {
-            logger.warn("Camera output framebuffer has no colour image; the scene pass is skipped this session");
-            missingCameraOutputLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::MissingCameraOutput,
+                           [] { return std::string("the scene pass records nothing"); });
+
         return;
     }
 
@@ -2228,11 +2227,14 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
-    if (declaredLights > maxLights && !lightLimitLogged)
+    if (declaredLights > maxLights)
     {
-        logger.warn("Vulkan frame data carries at most {} lights; {} were declared and the rest are ignored", maxLights,
-                    declaredLights);
-        lightLimitLogged = true;
+        diagnostics.record(FrameDiagnostic::LightLimitExceeded,
+                           [&]
+                           {
+                               return "Vulkan frame data carries " + std::to_string(maxLights) + " of the " +
+                                      std::to_string(declaredLights) + " declared";
+                           });
     }
 
     // Its own slot in the ring, kept until the frame is submitted: the next view records into
@@ -2321,6 +2323,9 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
         if (model == nullptr || instanceShader == nullptr)
         {
+            diagnostics.record(FrameDiagnostic::StaleModelHandle,
+                               [&] { return "model slot " + std::to_string(entity.model.index); });
+
             continue;
         }
 
@@ -2340,6 +2345,9 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
             if (mesh == nullptr)
             {
+                diagnostics.record(FrameDiagnostic::StaleMeshHandle,
+                                   [&] { return "mesh slot " + std::to_string(renderableMesh.mesh.index); });
+
                 continue;
             }
 
@@ -2352,11 +2360,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
             if (!mesh->gpuResourceId.has_value())
             {
-                if (!missingMeshUploadLogged)
-                {
-                    logger.warn("Skipping mesh without a GPU resource: {}", mesh->name);
-                    missingMeshUploadLogged = true;
-                }
+                diagnostics.record(FrameDiagnostic::MeshNotUploaded, [&] { return "mesh " + mesh->name; });
 
                 continue;
             }
@@ -2370,6 +2374,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             {
                 if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
@@ -2379,17 +2385,15 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
                 if (material == nullptr || !material->shader.has_value())
                 {
-                    if (!missingMaterialLogged)
-                    {
-                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh->name);
-                        missingMaterialLogged = true;
-                    }
+                    diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial, [&] { return "mesh " + mesh->name; });
 
                     continue;
                 }
 
                 if (!primitive.gpuVao.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
@@ -2416,6 +2420,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             postProcess == nullptr ? nullptr : memoryStorageService.shaders.find(postProcess->shader);
         if (postProcess == nullptr || postProcessShader == nullptr)
         {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "post-process slot " + std::to_string(postProcessKey.index) +
+                                          " or its shader is no longer loaded";
+                               });
+
             continue;
         }
 
@@ -2464,12 +2475,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                                      : VK_NULL_HANDLE;
         if (pipeline == VK_NULL_HANDLE)
         {
-            if (!missingPostProcessTargetLogged)
-            {
-                logger.warn("Vulkan post-process pass skipped: it needs an input attachment, a colour output "
-                            "attachment and a fullscreen shader");
-                missingPostProcessTargetLogged = true;
-            }
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "shader object " + std::to_string(postProcessShader->gpuResourceId) +
+                                          " has no fullscreen pipeline for this target";
+                               });
 
             continue;
         }
@@ -2504,6 +2515,12 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
     {
+        // makePrimitiveBinding already counted *why* the binding is not drawable (a topology or
+        // index type this backend has no equivalent for, a buffer that never uploaded); this is
+        // the draw that consequence costs.
+        diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded,
+                           [&] { return "primitive binding " + std::to_string(primitive.gpuVao.value()); });
+
         return;
     }
 
@@ -2512,6 +2529,9 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     const auto pipeline = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
     if (pipeline == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&] { return "shader object " + std::to_string(shaderId); });
+
         return;
     }
 
@@ -2533,12 +2553,16 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     const auto set = materialSet(materialKey, environmentImageId);
     if (set == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [&] { return "material slot " + std::to_string(materialKey.index); });
+
         return;
     }
 
     const auto slot = allocateDrawDataSlot();
     if (!slot.has_value())
     {
+        // allocateDrawDataSlot counted the exhaustion; this draw is what it costs.
         return;
     }
 
@@ -2555,12 +2579,12 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     auto jointCount = joints.size();
     if (jointCount > maxJoints)
     {
-        if (!jointLimitLogged)
-        {
-            logger.warn("Vulkan draw data carries at most {} joints; {} were supplied and the rest are ignored",
-                        maxJoints, jointCount);
-            jointLimitLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::JointLimitExceeded,
+                           [&]
+                           {
+                               return "Vulkan draw data carries " + std::to_string(maxJoints) + " of the " +
+                                      std::to_string(joints.size()) + " supplied";
+                           });
 
         jointCount = maxJoints;
     }
@@ -2601,6 +2625,8 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     const auto set = attachmentSet(sourceImageId);
     if (set == VK_NULL_HANDLE)
     {
+        // attachmentSet counted the pool exhaustion if that is what it was; an unknown image id
+        // is the caller's, and both leave the target untouched.
         return false;
     }
 
@@ -2747,12 +2773,8 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     const auto topology = primitiveTopology(primitive.mode);
     if (!topology.has_value())
     {
-        if (!unsupportedTopologyLogged)
-        {
-            logger.warn("Vulkan has no topology for glTF draw mode {}; primitives using it are not drawn",
-                        primitive.mode);
-            unsupportedTopologyLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::UnsupportedTopology,
+                           [&] { return "glTF draw mode " + std::to_string(primitive.mode); });
 
         return binding;
     }
@@ -2761,13 +2783,12 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     const auto indices = indexType(primitive.componentType);
     if (!indices.has_value())
     {
-        if (!unsupportedIndexTypeLogged)
-        {
-            logger.warn("Vulkan index component type 0x{:x} is outside this backend's uint16/uint32 support; "
-                        "primitives using it are not drawn",
-                        primitive.componentType);
-            unsupportedIndexTypeLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::UnsupportedIndexType,
+                           [&]
+                           {
+                               return "component type " + std::to_string(primitive.componentType) +
+                                      ", outside this backend's uint16/uint32 support";
+                           });
 
         return binding;
     }
@@ -2793,6 +2814,9 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     binding.indexBuffer = bufferHandle(primitive.meshBufferIndex);
     if (binding.indexBuffer == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded,
+                           [&] { return "index buffer view " + std::to_string(primitive.meshBufferIndex); });
+
         return binding;
     }
 
@@ -2801,6 +2825,9 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
         const auto handle = bufferHandle(bufferBind.bufferIndex);
         if (handle == VK_NULL_HANDLE)
         {
+            diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded,
+                               [&] { return "vertex buffer view " + std::to_string(bufferBind.bufferIndex); });
+
             return binding;
         }
 
@@ -2916,14 +2943,14 @@ std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture
                                      pixelComponentBytes(texture.pixelDataType);
             if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
             {
-                if (!unsupportedTextureLayoutLogged)
-                {
-                    logger.warn(
-                        "Vulkan texture upload skipped for {}: {}x{} needs {} byte(s) for its declared layout and "
-                        "carries {}",
-                        texture.name, texture.width, texture.height, sourceBytes, texture.data.size());
-                    unsupportedTextureLayoutLogged = true;
-                }
+                diagnostics.record(FrameDiagnostic::UnsupportedTextureLayout,
+                                   [&]
+                                   {
+                                       return texture.name + " is " + std::to_string(texture.width) + "x" +
+                                              std::to_string(texture.height) + ", needing " +
+                                              std::to_string(sourceBytes) + " byte(s) and carrying " +
+                                              std::to_string(texture.data.size());
+                                   });
 
                 return;
             }
@@ -3058,11 +3085,8 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
     {
-        if (!descriptorSetUnavailableLogged)
-        {
-            logger.warn("Vulkan descriptor pool has no room for another material set; those primitives are not drawn");
-            descriptorSetUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("the descriptor pool has no room for another material set"); });
 
         return VK_NULL_HANDLE;
     }
@@ -3140,11 +3164,8 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
     {
-        if (!descriptorSetUnavailableLogged)
-        {
-            logger.warn("Vulkan descriptor pool has no room for another attachment set; that pass is skipped");
-            descriptorSetUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("the descriptor pool has no room for another attachment set"); });
 
         return VK_NULL_HANDLE;
     }
@@ -3181,11 +3202,8 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     const auto shader = shaderObjects.find(shaderId);
     if (shader == shaderObjects.end() || shader->second.fullscreen)
     {
-        if (!scenePipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan shader object {} is not a scene shader; primitives using it are not drawn", shaderId);
-            scenePipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&] { return "shader object " + std::to_string(shaderId) + " is not a scene shader"; });
 
         return VK_NULL_HANDLE;
     }
@@ -3350,13 +3368,13 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     const auto createResult = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
     if (createResult != VK_SUCCESS)
     {
-        if (!scenePipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan scene pipeline for shader {} was not created (VkResult {}); primitives using it are "
-                        "not drawn",
-                        shaderId, static_cast<int>(createResult));
-            scenePipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&]
+                           {
+                               return "shader object " + std::to_string(shaderId) +
+                                      ", vkCreateGraphicsPipelines returned VkResult " +
+                                      std::to_string(static_cast<int>(createResult));
+                           });
 
         return VK_NULL_HANDLE;
     }
@@ -3406,13 +3424,13 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
     auto& frame = frames[frameIndex];
     if (frame.drawDataSlotsUsed >= drawDataRingSlots)
     {
-        if (!drawDataRingExhaustedLogged)
-        {
-            logger.warn("Vulkan draw-data ring exhausted: {} slots of {} bytes; draws beyond the ring are skipped "
-                        "for the rest of the frame",
-                        drawDataRingSlots, drawDataStride);
-            drawDataRingExhaustedLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DrawDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(drawDataRingSlots) + " slots of " +
+                                      std::to_string(drawDataStride) + " bytes";
+                           });
+
         return std::nullopt;
     }
 
@@ -3426,13 +3444,13 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateFrameDataSlot()
     auto& frame = frames[frameIndex];
     if (frame.frameDataSlotsUsed >= frameDataRingSlots)
     {
-        if (!frameDataRingExhaustedLogged)
-        {
-            logger.warn("Vulkan frame-data ring exhausted: {} slots of {} bytes; views beyond the ring are skipped "
-                        "for the rest of the frame",
-                        frameDataRingSlots, frameDataStride);
-            frameDataRingExhaustedLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::FrameDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(frameDataRingSlots) + " slots of " +
+                                      std::to_string(frameDataStride) + " bytes";
+                           });
+
         return std::nullopt;
     }
 
@@ -3441,7 +3459,7 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateFrameDataSlot()
     return offset;
 }
 
-std::optional<std::vector<uint32_t>>
+std::expected<std::vector<uint32_t>, std::string>
 VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_kind kind, const char* stageName)
 {
     // The C++ RAII wrapper over the C API: results release themselves, and both stay
@@ -3466,9 +3484,10 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success)
     {
-        // A Vulkan source that will not compile is a real failure on this backend.
-        logger.error("Vulkan {} shader compilation did not succeed: {}", stageName, result.GetErrorMessage());
-        return std::nullopt;
+        // A Vulkan source that will not compile is a real failure on this backend, and shaderc's
+        // message names the line — which is the whole value of it, and what was being logged and
+        // then left out of what the caller reported.
+        return std::unexpected(result.GetErrorMessage());
     }
 
     if (result.GetNumWarnings() > 0)
@@ -3597,11 +3616,18 @@ std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(cons
 
         const auto vertexSpirv =
             compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
+        if (!vertexSpirv)
+        {
+            return std::unexpected("the Vulkan-dialect vertex source did not compile to SPIR-V: " +
+                                   vertexSpirv.error());
+        }
+
         const auto fragmentSpirv =
             compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
-        if (!vertexSpirv.has_value() || !fragmentSpirv.has_value())
+        if (!fragmentSpirv)
         {
-            return std::unexpected("the Vulkan-dialect sources did not compile to SPIR-V");
+            return std::unexpected("the Vulkan-dialect fragment source did not compile to SPIR-V: " +
+                                   fragmentSpirv.error());
         }
 
         ShaderObject shaderObject;
@@ -3717,10 +3743,10 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     {
         mipLevels = mipLevelCount(width, height);
     }
-    else if (!mipGenerationUnavailableLogged)
+    else
     {
-        logger.warn("Vulkan mip generation unavailable for this format (no linear blit); sampling top level only");
-        mipGenerationUnavailableLogged = true;
+        diagnostics.record(FrameDiagnostic::MipGenerationUnavailable,
+                           [&] { return "VkFormat " + std::to_string(static_cast<int>(format)); });
     }
 
     VkImageCreateInfo imageInfo{};
@@ -3995,17 +4021,12 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
                 usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
                 aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
                 break;
-            default:
-            {
-                static auto warnedUnsupportedAttachment = false;
-                if (!warnedUnsupportedAttachment)
-                {
-                    logger.warn("Vulkan framebuffers support Color and Depth attachments only; skipping type {}",
-                                static_cast<int>(attachment.type));
-                    warnedUnsupportedAttachment = true;
-                }
-                continue;
-            }
+            // Same reading as an internalFormat with no Vulkan equivalent below: a model this
+            // backend cannot serve, not a runtime condition. Skipping it built a framebuffer
+            // that was missing an attachment its owner had asked for and said so once.
+            case FboAttachmentType::Stencil:
+                throw std::runtime_error("Vulkan framebuffers carry Color and Depth attachments only; "
+                                         "FboAttachmentType::Stencil has no equivalent here");
             }
 
             // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no

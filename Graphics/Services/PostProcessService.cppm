@@ -70,7 +70,17 @@ std::expected<void, std::string> PostProcessService::recreateOutputBuffer(const 
                                                                           int width, int height) const
 {
     const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
-    if (postProcess == nullptr || !postProcess->output.has_value())
+    if (postProcess == nullptr)
+    {
+        // Reported, not shrugged off: this used to return success for a handle it could not even
+        // resolve, so a camera still holding an unloaded post-process resized silently and drew
+        // through a buffer nobody rebuilt.
+        return std::unexpected("the post-process handle names no live post-process");
+    }
+
+    // A post-process with no output of its own writes the default framebuffer, which the window
+    // resized already. Nothing to do is not a failure.
+    if (!postProcess->output.has_value())
     {
         return {};
     }

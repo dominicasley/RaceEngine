@@ -19,6 +19,7 @@ module;
 
 export module raceengine.graphics:RenderableEntityService;
 
+import :FrameDiagnostics;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -29,9 +30,12 @@ export class RenderableEntityService
 {
 private:
     MemoryStorageService& memoryStorageService;
+    // joints() runs inside the draw path and has nowhere to report to; a clip ozz refuses to
+    // sample is counted here rather than becoming an empty palette with no explanation.
+    FrameDiagnostics& diagnostics;
 
 public:
-    explicit RenderableEntityService(MemoryStorageService& memoryStorageService);
+    explicit RenderableEntityService(MemoryStorageService& memoryStorageService, FrameDiagnostics& diagnostics);
 
     [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
     [[nodiscard]] std::expected<void, std::string>
@@ -59,8 +63,10 @@ std::string RenderableEntityService::meshName(const RenderableMesh& mesh) const
     return stored == nullptr ? "<unloaded mesh " + std::to_string(mesh.mesh.index) + ">" : stored->name;
 }
 
-RenderableEntityService::RenderableEntityService(MemoryStorageService& memoryStorageService) :
-    memoryStorageService(memoryStorageService)
+RenderableEntityService::RenderableEntityService(MemoryStorageService& memoryStorageService,
+                                                 FrameDiagnostics& diagnostics) :
+    memoryStorageService(memoryStorageService),
+    diagnostics(diagnostics)
 {
 }
 
@@ -305,8 +311,14 @@ const std::vector<glm::mat4>& RenderableEntityService::joints(RenderableMesh& re
     localToModelJob.input = ozz::make_span(renderableMesh.animationLocalSpaceTransforms);
     localToModelJob.output = ozz::make_span(renderableMesh.animationModelSpaceTransforms);
 
+    // ozz validates its jobs rather than reporting from inside them, so a refusal here means the
+    // clip and the skeleton disagree about something setSkeleton/addAnimation did not catch. The
+    // mesh renders unanimated either way; what changes is that the reason is no longer lost.
     if (!samplingJob.Run() || !localToModelJob.Run())
     {
+        diagnostics.record(FrameDiagnostic::SkinningRejected,
+                           [&] { return "mesh " + mesh->name + ", clip " + std::string(animation->name()); });
+
         return out;
     }
 

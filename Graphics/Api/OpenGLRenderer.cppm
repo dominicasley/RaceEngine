@@ -22,6 +22,7 @@ module;
 
 export module raceengine.graphics:OpenGLRenderer;
 
+import :FrameDiagnostics;
 import :GraphicsApi;
 import :IRenderBackend;
 import :RenderContract;
@@ -65,6 +66,9 @@ export class OpenGLRenderer : public IRenderBackend
 private:
     UniformPool uniformPool;
     spdlog::logger& logger;
+    // Every skipped draw, view or pass is counted here instead of at a per-site boolean; see
+    // FrameDiagnostics for why the sites do not throttle themselves any more.
+    FrameDiagnostics& diagnostics;
     MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
     SceneManagerService& sceneManagerService;
@@ -89,8 +93,9 @@ private:
     bool presentRecorded = false;
 
 public:
-    explicit OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
-                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
+    explicit OpenGLRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics,
+                            RenderableEntityService& renderableEntityService, SceneManagerService& sceneManagerService,
+                            MemoryStorageService& memoryStorageService);
     ~OpenGLRenderer() override;
 
     [[nodiscard]] std::expected<void, std::string> init() override;
@@ -116,7 +121,10 @@ public:
     [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
 private:
-    void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
+    // False means the pass was not recorded because its shader handle names nothing; the caller
+    // knows which pass it was asking for and counts it.
+    [[nodiscard]] bool drawFullScreenQuad(const Resource<Shader>& shader,
+                                          const std::vector<Resource<FboAttachment>>& textures) const;
     void bindMaterial(const Material& material, unsigned int programId);
     void uploadLights(unsigned int programId, const Scene& scene);
     void upload(const Resource<Model>& model);
@@ -127,7 +135,9 @@ private:
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
     [[nodiscard]] unsigned int getInternalFormatFromBitsPerPixel(int bitsPerPixel) const;
     void createQuad();
-    bool compileShader(unsigned int id, const std::string& source);
+    // Reports the compiler's own words rather than logging them: the only caller already has an
+    // error channel, and a stage that would not compile is the reason the program will not link.
+    [[nodiscard]] std::expected<void, std::string> compileShader(unsigned int id, const std::string& source);
     int getUniformLocation(unsigned int, const char*);
     void setProgramUniform(unsigned int, const char*, int);
     void setProgramUniform(unsigned int, const char*, float data);
@@ -203,9 +213,11 @@ void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, G
 }
 } // namespace
 
-OpenGLRenderer::OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
+OpenGLRenderer::OpenGLRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics,
+                               RenderableEntityService& renderableEntityService,
                                SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
+    diagnostics(diagnostics),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
     sceneManagerService(sceneManagerService)
@@ -334,12 +346,8 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
         }
         else
         {
-            static auto warnedMissingCameraOutput = false;
-            if (!warnedMissingCameraOutput)
-            {
-                logger.warn("Camera output framebuffer has no GPU resource; drawing to default framebuffer");
-                warnedMissingCameraOutput = true;
-            }
+            diagnostics.record(FrameDiagnostic::MissingCameraOutput,
+                               [] { return std::string("drawing to the default framebuffer instead"); });
         }
     }
 
@@ -361,6 +369,9 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
         const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
         if (model == nullptr || instanceShader == nullptr)
         {
+            diagnostics.record(FrameDiagnostic::StaleModelHandle,
+                               [&] { return "model slot " + std::to_string(entity.model.index); });
+
             continue;
         }
 
@@ -378,6 +389,9 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
             const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
             if (mesh == nullptr)
             {
+                diagnostics.record(FrameDiagnostic::StaleMeshHandle,
+                                   [&] { return "mesh slot " + std::to_string(renderableMesh.mesh.index); });
+
                 continue;
             }
 
@@ -392,12 +406,7 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
             if (!mesh->gpuResourceId.has_value())
             {
-                static auto warnedMissingMeshUpload = false;
-                if (!warnedMissingMeshUpload)
-                {
-                    logger.warn("Skipping mesh without a GPU resource: {}", mesh->name);
-                    warnedMissingMeshUpload = true;
-                }
+                diagnostics.record(FrameDiagnostic::MeshNotUploaded, [&] { return "mesh " + mesh->name; });
 
                 continue;
             }
@@ -411,20 +420,21 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
             if (joints.size() > maxJoints)
             {
-                static auto warnedJointLimit = false;
-                if (!warnedJointLimit)
-                {
-                    logger.warn("The GL joint uniform array holds at most {} joints; {} were supplied and the rest are "
-                                "ignored",
-                                maxJoints, joints.size());
-                    warnedJointLimit = true;
-                }
+                diagnostics.record(FrameDiagnostic::JointLimitExceeded,
+                                   [&]
+                                   {
+                                       return "the GL joint uniform array holds " + std::to_string(maxJoints) +
+                                              " of the " + std::to_string(joints.size()) + " supplied for mesh " +
+                                              mesh->name;
+                                   });
             }
 
             for (const auto& primitive : mesh->meshPrimitives)
             {
                 if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
@@ -434,12 +444,7 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
                 if (material == nullptr || !material->shader.has_value())
                 {
-                    static auto warnedMissingMaterial = false;
-                    if (!warnedMissingMaterial)
-                    {
-                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh->name);
-                        warnedMissingMaterial = true;
-                    }
+                    diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial, [&] { return "mesh " + mesh->name; });
 
                     continue;
                 }
@@ -483,6 +488,8 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
                 if (!primitive.gpuVao.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
@@ -509,6 +516,9 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
         const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
         if (postProcess == nullptr)
         {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&] { return "post-process slot " + std::to_string(postProcessKey.index); });
+
             continue;
         }
 
@@ -524,7 +534,11 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 
         glBindFramebuffer(GL_FRAMEBUFFER, postProcessTarget);
 
-        drawFullScreenQuad(postProcess->shader, postProcess->inputs);
+        if (!drawFullScreenQuad(postProcess->shader, postProcess->inputs))
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&] { return "shader slot " + std::to_string(postProcess->shader.index); });
+        }
     }
 }
 
@@ -535,7 +549,13 @@ void OpenGLRenderer::recordPresent(const Resource<Shader>& shaderKey, const Reso
 {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey});
+    if (!drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey}))
+    {
+        diagnostics.record(FrameDiagnostic::PresentPassSkipped,
+                           [&] { return "shader slot " + std::to_string(shaderKey.index); });
+
+        return;
+    }
 
     presentRecorded = true;
 }
@@ -568,13 +588,12 @@ void OpenGLRenderer::uploadLights(const unsigned int programId, const Scene& sce
 
     if (declared > maxLights)
     {
-        static auto warnedLightLimit = false;
-        if (!warnedLightLimit)
-        {
-            logger.warn("The GL light uniform array holds at most {} lights; {} were declared and the rest are ignored",
-                        maxLights, declared);
-            warnedLightLimit = true;
-        }
+        diagnostics.record(FrameDiagnostic::LightLimitExceeded,
+                           [&]
+                           {
+                               return "the GL light uniform array holds " + std::to_string(maxLights) + " of the " +
+                                      std::to_string(declared) + " declared";
+                           });
     }
 
     setProgramUniform(programId, "lightCount", static_cast<int>(uploaded));
@@ -807,9 +826,25 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
         return withShaderContractMacros(source, GraphicsApi::OpenGL);
     };
 
+    // A stage that will not compile is why the link below fails, so its message is carried to
+    // the caller with the link log rather than logged here and lost from the report.
+    std::string stageDiagnostics;
+    const auto compile = [&](const unsigned int shaderId, const std::string& source, const char* stage)
+    {
+        const auto compiled = compileShader(shaderId, contract(source));
+        if (compiled)
+        {
+            return true;
+        }
+
+        stageDiagnostics += (stageDiagnostics.empty() ? "" : "; ") + std::string(stage) + " stage: " + compiled.error();
+
+        return false;
+    };
+
     if (!object.vertexShaderSource.empty())
     {
-        if (compileShader(vertexShaderId, contract(object.vertexShaderSource)))
+        if (compile(vertexShaderId, object.vertexShaderSource, "vertex"))
         {
             glAttachShader(programId, vertexShaderId);
         }
@@ -817,7 +852,7 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
 
     if (!object.fragmentShaderSource.empty())
     {
-        if (compileShader(fragmentShaderId, contract(object.fragmentShaderSource)))
+        if (compile(fragmentShaderId, object.fragmentShaderSource, "fragment"))
         {
             glAttachShader(programId, fragmentShaderId);
         }
@@ -825,8 +860,12 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
 
     if (!object.tessellationControlShaderSource.empty() && !object.tessellationEvaluationShaderSource.empty())
     {
-        if (compileShader(tessellationControlShaderId, contract(object.tessellationControlShaderSource)) &&
-            compileShader(tessellationEvaluationShaderId, contract(object.tessellationEvaluationShaderSource)))
+        const auto control =
+            compile(tessellationControlShaderId, object.tessellationControlShaderSource, "tessellation control");
+        const auto evaluation = compile(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource,
+                                        "tessellation evaluation");
+
+        if (control && evaluation)
         {
             glAttachShader(programId, tessellationControlShaderId);
             glAttachShader(programId, tessellationEvaluationShaderId);
@@ -835,7 +874,7 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
 
     if (!object.computeShaderSource.empty())
     {
-        if (compileShader(computeShaderId, contract(object.computeShaderSource)))
+        if (compile(computeShaderId, object.computeShaderSource, "compute"))
         {
             glAttachShader(programId, computeShaderId);
         }
@@ -843,7 +882,7 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
 
     if (!object.geometryShaderSource.empty())
     {
-        if (compileShader(geometryShaderId, contract(object.geometryShaderSource)))
+        if (compile(geometryShaderId, object.geometryShaderSource, "geometry"))
         {
             glAttachShader(programId, geometryShaderId);
         }
@@ -881,7 +920,18 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(cons
     if (result != GL_TRUE)
     {
         glDeleteProgram(programId);
-        return std::unexpected("the GL program did not link" + (linkLog.empty() ? std::string() : ": " + linkLog));
+
+        auto reason = std::string("the GL program did not link");
+        if (!linkLog.empty())
+        {
+            reason += ": " + linkLog;
+        }
+        if (!stageDiagnostics.empty())
+        {
+            reason += " (" + stageDiagnostics + ")";
+        }
+
+        return std::unexpected(reason);
     }
 
     createdPrograms.push_back(programId);
@@ -998,6 +1048,9 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fb
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
+                // No default: every FboAttachmentType has a GL attachment point, and a new
+                // enumerator must be given one here rather than discovered at run time as a
+                // framebuffer that reported complete with an attachment bound to point 0.
                 unsigned int attachmentType = 0;
                 switch (attachment.type)
                 {
@@ -1011,9 +1064,6 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fb
                     break;
                 case FboAttachmentType::Stencil:
                     attachmentType = GL_STENCIL_ATTACHMENT;
-                    break;
-                default:
-                    logger.error("Unknown FBO attachment type {}", static_cast<int>(attachment.type));
                     break;
                 }
 
@@ -1150,7 +1200,7 @@ GpuResourceCensus OpenGLRenderer::gpuResourceCensus() const
                              .frameBuffers = static_cast<unsigned int>(createdFbos.size())};
 }
 
-bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
+std::expected<void, std::string> OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
 {
     auto shaderSource = source.c_str();
     glShaderSource(id, 1, &shaderSource, nullptr);
@@ -1161,22 +1211,27 @@ bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& sou
     glGetShaderiv(id, GL_COMPILE_STATUS, &result);
     glGetShaderiv(id, GL_INFO_LOG_LENGTH, &infoLogLength);
 
+    std::string compileLog;
     if (infoLogLength > 1)
     {
         std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
         glGetShaderInfoLog(id, infoLogLength, nullptr, infoLog.data());
-
-        if (result == GL_TRUE)
-        {
-            logger.warn("Shader compile log: {}", infoLog.data());
-        }
-        else
-        {
-            logger.error("Shader compile error: {}", infoLog.data());
-        }
+        compileLog = infoLog.data();
     }
 
-    return result == GL_TRUE;
+    if (result != GL_TRUE)
+    {
+        return std::unexpected(compileLog.empty() ? std::string("the stage did not compile") : compileLog);
+    }
+
+    // A log on a stage that compiled is a driver remark, not a failure, and there is no caller
+    // decision attached to it.
+    if (!compileLog.empty())
+    {
+        logger.warn("Shader compile log: {}", compileLog);
+    }
+
+    return {};
 }
 
 int OpenGLRenderer::getUniformLocation(const unsigned int programId, const char* uniformName)
@@ -1401,13 +1456,13 @@ void OpenGLRenderer::createQuad()
     glBindVertexArray(0);
 }
 
-void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
+bool OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
                                         const std::vector<Resource<FboAttachment>>& attachmentKeys) const
 {
     const auto* shader = memoryStorageService.shaders.find(shaderKey);
     if (shader == nullptr)
     {
-        return;
+        return false;
     }
 
     glViewport(0, 0, viewportWidth, viewportHeight);
@@ -1428,6 +1483,8 @@ void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
 
     glBindVertexArray(quadVao);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 4));
+
+    return true;
 }
 
 } // namespace raceengine

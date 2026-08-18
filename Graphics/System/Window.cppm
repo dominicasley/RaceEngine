@@ -17,6 +17,7 @@ module;
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -145,10 +146,11 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     graphicsApi(graphicsApi),
     unattended(std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
 {
+    // Thrown rather than logged and thrown: the exception is the report, and main's boundary is
+    // where it is read. Two channels for one problem reads as two problems.
     if (!glfwInit())
     {
-        logger.error("GLFW failed to initialize!");
-        throw std::runtime_error("GLFW failed to initialize!");
+        throw std::runtime_error("GLFW would not initialise");
     }
 
     if (glfwVulkanSupported())
@@ -180,9 +182,14 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
 
     if (!window)
     {
-        logger.error("GLFW failed to create a window!");
+        const char* description = nullptr;
+        const auto code = glfwGetError(&description);
+
         glfwTerminate();
-        throw std::runtime_error("GLFW failed to create a window!");
+
+        throw std::runtime_error(
+            "GLFW would not create a window: " + std::string(description == nullptr ? "no description" : description) +
+            " (code " + std::to_string(code) + ")");
     }
 
     glfwSetWindowPos(window, 150, 150);
@@ -211,14 +218,17 @@ VkSurfaceKHR GLFWWindow::generateVulkanSurface(const VkInstance& vkInstance)
 {
     VkSurfaceKHR vkSurfaceKhr;
 
+    // GLFW's own words travel with the exception rather than being logged beside a message that
+    // dropped them: the caller (VulkanRenderer::init) turns this into the reported reason the
+    // device would not come up, and "failed to create window surface!" said nothing about why.
     if (glfwCreateWindowSurface(vkInstance, window, nullptr, &vkSurfaceKhr) != VK_SUCCESS)
     {
-        const char* description;
-        int code = glfwGetError(&description);
+        const char* description = nullptr;
+        const auto code = glfwGetError(&description);
 
-        logger.error("{}, {}", code, description);
-
-        throw std::runtime_error("failed to create window surface!");
+        throw std::runtime_error("GLFW would not create a Vulkan window surface: " +
+                                 std::string(description == nullptr ? "no description" : description) + " (code " +
+                                 std::to_string(code) + ")");
     }
 
     return vkSurfaceKhr;

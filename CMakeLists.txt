@@ -62,6 +62,7 @@ target_sources(Engine PUBLIC
         Graphics/System/Window.cppm
         Graphics/Api/GraphicsApi.cppm
         Graphics/Api/RenderContract.cppm
+        Graphics/Api/FrameDiagnostics.cppm
         Graphics/Api/IFrameRecorder.cppm
         Graphics/Api/IGpuResourceFactory.cppm
         Graphics/Api/IFrameCapture.cppm

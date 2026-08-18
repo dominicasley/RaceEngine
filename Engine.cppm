@@ -55,6 +55,11 @@ private:
     // ResourceService takes it by reference before it is constructed, which is fine: the
     // reference is only stored, and no job can be submitted until the Engine is built.
     std::shared_ptr<spdlog::logger> logger;
+    // The engine's tally of work a frame was asked for and did not do. It belongs to the
+    // composition root rather than to the backend because the backend is not the only thing
+    // that skips: the skinning path does too, and there is one answer per Engine, not per
+    // process — which is what the function-local `static` latches this replaced could not say.
+    FrameDiagnostics frameDiagnostics;
     // Resolved before the window: the window's client API and the renderer factory both
     // depend on the selection (member init order is the mechanism).
     GraphicsApi graphicsApi;
@@ -93,6 +98,13 @@ private:
     float accumulator = fixedTimeStep;
     float interpolationAlpha = 0.0f;
     std::vector<std::function<void(float)>> updateCallbacks;
+    // How the engine asks its own loop to stop, and what the process should say when it does.
+    // The frame capture is the one thing that ends a run from below `main` today; it used to do
+    // it with std::exit, which skipped every destructor between here and the process — the
+    // renderer's device teardown, the window, the worker pool — and would take a test runner
+    // with it.
+    bool stopRequested = false;
+    int exitStatus = 0;
 
 public:
     // Simulation tick length. 120 Hz: 8.33 ms keeps the stiff spring/damper integration a
@@ -108,7 +120,17 @@ public:
     static constexpr int maxCatchUpSteps = 8;
 
     Engine();
+    // False once the window has been closed or the engine has asked its own loop to stop. A
+    // game's loop is `while (engine.running()) engine.step();` and nothing below it ends the
+    // process, so every destructor between the loop and `main` still runs.
     [[nodiscard]] bool running() const;
+    // What the process should return. Zero unless something below the loop asked to stop and
+    // had a failure to report — today that is only the frame capture.
+    [[nodiscard]] int status() const
+    {
+        return exitStatus;
+    }
+
     void step();
     // Game update logic on the fixed tick, run in registration order at the top of a tick —
     // before entity behaviours and before the scene settles, and always before the frame
@@ -213,31 +235,33 @@ namespace
 // storage service to write GPU ids back through their Resources, and the scene services
 // the draw path reads node transforms and joint matrices from.
 [[nodiscard]] std::unique_ptr<IRenderBackend> createRenderer(GraphicsApi graphicsApi, spdlog::logger& logger,
-                                                             IWindow& window,
+                                                             FrameDiagnostics& frameDiagnostics, IWindow& window,
                                                              RenderableEntityService& renderableEntityService,
                                                              SceneManagerService& sceneManagerService,
                                                              MemoryStorageService& memoryStorageService)
 {
     if (graphicsApi == GraphicsApi::Vulkan)
     {
-        return std::make_unique<VulkanRenderer>(logger, window, renderableEntityService, sceneManagerService,
-                                                memoryStorageService);
+        return std::make_unique<VulkanRenderer>(logger, frameDiagnostics, window, renderableEntityService,
+                                                sceneManagerService, memoryStorageService);
     }
 
-    return std::make_unique<OpenGLRenderer>(logger, renderableEntityService, sceneManagerService, memoryStorageService);
+    return std::make_unique<OpenGLRenderer>(logger, frameDiagnostics, renderableEntityService, sceneManagerService,
+                                            memoryStorageService);
 }
 
 } // namespace
 
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
+    frameDiagnostics(*logger),
     graphicsApi(selectGraphicsApi(*logger)),
     glfwWindow(*logger, graphicsApi),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
-    renderableEntityService(memoryStorageService),
-    renderer(createRenderer(graphicsApi, *logger, glfwWindow, renderableEntityService, sceneManagerService,
-                            memoryStorageService)),
+    renderableEntityService(memoryStorageService, frameDiagnostics),
+    renderer(createRenderer(graphicsApi, *logger, frameDiagnostics, glfwWindow, renderableEntityService,
+                            sceneManagerService, memoryStorageService)),
     fboService(memoryStorageService, *renderer),
     shaderService(memoryStorageService, *renderer),
     cubeMapService(*renderer, memoryStorageService),
@@ -249,9 +273,11 @@ Engine::Engine() :
 {
     // An engine whose device would not come up has nothing left to do: every service below
     // was built against it, and there is no second backend to fall back to.
+    // Thrown, not logged and thrown: main's boundary is what reports an engine that could not be
+    // built, and saying it twice through two channels is how a reader ends up looking for two
+    // problems.
     if (const auto initialised = renderer->init(); !initialised)
     {
-        logger->error("Renderer initialisation failed: {}", initialised.error());
         throw std::runtime_error("Renderer initialisation failed: " + initialised.error());
     }
 
@@ -300,7 +326,7 @@ Engine::Engine() :
 
 bool Engine::running() const
 {
-    return !glfwWindow.shouldClose();
+    return !stopRequested && !glfwWindow.shouldClose();
 }
 
 void Engine::onUpdate(std::function<void(float)> callback)
@@ -350,6 +376,8 @@ float Engine::frameDelta() const
 
 void Engine::step()
 {
+    frameDiagnostics.beginFrame();
+
     const auto delta = frameDelta();
 
     // Clamping the accumulator, not the loop, is what bounds catch-up: time beyond the
@@ -406,6 +434,10 @@ void Engine::step()
         renderer->endFrame();
     }
 
+    // The frame owns the report as it owns the frame: every recorder and the skinning path have
+    // finished counting by here, and a reason is stated once rather than at each site that met it.
+    frameDiagnostics.report();
+
     // After the present and before the swap: the capture reads what this frame put on screen,
     // and on GL the back buffer's contents are undefined once it has been swapped.
     dumpFrameIfRequested();
@@ -414,8 +446,14 @@ void Engine::step()
 }
 
 // The frame gate's exit code is the whole result: it says a PNG of frame 120 exists on disk.
-// A capture that reported a failure has written nothing, so exiting 0 would hand the gate a
+// A capture that reported a failure has written nothing, so returning 0 would hand the gate a
 // stale file — or no file — and call it a pass.
+//
+// The capture ends the run by asking the loop to stop, not by ending the process. std::exit here
+// skipped every automatic destructor between this call and main — the Vulkan device, the GLFW
+// window, the worker pool — which is why the recorded LSan noise on this path was third-party
+// allocations GLFW would have released in glfwTerminate. It would also have killed a test runner
+// stone dead, and a test suite is what comes next.
 void Engine::dumpFrameIfRequested()
 {
     static const char* dumpPath = std::getenv("RACEENGINE_DUMP_FRAME");
@@ -430,13 +468,13 @@ void Engine::dumpFrameIfRequested()
         return;
     }
 
+    stopRequested = true;
+
     if (const auto captured = renderer->captureFrame(dumpPath); !captured)
     {
-        logger->error("Frame capture to {} failed: {}", dumpPath, captured.error());
-        std::exit(1);
+        logger->error("Frame capture to {} did not produce a file: {}", dumpPath, captured.error());
+        exitStatus = 1;
     }
-
-    std::exit(0);
 }
 
 } // namespace raceengine

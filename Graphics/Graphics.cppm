@@ -3,6 +3,7 @@ export module raceengine.graphics;
 export import :Window;
 export import :GraphicsApi;
 export import :RenderContract;
+export import :FrameDiagnostics;
 export import :IFrameRecorder;
 export import :IGpuResourceFactory;
 export import :IFrameCapture;
