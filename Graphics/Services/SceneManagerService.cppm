@@ -1,6 +1,9 @@
 module;
 
 #include <deque>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -12,15 +15,24 @@ import raceengine.graphics.models;
 namespace raceengine
 {
 
+// Scenes are held indirectly so that destroying one leaves the others where they were: a Scene&
+// a game is holding, and every SceneNode& and RenderableModel* inside every *other* scene, has to
+// survive its neighbour going away. A destroyed scene leaves an empty slot, which the next
+// createScene reuses, so a level cycle does not grow the deque.
 export class SceneManagerService
 {
 private:
-    std::deque<Scene> scenes;
+    std::deque<std::unique_ptr<Scene>> scenes;
 
 public:
-    [[nodiscard]] std::deque<Scene>& getScenes();
+    [[nodiscard]] std::deque<std::unique_ptr<Scene>>& getScenes();
     [[nodiscard]] Scene& getScene(int index);
     [[nodiscard]] Scene& createScene();
+    // Destroys the scene and everything it owns: its cameras, lights, renderables and nodes. Every
+    // reference into it dies here, which is the whole point of the scene being the unit — see the
+    // note on Scene. Whatever the scene's cameras owned on the GPU is AssetService::unloadScene's
+    // job, and it calls this last.
+    void destroyScene(Scene& scene);
     [[nodiscard]] SceneNode& createNode(Scene& scene);
     [[nodiscard]] const glm::mat4& modelMatrix(SceneNode& node) const;
     void setPosition(SceneNode& node, float x, float y, float z) const;
@@ -32,20 +44,49 @@ public:
     void setParent(SceneNode& node, SceneNode& parent) const;
 };
 
-std::deque<Scene>& SceneManagerService::getScenes()
+std::deque<std::unique_ptr<Scene>>& SceneManagerService::getScenes()
 {
     return scenes;
 }
 
+// A slot a destroyed scene left behind is not a scene, and asking for it is a caller bug rather
+// than a runtime condition — the same reading getScene has always had for an index nothing was
+// created at.
 Scene& SceneManagerService::getScene(int index)
 {
-    return scenes.at(static_cast<size_t>(index));
+    auto& scene = scenes.at(static_cast<size_t>(index));
+    if (!scene)
+    {
+        throw std::out_of_range("Scene " + std::to_string(index) + " was destroyed");
+    }
+
+    return *scene;
 }
 
 Scene& SceneManagerService::createScene()
 {
-    auto& e = scenes.emplace_back();
-    return e;
+    for (auto& slot : scenes)
+    {
+        if (!slot)
+        {
+            slot = std::make_unique<Scene>();
+            return *slot;
+        }
+    }
+
+    return *scenes.emplace_back(std::make_unique<Scene>());
+}
+
+void SceneManagerService::destroyScene(Scene& scene)
+{
+    for (auto& slot : scenes)
+    {
+        if (slot.get() == &scene)
+        {
+            slot.reset();
+            return;
+        }
+    }
 }
 
 SceneNode& SceneManagerService::createNode(Scene& scene)

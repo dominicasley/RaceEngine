@@ -18,3 +18,4 @@ export import :PresenterService;
 export import :CameraService;
 export import :PostProcessService;
 export import :SceneService;
+export import :AssetService;

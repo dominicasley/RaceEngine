@@ -146,8 +146,11 @@ export struct RenderableModel : public RenderableEntity
 
 export struct Scene
 {
-    // std::deque: element addresses stay stable under growth; references into these containers rely on it, so no
-    // erasing.
+    // std::deque, and add-only *within a scene*: SceneNode::parent, RenderableEntity::node and a
+    // game's own pointer into models are raw references into these containers, and no generational
+    // handle reaches inside a scene. The scene is therefore the unit of teardown — destroying it
+    // invalidates all of them at once, which is a rule a game can hold, where erasing one node out
+    // of the middle is not. There is deliberately no API for the latter.
     std::deque<Camera> cameras;
     std::deque<Light> lights;
     std::deque<RenderableModel> models;

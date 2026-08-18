@@ -77,6 +77,10 @@ private:
     CubeMapService cubeMapService;
     PostProcessService postProcessService;
     PresenterService presenterService;
+    // The release side of the resource model. It needs both the storage (to remove elements) and
+    // the backend (to release what those elements held ids for), which is why it cannot sit with
+    // ResourceService up above the renderer — loading needs neither.
+    AssetService assetService;
     CameraService cameraService;
     SceneService sceneService;
     EntityService entityService;
@@ -178,6 +182,11 @@ public:
         return presenterService;
     }
 
+    [[nodiscard]] AssetService& asset()
+    {
+        return assetService;
+    }
+
     [[nodiscard]] EntityService& entity()
     {
         return entityService;
@@ -234,6 +243,7 @@ Engine::Engine() :
     cubeMapService(*renderer, memoryStorageService),
     postProcessService(memoryStorageService, fboService, glfwWindow),
     presenterService(*renderer),
+    assetService(*logger, memoryStorageService, *renderer, sceneManagerService),
     cameraService(memoryStorageService, fboService, glfwWindow),
     sceneService(renderableEntityService, cameraService, sceneManagerService)
 {
@@ -253,9 +263,14 @@ Engine::Engine() :
             logger->info("Window Resized: {}px x {}px", width, height);
             renderer->setViewport(width, height);
 
-            for (auto& scene : sceneManagerService.getScenes())
+            for (auto& scenePtr : sceneManagerService.getScenes())
             {
-                for (auto& camera : scene.cameras)
+                if (!scenePtr)
+                {
+                    continue;
+                }
+
+                for (auto& camera : scenePtr->cameras)
                 {
                     cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
 
@@ -305,9 +320,14 @@ void Engine::update(float delta)
 
     entityService.update(delta);
 
-    for (auto& scene : sceneManagerService.getScenes())
+    // A destroyed scene leaves its slot behind so the surviving scenes keep their addresses; the
+    // slot is not a scene and every walk skips it.
+    for (auto& scenePtr : sceneManagerService.getScenes())
     {
-        sceneService.update(scene, delta);
+        if (scenePtr)
+        {
+            sceneService.update(*scenePtr, delta);
+        }
     }
 }
 
@@ -345,9 +365,14 @@ void Engine::step()
 
     interpolationAlpha = accumulator / fixedTimeStep;
 
-    for (auto& scene : sceneManagerService.getScenes())
+    for (auto& scenePtr : sceneManagerService.getScenes())
     {
-        for (auto& camera : scene.cameras)
+        if (!scenePtr)
+        {
+            continue;
+        }
+
+        for (auto& camera : scenePtr->cameras)
         {
             cameraService.updateModelViewProjectionMatrix(camera);
         }
@@ -363,11 +388,16 @@ void Engine::step()
     // records nothing this step and skips the close, which is the one path with no present.
     if (renderer->beginFrame())
     {
-        for (auto& scene : sceneManagerService.getScenes())
+        for (auto& scenePtr : sceneManagerService.getScenes())
         {
-            for (auto& camera : scene.cameras)
+            if (!scenePtr)
             {
-                renderer->recordView(scene, camera, delta);
+                continue;
+            }
+
+            for (auto& camera : scenePtr->cameras)
+            {
+                renderer->recordView(*scenePtr, camera, delta);
             }
         }
 

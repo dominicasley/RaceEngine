@@ -791,6 +791,28 @@ private:
         unsigned int attachmentImageId = 0;
     };
 
+    // A GPU object the engine has finished with, waiting for the GPU to finish with it too.
+    // Deferral is not an optimisation here: two frames are in flight, so at the moment a release
+    // is asked for there are up to `framesInFlight` submissions still executing that may name the
+    // image, buffer or descriptor set being released. Destroying it at the call is undefined
+    // behaviour that a validation layer catches and a driver usually does not.
+    //
+    // readyAt is a value of submittedFrames (see below), not a fence: fences are per frame slot
+    // and get reset, so they cannot say "later than this". The rule is in retire().
+    struct RetiredResource
+    {
+        uint64_t readyAt = 0;
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation imageAllocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation bufferAllocation = nullptr;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkShaderModule shaderModule = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    };
+
     // Declaration order is dependency order; the destructor tears down in reverse.
     spdlog::logger& logger;
     IWindow& window;
@@ -862,6 +884,10 @@ private:
     bool swapchainPassRecorded = false;
     uint32_t currentImageIndex = 0;
     std::optional<PresentPass> lastPresentPass;
+    // Submissions this backend has issued, ever. It is the clock the retirement queue is keyed
+    // to, and it only advances in submitAndPresent — the one place that submits.
+    uint64_t submittedFrames = 0;
+    mutable std::vector<RetiredResource> retiredResources;
     mutable bool mipGenerationUnavailableLogged = false;
     bool drawDataRingExhaustedLogged = false;
     bool frameDataRingExhaustedLogged = false;
@@ -900,6 +926,9 @@ public:
                                                                          const Texture& bottom) override;
     [[nodiscard]] std::expected<unsigned int, std::string> createFbo(const Fbo& fbo) override;
     void deleteFbo(Fbo& fbo) override;
+    void releaseGpuResource(GpuResourceKind kind, unsigned int gpuResourceId) override;
+    void releaseMaterial(const Resource<Material>& material) override;
+    [[nodiscard]] GpuResourceCensus gpuResourceCensus() const override;
 
     [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
@@ -920,9 +949,9 @@ private:
     bool submitAndPresent(VkBuffer captureBuffer);
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
-    void recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader, const glm::mat4& entityModelMatrix,
-                    const Camera& camera, const std::vector<glm::mat4>& joints, VkFormat colorFormat,
-                    VkFormat depthFormat);
+    void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
+                    unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
+                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
@@ -951,6 +980,14 @@ private:
     void finishUploadCommands(VkCommandBuffer commandBuffer) const;
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
     void destroyImageResource(unsigned int id) const;
+    // Hands one GPU object to the retirement queue with the submission count it becomes safe at.
+    void retire(RetiredResource resource) const;
+    // Destroys everything the GPU is provably finished with. Called once per frame, right after
+    // the fence wait that is the proof.
+    void collectRetiredResources() const;
+    // Destroys the whole queue regardless of readyAt. Only valid immediately after a device idle.
+    void drainRetiredResources() const;
+    void releaseShaderObject(unsigned int shaderId);
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
     [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
@@ -972,6 +1009,11 @@ VulkanRenderer::~VulkanRenderer()
     {
         vkDeviceWaitIdle(device);
     }
+
+    // The queue holds objects whose readyAt has not arrived and never will, because no further
+    // frame will be submitted. The device idle above is the stronger guarantee they were waiting
+    // for, so they go now — before the descriptor pool and the allocator they belong to.
+    drainRetiredResources();
 
     for (const auto& [id, shader] : shaderObjects)
     {
@@ -1764,6 +1806,9 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
     }
 
     ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+    // The idle is a stronger guarantee than any readyAt the queue is holding out for, and a
+    // resize is the one place a lot of images are retired at once.
+    drainRetiredResources();
     destroySwapchain();
     createSwapchain();
     recreateNeeded = false;
@@ -1779,6 +1824,10 @@ bool VulkanRenderer::beginFrame()
 
     auto& frame = frames[frameIndex];
     ensure(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, waitForever), "vkWaitForFences");
+
+    // That fence is the only proof of completion this backend has, so it is where deferred
+    // destruction happens. See retire() for what the arithmetic means.
+    collectRetiredResources();
 
     // The fence guarantees the GPU is done with this slot's uniform rings; reset both for
     // the views and draws recorded this frame.
@@ -1943,8 +1992,89 @@ bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
     }
 
     frameOpen = false;
+    submittedFrames++;
     frameIndex = (frameIndex + 1) % framesInFlight;
     return true;
+}
+
+// The queue's whole contract, in one place.
+//
+// Submissions are numbered by submittedFrames: the submission being recorded right now, if a
+// frame is open, will be number `submittedFrames`, and the last one already issued was
+// `submittedFrames - 1`. Submission number n signals frames[n % framesInFlight].inFlight, and
+// beginFrame for submission number n + framesInFlight waits on that same fence before recording
+// anything. So by the time submittedFrames has reached some value C, every submission numbered
+// C - framesInFlight or lower has completed on the GPU.
+//
+// An object being retired can be named by any submission already issued, and by the open one if
+// there is a frame open. It is therefore safe once submission `submittedFrames - 1` (or
+// `submittedFrames`, with a frame open) has completed, which by the rule above has happened once
+// submittedFrames reaches that number + framesInFlight. readyAt is set one higher than the strict
+// bound, which costs one extra frame of residency and removes the off-by-one from the argument.
+void VulkanRenderer::retire(RetiredResource resource) const
+{
+    resource.readyAt = submittedFrames + framesInFlight + (frameOpen ? 1 : 0);
+    retiredResources.push_back(resource);
+}
+
+void VulkanRenderer::collectRetiredResources() const
+{
+    if (retiredResources.empty())
+    {
+        return;
+    }
+
+    auto stillInUse = std::vector<RetiredResource>();
+
+    for (const auto& resource : retiredResources)
+    {
+        if (resource.readyAt > submittedFrames)
+        {
+            stillInUse.push_back(resource);
+            continue;
+        }
+
+        if (resource.descriptorSet != VK_NULL_HANDLE)
+        {
+            vkFreeDescriptorSets(device, descriptorPool, 1, &resource.descriptorSet);
+        }
+        if (resource.sampler != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(device, resource.sampler, nullptr);
+        }
+        if (resource.view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, resource.view, nullptr);
+        }
+        if (resource.image != VK_NULL_HANDLE)
+        {
+            vmaDestroyImage(allocator, resource.image, resource.imageAllocation);
+        }
+        if (resource.buffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, resource.buffer, resource.bufferAllocation);
+        }
+        if (resource.pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device, resource.pipeline, nullptr);
+        }
+        if (resource.shaderModule != VK_NULL_HANDLE)
+        {
+            vkDestroyShaderModule(device, resource.shaderModule, nullptr);
+        }
+    }
+
+    retiredResources = std::move(stillInUse);
+}
+
+void VulkanRenderer::drainRetiredResources() const
+{
+    for (auto& resource : retiredResources)
+    {
+        resource.readyAt = 0;
+    }
+
+    collectRetiredResources();
 }
 
 // One view into the open frame. Every view records into the same command buffer, so N
@@ -1957,10 +2087,12 @@ void VulkanRenderer::recordView(Scene& scene, Camera& camera, const float delta)
 
 void VulkanRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
 {
-    const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-    if (attachment.gpuResourceId.has_value())
+    const auto* shader = memoryStorageService.shaders.find(shaderKey);
+    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+
+    if (shader != nullptr && attachment != nullptr && attachment->gpuResourceId.has_value())
     {
-        recordPresentPass(shaderKey->gpuResourceId, attachment.gpuResourceId.value());
+        recordPresentPass(shader->gpuResourceId, attachment->gpuResourceId.value());
     }
 }
 
@@ -2029,33 +2161,34 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     sceneEnvironmentImageId.reset();
     if (scene.environment.has_value())
     {
-        const auto environmentImageId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
-        if (imageResources.contains(environmentImageId))
+        if (const auto* environment = memoryStorageService.cubeMaps.find(scene.environment.value());
+            environment != nullptr && imageResources.contains(environment->gpuResourceId))
         {
-            sceneEnvironmentImageId = environmentImageId;
+            sceneEnvironmentImageId = environment->gpuResourceId;
         }
     }
 
     std::optional<unsigned int> colorImageId;
     std::optional<unsigned int> depthImageId;
-    if (camera.output.has_value())
+    const auto* outputBuffer =
+        camera.output.has_value() ? memoryStorageService.frameBuffers.find(camera.output.value()) : nullptr;
+    if (outputBuffer != nullptr)
     {
-        const auto& outputBuffer = memoryStorageService.frameBuffers.get(camera.output.value());
-        for (const auto& attachmentKey : outputBuffer.attachments)
+        for (const auto& attachmentKey : outputBuffer->attachments)
         {
-            const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-            if (!attachment.gpuResourceId.has_value())
+            const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachment == nullptr || !attachment->gpuResourceId.has_value())
             {
                 continue;
             }
 
-            if (attachment.type == FboAttachmentType::Color && !colorImageId.has_value())
+            if (attachment->type == FboAttachmentType::Color && !colorImageId.has_value())
             {
-                colorImageId = attachment.gpuResourceId;
+                colorImageId = attachment->gpuResourceId;
             }
-            else if (attachment.type == FboAttachmentType::Depth && !depthImageId.has_value())
+            else if (attachment->type == FboAttachmentType::Depth && !depthImageId.has_value())
             {
-                depthImageId = attachment.gpuResourceId;
+                depthImageId = attachment->gpuResourceId;
             }
         }
     }
@@ -2176,10 +2309,24 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     const VkRect2D scissor{VkOffset2D{0, 0}, extent};
     vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
 
+    // Same hoisting rule as the GL pass: every handle is resolved at the outermost loop where it
+    // is constant and read through for the nest below, so the pass costs
+    // O(entities + meshes + primitives) storage lookups rather than one per field. A handle that
+    // has gone stale — a model unloaded while its renderable is still in the scene — is skipped
+    // here, not chased into a recycled slot.
     auto recordedDraws = 0u;
     for (auto& entity : scene.models)
     {
-        auto& model = entity.model;
+        const auto* model = memoryStorageService.models.find(entity.model);
+        const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
+        if (model == nullptr || instanceShader == nullptr)
+        {
+            continue;
+        }
+
+        // The instance's shader, not the material's: materials live in shared storage, so two
+        // renderables built from one model would otherwise restyle each other.
+        const auto shaderId = instanceShader->gpuResourceId;
 
         // Around the entity's submission, which on this backend is where its commands are
         // recorded: the same point in the frame GL calls them at.
@@ -2188,41 +2335,53 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             (*entity.beforeDraw)();
         }
 
-        for (auto& mesh : entity.meshes)
+        for (auto& renderableMesh : entity.meshes)
         {
-            if (!mesh.mesh->gpuResourceId.has_value())
+            const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
+            if (mesh == nullptr)
             {
-                upload(model);
+                continue;
             }
 
-            if (!mesh.mesh->gpuResourceId.has_value())
+            if (!mesh->gpuResourceId.has_value())
+            {
+                // upload() writes through mutate(), in place, so this borrow still names the same
+                // element afterwards — carrying the ids the upload just produced.
+                upload(entity.model);
+            }
+
+            if (!mesh->gpuResourceId.has_value())
             {
                 if (!missingMeshUploadLogged)
                 {
-                    logger.warn("Skipping mesh without a GPU resource: {}", mesh.mesh->name);
+                    logger.warn("Skipping mesh without a GPU resource: {}", mesh->name);
                     missingMeshUploadLogged = true;
                 }
 
                 continue;
             }
 
-            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
+            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix;
             // Bound by reference into the mesh's palette buffer; copying undoes the per-frame
             // allocation the service avoids.
-            const auto& joints = renderableEntityService.joints(mesh, delta);
+            const auto& joints = renderableEntityService.joints(renderableMesh, delta);
 
-            for (const auto& primitive : mesh.mesh->meshPrimitives)
+            for (const auto& primitive : mesh->meshPrimitives)
             {
                 if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
                 {
                     continue;
                 }
 
-                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value())
+                const auto* material = primitive.material.has_value()
+                                           ? memoryStorageService.materials.find(primitive.material.value())
+                                           : nullptr;
+
+                if (material == nullptr || !material->shader.has_value())
                 {
                     if (!missingMaterialLogged)
                     {
-                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh.mesh->name);
+                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh->name);
                         missingMaterialLogged = true;
                     }
 
@@ -2234,7 +2393,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                     continue;
                 }
 
-                recordDraw(primitive, entity.shader, entityModelMatrix, camera, joints, colorImage.format, depthFormat);
+                recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
+                           joints, colorImage.format, depthFormat);
                 recordedDraws++;
             }
         }
@@ -2251,33 +2411,47 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     for (const auto& postProcessKey : camera.postProcesses)
     {
-        const auto& postProcess = memoryStorageService.postProcesses.get(postProcessKey);
+        const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+        const auto* postProcessShader =
+            postProcess == nullptr ? nullptr : memoryStorageService.shaders.find(postProcess->shader);
+        if (postProcess == nullptr || postProcessShader == nullptr)
+        {
+            continue;
+        }
 
         // GL binds every input to units 0..n; the Vulkan fullscreen layout carries exactly
         // one sampler (vulkan-abi.md), and the HDR shader declares only binding 0, so the
         // camera depth attachment GL also binds is deliberately left unbound.
         std::optional<unsigned int> sourceImageId;
-        if (!postProcess.inputs.empty())
+        if (!postProcess->inputs.empty())
         {
-            sourceImageId = memoryStorageService.bufferAttachments.get(postProcess.inputs.front()).gpuResourceId;
+            if (const auto* input = memoryStorageService.bufferAttachments.find(postProcess->inputs.front());
+                input != nullptr)
+            {
+                sourceImageId = input->gpuResourceId;
+            }
         }
 
         std::optional<unsigned int> targetImageId;
-        if (postProcess.output.has_value())
+        if (postProcess->output.has_value())
         {
-            const auto& targetBuffer = memoryStorageService.frameBuffers.get(postProcess.output.value());
-            for (const auto& attachmentKey : targetBuffer.attachments)
+            const auto* targetBuffer = memoryStorageService.frameBuffers.find(postProcess->output.value());
+            if (targetBuffer != nullptr)
             {
-                const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-                if (attachment.type == FboAttachmentType::Color && attachment.gpuResourceId.has_value())
+                for (const auto& attachmentKey : targetBuffer->attachments)
                 {
-                    targetImageId = attachment.gpuResourceId;
-                    break;
+                    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+                    if (attachment != nullptr && attachment->type == FboAttachmentType::Color &&
+                        attachment->gpuResourceId.has_value())
+                    {
+                        targetImageId = attachment->gpuResourceId;
+                        break;
+                    }
                 }
             }
         }
 
-        const auto shader = shaderObjects.find(postProcess.shader->gpuResourceId);
+        const auto shader = shaderObjects.find(postProcessShader->gpuResourceId);
         const auto usable = sourceImageId.has_value() && targetImageId.has_value() &&
                             imageResources.contains(sourceImageId.value()) &&
                             imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
@@ -2285,7 +2459,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         // The pipeline is built against the target attachment's own format, so a post-process
         // buffer created with any FboAttachment::internalFormat renders rather than mismatching
         // a hardcoded one.
-        const auto pipeline = usable ? offscreenPipeline(postProcess.shader->gpuResourceId,
+        const auto pipeline = usable ? offscreenPipeline(postProcessShader->gpuResourceId,
                                                          imageResources.at(targetImageId.value()).format)
                                      : VK_NULL_HANDLE;
         if (pipeline == VK_NULL_HANDLE)
@@ -2319,7 +2493,10 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
 }
 
-void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader,
+// The material arrives already resolved — both the handle, which keys the descriptor set cache,
+// and the element the caller borrowed to decide this draw was worth recording.
+void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey,
+                                const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
                                 const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
                                 const VkFormat depthFormat)
@@ -2330,11 +2507,7 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<S
         return;
     }
 
-    const auto material = primitive.material.value();
-    // The instance's shader, not the material's: materials live in shared storage, so two
-    // renderables built from one model would otherwise restyle each other.
-    const auto shaderId = shader->gpuResourceId;
-    const VkCullModeFlags cullMode = material->opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    const VkCullModeFlags cullMode = material.opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
     const auto pipeline = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
     if (pipeline == VK_NULL_HANDLE)
@@ -2344,16 +2517,20 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<S
 
     // GL's bindMaterial falls back to the scene environment when the material has none.
     auto environmentImageId = sceneEnvironmentImageId.value_or(0u);
-    if (material->environment.has_value())
+    if (material.environment.has_value())
     {
-        environmentImageId = memoryStorageService.cubeMaps.get(material->environment.value()).gpuResourceId;
+        if (const auto* environment = memoryStorageService.cubeMaps.find(material.environment.value());
+            environment != nullptr)
+        {
+            environmentImageId = environment->gpuResourceId;
+        }
     }
     if (!imageResources.contains(environmentImageId))
     {
         environmentImageId = dummyCubeMap();
     }
 
-    const auto set = materialSet(material, environmentImageId);
+    const auto set = materialSet(materialKey, environmentImageId);
     if (set == VK_NULL_HANDLE)
     {
         return;
@@ -2644,125 +2821,146 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     return binding;
 }
 
+// The whole upload runs inside one mutate() of the model, with a nested mutate() per mesh: the
+// only shape that writes the ids into the elements the draw path reads without copying a
+// multi-megabyte model out and back, or const_casting the storage's own reference. Lock nesting
+// is models -> meshes and models -> materials -> textures, never back into the same storage.
 void VulkanRenderer::upload(const Resource<Model>& modelKey)
 {
-    auto model = memoryStorageService.models.get(modelKey);
     auto uploadedBuffers = 0u;
+    auto meshCount = size_t{0};
+    auto materialCount = size_t{0};
 
-    for (const auto& meshKey : model.meshes)
-    {
-        auto mesh = memoryStorageService.meshes.get(meshKey);
+    memoryStorageService.models.mutate(modelKey,
+                                       [&](Model& model)
+                                       {
+                                           meshCount = model.meshes.size();
+                                           materialCount = model.materials.size();
 
-        if (mesh.gpuResourceId.has_value())
-        {
-            continue;
-        }
+                                           for (const auto& meshKey : model.meshes)
+                                           {
+                                               memoryStorageService.meshes.mutate(
+                                                   meshKey,
+                                                   [&](Mesh& mesh)
+                                                   {
+                                                       if (mesh.gpuResourceId.has_value())
+                                                       {
+                                                           return;
+                                                       }
 
-        for (auto& buffer : model.meshBuffers)
-        {
-            if (buffer.gpuId.has_value())
-            {
-                continue;
-            }
+                                                       for (auto& buffer : model.meshBuffers)
+                                                       {
+                                                           if (buffer.gpuId.has_value())
+                                                           {
+                                                               continue;
+                                                           }
 
-            buffer.gpuId = uploadMeshBuffer(buffer);
-            buffer.data.clear();
-            buffer.data.shrink_to_fit();
-            uploadedBuffers++;
-        }
+                                                           buffer.gpuId = uploadMeshBuffer(buffer);
+                                                           buffer.data.clear();
+                                                           buffer.data.shrink_to_fit();
+                                                           uploadedBuffers++;
+                                                       }
 
-        memoryStorageService.models.update(modelKey, model);
+                                                       // draw()'s "already uploaded" sentinel. Nothing looks the id up
+                                                       // — each primitive owns its binding in gpuVao — but it has to be
+                                                       // assigned outside the loop below: GLTFService drops non-indexed
+                                                       // primitives, so meshPrimitives can be empty, and an unset
+                                                       // sentinel makes draw() re-enter upload() on every frame.
+                                                       auto uploadedSentinel = 0u;
 
-        // draw()'s "already uploaded" sentinel. Nothing looks the id up — each primitive owns
-        // its binding in gpuVao — but it has to be assigned outside the loop below: GLTFService
-        // drops non-indexed primitives, so meshPrimitives can be empty, and an unset sentinel
-        // makes draw() re-enter upload() on every frame.
-        auto uploadedSentinel = 0u;
+                                                       for (auto& primitive : mesh.meshPrimitives)
+                                                       {
+                                                           const auto id = nextResourceId++;
+                                                           primitiveBindings.emplace(
+                                                               id, makePrimitiveBinding(model, primitive));
+                                                           primitive.gpuVao = id;
+                                                           uploadedSentinel = id;
+                                                       }
 
-        for (auto& primitive : mesh.meshPrimitives)
-        {
-            const auto id = nextResourceId++;
-            primitiveBindings.emplace(id, makePrimitiveBinding(model, primitive));
-            primitive.gpuVao = id;
-            uploadedSentinel = id;
-        }
+                                                       mesh.gpuResourceId = uploadedSentinel;
+                                                   });
+                                           }
 
-        mesh.gpuResourceId = uploadedSentinel;
+                                           for (const auto& materialKey : model.materials)
+                                           {
+                                               uploadMaterialTextures(materialKey);
+                                           }
+                                       });
 
-        memoryStorageService.meshes.update(meshKey, mesh);
-    }
-
-    for (const auto& materialKey : model.materials)
-    {
-        uploadMaterialTextures(materialKey);
-    }
-
-    logger.info("Vulkan model uploaded: {} buffer(s), {} mesh(es), {} material(s)", uploadedBuffers,
-                model.meshes.size(), model.materials.size());
+    logger.info("Vulkan model uploaded: {} buffer(s), {} mesh(es), {} material(s)", uploadedBuffers, meshCount,
+                materialCount);
 }
 
 std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture>& textureKey)
 {
-    const auto& texture = memoryStorageService.textures.get(textureKey);
-    if (texture.gpuResourceId.has_value())
-    {
-        return texture.gpuResourceId;
-    }
+    std::optional<unsigned int> uploadedId;
 
-    // Any channel count at any of the three source precisions uploads (createSampledImage
-    // expands it the way GL's driver does); only a payload that cannot describe the image is
-    // rejected.
-    const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
-    const auto sourceBytes =
-        texelCount * static_cast<size_t>(channelCount(texture.format)) * pixelComponentBytes(texture.pixelDataType);
-    if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
-    {
-        if (!unsupportedTextureLayoutLogged)
+    // In place: the id is written and the pixels dropped inside the element, so a multi-megabyte
+    // payload is never copied through the storage. The const_cast this needed is gone with
+    // update() — mutate() is the API that says "write this element".
+    memoryStorageService.textures.mutate(
+        textureKey,
+        [&](Texture& texture)
         {
-            logger.warn("Vulkan texture upload skipped for {}: {}x{} needs {} byte(s) for its declared layout and "
+            if (texture.gpuResourceId.has_value())
+            {
+                uploadedId = texture.gpuResourceId;
+                return;
+            }
+
+            // Any channel count at any of the three source precisions uploads (createSampledImage
+            // expands it the way GL's driver does); only a payload that cannot describe the image
+            // is rejected.
+            const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
+            const auto sourceBytes = texelCount * static_cast<size_t>(channelCount(texture.format)) *
+                                     pixelComponentBytes(texture.pixelDataType);
+            if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
+            {
+                if (!unsupportedTextureLayoutLogged)
+                {
+                    logger.warn(
+                        "Vulkan texture upload skipped for {}: {}x{} needs {} byte(s) for its declared layout and "
                         "carries {}",
                         texture.name, texture.width, texture.height, sourceBytes, texture.data.size());
-            unsupportedTextureLayoutLogged = true;
-        }
+                    unsupportedTextureLayoutLogged = true;
+                }
 
-        return std::nullopt;
-    }
+                return;
+            }
 
-    const std::array faces = {&texture};
-    const auto id = createSampledImage(faces, false);
+            const std::array faces = {&std::as_const(texture)};
+            const auto id = createSampledImage(faces, false);
+            texture.gpuResourceId = id;
+            uploadedId = id;
 
-    // MemoryStorage hands out const references to non-const elements; writing the id back
-    // in place keeps the GL-visible contract without copying a multi-megabyte payload
-    // through get/update (same justification as createCubeMap's face clearing).
-    auto& uploaded = const_cast<Texture&>(texture);
-    uploaded.gpuResourceId = id;
+            // The GPU owns the texels now; shed the CPU copy the way upload() sheds mesh buffers.
+            texture.data.clear();
+            texture.data.shrink_to_fit();
+        });
 
-    // The GPU owns the texels now; shed the CPU copy the way upload() sheds mesh buffers.
-    uploaded.data.clear();
-    uploaded.data.shrink_to_fit();
-
-    return id;
+    return uploadedId;
 }
 
 void VulkanRenderer::uploadMaterialTextures(const Resource<Material>& materialKey)
 {
-    const auto& material = memoryStorageService.materials.get(materialKey);
+    const auto* material = memoryStorageService.materials.find(materialKey);
+    if (material == nullptr)
+    {
+        return;
+    }
 
     for (const auto& textureKey :
-         {material.albedo, material.normal, material.metallicRoughness, material.emissive, material.occlusion})
+         {material->albedo, material->normal, material->metallicRoughness, material->emissive, material->occlusion})
     {
-        if (textureKey.has_value() && memoryStorageService.textures.exists(textureKey.value()))
+        if (textureKey.has_value())
         {
             static_cast<void>(uploadTexture(textureKey.value()));
         }
     }
 
-    for (const auto& textureKey : material.textures)
+    for (const auto& textureKey : material->textures)
     {
-        if (memoryStorageService.textures.exists(textureKey))
-        {
-            static_cast<void>(uploadTexture(textureKey));
-        }
+        static_cast<void>(uploadTexture(textureKey));
     }
 }
 
@@ -2806,27 +3004,38 @@ unsigned int VulkanRenderer::dummyCubeMap()
     return dummyCubeMapId;
 }
 
+// Keyed by the material's slot index and the environment it is bound against. The index is
+// enough because releaseMaterial() drops every entry for a slot when that slot is released, so a
+// recycled index never finds the previous material's descriptors waiting for it.
 VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKey,
                                             const unsigned int environmentImageId)
 {
-    const auto key = (static_cast<uint64_t>(materialKey.id) << 32u) | static_cast<uint64_t>(environmentImageId);
+    const auto key = (static_cast<uint64_t>(materialKey.index) << 32u) | static_cast<uint64_t>(environmentImageId);
     const auto cached = materialResources.find(key);
     if (cached != materialResources.end())
     {
         return cached->second.set;
     }
 
-    const auto& material = memoryStorageService.materials.get(materialKey);
+    const auto* materialSlot = memoryStorageService.materials.find(materialKey);
+    if (materialSlot == nullptr)
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const auto& material = *materialSlot;
 
     const auto textureImage = [&](const std::optional<Resource<Texture>>& textureKey) -> std::optional<unsigned int>
     {
-        if (!textureKey.has_value() || !textureKey.value()->gpuResourceId.has_value() ||
-            !imageResources.contains(textureKey.value()->gpuResourceId.value()))
+        const auto* texture = textureKey.has_value() ? memoryStorageService.textures.find(textureKey.value()) : nullptr;
+
+        if (texture == nullptr || !texture->gpuResourceId.has_value() ||
+            !imageResources.contains(texture->gpuResourceId.value()))
         {
             return std::nullopt;
         }
 
-        return textureKey.value()->gpuResourceId;
+        return texture->gpuResourceId;
     };
 
     const auto diffuse = textureImage(material.albedo);
@@ -3712,16 +3921,8 @@ std::expected<unsigned int, std::string> VulkanRenderer::createCubeMap(const Tex
         const std::array faces = {&right, &left, &bottom, &top, &front, &back};
         const auto id = createSampledImage(faces, true);
 
-        // The GPU owns the texels now; shed the CPU copies the way the GL path sheds staged
-        // mesh buffers. The storage deque's elements are non-const objects, so the cast is
-        // defined behaviour.
-        for (const auto* face : faces)
-        {
-            auto& texture = const_cast<Texture&>(*face);
-            texture.data.clear();
-            texture.data.shrink_to_fit();
-        }
-
+        // The faces' pixel data is CubeMapService's to drop, through the handles it holds; this
+        // used to const_cast the const Texture& it was handed and empty it here.
         logger.info("Vulkan cube map {} uploaded: 6 faces {}x{}, {} mip levels", id, right.width, right.height,
                     imageResources.at(id).mipLevels);
         return id;
@@ -3732,6 +3933,8 @@ std::expected<unsigned int, std::string> VulkanRenderer::createCubeMap(const Tex
     }
 }
 
+// The image leaves the registry now — nothing may name it again — and is destroyed later, when
+// the frames that could still be sampling it have completed. See retire().
 void VulkanRenderer::destroyImageResource(const unsigned int id) const
 {
     const auto entry = imageResources.find(id);
@@ -3740,29 +3943,26 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
         return;
     }
 
-    // The cached fullscreen set names this image's view; recycle it with the image so a
-    // resize does not leak pool space (the pool carries FREE_DESCRIPTOR_SET for this).
+    RetiredResource retired;
+
+    // The cached fullscreen set names this image's view, so it is recycled with the image and on
+    // the same schedule: a descriptor set a submitted command buffer bound may not be freed
+    // either. The pool carries FREE_DESCRIPTOR_SET for this.
     const auto cachedSet = attachmentSets.find(id);
     if (cachedSet != attachmentSets.end())
     {
-        vkFreeDescriptorSets(device, descriptorPool, 1, &cachedSet->second);
+        retired.descriptorSet = cachedSet->second;
         attachmentSets.erase(cachedSet);
     }
 
     const auto& resource = entry->second;
-    if (resource.sampler != VK_NULL_HANDLE)
-    {
-        vkDestroySampler(device, resource.sampler, nullptr);
-    }
-    if (resource.view != VK_NULL_HANDLE)
-    {
-        vkDestroyImageView(device, resource.view, nullptr);
-    }
-    if (resource.image != VK_NULL_HANDLE)
-    {
-        vmaDestroyImage(allocator, resource.image, resource.allocation);
-    }
+    retired.sampler = resource.sampler;
+    retired.view = resource.view;
+    retired.image = resource.image;
+    retired.imageAllocation = resource.allocation;
+
     imageResources.erase(entry);
+    retire(retired);
 }
 
 std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fbo)
@@ -3775,7 +3975,13 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
 
         for (const auto& attachmentKey : fbo.attachments)
         {
-            auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+            const auto* attachmentSlot = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachmentSlot == nullptr)
+            {
+                continue;
+            }
+
+            const auto& attachment = *attachmentSlot;
 
             VkImageUsageFlags usage;
             VkImageAspectFlags aspect;
@@ -3858,8 +4064,8 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
 
             // Observable contract shared with GL: every attachment's id is written back
             // through its Resource.
-            attachment.gpuResourceId = attachmentId;
-            memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
+            memoryStorageService.bufferAttachments.mutate(attachmentKey, [&](FboAttachment& target)
+                                                          { target.gpuResourceId = attachmentId; });
         }
 
         const auto id = nextResourceId++;
@@ -3876,6 +4082,10 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
     }
 }
 
+// No device idle any more. This used to stall the whole device on every resize, which was
+// tolerable at resize rate and would not be at unload rate — an FBO is also what a camera owns,
+// so unloading a scene deletes several. The retirement queue is the in-flight guard now, and it
+// costs the images two more frames of residency instead of the GPU a full drain.
 void VulkanRenderer::deleteFbo(Fbo& fbo)
 {
     if (device == VK_NULL_HANDLE)
@@ -3883,23 +4093,180 @@ void VulkanRenderer::deleteFbo(Fbo& fbo)
         return;
     }
 
-    // Resize-rate operation: a full device idle is the in-flight guard until the draw
-    // path gives a reason for deferred per-frame destruction (V3).
-    ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
-
     for (const auto& attachmentKey : fbo.attachments)
     {
-        const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-        if (attachment.gpuResourceId.has_value())
-        {
-            destroyImageResource(attachment.gpuResourceId.value());
-        }
+        memoryStorageService.bufferAttachments.mutate(attachmentKey,
+                                                      [&](FboAttachment& attachment)
+                                                      {
+                                                          if (!attachment.gpuResourceId.has_value())
+                                                          {
+                                                              return;
+                                                          }
+
+                                                          destroyImageResource(attachment.gpuResourceId.value());
+                                                          attachment.gpuResourceId.reset();
+                                                      });
     }
 
     if (fbo.gpuResourceId.has_value())
     {
         fboResources.erase(fbo.gpuResourceId.value());
+        fbo.gpuResourceId.reset();
     }
+}
+
+void VulkanRenderer::releaseGpuResource(const GpuResourceKind kind, const unsigned int gpuResourceId)
+{
+    if (device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    switch (kind)
+    {
+    case GpuResourceKind::Buffer:
+    {
+        const auto entry = bufferResources.find(gpuResourceId);
+        if (entry == bufferResources.end())
+        {
+            return;
+        }
+
+        RetiredResource retired;
+        retired.buffer = entry->second.buffer;
+        retired.bufferAllocation = entry->second.allocation;
+        bufferResources.erase(entry);
+        retire(retired);
+        break;
+    }
+    case GpuResourceKind::Texture:
+    case GpuResourceKind::CubeMap:
+        destroyImageResource(gpuResourceId);
+        break;
+    case GpuResourceKind::VertexArray:
+        // The Vulkan counterpart of a VAO owns no Vulkan object: it is the resolved vertex input
+        // plus copies of buffer handles the model owns and a pipeline the cache owns. Dropping the
+        // entry is the whole release, and it has to happen before the buffers it names.
+        primitiveBindings.erase(gpuResourceId);
+        break;
+    case GpuResourceKind::ShaderProgram:
+        releaseShaderObject(gpuResourceId);
+        break;
+    case GpuResourceKind::FrameBuffer:
+        fboResources.erase(gpuResourceId);
+        break;
+    }
+}
+
+// A shader owns its two modules and every pipeline built from them: the swapchain-target one, the
+// offscreen ones keyed by target format, and the scene ones keyed by shader, cull mode, topology,
+// formats and vertex-input signature — all of which start with this shader's id.
+void VulkanRenderer::releaseShaderObject(const unsigned int shaderId)
+{
+    auto destroyedPipelines = std::vector<VkPipeline>();
+
+    const auto entry = shaderObjects.find(shaderId);
+    if (entry != shaderObjects.end())
+    {
+        if (entry->second.swapchainTargetPipeline != VK_NULL_HANDLE)
+        {
+            destroyedPipelines.push_back(entry->second.swapchainTargetPipeline);
+        }
+
+        RetiredResource vertexModule;
+        vertexModule.shaderModule = entry->second.vertexModule;
+        retire(vertexModule);
+
+        RetiredResource fragmentModule;
+        fragmentModule.shaderModule = entry->second.fragmentModule;
+        retire(fragmentModule);
+
+        shaderObjects.erase(entry);
+    }
+
+    std::erase_if(offscreenPipelines,
+                  [&](const auto& pipeline)
+                  {
+                      if ((pipeline.first >> 32u) != shaderId)
+                      {
+                          return false;
+                      }
+
+                      destroyedPipelines.push_back(pipeline.second);
+
+                      return true;
+                  });
+
+    const auto scenePrefix = std::to_string(shaderId) + "|";
+    std::erase_if(scenePipelines,
+                  [&](const auto& pipeline)
+                  {
+                      if (!pipeline.first.starts_with(scenePrefix))
+                      {
+                          return false;
+                      }
+
+                      destroyedPipelines.push_back(pipeline.second);
+
+                      return true;
+                  });
+
+    // A primitive binding caches the pipeline it resolved to. Any binding that resolved to one of
+    // these has to resolve again — a model still drawing with a released shader is a caller bug,
+    // but it must not be a dangling VkPipeline.
+    for (auto& [id, binding] : primitiveBindings)
+    {
+        if (std::ranges::find(destroyedPipelines, binding.pipeline) != destroyedPipelines.end())
+        {
+            binding.pipeline = VK_NULL_HANDLE;
+            binding.resolved = false;
+        }
+    }
+
+    for (const auto pipeline : destroyedPipelines)
+    {
+        RetiredResource retired;
+        retired.pipeline = pipeline;
+        retire(retired);
+    }
+}
+
+// Every descriptor set and uniform buffer this backend cached against the material's slot, for
+// whatever environment it was bound with. The slot is about to be reused by a different material.
+void VulkanRenderer::releaseMaterial(const Resource<Material>& material)
+{
+    if (device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const auto slot = static_cast<uint64_t>(material.index);
+
+    std::erase_if(materialResources,
+                  [&](const auto& entry)
+                  {
+                      if ((entry.first >> 32u) != slot)
+                      {
+                          return false;
+                      }
+
+                      RetiredResource retired;
+                      retired.buffer = entry.second.buffer;
+                      retired.bufferAllocation = entry.second.allocation;
+                      retired.descriptorSet = entry.second.set;
+                      retire(retired);
+
+                      return true;
+                  });
+}
+
+GpuResourceCensus VulkanRenderer::gpuResourceCensus() const
+{
+    return GpuResourceCensus{.buffers = static_cast<unsigned int>(bufferResources.size()),
+                             .textures = static_cast<unsigned int>(imageResources.size()),
+                             .vertexArrays = static_cast<unsigned int>(primitiveBindings.size()),
+                             .shaderPrograms = static_cast<unsigned int>(shaderObjects.size()),
+                             .frameBuffers = static_cast<unsigned int>(fboResources.size())};
 }
 
 std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string& path)

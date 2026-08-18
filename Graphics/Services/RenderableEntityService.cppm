@@ -45,7 +45,19 @@ public:
     // The palette lives on the mesh and is rebuilt in place; it stays valid until this mesh's
     // next joints() call.
     [[nodiscard]] const std::vector<glm::mat4>& joints(RenderableMesh& renderableMesh, float frameTimeDelta) const;
+
+private:
+    // For messages only, so a handle whose mesh has been unloaded names itself rather than
+    // throwing out of the reporting path of an error that has already happened.
+    [[nodiscard]] std::string meshName(const RenderableMesh& mesh) const;
 };
+
+std::string RenderableEntityService::meshName(const RenderableMesh& mesh) const
+{
+    const auto* stored = memoryStorageService.meshes.find(mesh.mesh);
+
+    return stored == nullptr ? "<unloaded mesh " + std::to_string(mesh.mesh.index) + ">" : stored->name;
+}
 
 RenderableEntityService::RenderableEntityService(MemoryStorageService& memoryStorageService) :
     memoryStorageService(memoryStorageService)
@@ -54,26 +66,36 @@ RenderableEntityService::RenderableEntityService(MemoryStorageService& memorySto
 
 RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
 {
+    // Resolved once and read through: the model is the handle's element, and every list below
+    // lives inside it. A model whose handle went stale between the load and here builds an
+    // entity with no meshes, which the draw path already skips.
+    const auto* model = memoryStorageService.models.find(entityDescriptor.model);
+    if (model == nullptr)
+    {
+        return RenderableModel(entityDescriptor.node, entityDescriptor.model, entityDescriptor.shader,
+                               std::vector<RenderableMesh>());
+    }
+
     // The shader is a per-instance choice but materials are shared storage owned by the Model,
     // so it is written there only as the default for materials that have none: two renderables
     // built from one Resource<Model> would otherwise rewrite each other's materials, the second
     // silently restyling the first. The instance's own choice travels on the RenderableModel.
-    for (const auto& materialKey : entityDescriptor.model->materials)
+    for (const auto& materialKey : model->materials)
     {
-        auto material = memoryStorageService.materials.get(materialKey);
-        if (material.shader.has_value())
-        {
-            continue;
-        }
-
-        material.shader = entityDescriptor.shader;
-        memoryStorageService.materials.update(materialKey, material);
+        memoryStorageService.materials.mutate(materialKey,
+                                              [&](Material& material)
+                                              {
+                                                  if (!material.shader.has_value())
+                                                  {
+                                                      material.shader = entityDescriptor.shader;
+                                                  }
+                                              });
     }
 
     auto meshes = std::vector<RenderableMesh>();
-    meshes.reserve(entityDescriptor.model->meshes.size());
+    meshes.reserve(model->meshes.size());
 
-    for (const auto& meshKey : entityDescriptor.model->meshes)
+    for (const auto& meshKey : model->meshes)
     {
         meshes.emplace_back(RenderableMesh{.mesh = meshKey, .skeleton = std::nullopt});
     }
@@ -85,8 +107,15 @@ std::expected<void, std::string>
 RenderableEntityService::setSkeleton(RenderableMesh& mesh,
                                      Resource<std::unique_ptr<ozz::animation::Skeleton>> skeletonKey) const
 {
-    const auto* skeleton = skeletonKey.value->get();
-    const auto& storedMesh = memoryStorageService.meshes.get(mesh.mesh);
+    const auto* skeletonSlot = memoryStorageService.skeletons.find(skeletonKey);
+    const auto* storedMeshSlot = memoryStorageService.meshes.find(mesh.mesh);
+    if (skeletonSlot == nullptr || storedMeshSlot == nullptr)
+    {
+        return std::unexpected("the skeleton or the mesh it would be set on is no longer loaded");
+    }
+
+    const auto* skeleton = skeletonSlot->get();
+    const auto& storedMesh = *storedMeshSlot;
     const auto jointCount = static_cast<size_t>(skeleton->num_joints());
 
     // Resolved and checked before anything is written to the mesh: a skeleton whose joints the
@@ -153,25 +182,37 @@ std::expected<void, std::string>
 RenderableEntityService::addAnimation(RenderableMesh& mesh,
                                       Resource<std::unique_ptr<ozz::animation::Animation>> animationKey) const
 {
-    const auto* animation = animationKey.value->get();
+    const auto* animationSlot = memoryStorageService.animations.find(animationKey);
+    if (animationSlot == nullptr)
+    {
+        return std::unexpected("the animation is no longer loaded");
+    }
+
+    const auto* animation = animationSlot->get();
 
     // Sampling reads into buffers sized from the skeleton, so the skeleton has to be set
     // first; without this the mismatch only shows up as a throw from inside the draw loop.
     if (!mesh.skeleton.has_value())
     {
-        return std::unexpected("Cannot add animation " + std::string(animation->name()) + " to mesh " +
-                               memoryStorageService.meshes.get(mesh.mesh).name + ": it has no skeleton yet");
+        return std::unexpected("Cannot add animation " + std::string(animation->name()) + " to mesh " + meshName(mesh) +
+                               ": it has no skeleton yet");
+    }
+
+    const auto* skeletonSlot = memoryStorageService.skeletons.find(mesh.skeleton.value());
+    if (skeletonSlot == nullptr)
+    {
+        return std::unexpected("Cannot add animation " + std::string(animation->name()) + " to mesh " + meshName(mesh) +
+                               ": its skeleton is no longer loaded");
     }
 
     // A clip with more tracks than the skeleton has joints fails ozz's own job validation,
     // which would otherwise surface as a mesh that simply never moves.
-    const auto* skeleton = mesh.skeleton.value().value->get();
+    const auto* skeleton = skeletonSlot->get();
     if (animation->num_tracks() > skeleton->num_joints())
     {
         return std::unexpected("Animation " + std::string(animation->name()) + " drives " +
                                std::to_string(animation->num_tracks()) + " tracks but the skeleton of mesh " +
-                               memoryStorageService.meshes.get(mesh.mesh).name + " has " +
-                               std::to_string(skeleton->num_joints()) + " joints");
+                               meshName(mesh) + " has " + std::to_string(skeleton->num_joints()) + " joints");
     }
 
     mesh.animations.push_back(animationKey);
@@ -186,14 +227,14 @@ std::expected<void, std::string> RenderableEntityService::setAnimation(Renderabl
     // selection itself is the index overload's job.
     for (size_t i = 0; i < mesh.animations.size(); i++)
     {
-        if (animationName == mesh.animations[i].value->get()->name())
+        const auto* animation = memoryStorageService.animations.find(mesh.animations[i]);
+        if (animation != nullptr && animationName == (*animation)->name())
         {
             return setAnimation(mesh, static_cast<unsigned int>(i));
         }
     }
 
-    return std::unexpected("No animation named " + animationName + " on mesh " +
-                           memoryStorageService.meshes.get(mesh.mesh).name);
+    return std::unexpected("No animation named " + animationName + " on mesh " + meshName(mesh));
 }
 
 std::expected<void, std::string> RenderableEntityService::setAnimation(RenderableMesh& mesh,
@@ -202,8 +243,8 @@ std::expected<void, std::string> RenderableEntityService::setAnimation(Renderabl
     if (animationIndex >= mesh.animations.size())
     {
         return std::unexpected("Animation index " + std::to_string(animationIndex) + " is out of range for mesh " +
-                               memoryStorageService.meshes.get(mesh.mesh).name + ", which carries " +
-                               std::to_string(mesh.animations.size()) + " animation(s)");
+                               meshName(mesh) + ", which carries " + std::to_string(mesh.animations.size()) +
+                               " animation(s)");
     }
 
     mesh.currentAnimationIndex = animationIndex;
@@ -235,9 +276,21 @@ const std::vector<glm::mat4>& RenderableEntityService::joints(RenderableMesh& re
         return out;
     }
 
-    const auto& mesh = renderableMesh.mesh;
-    const auto* animation = renderableMesh.animations[renderableMesh.currentAnimationIndex].value->get();
-    const auto* skeleton = renderableMesh.skeleton.value().value->get();
+    // Three lookups per animated mesh per frame, all of them past the early return above, so an
+    // unanimated mesh pays none of them and an animated one pays them once rather than once per
+    // joint. Any of the three going stale means the clip cannot be sampled, which is the same
+    // answer as having no clip: an empty palette, and the draw records an unanimated mesh.
+    const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
+    const auto* animationSlot =
+        memoryStorageService.animations.find(renderableMesh.animations[renderableMesh.currentAnimationIndex]);
+    const auto* skeletonSlot = memoryStorageService.skeletons.find(renderableMesh.skeleton.value());
+    if (mesh == nullptr || animationSlot == nullptr || skeletonSlot == nullptr)
+    {
+        return out;
+    }
+
+    const auto* animation = animationSlot->get();
+    const auto* skeleton = skeletonSlot->get();
 
     renderableMesh.animationTime = std::fmod(renderableMesh.animationTime + frameTimeDelta, animation->duration());
 

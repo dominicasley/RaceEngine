@@ -77,6 +77,7 @@ target_sources(Engine PUBLIC
         Graphics/Services/CameraService.cppm
         Graphics/Services/PostProcessService.cppm
         Graphics/Services/SceneService.cppm
+        Graphics/Services/AssetService.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm

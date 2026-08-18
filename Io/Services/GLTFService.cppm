@@ -250,48 +250,30 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
         textureMap.insert_or_assign(texture.source, memoryStorageService.textures.add(image));
     }
 
+    // find, not operator[]: a texture reference whose image was skipped above (source < 0) has no
+    // entry, and operator[] would insert a default-constructed handle and hand it back as if it
+    // named something. That used to be invisible — a default Resource passed the bounds check
+    // exists() was — and is now simply absent, which is what the slot means.
+    const auto textureFor = [&](const int textureIndex) -> std::optional<Resource<Texture>>
+    {
+        if (textureIndex < 0 || std::cmp_greater_equal(textureIndex, tinyGltfModel.textures.size()))
+        {
+            return std::nullopt;
+        }
+
+        const auto found = textureMap.find(tinyGltfModel.textures[static_cast<size_t>(textureIndex)].source);
+
+        return found == textureMap.end() ? std::nullopt : std::optional<Resource<Texture>>(found->second);
+    };
+
     for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
     {
-        std::optional<Resource<Texture>> albedoTexturePtr;
-        std::optional<Resource<Texture>> metallicRoughnessTexturePtr;
-        std::optional<Resource<Texture>> normalTexturePtr;
-        std::optional<Resource<Texture>> occlusionTexturePtr;
-        std::optional<Resource<Texture>> emissiveTexturePtr;
-
-        if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
-        {
-            albedoTexturePtr = textureMap[tinyGltfModel
-                                              .textures[static_cast<size_t>(
-                                                  tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index)]
-                                              .source];
-        }
-
-        if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
-        {
-            metallicRoughnessTexturePtr =
-                textureMap[tinyGltfModel
-                               .textures[static_cast<size_t>(
-                                   tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index)]
-                               .source];
-        }
-
-        if (tinyGltfMaterial.normalTexture.index != -1)
-        {
-            normalTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.normalTexture.index)].source];
-        }
-
-        if (tinyGltfMaterial.occlusionTexture.index != -1)
-        {
-            occlusionTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.occlusionTexture.index)].source];
-        }
-
-        if (tinyGltfMaterial.emissiveTexture.index != -1)
-        {
-            emissiveTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.emissiveTexture.index)].source];
-        }
+        const auto albedoTexturePtr = textureFor(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index);
+        const auto metallicRoughnessTexturePtr =
+            textureFor(tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index);
+        const auto normalTexturePtr = textureFor(tinyGltfMaterial.normalTexture.index);
+        const auto occlusionTexturePtr = textureFor(tinyGltfMaterial.occlusionTexture.index);
+        const auto emissiveTexturePtr = textureFor(tinyGltfMaterial.emissiveTexture.index);
 
         auto material = memoryStorageService.materials.add(Material{
             .baseColour = glm::vec4(tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[0],

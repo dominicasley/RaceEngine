@@ -62,32 +62,24 @@ std::expected<Resource<PostProcess>, std::string> PostProcessService::create(con
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
                                   const Resource<FboAttachment>& attachment) const
 {
-    auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
-    postProcess.inputs.push_back(attachment);
-
-    memoryStorageService.postProcesses.update(postProcessKey, postProcess);
+    memoryStorageService.postProcesses.mutate(postProcessKey, [&](PostProcess& postProcess)
+                                              { postProcess.inputs.push_back(attachment); });
 }
 
 std::expected<void, std::string> PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postProcessKey,
                                                                           int width, int height) const
 {
-    auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
-
-    if (!postProcess.output.has_value())
+    const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+    if (postProcess == nullptr || !postProcess->output.has_value())
     {
         return {};
     }
 
-    const auto resized = fboService.resize(postProcess.output.value(), static_cast<unsigned int>(width),
-                                           static_cast<unsigned int>(height));
-    if (!resized)
-    {
-        return std::unexpected(resized.error());
-    }
-
-    memoryStorageService.postProcesses.update(postProcessKey, postProcess);
-
-    return {};
+    // The post-process element itself is unchanged by a resize — only the framebuffer it names
+    // is rebuilt — so there is nothing to write back here. The write-back this used to do was a
+    // copy of an untouched element assigned over itself.
+    return fboService.resize(postProcess->output.value(), static_cast<unsigned int>(width),
+                             static_cast<unsigned int>(height));
 }
 
 } // namespace raceengine
