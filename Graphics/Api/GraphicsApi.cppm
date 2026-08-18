@@ -18,19 +18,19 @@ export [[nodiscard]] GraphicsApi selectGraphicsApi(spdlog::logger& logger)
 {
     const char* requested = std::getenv("RACEENGINE_RENDERER");
 
-    if (requested == nullptr || std::string_view(requested) == "opengl")
+    if (requested != nullptr && std::string_view(requested) == "opengl")
     {
+        logger.info("Selected graphics API: OpenGL");
         return GraphicsApi::OpenGL;
     }
 
-    if (std::string_view(requested) == "vulkan")
+    if (requested != nullptr && std::string_view(requested) != "vulkan")
     {
-        logger.info("Selected graphics API: Vulkan");
-        return GraphicsApi::Vulkan;
+        logger.warn("Unknown RACEENGINE_RENDERER value '{}'; using Vulkan", requested);
     }
 
-    logger.warn("Unknown RACEENGINE_RENDERER value '{}'; using OpenGL", requested);
-    return GraphicsApi::OpenGL;
+    logger.info("Selected graphics API: Vulkan");
+    return GraphicsApi::Vulkan;
 }
 
 } // namespace raceengine

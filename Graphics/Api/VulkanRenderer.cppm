@@ -2996,14 +2996,11 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     const shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    // Unoptimized on purpose: spirv-opt eliminates stage interface variables the shader
-    // declares but never reads (PbrFragmentShader computes an unused product of
-    // tangentBinormalNormalMatrix; ColourFragmentShader reads none of its inputs), which
-    // leaves the vertex stage writing outputs the fragment stage no longer declares and
-    // makes validation report the mismatch on every scene pipeline. Drivers optimize the
-    // module at pipeline creation regardless; the fix on the other side would be in the
-    // shader sources, which this backend does not own.
-    options.SetOptimizationLevel(shaderc_optimization_level_zero);
+    // spirv-opt eliminates stage interface variables a shader declares but never reads, so
+    // a Vulkan-dialect source must not declare any: an input dropped from the fragment
+    // stage leaves the vertex stage writing an output nothing consumes, and validation
+    // reports the mismatch on every pipeline built from the pair.
+    options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success)
