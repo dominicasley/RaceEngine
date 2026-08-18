@@ -9,6 +9,7 @@ import raceengine.tests.recording;
 using raceengine::CreateFboAttachmentDTO;
 using raceengine::CreateFboDTO;
 using raceengine::CubeMapService;
+using raceengine::DepthComparison;
 using raceengine::FboAttachmentType;
 using raceengine::FboService;
 using raceengine::FboType;
@@ -40,6 +41,17 @@ CreateFboDTO colourAndDepth(const unsigned int width, const unsigned int height)
                                                                .type = FboAttachmentType::Depth,
                                                                .captureFormat = TextureFormat::DepthComponent,
                                                                .internalFormat = TextureFormat::DepthComponent}}};
+}
+
+CreateFboDTO depthOnly(const unsigned int width, const unsigned int height, const DepthComparison comparison)
+{
+    return CreateFboDTO{.type = FboType::Planar,
+                        .attachments = {CreateFboAttachmentDTO{.width = width,
+                                                               .height = height,
+                                                               .type = FboAttachmentType::Depth,
+                                                               .captureFormat = TextureFormat::DepthComponent,
+                                                               .internalFormat = TextureFormat::DepthComponent,
+                                                               .depthComparison = comparison}}};
 }
 
 Texture face(const std::string& name)
@@ -210,6 +222,59 @@ TEST_CASE("getAttachmentsOfType filters by type and skips removed attachments", 
 
     REQUIRE(fboService.getAttachmentsOfType(frameBuffer, FboAttachmentType::Color).empty());
     REQUIRE(fboService.getAttachmentsOfType(frameBuffer, FboAttachmentType::Depth).size() == 1);
+}
+
+TEST_CASE("a depth-only framebuffer reaches the backend with one attachment", "[fbo][seam][depth]")
+{
+    MemoryStorageService storage;
+    RecordingRenderBackend backend;
+    const FboService fboService(storage, backend);
+
+    const auto created = fboService.create(depthOnly(2048, 2048, DepthComparison::LessOrEqual));
+
+    REQUIRE(created.has_value());
+
+    const auto* stored = storage.frameBuffers.find(created.value());
+    REQUIRE(stored != nullptr);
+    REQUIRE(stored->attachments.size() == 1);
+
+    // The backend was handed a framebuffer with no colour attachment at all, which is what a GL
+    // GL_NONE draw/read buffer pair and a zero-colour VkRenderingInfo exist to serve.
+    REQUIRE(backend.fboRequests.size() == 1);
+    REQUIRE(backend.fboRequests.front().attachments == 1);
+
+    const auto* attachment = storage.bufferAttachments.find(stored->attachments.front());
+    REQUIRE(attachment != nullptr);
+    REQUIRE(attachment->type == FboAttachmentType::Depth);
+    REQUIRE(attachment->width == 2048);
+    REQUIRE(attachment->height == 2048);
+
+    // Carried from the DTO into the element the backends read: this is the only place either
+    // backend learns it should build a comparison sampler rather than an ordinary one.
+    REQUIRE(attachment->depthComparison == DepthComparison::LessOrEqual);
+}
+
+TEST_CASE("a resized depth target keeps its comparison mode", "[fbo][seam][depth]")
+{
+    MemoryStorageService storage;
+    RecordingRenderBackend backend;
+    const FboService fboService(storage, backend);
+
+    const auto created = fboService.create(depthOnly(2048, 2048, DepthComparison::LessOrEqual));
+    REQUIRE(created.has_value());
+
+    REQUIRE(fboService.resize(created.value(), 1024, 1024).has_value());
+
+    const auto* stored = storage.frameBuffers.find(created.value());
+    REQUIRE(stored != nullptr);
+
+    const auto* attachment = storage.bufferAttachments.find(stored->attachments.front());
+    REQUIRE(attachment != nullptr);
+    REQUIRE(attachment->width == 1024);
+
+    // Resize rewrites the extent and rebuilds; it must not quietly drop the sampler state the
+    // rebuilt attachment is asked for, because nothing else re-states it.
+    REQUIRE(attachment->depthComparison == DepthComparison::LessOrEqual);
 }
 
 TEST_CASE("ShaderService::createShader registers the shader under its name", "[shader][seam]")

@@ -51,8 +51,16 @@ export struct SceneNode
     unsigned int parentTransformVersion = 0;
 };
 
+// What the light's geometry is. A point light radiates from `position` and attenuates; a
+// directional light has no position that matters and casts along `direction` from infinitely far
+// away, which is the light a cascaded shadow map is a shadow map *of*. Nothing reads this yet:
+// both backends still upload position and the four terms below exactly as before, so declaring a
+// light directional changes no shading until the maths that reads it lands.
+export enum class LightType { Point, Directional };
+
 export struct Light
 {
+    LightType type = LightType::Point;
     glm::vec3 position{};
     glm::vec3 direction{};
     // The four terms both backends upload per light. They are stored as authored rather than
@@ -66,6 +74,23 @@ export struct Light
     float strength{};
 };
 
+// How a camera turns view space into clip space. Perspective is the default and the only one any
+// camera in a scene has ever used; orthographic is what a directional light's cascade needs,
+// because a slice of a directional light's frustum is a box, not a pyramid.
+export enum class CameraProjection { Perspective, Orthographic };
+
+// The orthographic view volume's side planes, in view space. Held as four edges rather than a
+// width and a height because a cascade's box is fitted to a frustum slice and is not centred on
+// the light's axis in general. The near and far planes are Camera's own clipping planes, so an
+// orthographic camera and a perspective one state their depth range the same way.
+export struct OrthographicVolume
+{
+    float left = -1.0f;
+    float right = 1.0f;
+    float bottom = -1.0f;
+    float top = 1.0f;
+};
+
 export struct Camera
 {
     unsigned int iso;
@@ -73,6 +98,16 @@ export struct Camera
     float aperture;
     float exposure{};
     float fieldOfView;
+    CameraProjection projection = CameraProjection::Perspective;
+    // Read only when `projection` is Orthographic; `fieldOfView` and `aspectRatio` are read only
+    // when it is Perspective. Both sets are kept rather than unioned so switching a camera back
+    // and forth does not lose the other mode's framing.
+    OrthographicVolume orthographicVolume{};
+    // Whether a window resize rebuilds this camera's render target at the new size. True for a
+    // camera that fills the screen — every camera built by createCamera() with no argument.
+    // False for one that owns a target of its own resolution: a 2048x2048 shadow cascade does not
+    // become 1920x1080 because the window did.
+    bool tracksWindowSize = true;
     float nearClippingPlane{};
     float farClippingPlane{};
     glm::vec3 position{};

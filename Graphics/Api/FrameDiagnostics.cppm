@@ -71,7 +71,7 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
     case FrameDiagnostic::PrimitiveNotUploaded:
         return "primitive(s) with no GPU binding";
     case FrameDiagnostic::MissingCameraOutput:
-        return "camera(s) whose output framebuffer has no colour target";
+        return "camera(s) whose output framebuffer has no colour or depth target";
     case FrameDiagnostic::JointLimitExceeded:
         return "draw(s) supplying more joints than the shader array holds";
     case FrameDiagnostic::LightLimitExceeded:

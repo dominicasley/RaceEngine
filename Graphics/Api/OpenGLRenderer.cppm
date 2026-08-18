@@ -340,6 +340,11 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
     // default framebuffer, or culling switched off by its last non-opaque material — says
     // nothing about what this one needs.
     auto target = 0u;
+    // The window's extent is the fallback, because a camera with no output of its own draws to
+    // the default framebuffer, which is the window.
+    auto targetWidth = viewportWidth;
+    auto targetHeight = viewportHeight;
+
     if (camera.output.has_value())
     {
         const auto* output = memoryStorageService.frameBuffers.find(camera.output.value());
@@ -347,6 +352,24 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
         if (output != nullptr && output->gpuResourceId.has_value())
         {
             target = output->gpuResourceId.value();
+
+            // The pass covers the target it is drawing into, not the window: an off-screen
+            // camera's attachments are whatever size it asked for, and every attachment of one
+            // framebuffer shares that size. Vulkan has always taken its extent from the
+            // attachment this way; for a camera whose target follows the window these are the
+            // same two numbers the viewport already held.
+            for (const auto& attachmentKey : output->attachments)
+            {
+                const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+                if (attachment == nullptr)
+                {
+                    continue;
+                }
+
+                targetWidth = static_cast<int>(attachment->width);
+                targetHeight = static_cast<int>(attachment->height);
+                break;
+            }
         }
         else
         {
@@ -356,7 +379,7 @@ void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, target);
-    glViewport(0, 0, viewportWidth, viewportHeight);
+    glViewport(0, 0, targetWidth, targetHeight);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
@@ -1052,6 +1075,28 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fb
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
+                // The comparison state belongs to the texture object on GL, so it is set once
+                // here rather than per bind. With it on, a sampler2DShadow returns the filtered
+                // comparison result and a plain sampler2D reading the same texture is undefined —
+                // which is why it is off unless the attachment asked for it.
+                switch (attachment.depthComparison)
+                {
+                case DepthComparison::LessOrEqual:
+                {
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+                    // Same border rule as the Vulkan comparison sampler: a lookup outside the map
+                    // reads the far value, so it compares as "nothing was in front of this".
+                    const float border[] = {1.0f, 1.0f, 1.0f, 1.0f};
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+                    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+                    break;
+                }
+                case DepthComparison::None:
+                    break;
+                }
+
                 // No default: every FboAttachmentType has a GL attachment point, and a new
                 // enumerator must be given one here rather than discovered at run time as a
                 // framebuffer that reported complete with an attachment bound to point 0.
@@ -1076,7 +1121,19 @@ std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fb
             });
     }
 
-    glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
+    if (drawBuffers.empty())
+    {
+        // A depth-only framebuffer is incomplete until both buffer bindings are told there is no
+        // colour: they default to GL_COLOR_ATTACHMENT0 on a user framebuffer, and an attachment
+        // point with nothing bound to it fails GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER /
+        // _READ_BUFFER. Vulkan's equivalent is a rendering info with colorAttachmentCount 0.
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+    }
+    else
+    {
+        glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
+    }
 
     const auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);

@@ -273,6 +273,15 @@ Engine::Engine() :
 
                 for (auto& camera : scenePtr->cameras)
                 {
+                    // A camera that owns a target of its own resolution is not following the
+                    // window: a 2048x2048 shadow cascade rebuilt at the window's size would lose
+                    // the resolution it was asked for, and its framing is not the window's aspect
+                    // either. Its post-process chain is its own for the same reason.
+                    if (!camera.tracksWindowSize)
+                    {
+                        continue;
+                    }
+
                     cameraService.setAspectRatio(camera, static_cast<float>(width) / static_cast<float>(height));
 
                     // This runs inside a GLFW callback, so there is no caller to return the
