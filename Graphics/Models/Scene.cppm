@@ -1,6 +1,7 @@
 module;
 
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,6 +27,7 @@ export module raceengine.graphics.models:Scene;
 import raceengine.resource;
 import :Fbo;
 import :Mesh;
+import :Shader;
 import :Texture;
 
 namespace raceengine
@@ -51,10 +53,17 @@ export struct SceneNode
 
 export struct Light
 {
-    glm::vec3 position;
-    glm::vec3 direction;
-    glm::vec3 color;
-    float strength;
+    glm::vec3 position{};
+    glm::vec3 direction{};
+    // The four terms both backends upload per light. They are stored as authored rather than
+    // derived from color/strength: the renderers hand them to the shaders verbatim, and a
+    // product would not reproduce an authored value bit for bit.
+    glm::vec3 diffuse{};
+    glm::vec3 specular{};
+    glm::vec3 ambient{};
+    float attenuation = 1.0f;
+    glm::vec3 color{};
+    float strength{};
 };
 
 export struct Camera
@@ -84,6 +93,13 @@ export struct RenderableEntity
 {
     RenderableEntityType type;
     SceneNode& node;
+    // Called by the backend immediately around this entity's submission, once per view that
+    // draws it. The hooks live on the renderable rather than on the game's Drawable component
+    // because this module is the one both sides already depend on: a renderer that had to see
+    // a Drawable would make raceengine.graphics import raceengine.game and invert the module
+    // graph. Drawable holds them as a view, so a game still writes them through its component.
+    std::optional<std::function<void()>> beforeDraw;
+    std::optional<std::function<void()>> afterDraw;
 
     explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
         type(type),
@@ -102,17 +118,27 @@ export struct RenderableMesh
     std::optional<Resource<std::unique_ptr<ozz::animation::Skeleton>>> skeleton;
     std::vector<Resource<std::unique_ptr<ozz::animation::Animation>>> animations{};
     std::unique_ptr<ozz::animation::SamplingJob::Context> animationCache{};
+    // ozz joint index -> glTF skin joint index, validated against both when the skeleton is set
+    // so the per-frame palette build needs no lookup guards.
     std::map<int, int> jointMap{};
+    // Joint palette, rebuilt in place every frame by RenderableEntityService::joints so the draw
+    // path does not allocate one vector per mesh per frame.
+    std::vector<glm::mat4> jointTransforms{};
 };
 
 export struct RenderableModel : public RenderableEntity
 {
     Resource<Model> model;
+    // The shader this instance was created with. Materials live in shared storage, so the
+    // choice cannot be written through to them without one instance rewriting another's.
+    Resource<Shader> shader;
     std::vector<RenderableMesh> meshes;
 
-    explicit RenderableModel(SceneNode& node, Resource<Model> model, std::vector<RenderableMesh> meshes) :
+    explicit RenderableModel(SceneNode& node, Resource<Model> model, Resource<Shader> shader,
+                             std::vector<RenderableMesh> meshes) :
         RenderableEntity(RenderableEntityType::Mesh, node),
         model(model),
+        shader(shader),
         meshes(std::move(meshes))
     {
     }
@@ -120,8 +146,11 @@ export struct RenderableModel : public RenderableEntity
 
 export struct Scene
 {
-    // std::deque: element addresses stay stable under growth; references into these containers rely on it, so no
-    // erasing.
+    // std::deque, and add-only *within a scene*: SceneNode::parent, RenderableEntity::node and a
+    // game's own pointer into models are raw references into these containers, and no generational
+    // handle reaches inside a scene. The scene is therefore the unit of teardown — destroying it
+    // invalidates all of them at once, which is a rule a game can hold, where erasing one node out
+    // of the middle is not. There is deliberately no API for the latter.
     std::deque<Camera> cameras;
     std::deque<Light> lights;
     std::deque<RenderableModel> models;

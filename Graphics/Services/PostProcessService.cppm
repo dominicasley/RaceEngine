@@ -1,5 +1,6 @@
 module;
 
+#include <expected>
 #include <string>
 
 export module raceengine.graphics:PostProcessService;
@@ -20,9 +21,11 @@ export class PostProcessService
 
 public:
     explicit PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService, IWindow& window);
-    [[nodiscard]] Resource<PostProcess> create(const std::string& id, const Resource<Shader>& shader) const;
+    [[nodiscard]] std::expected<Resource<PostProcess>, std::string> create(const std::string& id,
+                                                                           const Resource<Shader>& shader) const;
     void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment) const;
-    void recreateOutputBuffer(const Resource<PostProcess>& postProcess, int width, int height) const;
+    [[nodiscard]] std::expected<void, std::string> recreateOutputBuffer(const Resource<PostProcess>& postProcess,
+                                                                        int width, int height) const;
 };
 
 PostProcessService::PostProcessService(MemoryStorageService& memoryStorageService, FboService& fboService,
@@ -33,42 +36,60 @@ PostProcessService::PostProcessService(MemoryStorageService& memoryStorageServic
 {
 }
 
-Resource<PostProcess> PostProcessService::create(const std::string&, const Resource<Shader>& shader) const
+std::expected<Resource<PostProcess>, std::string> PostProcessService::create(const std::string& id,
+                                                                             const Resource<Shader>& shader) const
 {
     auto state = window.state();
     auto windowWidth = static_cast<unsigned int>(state.windowWidth);
     auto windowHeight = static_cast<unsigned int>(state.windowHeight);
 
-    return memoryStorageService.postProcesses.add(
-        PostProcess{.shader = shader,
-                    .output = fboService.create(CreateFboDTO{
-                        .type = FboType::Planar,
-                        .attachments = {CreateFboAttachmentDTO{.width = windowWidth,
-                                                               .height = windowHeight,
-                                                               .type = FboAttachmentType::Color,
-                                                               .captureFormat = TextureFormat::RGBA,
-                                                               .internalFormat = TextureFormat::RGBA16F}}})});
+    const auto output = fboService.create(
+        CreateFboDTO{.type = FboType::Planar,
+                     .attachments = {CreateFboAttachmentDTO{.width = windowWidth,
+                                                            .height = windowHeight,
+                                                            .type = FboAttachmentType::Color,
+                                                            .captureFormat = TextureFormat::RGBA,
+                                                            .internalFormat = TextureFormat::RGBA16F}}});
+
+    if (!output)
+    {
+        return std::unexpected("post process '" + id + "' has no output buffer: " + output.error());
+    }
+
+    return memoryStorageService.postProcesses.add(PostProcess{.shader = shader, .output = output.value()});
 }
 
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
                                   const Resource<FboAttachment>& attachment) const
 {
-    auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
-    postProcess.inputs.push_back(attachment);
-
-    memoryStorageService.postProcesses.update(postProcessKey, postProcess);
+    memoryStorageService.postProcesses.mutate(postProcessKey, [&](PostProcess& postProcess)
+                                              { postProcess.inputs.push_back(attachment); });
 }
 
-void PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postProcessKey, int width, int height) const
+std::expected<void, std::string> PostProcessService::recreateOutputBuffer(const Resource<PostProcess>& postProcessKey,
+                                                                          int width, int height) const
 {
-    auto postProcess = memoryStorageService.postProcesses.get(postProcessKey);
-
-    if (postProcess.output.has_value())
+    const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+    if (postProcess == nullptr)
     {
-        fboService.resize(postProcess.output.value(), static_cast<unsigned int>(width),
-                          static_cast<unsigned int>(height));
-        memoryStorageService.postProcesses.update(postProcessKey, postProcess);
+        // Reported, not shrugged off: this used to return success for a handle it could not even
+        // resolve, so a camera still holding an unloaded post-process resized silently and drew
+        // through a buffer nobody rebuilt.
+        return std::unexpected("the post-process handle names no live post-process");
     }
+
+    // A post-process with no output of its own writes the default framebuffer, which the window
+    // resized already. Nothing to do is not a failure.
+    if (!postProcess->output.has_value())
+    {
+        return {};
+    }
+
+    // The post-process element itself is unchanged by a resize — only the framebuffer it names
+    // is rebuilt — so there is nothing to write back here. The write-back this used to do was a
+    // copy of an untouched element assigned over itself.
+    return fboService.resize(postProcess->output.value(), static_cast<unsigned int>(width),
+                             static_cast<unsigned int>(height));
 }
 
 } // namespace raceengine

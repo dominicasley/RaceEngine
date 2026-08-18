@@ -61,21 +61,35 @@ ResourceService::ResourceService(spdlog::logger& logger, MemoryStorageService& m
 {
 }
 
+// Opened binary and read by size, because the size is the only thing that can say the read
+// finished. The previous shape streamed through an istreambuf_iterator, which works on the
+// streambuf directly and never touches the stream's state bits: a read that stopped early — a
+// truncated file, a disk giving up mid-shader — produced a short string and reported success, and
+// what the caller then compiled was half a shader.
 std::expected<std::string, std::string> ResourceService::loadTextFile(const std::string& filePath) const
 {
-    std::string output;
-    std::ifstream fileStream(filePath);
+    std::ifstream fileStream(filePath, std::ios::binary | std::ios::ate);
 
     if (!fileStream.is_open())
     {
         return std::unexpected("Unable to open file with path " + filePath);
     }
 
-    fileStream.seekg(0, std::ios::end);
-    output.reserve(static_cast<size_t>(fileStream.tellg()));
-    fileStream.seekg(0, std::ios::beg);
+    const auto declaredSize = fileStream.tellg();
+    if (declaredSize < 0)
+    {
+        return std::unexpected("Unable to determine the size of file with path " + filePath);
+    }
 
-    output.assign((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
+    auto output = std::string(static_cast<size_t>(declaredSize), '\0');
+    fileStream.seekg(0, std::ios::beg);
+    fileStream.read(output.data(), declaredSize);
+
+    if (fileStream.gcount() != declaredSize)
+    {
+        return std::unexpected("Read " + std::to_string(fileStream.gcount()) + " of the " +
+                               std::to_string(declaredSize) + " bytes of file with path " + filePath);
+    }
 
     return output;
 }
@@ -91,7 +105,10 @@ std::expected<Resource<Model>, std::string> ResourceService::loadModel(const std
     auto model = gltfService.loadModelFromFile(filePath);
     if (!model)
     {
-        return std::unexpected("Unable to load model with path " + filePath);
+        // The importer's own sentence, not a replacement for it: it names the accessor, the
+        // buffer view or the index that is wrong, and "Unable to load model with path X" was
+        // this layer throwing that away and restating what the caller already knew.
+        return std::unexpected("Unable to load model with path " + filePath + ": " + model.error());
     }
 
     return memoryStorageService.models.add(std::move(model).value());
@@ -116,6 +133,18 @@ ResourceService::loadSkeleton(const std::string& filePath) const
     auto skeleton = std::make_unique<ozz::animation::Skeleton>();
     archive >> *skeleton;
 
+    // ozz states plainly that its archives detect nothing while reading and that stream
+    // integrity — truncation, corruption — is the caller's to check. The tag above proves the
+    // file starts as a skeleton; this is what proves one came out. Without it a truncated
+    // archive yielded a joint-less skeleton that every later stage treated as a mesh with
+    // nothing to animate.
+    if (skeleton->num_joints() <= 0)
+    {
+        return std::unexpected("Skeleton read from " + filePath +
+                               " carries no joints; the archive is truncated or "
+                               "does not hold what its tag claims");
+    }
+
     return memoryStorageService.skeletons.add(std::move(skeleton));
 }
 
@@ -138,6 +167,17 @@ ResourceService::loadAnimation(const std::string& filePath) const
 
     auto animation = std::make_unique<ozz::animation::Animation>();
     archive >> *animation;
+
+    // Same reading as the skeleton above: the archive reports nothing, so the object it produced
+    // is the evidence. A clip with no tracks or no duration cannot be sampled, and ozz's
+    // SamplingJob would refuse it once per frame from inside the draw path instead.
+    if (animation->num_tracks() <= 0 || animation->duration() <= 0.0f)
+    {
+        return std::unexpected("Animation read from " + filePath + " carries " +
+                               std::to_string(animation->num_tracks()) + " track(s) over " +
+                               std::to_string(animation->duration()) +
+                               "s; the archive is truncated or does not hold what its tag claims");
+    }
 
     return memoryStorageService.animations.add(std::move(animation));
 }
@@ -218,7 +258,7 @@ ResourceService::loadSkeletonAsync(std::string filePath) const
 AsyncResult<Resource<std::unique_ptr<ozz::animation::Animation>>>
 ResourceService::loadAnimationAsync(std::string filePath) const
 {
-    logger.info("Loading skeleton: {}", filePath);
+    logger.info("Loading animation: {}", filePath);
 
     return backgroundWorkerService.submit([this, filePath = std::move(filePath)] { return loadAnimation(filePath); });
 }

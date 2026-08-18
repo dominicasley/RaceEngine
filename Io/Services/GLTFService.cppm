@@ -1,5 +1,6 @@
 module;
 
+#include <expected>
 #include <map>
 #include <optional>
 #include <set>
@@ -15,7 +16,7 @@ module;
 
 export module raceengine.io:GLTFService;
 
-import :AccessorUtility;
+import raceengine.io.accessor;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -35,15 +36,20 @@ private:
 
 public:
     explicit GLTFService(spdlog::logger& logger, MemoryStorageService& memoryStorageService);
-    [[nodiscard]] Model gltfModelToInternal(const std::string& fileName, const tinygltf::Model& tinyGltfModel) const;
-    [[nodiscard]] std::optional<Model> loadModelFromFile(const std::string& filePath) const;
+    // These three report rather than returning an empty optional or a half-built Model: the file
+    // says what is wrong with it, and the sentence is the only thing that tells a caller whether
+    // the asset is missing, the wrong format, or malformed in a specific place.
+    [[nodiscard]] std::expected<Model, std::string> gltfModelToInternal(const std::string& fileName,
+                                                                        const tinygltf::Model& tinyGltfModel) const;
+    [[nodiscard]] std::expected<Model, std::string> loadModelFromFile(const std::string& filePath) const;
     [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
     [[nodiscard]] glm::mat3 toTextureTransform(const tinygltf::TextureInfo& textureInfo) const;
-    [[nodiscard]] Texture getImageFromIndex(const tinygltf::Model& model, int index) const;
+    [[nodiscard]] std::expected<Texture, std::string> getImageFromIndex(const tinygltf::Model& model, int index) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
-    void processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node& node,
-                     const glm::mat4 parentTransform) const;
+    [[nodiscard]] std::expected<void, std::string> processNode(Model& model, const tinygltf::Model& tinyGltfModel,
+                                                               const tinygltf::Node& node,
+                                                               const glm::mat4 parentTransform) const;
 };
 
 GLTFService::GLTFService(spdlog::logger& logger, MemoryStorageService& memoryStorageService) :
@@ -52,7 +58,7 @@ GLTFService::GLTFService(spdlog::logger& logger, MemoryStorageService& memorySto
 {
 }
 
-std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath) const
+std::expected<Model, std::string> GLTFService::loadModelFromFile(const std::string& filePath) const
 {
     bool result;
     std::string error;
@@ -70,36 +76,50 @@ std::optional<Model> GLTFService::loadModelFromFile(const std::string& filePath)
     }
     else
     {
-        logger.error("Unknown extension {} when loading model with path {}", fileExtension, filePath);
-        return std::nullopt;
+        return std::unexpected("Unknown extension " + fileExtension + " when loading model with path " + filePath);
     }
 
-    if (result)
+    if (!result)
     {
-        logger.info("Loaded model: {}", filePath);
+        return std::unexpected("tinygltf could not read " + filePath + (error.empty() ? "" : ": " + error));
     }
-    else
+
+    // tinygltf's warning is what it recovered from; its error is what it did not. A non-empty
+    // error alongside a successful return used to be logged and the model used regardless, which
+    // made "the file is partly unreadable" indistinguishable from "the file loaded".
+    if (!error.empty())
     {
-        logger.error("Failed to load model: {}", filePath);
-        return std::nullopt;
+        return std::unexpected("tinygltf read " + filePath + " with an unrecovered problem: " + error);
     }
+
+    logger.info("Loaded model: {}", filePath);
 
     if (!warning.empty())
     {
-        logger.warn(warning);
-    }
-
-    if (!error.empty())
-    {
-        logger.error(error);
+        logger.warn("tinygltf recovered while reading {}: {}", filePath, warning);
     }
 
     return gltfModelToInternal(filePath, model);
 }
 
-void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel, const tinygltf::Node& node,
-                              const glm::mat4 parentTransform) const
+std::expected<void, std::string> GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel,
+                                                          const tinygltf::Node& node,
+                                                          const glm::mat4 parentTransform) const
 {
+    // Every index below this point comes out of the file. The walk used to index the model's
+    // vectors with all of them unchecked, so a hand-edited or truncated glTF read whatever was
+    // next in memory; each is range-checked now and a bad one is the file's answer, reported.
+    const auto childNode = [&](const int index) -> std::expected<const tinygltf::Node*, std::string>
+    {
+        if (index < 0 || std::cmp_greater_equal(index, tinyGltfModel.nodes.size()))
+        {
+            return std::unexpected("node names child " + std::to_string(index) + " of " +
+                                   std::to_string(tinyGltfModel.nodes.size()));
+        }
+
+        return &tinyGltfModel.nodes[static_cast<size_t>(index)];
+    };
+
     auto transform =
         parentTransform *
         ((node.translation.size() == 3
@@ -117,10 +137,25 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
     {
         for (const auto& child : node.children)
         {
-            processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(child)], transform);
+            const auto resolved = childNode(child);
+            if (!resolved)
+            {
+                return std::unexpected(resolved.error());
+            }
+
+            if (const auto walked = processNode(model, tinyGltfModel, *resolved.value(), transform); !walked)
+            {
+                return walked;
+            }
         }
 
-        return;
+        return {};
+    }
+
+    if (std::cmp_greater_equal(node.mesh, tinyGltfModel.meshes.size()))
+    {
+        return std::unexpected("node names mesh " + std::to_string(node.mesh) + " of " +
+                               std::to_string(tinyGltfModel.meshes.size()));
     }
 
     const auto tinyGltfMesh = tinyGltfModel.meshes[static_cast<size_t>(node.mesh)];
@@ -131,9 +166,21 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     if (node.skin != -1)
     {
+        if (std::cmp_greater_equal(node.skin, tinyGltfModel.skins.size()))
+        {
+            return std::unexpected("node names skin " + std::to_string(node.skin) + " of " +
+                                   std::to_string(tinyGltfModel.skins.size()));
+        }
+
         auto skin = tinyGltfModel.skins[static_cast<size_t>(node.skin)];
         for (size_t j = 0; j < skin.joints.size(); j++)
         {
+            const auto jointNode = childNode(skin.joints[j]);
+            if (!jointNode)
+            {
+                return std::unexpected("skin of mesh " + tinyGltfMesh.name + ": " + jointNode.error());
+            }
+
             const auto jointNodeIndex = static_cast<size_t>(skin.joints[j]);
             if (tinyGltfModel.nodes[jointNodeIndex].name.empty())
             {
@@ -145,8 +192,29 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             }
         }
 
-        mesh.inverseBindPoseTransforms = AccessorUtility::get<std::vector<glm::mat4>>(
-            tinyGltfModel, tinyGltfModel.accessors[static_cast<size_t>(skin.inverseBindMatrices)]);
+        // inverseBindMatrices is optional (-1); the spec then defines every joint's inverse
+        // bind matrix as the identity, which is what the skinning path expects to find.
+        if (skin.inverseBindMatrices >= 0 && std::cmp_less(skin.inverseBindMatrices, tinyGltfModel.accessors.size()))
+        {
+            // The accessor reports why it could not be read now. It used to answer a malformed
+            // one with an empty vector, which reads exactly like a skin that declared none — and
+            // the difference is a mesh that renders in its bind pose versus one that does not
+            // render right at all.
+            auto inverseBindPose = AccessorUtility::get<std::vector<glm::mat4>>(
+                tinyGltfModel, tinyGltfModel.accessors[static_cast<size_t>(skin.inverseBindMatrices)]);
+
+            if (!inverseBindPose)
+            {
+                return std::unexpected("inverse bind matrices of mesh " + tinyGltfMesh.name + ": " +
+                                       inverseBindPose.error());
+            }
+
+            mesh.inverseBindPoseTransforms = std::move(inverseBindPose).value();
+        }
+        else
+        {
+            mesh.inverseBindPoseTransforms.assign(skin.joints.size(), glm::mat4(1.0f));
+        }
     }
 
     for (const auto& primitive : tinyGltfMesh.primitives)
@@ -157,7 +225,30 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
             continue;
         }
 
+        if (std::cmp_greater_equal(primitive.indices, tinyGltfModel.accessors.size()))
+        {
+            return std::unexpected("primitive of mesh " + tinyGltfMesh.name + " names index accessor " +
+                                   std::to_string(primitive.indices) + " of " +
+                                   std::to_string(tinyGltfModel.accessors.size()));
+        }
+
         auto indexAccessor = tinyGltfModel.accessors[static_cast<size_t>(primitive.indices)];
+
+        // meshBufferIndex indexes model.meshBuffers, which is built one entry per bufferView:
+        // an index accessor with no bufferView (-1, legal glTF) has no geometry to draw.
+        if (indexAccessor.bufferView < 0 ||
+            std::cmp_greater_equal(indexAccessor.bufferView, tinyGltfModel.bufferViews.size()))
+        {
+            logger.warn("Skipping primitive whose index accessor has no buffer view in mesh {}", tinyGltfMesh.name);
+            continue;
+        }
+
+        if (primitive.material != -1 && std::cmp_greater_equal(primitive.material, model.materials.size()))
+        {
+            return std::unexpected("primitive of mesh " + tinyGltfMesh.name + " names material " +
+                                   std::to_string(primitive.material) + " of " +
+                                   std::to_string(model.materials.size()));
+        }
 
         auto meshPrimitive = MeshPrimitive{
             .mode = primitive.mode == -1 ? TINYGLTF_MODE_TRIANGLES : primitive.mode,
@@ -178,7 +269,24 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
                 continue;
             }
 
+            if (attribute.second < 0 || std::cmp_greater_equal(attribute.second, tinyGltfModel.accessors.size()))
+            {
+                return std::unexpected("attribute " + attribute.first + " of mesh " + tinyGltfMesh.name +
+                                       " names accessor " + std::to_string(attribute.second) + " of " +
+                                       std::to_string(tinyGltfModel.accessors.size()));
+            }
+
             auto accessor = tinyGltfModel.accessors[static_cast<size_t>(attribute.second)];
+
+            // bufferView is optional on an accessor (-1 for a sparse or zero-filled one); both
+            // the stride lookup here and bufferIndex below index by it.
+            if (accessor.bufferView < 0 ||
+                std::cmp_greater_equal(accessor.bufferView, tinyGltfModel.bufferViews.size()))
+            {
+                logger.warn("Skipping attribute {} with no buffer view in mesh {}", attribute.first, tinyGltfMesh.name);
+                continue;
+            }
+
             auto byteStride = accessor.ByteStride(tinyGltfModel.bufferViews[static_cast<size_t>(accessor.bufferView)]);
 
             meshPrimitive.attributes.push_back(MeshPrimitiveAttribute{
@@ -200,11 +308,23 @@ void GLTFService::processNode(Model& model, const tinygltf::Model& tinyGltfModel
 
     for (const auto& child : node.children)
     {
-        processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(child)], transform);
+        const auto resolved = childNode(child);
+        if (!resolved)
+        {
+            return std::unexpected(resolved.error());
+        }
+
+        if (const auto walked = processNode(model, tinyGltfModel, *resolved.value(), transform); !walked)
+        {
+            return walked;
+        }
     }
+
+    return {};
 }
 
-Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygltf::Model& tinyGltfModel) const
+std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::string& filePath,
+                                                                   const tinygltf::Model& tinyGltfModel) const
 {
     logger.info("Processing model: {}", filePath);
     Model model;
@@ -219,51 +339,38 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
         }
 
         auto image = getImageFromIndex(tinyGltfModel, texture.source);
-        textureMap.insert_or_assign(texture.source, memoryStorageService.textures.add(image));
+        if (!image)
+        {
+            return std::unexpected(image.error());
+        }
+
+        textureMap.insert_or_assign(texture.source, memoryStorageService.textures.add(std::move(image).value()));
     }
+
+    // find, not operator[]: a texture reference whose image was skipped above (source < 0) has no
+    // entry, and operator[] would insert a default-constructed handle and hand it back as if it
+    // named something. That used to be invisible — a default Resource passed the bounds check
+    // exists() was — and is now simply absent, which is what the slot means.
+    const auto textureFor = [&](const int textureIndex) -> std::optional<Resource<Texture>>
+    {
+        if (textureIndex < 0 || std::cmp_greater_equal(textureIndex, tinyGltfModel.textures.size()))
+        {
+            return std::nullopt;
+        }
+
+        const auto found = textureMap.find(tinyGltfModel.textures[static_cast<size_t>(textureIndex)].source);
+
+        return found == textureMap.end() ? std::nullopt : std::optional<Resource<Texture>>(found->second);
+    };
 
     for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
     {
-        std::optional<Resource<Texture>> albedoTexturePtr;
-        std::optional<Resource<Texture>> metallicRoughnessTexturePtr;
-        std::optional<Resource<Texture>> normalTexturePtr;
-        std::optional<Resource<Texture>> occlusionTexturePtr;
-        std::optional<Resource<Texture>> emissiveTexturePtr;
-
-        if (tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index != -1)
-        {
-            albedoTexturePtr = textureMap[tinyGltfModel
-                                              .textures[static_cast<size_t>(
-                                                  tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index)]
-                                              .source];
-        }
-
-        if (tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index != -1)
-        {
-            metallicRoughnessTexturePtr =
-                textureMap[tinyGltfModel
-                               .textures[static_cast<size_t>(
-                                   tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index)]
-                               .source];
-        }
-
-        if (tinyGltfMaterial.normalTexture.index != -1)
-        {
-            normalTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.normalTexture.index)].source];
-        }
-
-        if (tinyGltfMaterial.occlusionTexture.index != -1)
-        {
-            occlusionTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.occlusionTexture.index)].source];
-        }
-
-        if (tinyGltfMaterial.emissiveTexture.index != -1)
-        {
-            emissiveTexturePtr =
-                textureMap[tinyGltfModel.textures[static_cast<size_t>(tinyGltfMaterial.emissiveTexture.index)].source];
-        }
+        const auto albedoTexturePtr = textureFor(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index);
+        const auto metallicRoughnessTexturePtr =
+            textureFor(tinyGltfMaterial.pbrMetallicRoughness.metallicRoughnessTexture.index);
+        const auto normalTexturePtr = textureFor(tinyGltfMaterial.normalTexture.index);
+        const auto occlusionTexturePtr = textureFor(tinyGltfMaterial.occlusionTexture.index);
+        const auto emissiveTexturePtr = textureFor(tinyGltfMaterial.emissiveTexture.index);
 
         auto material = memoryStorageService.materials.add(Material{
             .baseColour = glm::vec4(tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[0],
@@ -299,6 +406,13 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
                 continue;
             }
 
+            if (std::cmp_greater_equal(primitive.indices, tinyGltfModel.accessors.size()))
+            {
+                return std::unexpected("primitive of mesh " + tinyGltfMesh.name + " names index accessor " +
+                                       std::to_string(primitive.indices) + " of " +
+                                       std::to_string(tinyGltfModel.accessors.size()));
+            }
+
             const auto bufferView = tinyGltfModel.accessors[static_cast<size_t>(primitive.indices)].bufferView;
             if (bufferView >= 0)
             {
@@ -317,9 +431,25 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
             target = indexBufferViews.contains(i) ? TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER : TINYGLTF_TARGET_ARRAY_BUFFER;
         }
 
+        if (bufferView.buffer < 0 || std::cmp_greater_equal(bufferView.buffer, tinyGltfModel.buffers.size()))
+        {
+            return std::unexpected("buffer view " + std::to_string(i) + " names buffer " +
+                                   std::to_string(bufferView.buffer) + " of " +
+                                   std::to_string(tinyGltfModel.buffers.size()));
+        }
+
         // Store only this view's slice of the binary blob; accessor byte offsets are
         // relative to the bufferView, so they keep working against the sliced data.
         const auto& blob = tinyGltfModel.buffers[static_cast<size_t>(bufferView.buffer)].data;
+
+        if (bufferView.byteOffset > blob.size() || bufferView.byteLength > blob.size() - bufferView.byteOffset)
+        {
+            return std::unexpected("buffer view " + std::to_string(i) + " spans bytes " +
+                                   std::to_string(bufferView.byteOffset) + ".." +
+                                   std::to_string(bufferView.byteOffset + bufferView.byteLength) + " of a " +
+                                   std::to_string(blob.size()) + " byte buffer");
+        }
+
         const auto sliceBegin = blob.begin() + static_cast<std::ptrdiff_t>(bufferView.byteOffset);
 
         model.meshBuffers.push_back(
@@ -331,10 +461,31 @@ Model GLTFService::gltfModelToInternal(const std::string& filePath, const tinygl
                            sliceBegin, sliceBegin + static_cast<std::ptrdiff_t>(bufferView.byteLength))});
     }
 
-    const auto sceneIndex = tinyGltfModel.defaultScene < 0 ? 0 : tinyGltfModel.defaultScene;
-    for (auto& sceneNode : tinyGltfModel.scenes[static_cast<size_t>(sceneIndex)].nodes)
+    if (tinyGltfModel.scenes.empty())
     {
-        processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(sceneNode)], glm::mat4(1.0));
+        logger.warn("Model {} contains no scenes; it contributes materials and buffers but no meshes", filePath);
+        return model;
+    }
+
+    // defaultScene is optional (-1) and only meaningful as an index into scenes.
+    const auto defaultScene = tinyGltfModel.defaultScene;
+    const auto sceneIndex = defaultScene >= 0 && std::cmp_less(defaultScene, tinyGltfModel.scenes.size())
+                                ? static_cast<size_t>(defaultScene)
+                                : size_t{0};
+    for (auto& sceneNode : tinyGltfModel.scenes[sceneIndex].nodes)
+    {
+        if (sceneNode < 0 || std::cmp_greater_equal(sceneNode, tinyGltfModel.nodes.size()))
+        {
+            return std::unexpected("scene names root node " + std::to_string(sceneNode) + " of " +
+                                   std::to_string(tinyGltfModel.nodes.size()));
+        }
+
+        if (const auto walked =
+                processNode(model, tinyGltfModel, tinyGltfModel.nodes[static_cast<size_t>(sceneNode)], glm::mat4(1.0));
+            !walked)
+        {
+            return std::unexpected(filePath + ": " + walked.error());
+        }
     }
 
     logger.info("Processed model: {}", filePath);
@@ -425,8 +576,14 @@ glm::mat3 GLTFService::toTextureTransform(const tinygltf::TextureInfo& textureIn
     return translation * rotate * stretch;
 }
 
-Texture GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const
+std::expected<Texture, std::string> GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const
 {
+    if (index < 0 || std::cmp_greater_equal(index, model.images.size()))
+    {
+        return std::unexpected("texture names image " + std::to_string(index) + " of " +
+                               std::to_string(model.images.size()));
+    }
+
     auto image = model.images[static_cast<size_t>(index)];
 
     auto width = static_cast<unsigned int>(image.width);

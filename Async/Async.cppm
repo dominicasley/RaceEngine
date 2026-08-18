@@ -65,9 +65,14 @@ export class BackgroundWorkerService
         using type = U;
     };
 
+    // A queued job runs its work, or — once shutdown has begun — is cancelled: it resolves its
+    // future with an error and never touches the services the work captured. The cancel flag is
+    // part of the job because the promise is the only thing that survives type erasure.
+    using Job = std::move_only_function<void(bool cancelled)>;
+
     std::mutex mutex;
     std::condition_variable_any wake;
-    std::deque<std::move_only_function<void()>> queue;
+    std::deque<Job> queue;
     // workers last: they stop and join before the queue/mutex above are destroyed.
     std::vector<std::jthread> workers;
 
@@ -88,8 +93,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex);
             queue.emplace_back(
-                [promise = std::move(promise), work = std::move(work)]() mutable
+                [promise = std::move(promise), work = std::move(work)](bool cancelled) mutable
                 {
+                    if (cancelled)
+                    {
+                        promise.set_value(std::unexpected("cancelled: background workers are shutting down"));
+                        return;
+                    }
+
                     try
                     {
                         promise.set_value(work());
@@ -135,27 +146,45 @@ BackgroundWorkerService::~BackgroundWorkerService()
     {
         worker.request_stop();
     }
+
+    // Jobs still queued are cancelled here rather than left to the queue's destructor: their
+    // futures resolve with an error instead of a broken promise, and the work itself — which
+    // captured services this pool outlives — never runs. Workers have already stopped taking
+    // from the queue by the time stop is observed, so nothing else can claim these.
+    auto pending = std::deque<Job>();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        pending.swap(queue);
+    }
+
+    for (auto& job : pending)
+    {
+        job(true);
+    }
 }
 
 void BackgroundWorkerService::pump(const std::stop_token& stopToken)
 {
     while (true)
     {
-        auto work = std::move_only_function<void()>();
+        auto job = Job();
 
         {
             std::unique_lock<std::mutex> lock(mutex);
 
-            if (!wake.wait(lock, stopToken, [this] { return !queue.empty(); }))
+            // wait returns the predicate, so a stop request with a non-empty queue returns
+            // true: without this check the pool would drain on shutdown and run jobs against
+            // services already destroyed. Pending work is discarded, not executed.
+            if (!wake.wait(lock, stopToken, [this] { return !queue.empty(); }) || stopToken.stop_requested())
             {
                 return;
             }
 
-            work = std::move(queue.front());
+            job = std::move(queue.front());
             queue.pop_front();
         }
 
-        work();
+        job(false);
     }
 }
 

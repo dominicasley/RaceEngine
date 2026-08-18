@@ -13,8 +13,8 @@ module;
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <limits>
 #include <optional>
 #include <span>
@@ -25,9 +25,16 @@ module;
 #include <utility>
 #include <vector>
 
-export module raceengine.graphics:VulkanRenderer;
+// An implementation partition, not an interface one: naming it `export module` put the whole
+// backend — and `vulkan/vulkan.h`, `vk_mem_alloc.h` and shaderc with it — into the interface
+// closure of raceengine.graphics, and so into every translation unit that imports raceengine.
+// Only :RenderBackendFactoryImpl imports this, and nothing outside this module can.
+module raceengine.graphics:VulkanRenderer;
 
-import :IRenderer;
+import :FrameDiagnostics;
+import :GraphicsApi;
+import :IRenderBackend;
+import :RenderContract;
 import :RenderableEntityService;
 import :SceneManagerService;
 import :Window;
@@ -42,11 +49,13 @@ namespace
 
 constexpr auto waitForever = std::numeric_limits<uint64_t>::max();
 constexpr const char* validationLayerName = "VK_LAYER_KHRONOS_validation";
-// Parity with the GL shaders' jointTransformationMatrixes[128] (vulkan-abi.md).
-constexpr uint32_t maxJoints = 128;
 // DrawData is ~8.5 KiB per draw; a few hundred draws per frame covers the sandbox scene
 // with generous headroom while keeping the ring under 5 MiB per frame in flight.
 constexpr uint32_t drawDataRingSlots = 512;
+// FrameData is per view, not per frame: Engine::step records every camera into one command
+// buffer, so a single slot would have the last camera's view matrix and position shading all
+// of them. 16 views in a frame is far past a split-screen game's needs at 352 bytes each.
+constexpr uint32_t frameDataRingSlots = 16;
 
 // Pool sizing: fixed and generous beats grow-on-demand here — the game's realistic
 // ceiling is a few hundred materials (7 descriptors each) plus per-frame frame/draw sets
@@ -57,17 +66,27 @@ constexpr uint32_t descriptorPoolDynamicUniformBuffers = 16;
 constexpr uint32_t descriptorPoolCombinedImageSamplers = 4096;
 
 // Set 0 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
+// A std140 array of these has a 16-byte element alignment, which 64 bytes already satisfies.
+struct LightUbo
+{
+    glm::vec4 position;
+    glm::vec4 diffuse;
+    glm::vec4 specular;
+    glm::vec4 ambientAttenuation;
+};
+
 struct FrameDataUbo
 {
     glm::mat4 viewMatrix;
     glm::vec4 cameraPosition;
-    glm::vec4 lightPosition;
-    glm::vec4 lightDiffuse;
-    glm::vec4 lightSpecular;
-    glm::vec4 lightAmbientAttenuation;
+    glm::ivec4 lightCount;
+    std::array<LightUbo, maxLights> lights;
 };
 
-static_assert(sizeof(FrameDataUbo) == 144);
+static_assert(sizeof(LightUbo) == 64);
+static_assert(sizeof(FrameDataUbo) == 352);
+static_assert(offsetof(FrameDataUbo, lightCount) == 80);
+static_assert(offsetof(FrameDataUbo, lights) == 96);
 
 // Set 2 binding 0, dynamic-offset (vulkan-abi.md); ring-buffered per frame in flight.
 struct DrawDataUbo
@@ -101,6 +120,81 @@ struct MaterialDataUbo
 
 static_assert(sizeof(MaterialDataUbo) == 128);
 static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
+
+[[nodiscard]] constexpr uint32_t channelCount(const TextureFormat format)
+{
+    switch (format)
+    {
+    case TextureFormat::R:
+        return 1;
+    case TextureFormat::RG:
+        return 2;
+    case TextureFormat::RGB:
+        return 3;
+    case TextureFormat::RGBA:
+    case TextureFormat::RGBA16F:
+    case TextureFormat::RGBA32F:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+[[nodiscard]] constexpr uint32_t pixelComponentBytes(const PixelDataType type)
+{
+    switch (type)
+    {
+    case PixelDataType::UnsignedShort:
+        return 2;
+    case PixelDataType::Float:
+        return 4;
+    default:
+        return 1;
+    }
+}
+
+// Sampled images are always uploaded four-channel: the three-component formats
+// (R8G8B8/R16G16B16/R32G32B32) have no universal sampling support, so the source is expanded
+// on the CPU at its own precision instead — which is also what keeps a 16-bit glTF texture's
+// bits, where GL keeps them by asking for a 16-bit internal format.
+[[nodiscard]] constexpr VkFormat sampledImageFormat(const PixelDataType type)
+{
+    switch (type)
+    {
+    case PixelDataType::UnsignedShort:
+        return VK_FORMAT_R16G16B16A16_UNORM;
+    case PixelDataType::Float:
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    default:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+// FboAttachment::internalFormat is the model's request, exactly as GL passes it to
+// glTexImage2D. captureFormat has no Vulkan analogue: it is GL's client-side format for an
+// upload the attachment path never performs.
+[[nodiscard]] constexpr std::optional<VkFormat> attachmentFormat(const TextureFormat format)
+{
+    switch (format)
+    {
+    case TextureFormat::R:
+        return VK_FORMAT_R8_UNORM;
+    case TextureFormat::RG:
+        return VK_FORMAT_R8G8_UNORM;
+    case TextureFormat::RGB:
+        return VK_FORMAT_R8G8B8_UNORM;
+    case TextureFormat::RGBA:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case TextureFormat::RGBA16F:
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case TextureFormat::RGBA32F:
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case TextureFormat::DepthComponent:
+        return VK_FORMAT_D32_SFLOAT;
+    default:
+        return std::nullopt;
+    }
+}
 
 // CameraService keeps the GL depth convention (z in -w..w); Vulkan clips against 0..w.
 // Column-major glm: z' = 0.5z + 0.5w (vulkan-abi.md).
@@ -597,7 +691,7 @@ void transitionImage(const VkCommandBuffer commandBuffer, const VkImage image, c
 
 } // namespace
 
-export class VulkanRenderer : public IRenderer
+class VulkanRenderer : public IRenderBackend
 {
 private:
     static constexpr uint32_t framesInFlight = 2;
@@ -617,6 +711,9 @@ private:
         VkDescriptorSet frameDataSet = VK_NULL_HANDLE;
         VkDescriptorSet drawDataSet = VK_NULL_HANDLE;
         uint32_t drawDataSlotsUsed = 0;
+        uint32_t frameDataSlotsUsed = 0;
+        // Byte offset of the view currently being recorded; every draw in that view binds it.
+        VkDeviceSize frameDataOffset = 0;
     };
 
     struct ShaderObject
@@ -631,7 +728,6 @@ private:
         // swapchain, post-processes write RGBA16F); the draw path picks by actual target.
         // Scene pipelines are vertex-input-dependent and are built by the draw path.
         VkPipeline swapchainTargetPipeline = VK_NULL_HANDLE;
-        VkPipeline offscreenTargetPipeline = VK_NULL_HANDLE;
     };
 
     // Cube maps and FBO attachments share this shape; attachments use the shared
@@ -700,9 +796,37 @@ private:
         unsigned int attachmentImageId = 0;
     };
 
+    // A GPU object the engine has finished with, waiting for the GPU to finish with it too.
+    // Deferral is not an optimisation here: two frames are in flight, so at the moment a release
+    // is asked for there are up to `framesInFlight` submissions still executing that may name the
+    // image, buffer or descriptor set being released. Destroying it at the call is undefined
+    // behaviour that a validation layer catches and a driver usually does not.
+    //
+    // readyAt is a value of submittedFrames (see below), not a fence: fences are per frame slot
+    // and get reset, so they cannot say "later than this". The rule is in retire().
+    struct RetiredResource
+    {
+        uint64_t readyAt = 0;
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation imageAllocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation bufferAllocation = nullptr;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkShaderModule shaderModule = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    };
+
     // Declaration order is dependency order; the destructor tears down in reverse.
     spdlog::logger& logger;
+    // Every skipped draw, view or pass is counted here instead of at a per-site boolean; see
+    // FrameDiagnostics for why the sites do not throttle themselves any more.
+    FrameDiagnostics& diagnostics;
     IWindow& window;
+    // The window's Vulkan half, taken separately: the same object as `window`, through the seam
+    // that carries surface creation. IWindow does not, because IWindow is what the game holds.
+    IVulkanSurfaceSource& surfaceSource;
     MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
     SceneManagerService& sceneManagerService;
@@ -713,6 +837,7 @@ private:
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceLimits deviceLimits{};
+    bool samplerAnisotropySupported = false;
     uint32_t graphicsQueueFamily = 0;
     uint32_t presentQueueFamily = 0;
     VkDevice device = VK_NULL_HANDLE;
@@ -729,6 +854,7 @@ private:
     VkCommandPool uploadCommandPool = VK_NULL_HANDLE;
     VkSampler attachmentSampler = VK_NULL_HANDLE;
     VkDeviceSize drawDataStride = 0;
+    VkDeviceSize frameDataStride = 0;
     VkSurfaceFormatKHR surfaceFormat{};
     VkExtent2D swapchainExtent{};
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -754,47 +880,56 @@ private:
     std::unordered_map<uint64_t, MaterialResource> materialResources;
     mutable std::unordered_map<unsigned int, VkDescriptorSet> attachmentSets;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
+    // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
+    // the target's format: the format comes from FboAttachment::internalFormat, which is not
+    // known when the shader object is built.
+    std::unordered_map<uint64_t, VkPipeline> offscreenPipelines;
     unsigned int dummyTextureId = 0;
     unsigned int dummyCubeMapId = 0;
     BufferResource dummyVertexBuffer{};
     std::optional<unsigned int> sceneEnvironmentImageId;
-    // Frame recording state: draw() opens the frame and records the scene and post
-    // passes, drawFullScreenQuad() records the swapchain pass and closes it.
+    // Frame recording state. The frame belongs to Engine::step: beginFrame acquires the
+    // image and opens the command buffer, recordView and recordPresent only record into it,
+    // and endFrame is the one place that submits and presents.
     bool frameOpen = false;
     bool swapchainPassRecorded = false;
     uint32_t currentImageIndex = 0;
     std::optional<PresentPass> lastPresentPass;
-    mutable bool mipGenerationUnavailableLogged = false;
-    bool drawDataRingExhaustedLogged = false;
-    bool missingCameraOutputLogged = false;
-    bool missingMeshUploadLogged = false;
-    bool missingMaterialLogged = false;
-    bool unsupportedIndexTypeLogged = false;
-    bool unsupportedTopologyLogged = false;
-    bool unsupportedTextureLayoutLogged = false;
-    bool jointLimitLogged = false;
-    bool scenePipelineUnavailableLogged = false;
-    bool fullscreenPipelineUnavailableLogged = false;
-    bool descriptorSetUnavailableLogged = false;
-    bool missingPostProcessTargetLogged = false;
+    // Submissions this backend has issued, ever. It is the clock the retirement queue is keyed
+    // to, and it only advances in submitAndPresent — the one place that submits.
+    uint64_t submittedFrames = 0;
+    mutable std::vector<RetiredResource> retiredResources;
+    // Not a diagnostic: the one-shot info line that says the backend reached a recorded scene
+    // pass, which the smoke gate reads. Nothing is skipped when it fires.
     bool drawSummaryLogged = false;
 
 public:
-    explicit VulkanRenderer(spdlog::logger& logger, IWindow& window, RenderableEntityService& renderableEntityService,
+    explicit VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
+                            IVulkanSurfaceSource& surfaceSource, RenderableEntityService& renderableEntityService,
                             SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~VulkanRenderer() override;
 
-    bool init() override;
-    void draw(Scene& scene, Camera& camera, float delta) override;
-    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const override;
+    [[nodiscard]] std::expected<void, std::string> init() override;
     void setViewport(int width, int height) override;
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                             const Texture& right, const Texture& top,
-                                             const Texture& bottom) const override;
-    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const override;
-    void deleteFbo(Fbo& fbo) const override;
-    void captureFrame(const std::string& path) override;
+
+    [[nodiscard]] bool beginFrame() override;
+    void recordView(Scene& scene, Camera& camera, float delta) override;
+    void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) override;
+    void endFrame() override;
+
+    [[nodiscard]] std::expected<unsigned int, std::string>
+    createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createCubeMap(const Texture& front, const Texture& back,
+                                                                         const Texture& left, const Texture& right,
+                                                                         const Texture& top,
+                                                                         const Texture& bottom) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createFbo(const Fbo& fbo) override;
+    void deleteFbo(Fbo& fbo) override;
+    void releaseGpuResource(GpuResourceKind kind, unsigned int gpuResourceId) override;
+    void releaseMaterial(const Resource<Material>& material) override;
+    [[nodiscard]] GpuResourceCensus gpuResourceCensus() const override;
+
+    [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
 private:
     void createInstance();
@@ -807,15 +942,17 @@ private:
     void createFrameResources();
     void createDescriptorInfrastructure();
     void recreateSwapchainIfNeeded();
-    [[nodiscard]] bool beginFrame();
-    bool endFrame(VkBuffer captureBuffer);
+    // The body of endFrame, with the capture readback the debug seam needs threaded through:
+    // captureFrame replays a frame of its own and has to copy the presented image out of it.
+    // Returns whether a frame was actually submitted and presented.
+    bool submitAndPresent(VkBuffer captureBuffer);
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
-    void recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix, const Camera& camera,
-                    const std::vector<glm::mat4>& joints);
+    void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
+                    unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
+                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
-    void presentAndCloseFrame(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
     void transitionTracked(VkCommandBuffer commandBuffer, unsigned int imageId, VkImageLayout newLayout);
     void upload(const Resource<Model>& modelKey);
@@ -826,11 +963,16 @@ private:
     [[nodiscard]] std::optional<unsigned int> uploadTexture(const Resource<Texture>& textureKey);
     [[nodiscard]] VkDescriptorSet materialSet(const Resource<Material>& materialKey, unsigned int environmentImageId);
     [[nodiscard]] VkDescriptorSet attachmentSet(unsigned int imageId);
-    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode);
+    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode,
+                                           VkFormat colorFormat, VkFormat depthFormat);
+    [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
-    [[nodiscard]] std::optional<std::vector<uint32_t>> compileToSpirv(const std::string& source,
-                                                                      shaderc_shader_kind kind, const char* stageName);
+    // Reports shaderc's own message rather than logging it: createShaderObject already has an
+    // error channel, and a source that will not compile is the whole reason it has nothing to
+    // hand back.
+    [[nodiscard]] std::expected<std::vector<uint32_t>, std::string>
+    compileToSpirv(const std::string& source, shaderc_shader_kind kind, const char* stageName);
     [[nodiscard]] VkShaderModule createShaderModule(const std::vector<uint32_t>& spirv) const;
     [[nodiscard]] VkPipeline buildFullscreenPipeline(VkShaderModule vertexModule, VkShaderModule fragmentModule,
                                                      VkFormat colorFormat) const;
@@ -840,14 +982,25 @@ private:
     void finishUploadCommands(VkCommandBuffer commandBuffer) const;
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
     void destroyImageResource(unsigned int id) const;
+    // Hands one GPU object to the retirement queue with the submission count it becomes safe at.
+    void retire(RetiredResource resource) const;
+    // Destroys everything the GPU is provably finished with. Called once per frame, right after
+    // the fence wait that is the proof.
+    void collectRetiredResources() const;
+    // Destroys the whole queue regardless of readyAt. Only valid immediately after a device idle.
+    void drainRetiredResources() const;
+    void releaseShaderObject(unsigned int shaderId);
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
+    [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
 
-VulkanRenderer::VulkanRenderer(spdlog::logger& logger, IWindow& window,
-                               RenderableEntityService& renderableEntityService,
+VulkanRenderer::VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
+                               IVulkanSurfaceSource& surfaceSource, RenderableEntityService& renderableEntityService,
                                SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
+    diagnostics(diagnostics),
     window(window),
+    surfaceSource(surfaceSource),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
     sceneManagerService(sceneManagerService)
@@ -861,16 +1014,18 @@ VulkanRenderer::~VulkanRenderer()
         vkDeviceWaitIdle(device);
     }
 
+    // The queue holds objects whose readyAt has not arrived and never will, because no further
+    // frame will be submitted. The device idle above is the stronger guarantee they were waiting
+    // for, so they go now — before the descriptor pool and the allocator they belong to.
+    drainRetiredResources();
+
     for (const auto& [id, shader] : shaderObjects)
     {
         if (shader.swapchainTargetPipeline != VK_NULL_HANDLE)
         {
             vkDestroyPipeline(device, shader.swapchainTargetPipeline, nullptr);
         }
-        if (shader.offscreenTargetPipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(device, shader.offscreenTargetPipeline, nullptr);
-        }
+
         if (shader.vertexModule != VK_NULL_HANDLE)
         {
             vkDestroyShaderModule(device, shader.vertexModule, nullptr);
@@ -882,6 +1037,11 @@ VulkanRenderer::~VulkanRenderer()
     }
 
     for (const auto& [key, pipeline] : scenePipelines)
+    {
+        vkDestroyPipeline(device, pipeline, nullptr);
+    }
+
+    for (const auto& [key, pipeline] : offscreenPipelines)
     {
         vkDestroyPipeline(device, pipeline, nullptr);
     }
@@ -1003,28 +1163,29 @@ VulkanRenderer::~VulkanRenderer()
     }
 }
 
-bool VulkanRenderer::init()
+std::expected<void, std::string> VulkanRenderer::init()
 {
+    // The bring-up steps report through `ensure`, which throws: converting here is what turns
+    // "this machine has no usable Vulkan device" into something the composition root decides
+    // about, rather than an exception escaping a constructor body.
     try
     {
         requestedExtent = VkExtent2D{static_cast<uint32_t>(std::max(window.state().windowWidth, 0)),
                                      static_cast<uint32_t>(std::max(window.state().windowHeight, 0))};
         createInstance();
         createDebugMessenger();
-        surface = window.generateVulkanSurface(instance);
+        surface = surfaceSource.generateVulkanSurface(instance);
         selectPhysicalDevice();
         createDevice();
         createAllocator();
         createSwapchain();
         createFrameResources();
         createDescriptorInfrastructure();
-        return true;
+        return {};
     }
     catch (const std::exception& exception)
     {
-        // Engine ignores the return value, so an unusable backend must not limp on.
-        logger.error("Vulkan renderer initialisation aborted: {}", exception.what());
-        throw;
+        return std::unexpected(exception.what());
     }
 }
 
@@ -1042,7 +1203,7 @@ void VulkanRenderer::createInstance()
     validationLayerEnabled = std::ranges::any_of(availableLayers, [](const VkLayerProperties& layer)
                                                  { return std::strcmp(layer.layerName, validationLayerName) == 0; });
 
-    const auto requiredWindowExtensions = window.getRequiredVulkanWindowExtensions();
+    const auto requiredWindowExtensions = surfaceSource.getRequiredVulkanWindowExtensions();
     // The extension list pointer is GLFW-owned static storage; copy before appending.
     std::vector<const char*> extensions(requiredWindowExtensions.extensions,
                                         requiredWindowExtensions.extensions + requiredWindowExtensions.count);
@@ -1132,6 +1293,7 @@ void VulkanRenderer::selectPhysicalDevice()
 
     VkPhysicalDevice chosen = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties chosenProperties{};
+    VkBool32 chosenSamplerAnisotropy = VK_FALSE;
     uint32_t chosenGraphicsFamily = 0;
     uint32_t chosenPresentFamily = 0;
 
@@ -1220,6 +1382,9 @@ void VulkanRenderer::selectPhysicalDevice()
         {
             chosen = candidate;
             chosenProperties = properties;
+            // Optional, not a selection criterion: GL falls back to 1x anisotropy on a driver
+            // that does not advertise the extension, and so does this backend.
+            chosenSamplerAnisotropy = features2.features.samplerAnisotropy;
             chosenGraphicsFamily = foundGraphicsFamily.value();
             chosenPresentFamily = foundPresentFamily.value();
         }
@@ -1233,12 +1398,16 @@ void VulkanRenderer::selectPhysicalDevice()
 
     physicalDevice = chosen;
     deviceLimits = chosenProperties.limits;
+    samplerAnisotropySupported = chosenSamplerAnisotropy == VK_TRUE;
     graphicsQueueFamily = chosenGraphicsFamily;
     presentQueueFamily = chosenPresentFamily;
 
-    logger.info("Vulkan device selected: {} ({}, api {}.{}.{})", std::string_view(chosenProperties.deviceName),
-                describeDeviceType(chosenProperties.deviceType), VK_API_VERSION_MAJOR(chosenProperties.apiVersion),
-                VK_API_VERSION_MINOR(chosenProperties.apiVersion), VK_API_VERSION_PATCH(chosenProperties.apiVersion));
+    // GL falls back to 1x where the anisotropy limit query yields it; so does this.
+    const auto anisotropy = samplerAnisotropySupported ? deviceLimits.maxSamplerAnisotropy : 1.0f;
+    logger.info("Vulkan device selected: {} ({}, api {}.{}.{}, anisotropic filtering {:g}x)",
+                std::string_view(chosenProperties.deviceName), describeDeviceType(chosenProperties.deviceType),
+                VK_API_VERSION_MAJOR(chosenProperties.apiVersion), VK_API_VERSION_MINOR(chosenProperties.apiVersion),
+                VK_API_VERSION_PATCH(chosenProperties.apiVersion), anisotropy);
 }
 
 void VulkanRenderer::createDevice()
@@ -1270,9 +1439,15 @@ void VulkanRenderer::createDevice()
 
     const std::array deviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
+    // GL applies GL_TEXTURE_MAX_ANISOTROPY to every model texture it uploads; the sampler
+    // path below can only ask for it if the feature is switched on here.
+    VkPhysicalDeviceFeatures features{};
+    features.samplerAnisotropy = samplerAnisotropySupported ? VK_TRUE : VK_FALSE;
+
     VkDeviceCreateInfo deviceCreateInfo{};
     deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceCreateInfo.pNext = &features13;
+    deviceCreateInfo.pEnabledFeatures = &features;
     deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
     deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
     deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
@@ -1490,19 +1665,23 @@ void VulkanRenderer::createDescriptorInfrastructure()
         return layout;
     };
 
-    // Scene set 0: FrameData UBO, read by both stages (vulkan-abi.md).
-    const std::array frameBindings = {VkDescriptorSetLayoutBinding{
-        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    // Scene set 0: FrameData UBO, read by both stages (vulkan-abi.md). Dynamic-offset like
+    // set 2, because the frame holds one of these per view rather than one in total.
+    const std::array frameBindings = {
+        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+                                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     frameDataSetLayout = makeSetLayout(frameBindings);
 
-    // Scene set 1: MaterialData UBO + sampler2D bindings 1-5 + samplerCube binding 6.
-    std::array<VkDescriptorSetLayoutBinding, 7> materialBindings{};
+    // Scene set 1: MaterialData UBO at binding 0, then one sampler per material texture slot
+    // at the binding RenderContract assigns it.
+    std::array<VkDescriptorSetLayoutBinding, materialTextureSlotCount + 1> materialBindings{};
     materialBindings[0] =
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    for (uint32_t binding = 1; binding <= 6; binding++)
+    for (uint32_t slot = 0; slot < materialTextureSlotCount; slot++)
     {
-        materialBindings[binding] = VkDescriptorSetLayoutBinding{binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                                                 VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        const auto binding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        materialBindings[slot + 1] = VkDescriptorSetLayoutBinding{binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                                                  VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     }
     materialSetLayout = makeSetLayout(materialBindings);
 
@@ -1568,11 +1747,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
 
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
     drawDataStride = (sizeof(DrawDataUbo) + alignment - 1) / alignment * alignment;
+    frameDataStride = (sizeof(FrameDataUbo) + alignment - 1) / alignment * alignment;
 
     for (auto& frame : frames)
     {
-        createHostVisibleUniformBuffer(sizeof(FrameDataUbo), frame.frameDataBuffer, frame.frameDataAllocation,
-                                       frame.frameDataMapped);
+        createHostVisibleUniformBuffer(frameDataStride * frameDataRingSlots, frame.frameDataBuffer,
+                                       frame.frameDataAllocation, frame.frameDataMapped);
         createHostVisibleUniformBuffer(drawDataStride * drawDataRingSlots, frame.drawDataBuffer,
                                        frame.drawDataAllocation, frame.drawDataMapped);
 
@@ -1587,6 +1767,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         frame.frameDataSet = sets[0];
         frame.drawDataSet = sets[1];
 
+        // Dynamic UBO range is one FrameData; the bound offset walks the ring per view.
         const VkDescriptorBufferInfo frameDataInfo{frame.frameDataBuffer, 0, sizeof(FrameDataUbo)};
         // Dynamic UBO range is one DrawData; the bound offset walks the ring per draw.
         const VkDescriptorBufferInfo drawDataInfo{frame.drawDataBuffer, 0, sizeof(DrawDataUbo)};
@@ -1596,7 +1777,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         writes[0].dstSet = frame.frameDataSet;
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[0].pBufferInfo = &frameDataInfo;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1].dstSet = frame.drawDataSet;
@@ -1629,6 +1810,9 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
     }
 
     ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+    // The idle is a stronger guarantee than any readyAt the queue is holding out for, and a
+    // resize is the one place a lot of images are retired at once.
+    drainRetiredResources();
     destroySwapchain();
     createSwapchain();
     recreateNeeded = false;
@@ -1636,11 +1820,6 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
 
 bool VulkanRenderer::beginFrame()
 {
-    if (frameOpen)
-    {
-        return true;
-    }
-
     recreateSwapchainIfNeeded();
     if (swapchain == VK_NULL_HANDLE)
     {
@@ -1650,9 +1829,15 @@ bool VulkanRenderer::beginFrame()
     auto& frame = frames[frameIndex];
     ensure(vkWaitForFences(device, 1, &frame.inFlight, VK_TRUE, waitForever), "vkWaitForFences");
 
-    // The fence guarantees the GPU is done with this slot's DrawData ring; reset it for
-    // the draws recorded this frame.
+    // That fence is the only proof of completion this backend has, so it is where deferred
+    // destruction happens. See retire() for what the arithmetic means.
+    collectRetiredResources();
+
+    // The fence guarantees the GPU is done with this slot's uniform rings; reset both for
+    // the views and draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
+    frame.frameDataSlotsUsed = 0;
+    frame.frameDataOffset = 0;
 
     const auto acquireResult =
         vkAcquireNextImageKHR(device, swapchain, waitForever, frame.imageAvailable, VK_NULL_HANDLE, &currentImageIndex);
@@ -1700,8 +1885,8 @@ void VulkanRenderer::recordClearOnlySwapchainPass()
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // Matches the GL path's glClearColor(1, 1, 1, 1).
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -1716,7 +1901,12 @@ void VulkanRenderer::recordClearOnlySwapchainPass()
     swapchainPassRecorded = true;
 }
 
-bool VulkanRenderer::endFrame(const VkBuffer captureBuffer)
+void VulkanRenderer::endFrame()
+{
+    static_cast<void>(submitAndPresent(VK_NULL_HANDLE));
+}
+
+bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
 {
     if (!frameOpen)
     {
@@ -1806,53 +1996,108 @@ bool VulkanRenderer::endFrame(const VkBuffer captureBuffer)
     }
 
     frameOpen = false;
+    submittedFrames++;
     frameIndex = (frameIndex + 1) % framesInFlight;
     return true;
 }
 
-void VulkanRenderer::draw(Scene& scene, Camera& camera, float delta)
+// The queue's whole contract, in one place.
+//
+// Submissions are numbered by submittedFrames: the submission being recorded right now, if a
+// frame is open, will be number `submittedFrames`, and the last one already issued was
+// `submittedFrames - 1`. Submission number n signals frames[n % framesInFlight].inFlight, and
+// beginFrame for submission number n + framesInFlight waits on that same fence before recording
+// anything. So by the time submittedFrames has reached some value C, every submission numbered
+// C - framesInFlight or lower has completed on the GPU.
+//
+// An object being retired can be named by any submission already issued, and by the open one if
+// there is a frame open. It is therefore safe once submission `submittedFrames - 1` (or
+// `submittedFrames`, with a frame open) has completed, which by the rule above has happened once
+// submittedFrames reaches that number + framesInFlight. readyAt is set one higher than the strict
+// bound, which costs one extra frame of residency and removes the off-by-one from the argument.
+void VulkanRenderer::retire(RetiredResource resource) const
 {
-    // draw() opens the frame; the presenter's fullscreen pass closes it. A frame still
-    // open here belongs to a step that never presented (no presenter, or a second camera),
-    // so it is finished as recorded before this one starts.
-    if (frameOpen)
-    {
-        endFrame(VK_NULL_HANDLE);
-    }
+    resource.readyAt = submittedFrames + framesInFlight + (frameOpen ? 1 : 0);
+    retiredResources.push_back(resource);
+}
 
-    if (!beginFrame())
+void VulkanRenderer::collectRetiredResources() const
+{
+    if (retiredResources.empty())
     {
         return;
     }
 
+    auto stillInUse = std::vector<RetiredResource>();
+
+    for (const auto& resource : retiredResources)
+    {
+        if (resource.readyAt > submittedFrames)
+        {
+            stillInUse.push_back(resource);
+            continue;
+        }
+
+        if (resource.descriptorSet != VK_NULL_HANDLE)
+        {
+            vkFreeDescriptorSets(device, descriptorPool, 1, &resource.descriptorSet);
+        }
+        if (resource.sampler != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(device, resource.sampler, nullptr);
+        }
+        if (resource.view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, resource.view, nullptr);
+        }
+        if (resource.image != VK_NULL_HANDLE)
+        {
+            vmaDestroyImage(allocator, resource.image, resource.imageAllocation);
+        }
+        if (resource.buffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, resource.buffer, resource.bufferAllocation);
+        }
+        if (resource.pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device, resource.pipeline, nullptr);
+        }
+        if (resource.shaderModule != VK_NULL_HANDLE)
+        {
+            vkDestroyShaderModule(device, resource.shaderModule, nullptr);
+        }
+    }
+
+    retiredResources = std::move(stillInUse);
+}
+
+void VulkanRenderer::drainRetiredResources() const
+{
+    for (auto& resource : retiredResources)
+    {
+        resource.readyAt = 0;
+    }
+
+    collectRetiredResources();
+}
+
+// One view into the open frame. Every view records into the same command buffer, so N
+// cameras produce N scene passes and still reach the screen through the single present
+// endFrame issues.
+void VulkanRenderer::recordView(Scene& scene, Camera& camera, const float delta)
+{
     recordScenePass(scene, camera, delta);
 }
 
-void VulkanRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
-                                        const Resource<FboAttachment>& attachmentKey) const
+void VulkanRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
 {
-    // IRenderer declares this const for the GL backend, where a fullscreen quad is a pure
-    // draw. On Vulkan it is the frame's closing pass: it records, submits and presents.
-    // The renderer is never held by const reference (Engine owns it through a non-const
-    // unique_ptr, PresenterService through a non-const reference), so the cast is defined.
-    const_cast<VulkanRenderer*>(this)->presentAndCloseFrame(shaderKey, attachmentKey);
-}
+    const auto* shader = memoryStorageService.shaders.find(shaderKey);
+    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
 
-void VulkanRenderer::presentAndCloseFrame(const Resource<Shader>& shaderKey,
-                                          const Resource<FboAttachment>& attachmentKey)
-{
-    if (!beginFrame())
+    if (shader != nullptr && attachment != nullptr && attachment->gpuResourceId.has_value())
     {
-        return;
+        recordPresentPass(shader->gpuResourceId, attachment->gpuResourceId.value());
     }
-
-    const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-    if (attachment.gpuResourceId.has_value())
-    {
-        recordPresentPass(shaderKey->gpuResourceId, attachment.gpuResourceId.value());
-    }
-
-    endFrame(VK_NULL_HANDLE);
 }
 
 bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsigned int attachmentImageId)
@@ -1861,13 +2106,14 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
     if (shader == shaderObjects.end() || shader->second.swapchainTargetPipeline == VK_NULL_HANDLE ||
         !imageResources.contains(attachmentImageId))
     {
-        if (!fullscreenPipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan presenter pass skipped: shader {} has no swapchain pipeline or attachment image {} is "
-                        "unknown; presenting the clear colour",
-                        shaderId, attachmentImageId);
-            fullscreenPipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::PresentPassSkipped,
+                           [&]
+                           {
+                               return "shader object " + std::to_string(shaderId) +
+                                      " has no swapchain pipeline, or attachment image " +
+                                      std::to_string(attachmentImageId) + " is unknown";
+                           });
+
         return false;
     }
 
@@ -1875,6 +2121,10 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
     // must leave the image untouched so the clear fallback can still take it.
     if (attachmentSet(attachmentImageId) == VK_NULL_HANDLE)
     {
+        diagnostics.record(
+            FrameDiagnostic::PresentPassSkipped,
+            [&] { return "attachment image " + std::to_string(attachmentImageId) + " has no descriptor set"; });
+
         return false;
     }
 
@@ -1920,56 +2170,91 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     sceneEnvironmentImageId.reset();
     if (scene.environment.has_value())
     {
-        const auto environmentImageId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
-        if (imageResources.contains(environmentImageId))
+        if (const auto* environment = memoryStorageService.cubeMaps.find(scene.environment.value());
+            environment != nullptr && imageResources.contains(environment->gpuResourceId))
         {
-            sceneEnvironmentImageId = environmentImageId;
+            sceneEnvironmentImageId = environment->gpuResourceId;
         }
     }
 
     std::optional<unsigned int> colorImageId;
     std::optional<unsigned int> depthImageId;
-    if (camera.output.has_value())
+    const auto* outputBuffer =
+        camera.output.has_value() ? memoryStorageService.frameBuffers.find(camera.output.value()) : nullptr;
+    if (outputBuffer != nullptr)
     {
-        const auto& outputBuffer = memoryStorageService.frameBuffers.get(camera.output.value());
-        for (const auto& attachmentKey : outputBuffer.attachments)
+        for (const auto& attachmentKey : outputBuffer->attachments)
         {
-            const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-            if (!attachment.gpuResourceId.has_value())
+            const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachment == nullptr || !attachment->gpuResourceId.has_value())
             {
                 continue;
             }
 
-            if (attachment.type == FboAttachmentType::Color && !colorImageId.has_value())
+            if (attachment->type == FboAttachmentType::Color && !colorImageId.has_value())
             {
-                colorImageId = attachment.gpuResourceId;
+                colorImageId = attachment->gpuResourceId;
             }
-            else if (attachment.type == FboAttachmentType::Depth && !depthImageId.has_value())
+            else if (attachment->type == FboAttachmentType::Depth && !depthImageId.has_value())
             {
-                depthImageId = attachment.gpuResourceId;
+                depthImageId = attachment->gpuResourceId;
             }
         }
     }
 
     if (!colorImageId.has_value() || !imageResources.contains(colorImageId.value()))
     {
-        if (!missingCameraOutputLogged)
-        {
-            logger.warn("Camera output framebuffer has no colour image; the scene pass is skipped this session");
-            missingCameraOutputLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::MissingCameraOutput,
+                           [] { return std::string("the scene pass records nothing"); });
+
         return;
     }
 
-    // Values mirror the GL renderer's hardcoded per-shader uploads (OpenGLRenderer::draw).
     FrameDataUbo frameData{};
     frameData.viewMatrix = camera.modelViewMatrix;
     frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
-    frameData.lightPosition = glm::vec4(glm::vec3(0.0f, 350.0f, 350.0f), 1.0f);
-    frameData.lightDiffuse = glm::vec4(glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5), 0.0f);
-    frameData.lightSpecular = glm::vec4(glm::vec3(1.2859, 1.2973, 1.3), 0.0f);
-    frameData.lightAmbientAttenuation = glm::vec4(glm::vec3(0.29859, 0.29973, 0.3), 1.0f);
-    std::memcpy(frame.frameDataMapped, &frameData, sizeof(frameData));
+
+    // A scene with no lights uploads lightCount 0: both shader loops then contribute nothing
+    // and the ambient floor is zero, leaving the image-based term as the only lighting. That
+    // is a legitimate scene, not a failure, so nothing is logged.
+    auto uploadedLights = 0u;
+    auto declaredLights = 0u;
+    for (const auto& light : scene.lights)
+    {
+        declaredLights++;
+
+        if (uploadedLights >= maxLights)
+        {
+            continue;
+        }
+
+        frameData.lights[uploadedLights] =
+            LightUbo{glm::vec4(light.position, 1.0f), glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
+                     glm::vec4(light.ambient, light.attenuation)};
+        uploadedLights++;
+    }
+    frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
+
+    if (declaredLights > maxLights)
+    {
+        diagnostics.record(FrameDiagnostic::LightLimitExceeded,
+                           [&]
+                           {
+                               return "Vulkan frame data carries " + std::to_string(maxLights) + " of the " +
+                                      std::to_string(declaredLights) + " declared";
+                           });
+    }
+
+    // Its own slot in the ring, kept until the frame is submitted: the next view records into
+    // the same command buffer, and a shared slot would have its camera shade this one's draws.
+    const auto frameDataSlot = allocateFrameDataSlot();
+    if (!frameDataSlot.has_value())
+    {
+        return;
+    }
+
+    frame.frameDataOffset = frameDataSlot.value();
+    std::memcpy(static_cast<char*>(frame.frameDataMapped) + frame.frameDataOffset, &frameData, sizeof(frameData));
 
     transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (depthImageId.has_value())
@@ -1988,8 +2273,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // GL clears the camera FBO with glClearColor(1, 1, 1, 1) and depth 1.
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1997,9 +2282,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
+    // A camera with no depth attachment renders depth-less, which the pipeline has to be told.
+    auto depthFormat = VK_FORMAT_UNDEFINED;
     if (depthImageId.has_value())
     {
-        depthAttachment.imageView = imageResources.at(depthImageId.value()).view;
+        const auto& depthImage = imageResources.at(depthImageId.value());
+        depthAttachment.imageView = depthImage.view;
+        depthFormat = depthImage.format;
     }
 
     VkRenderingInfo renderingInfo{};
@@ -2030,58 +2319,101 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     const VkRect2D scissor{VkOffset2D{0, 0}, extent};
     vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
 
+    // Same hoisting rule as the GL pass: every handle is resolved at the outermost loop where it
+    // is constant and read through for the nest below, so the pass costs
+    // O(entities + meshes + primitives) storage lookups rather than one per field. A handle that
+    // has gone stale — a model unloaded while its renderable is still in the scene — is skipped
+    // here, not chased into a recycled slot.
     auto recordedDraws = 0u;
     for (auto& entity : scene.models)
     {
-        auto& model = entity.model;
-
-        for (auto& mesh : entity.meshes)
+        const auto* model = memoryStorageService.models.find(entity.model);
+        const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
+        if (model == nullptr || instanceShader == nullptr)
         {
-            if (!mesh.mesh->gpuResourceId.has_value())
-            {
-                upload(model);
-            }
+            diagnostics.record(FrameDiagnostic::StaleModelHandle,
+                               [&] { return "model slot " + std::to_string(entity.model.index); });
 
-            if (!mesh.mesh->gpuResourceId.has_value())
+            continue;
+        }
+
+        // The instance's shader, not the material's: materials live in shared storage, so two
+        // renderables built from one model would otherwise restyle each other.
+        const auto shaderId = instanceShader->gpuResourceId;
+
+        // Around the entity's submission, which on this backend is where its commands are
+        // recorded: the same point in the frame GL calls them at.
+        if (entity.beforeDraw.has_value())
+        {
+            (*entity.beforeDraw)();
+        }
+
+        for (auto& renderableMesh : entity.meshes)
+        {
+            const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
+            if (mesh == nullptr)
             {
-                if (!missingMeshUploadLogged)
-                {
-                    logger.warn("Skipping mesh without a GPU resource: {}", mesh.mesh->name);
-                    missingMeshUploadLogged = true;
-                }
+                diagnostics.record(FrameDiagnostic::StaleMeshHandle,
+                                   [&] { return "mesh slot " + std::to_string(renderableMesh.mesh.index); });
 
                 continue;
             }
 
-            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
-            const auto joints = renderableEntityService.joints(mesh, delta);
+            if (!mesh->gpuResourceId.has_value())
+            {
+                // upload() writes through mutate(), in place, so this borrow still names the same
+                // element afterwards — carrying the ids the upload just produced.
+                upload(entity.model);
+            }
 
-            for (const auto& primitive : mesh.mesh->meshPrimitives)
+            if (!mesh->gpuResourceId.has_value())
+            {
+                diagnostics.record(FrameDiagnostic::MeshNotUploaded, [&] { return "mesh " + mesh->name; });
+
+                continue;
+            }
+
+            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix;
+            // Bound by reference into the mesh's palette buffer; copying undoes the per-frame
+            // allocation the service avoids.
+            const auto& joints = renderableEntityService.joints(renderableMesh, delta);
+
+            for (const auto& primitive : mesh->meshPrimitives)
             {
                 if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
-                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value())
+                const auto* material = primitive.material.has_value()
+                                           ? memoryStorageService.materials.find(primitive.material.value())
+                                           : nullptr;
+
+                if (material == nullptr || !material->shader.has_value())
                 {
-                    if (!missingMaterialLogged)
-                    {
-                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh.mesh->name);
-                        missingMaterialLogged = true;
-                    }
+                    diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial, [&] { return "mesh " + mesh->name; });
 
                     continue;
                 }
 
                 if (!primitive.gpuVao.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
-                recordDraw(primitive, entityModelMatrix, camera, joints);
+                recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
+                           joints, colorImage.format, depthFormat);
                 recordedDraws++;
             }
+        }
+
+        if (entity.afterDraw.has_value())
+        {
+            (*entity.afterDraw)();
         }
     }
 
@@ -2091,45 +2423,72 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
     for (const auto& postProcessKey : camera.postProcesses)
     {
-        const auto& postProcess = memoryStorageService.postProcesses.get(postProcessKey);
+        const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+        const auto* postProcessShader =
+            postProcess == nullptr ? nullptr : memoryStorageService.shaders.find(postProcess->shader);
+        if (postProcess == nullptr || postProcessShader == nullptr)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "post-process slot " + std::to_string(postProcessKey.index) +
+                                          " or its shader is no longer loaded";
+                               });
+
+            continue;
+        }
 
         // GL binds every input to units 0..n; the Vulkan fullscreen layout carries exactly
         // one sampler (vulkan-abi.md), and the HDR shader declares only binding 0, so the
         // camera depth attachment GL also binds is deliberately left unbound.
         std::optional<unsigned int> sourceImageId;
-        if (!postProcess.inputs.empty())
+        if (!postProcess->inputs.empty())
         {
-            sourceImageId = memoryStorageService.bufferAttachments.get(postProcess.inputs.front()).gpuResourceId;
+            if (const auto* input = memoryStorageService.bufferAttachments.find(postProcess->inputs.front());
+                input != nullptr)
+            {
+                sourceImageId = input->gpuResourceId;
+            }
         }
 
         std::optional<unsigned int> targetImageId;
-        if (postProcess.output.has_value())
+        if (postProcess->output.has_value())
         {
-            const auto& targetBuffer = memoryStorageService.frameBuffers.get(postProcess.output.value());
-            for (const auto& attachmentKey : targetBuffer.attachments)
+            const auto* targetBuffer = memoryStorageService.frameBuffers.find(postProcess->output.value());
+            if (targetBuffer != nullptr)
             {
-                const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-                if (attachment.type == FboAttachmentType::Color && attachment.gpuResourceId.has_value())
+                for (const auto& attachmentKey : targetBuffer->attachments)
                 {
-                    targetImageId = attachment.gpuResourceId;
-                    break;
+                    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+                    if (attachment != nullptr && attachment->type == FboAttachmentType::Color &&
+                        attachment->gpuResourceId.has_value())
+                    {
+                        targetImageId = attachment->gpuResourceId;
+                        break;
+                    }
                 }
             }
         }
 
-        const auto shader = shaderObjects.find(postProcess.shader->gpuResourceId);
+        const auto shader = shaderObjects.find(postProcessShader->gpuResourceId);
         const auto usable = sourceImageId.has_value() && targetImageId.has_value() &&
                             imageResources.contains(sourceImageId.value()) &&
                             imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
-                            shader->second.offscreenTargetPipeline != VK_NULL_HANDLE;
-        if (!usable)
+                            shader->second.fullscreen;
+        // The pipeline is built against the target attachment's own format, so a post-process
+        // buffer created with any FboAttachment::internalFormat renders rather than mismatching
+        // a hardcoded one.
+        const auto pipeline = usable ? offscreenPipeline(postProcessShader->gpuResourceId,
+                                                         imageResources.at(targetImageId.value()).format)
+                                     : VK_NULL_HANDLE;
+        if (pipeline == VK_NULL_HANDLE)
         {
-            if (!missingPostProcessTargetLogged)
-            {
-                logger.warn("Vulkan post-process pass skipped: it needs an input attachment, an RGBA16F output "
-                            "attachment and a fullscreen shader");
-                missingPostProcessTargetLogged = true;
-            }
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "shader object " + std::to_string(postProcessShader->gpuResourceId) +
+                                          " has no fullscreen pipeline for this target";
+                               });
 
             continue;
         }
@@ -2138,7 +2497,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
         const auto& targetImage = imageResources.at(targetImageId.value());
         recordFullScreenPass(sourceImageId.value(), targetImage.view, VkExtent2D{targetImage.width, targetImage.height},
-                             shader->second.offscreenTargetPipeline);
+                             pipeline);
 
         transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
@@ -2153,45 +2512,65 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
 }
 
-void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix,
-                                const Camera& camera, const std::vector<glm::mat4>& joints)
+// The material arrives already resolved — both the handle, which keys the descriptor set cache,
+// and the element the caller borrowed to decide this draw was worth recording.
+void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey,
+                                const Material& material, const unsigned int shaderId,
+                                const glm::mat4& entityModelMatrix, const Camera& camera,
+                                const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
+                                const VkFormat depthFormat)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
     {
+        // makePrimitiveBinding already counted *why* the binding is not drawable (a topology or
+        // index type this backend has no equivalent for, a buffer that never uploaded); this is
+        // the draw that consequence costs.
+        diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded,
+                           [&] { return "primitive binding " + std::to_string(primitive.gpuVao.value()); });
+
         return;
     }
 
-    const auto material = primitive.material.value();
-    const auto shaderId = material->shader.value()->gpuResourceId;
-    const VkCullModeFlags cullMode = material->opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    const VkCullModeFlags cullMode = material.opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
-    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode);
+    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
     if (pipeline == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&] { return "shader object " + std::to_string(shaderId); });
+
         return;
     }
 
     // GL's bindMaterial falls back to the scene environment when the material has none.
     auto environmentImageId = sceneEnvironmentImageId.value_or(0u);
-    if (material->environment.has_value())
+    if (material.environment.has_value())
     {
-        environmentImageId = memoryStorageService.cubeMaps.get(material->environment.value()).gpuResourceId;
+        if (const auto* environment = memoryStorageService.cubeMaps.find(material.environment.value());
+            environment != nullptr)
+        {
+            environmentImageId = environment->gpuResourceId;
+        }
     }
     if (!imageResources.contains(environmentImageId))
     {
         environmentImageId = dummyCubeMap();
     }
 
-    const auto set = materialSet(material, environmentImageId);
+    const auto set = materialSet(materialKey, environmentImageId);
     if (set == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [&] { return "material slot " + std::to_string(materialKey.index); });
+
         return;
     }
 
     const auto slot = allocateDrawDataSlot();
     if (!slot.has_value())
     {
+        // allocateDrawDataSlot counted the exhaustion; this draw is what it costs.
         return;
     }
 
@@ -2208,12 +2587,12 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4&
     auto jointCount = joints.size();
     if (jointCount > maxJoints)
     {
-        if (!jointLimitLogged)
-        {
-            logger.warn("Vulkan draw data carries at most {} joints; {} were supplied and the rest are ignored",
-                        maxJoints, jointCount);
-            jointLimitLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::JointLimitExceeded,
+                           [&]
+                           {
+                               return "Vulkan draw data carries " + std::to_string(maxJoints) + " of the " +
+                                      std::to_string(joints.size()) + " supplied";
+                           });
 
         jointCount = maxJoints;
     }
@@ -2237,9 +2616,13 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4&
                          bound->second.indexType);
 
     const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet};
-    const auto dynamicOffset = static_cast<uint32_t>(slot.value());
+    // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then
+    // set 2's draw slot.
+    const std::array dynamicOffsets = {static_cast<uint32_t>(frame.frameDataOffset),
+                                       static_cast<uint32_t>(slot.value())};
     vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout, 0,
-                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 1, &dynamicOffset);
+                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
+                            static_cast<uint32_t>(dynamicOffsets.size()), dynamicOffsets.data());
 
     vkCmdDrawIndexed(frame.commandBuffer, bound->second.indexCount, 1, 0, 0, 0);
 }
@@ -2250,6 +2633,8 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     const auto set = attachmentSet(sourceImageId);
     if (set == VK_NULL_HANDLE)
     {
+        // attachmentSet counted the pool exhaustion if that is what it was; an unknown image id
+        // is the caller's, and both leave the target untouched.
         return false;
     }
 
@@ -2263,7 +2648,8 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     // GL's drawFullScreenQuad clears before the quad; the quad covers the target anyway.
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -2395,12 +2781,8 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     const auto topology = primitiveTopology(primitive.mode);
     if (!topology.has_value())
     {
-        if (!unsupportedTopologyLogged)
-        {
-            logger.warn("Vulkan has no topology for glTF draw mode {}; primitives using it are not drawn",
-                        primitive.mode);
-            unsupportedTopologyLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::UnsupportedTopology,
+                           [&] { return "glTF draw mode " + std::to_string(primitive.mode); });
 
         return binding;
     }
@@ -2409,13 +2791,12 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     const auto indices = indexType(primitive.componentType);
     if (!indices.has_value())
     {
-        if (!unsupportedIndexTypeLogged)
-        {
-            logger.warn("Vulkan index component type 0x{:x} is outside this backend's uint16/uint32 support; "
-                        "primitives using it are not drawn",
-                        primitive.componentType);
-            unsupportedIndexTypeLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::UnsupportedIndexType,
+                           [&]
+                           {
+                               return "component type " + std::to_string(primitive.componentType) +
+                                      ", outside this backend's uint16/uint32 support";
+                           });
 
         return binding;
     }
@@ -2441,6 +2822,9 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     binding.indexBuffer = bufferHandle(primitive.meshBufferIndex);
     if (binding.indexBuffer == VK_NULL_HANDLE)
     {
+        diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded,
+                           [&] { return "index buffer view " + std::to_string(primitive.meshBufferIndex); });
+
         return binding;
     }
 
@@ -2449,6 +2833,9 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
         const auto handle = bufferHandle(bufferBind.bufferIndex);
         if (handle == VK_NULL_HANDLE)
         {
+            diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded,
+                               [&] { return "vertex buffer view " + std::to_string(bufferBind.bufferIndex); });
+
             return binding;
         }
 
@@ -2469,106 +2856,146 @@ VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Mode
     return binding;
 }
 
+// The whole upload runs inside one mutate() of the model, with a nested mutate() per mesh: the
+// only shape that writes the ids into the elements the draw path reads without copying a
+// multi-megabyte model out and back, or const_casting the storage's own reference. Lock nesting
+// is models -> meshes and models -> materials -> textures, never back into the same storage.
 void VulkanRenderer::upload(const Resource<Model>& modelKey)
 {
-    auto model = memoryStorageService.models.get(modelKey);
     auto uploadedBuffers = 0u;
+    auto meshCount = size_t{0};
+    auto materialCount = size_t{0};
 
-    for (const auto& meshKey : model.meshes)
-    {
-        auto mesh = memoryStorageService.meshes.get(meshKey);
+    memoryStorageService.models.mutate(modelKey,
+                                       [&](Model& model)
+                                       {
+                                           meshCount = model.meshes.size();
+                                           materialCount = model.materials.size();
 
-        if (mesh.gpuResourceId.has_value())
-        {
-            continue;
-        }
+                                           for (const auto& meshKey : model.meshes)
+                                           {
+                                               memoryStorageService.meshes.mutate(
+                                                   meshKey,
+                                                   [&](Mesh& mesh)
+                                                   {
+                                                       if (mesh.gpuResourceId.has_value())
+                                                       {
+                                                           return;
+                                                       }
 
-        for (auto& buffer : model.meshBuffers)
-        {
-            if (buffer.gpuId.has_value())
-            {
-                continue;
-            }
+                                                       for (auto& buffer : model.meshBuffers)
+                                                       {
+                                                           if (buffer.gpuId.has_value())
+                                                           {
+                                                               continue;
+                                                           }
 
-            buffer.gpuId = uploadMeshBuffer(buffer);
-            buffer.data.clear();
-            buffer.data.shrink_to_fit();
-            uploadedBuffers++;
-        }
+                                                           buffer.gpuId = uploadMeshBuffer(buffer);
+                                                           buffer.data.clear();
+                                                           buffer.data.shrink_to_fit();
+                                                           uploadedBuffers++;
+                                                       }
 
-        memoryStorageService.models.update(modelKey, model);
+                                                       // draw()'s "already uploaded" sentinel. Nothing looks the id up
+                                                       // — each primitive owns its binding in gpuVao — but it has to be
+                                                       // assigned outside the loop below: GLTFService drops non-indexed
+                                                       // primitives, so meshPrimitives can be empty, and an unset
+                                                       // sentinel makes draw() re-enter upload() on every frame.
+                                                       auto uploadedSentinel = 0u;
 
-        for (auto& primitive : mesh.meshPrimitives)
-        {
-            const auto id = nextResourceId++;
-            primitiveBindings.emplace(id, makePrimitiveBinding(model, primitive));
-            primitive.gpuVao = id;
-            mesh.gpuResourceId = id;
-        }
+                                                       for (auto& primitive : mesh.meshPrimitives)
+                                                       {
+                                                           const auto id = nextResourceId++;
+                                                           primitiveBindings.emplace(
+                                                               id, makePrimitiveBinding(model, primitive));
+                                                           primitive.gpuVao = id;
+                                                           uploadedSentinel = id;
+                                                       }
 
-        memoryStorageService.meshes.update(meshKey, mesh);
-    }
+                                                       mesh.gpuResourceId = uploadedSentinel;
+                                                   });
+                                           }
 
-    for (const auto& materialKey : model.materials)
-    {
-        uploadMaterialTextures(materialKey);
-    }
+                                           for (const auto& materialKey : model.materials)
+                                           {
+                                               uploadMaterialTextures(materialKey);
+                                           }
+                                       });
 
-    logger.info("Vulkan model uploaded: {} buffer(s), {} mesh(es), {} material(s)", uploadedBuffers,
-                model.meshes.size(), model.materials.size());
+    logger.info("Vulkan model uploaded: {} buffer(s), {} mesh(es), {} material(s)", uploadedBuffers, meshCount,
+                materialCount);
 }
 
 std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture>& textureKey)
 {
-    const auto& texture = memoryStorageService.textures.get(textureKey);
-    if (texture.gpuResourceId.has_value())
-    {
-        return texture.gpuResourceId;
-    }
+    std::optional<unsigned int> uploadedId;
 
-    const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
-    if (texelCount == 0 || texture.pixelDataType != PixelDataType::UnsignedByte || texture.data.size() < texelCount * 4)
-    {
-        if (!unsupportedTextureLayoutLogged)
+    // In place: the id is written and the pixels dropped inside the element, so a multi-megabyte
+    // payload is never copied through the storage. The const_cast this needed is gone with
+    // update() — mutate() is the API that says "write this element".
+    memoryStorageService.textures.mutate(
+        textureKey,
+        [&](Texture& texture)
         {
-            logger.warn("Vulkan texture upload skipped for {}: {}x{} with {} byte(s) is not the 8-bit RGBA layout this "
-                        "backend uploads",
-                        texture.name, texture.width, texture.height, texture.data.size());
-            unsupportedTextureLayoutLogged = true;
-        }
+            if (texture.gpuResourceId.has_value())
+            {
+                uploadedId = texture.gpuResourceId;
+                return;
+            }
 
-        return std::nullopt;
-    }
+            // Any channel count at any of the three source precisions uploads (createSampledImage
+            // expands it the way GL's driver does); only a payload that cannot describe the image
+            // is rejected.
+            const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
+            const auto sourceBytes = texelCount * static_cast<size_t>(channelCount(texture.format)) *
+                                     pixelComponentBytes(texture.pixelDataType);
+            if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
+            {
+                diagnostics.record(FrameDiagnostic::UnsupportedTextureLayout,
+                                   [&]
+                                   {
+                                       return texture.name + " is " + std::to_string(texture.width) + "x" +
+                                              std::to_string(texture.height) + ", needing " +
+                                              std::to_string(sourceBytes) + " byte(s) and carrying " +
+                                              std::to_string(texture.data.size());
+                                   });
 
-    const std::array faces = {&texture};
-    const auto id = createSampledImage(faces, false);
+                return;
+            }
 
-    // MemoryStorage hands out const references to non-const elements; writing the id back
-    // in place keeps the GL-visible contract without copying a multi-megabyte payload
-    // through get/update (same justification as createCubeMap's face clearing).
-    const_cast<Texture&>(texture).gpuResourceId = id;
-    return id;
+            const std::array faces = {&std::as_const(texture)};
+            const auto id = createSampledImage(faces, false);
+            texture.gpuResourceId = id;
+            uploadedId = id;
+
+            // The GPU owns the texels now; shed the CPU copy the way upload() sheds mesh buffers.
+            texture.data.clear();
+            texture.data.shrink_to_fit();
+        });
+
+    return uploadedId;
 }
 
 void VulkanRenderer::uploadMaterialTextures(const Resource<Material>& materialKey)
 {
-    const auto& material = memoryStorageService.materials.get(materialKey);
+    const auto* material = memoryStorageService.materials.find(materialKey);
+    if (material == nullptr)
+    {
+        return;
+    }
 
     for (const auto& textureKey :
-         {material.albedo, material.normal, material.metallicRoughness, material.emissive, material.occlusion})
+         {material->albedo, material->normal, material->metallicRoughness, material->emissive, material->occlusion})
     {
-        if (textureKey.has_value() && memoryStorageService.textures.exists(textureKey.value()))
+        if (textureKey.has_value())
         {
             static_cast<void>(uploadTexture(textureKey.value()));
         }
     }
 
-    for (const auto& textureKey : material.textures)
+    for (const auto& textureKey : material->textures)
     {
-        if (memoryStorageService.textures.exists(textureKey))
-        {
-            static_cast<void>(uploadTexture(textureKey));
-        }
+        static_cast<void>(uploadTexture(textureKey));
     }
 }
 
@@ -2612,27 +3039,38 @@ unsigned int VulkanRenderer::dummyCubeMap()
     return dummyCubeMapId;
 }
 
+// Keyed by the material's slot index and the environment it is bound against. The index is
+// enough because releaseMaterial() drops every entry for a slot when that slot is released, so a
+// recycled index never finds the previous material's descriptors waiting for it.
 VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKey,
                                             const unsigned int environmentImageId)
 {
-    const auto key = (static_cast<uint64_t>(materialKey.id) << 32u) | static_cast<uint64_t>(environmentImageId);
+    const auto key = (static_cast<uint64_t>(materialKey.index) << 32u) | static_cast<uint64_t>(environmentImageId);
     const auto cached = materialResources.find(key);
     if (cached != materialResources.end())
     {
         return cached->second.set;
     }
 
-    const auto& material = memoryStorageService.materials.get(materialKey);
+    const auto* materialSlot = memoryStorageService.materials.find(materialKey);
+    if (materialSlot == nullptr)
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const auto& material = *materialSlot;
 
     const auto textureImage = [&](const std::optional<Resource<Texture>>& textureKey) -> std::optional<unsigned int>
     {
-        if (!textureKey.has_value() || !textureKey.value()->gpuResourceId.has_value() ||
-            !imageResources.contains(textureKey.value()->gpuResourceId.value()))
+        const auto* texture = textureKey.has_value() ? memoryStorageService.textures.find(textureKey.value()) : nullptr;
+
+        if (texture == nullptr || !texture->gpuResourceId.has_value() ||
+            !imageResources.contains(texture->gpuResourceId.value()))
         {
             return std::nullopt;
         }
 
-        return textureKey.value()->gpuResourceId;
+        return texture->gpuResourceId;
     };
 
     const auto diffuse = textureImage(material.albedo);
@@ -2655,11 +3093,8 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
     {
-        if (!descriptorSetUnavailableLogged)
-        {
-            logger.warn("Vulkan descriptor pool has no room for another material set; those primitives are not drawn");
-            descriptorSetUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("the descriptor pool has no room for another material set"); });
 
         return VK_NULL_HANDLE;
     }
@@ -2684,8 +3119,8 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
                                       occlusion.value_or(fallbackTexture), environment};
 
     const VkDescriptorBufferInfo bufferInfo{resource.buffer, 0, sizeof(MaterialDataUbo)};
-    std::array<VkDescriptorImageInfo, 6> imageInfos{};
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    std::array<VkDescriptorImageInfo, materialTextureSlotCount> imageInfos{};
+    std::array<VkWriteDescriptorSet, materialTextureSlotCount + 1> writes{};
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
@@ -2694,18 +3129,19 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[0].pBufferInfo = &bufferInfo;
 
-    for (uint32_t binding = 1; binding <= 6; binding++)
+    // sampledImages is in MaterialTextureSlot order; the binding each lands on is the
+    // contract's, not this loop's index.
+    for (uint32_t slot = 0; slot < materialTextureSlotCount; slot++)
     {
-        const auto& image = imageResources.at(sampledImages[binding - 1]);
-        imageInfos[binding - 1] =
-            VkDescriptorImageInfo{image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const auto& image = imageResources.at(sampledImages[slot]);
+        imageInfos[slot] = VkDescriptorImageInfo{image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-        writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[binding].dstSet = set;
-        writes[binding].dstBinding = binding;
-        writes[binding].descriptorCount = 1;
-        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[binding].pImageInfo = &imageInfos[binding - 1];
+        writes[slot + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[slot + 1].dstSet = set;
+        writes[slot + 1].dstBinding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        writes[slot + 1].descriptorCount = 1;
+        writes[slot + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[slot + 1].pImageInfo = &imageInfos[slot];
     }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -2736,11 +3172,8 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
     {
-        if (!descriptorSetUnavailableLogged)
-        {
-            logger.warn("Vulkan descriptor pool has no room for another attachment set; that pass is skipped");
-            descriptorSetUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DescriptorSetUnavailable,
+                           [] { return std::string("the descriptor pool has no room for another attachment set"); });
 
         return VK_NULL_HANDLE;
     }
@@ -2763,7 +3196,8 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
 }
 
 VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding,
-                                         const VkCullModeFlags cullMode)
+                                         const VkCullModeFlags cullMode, const VkFormat colorFormat,
+                                         const VkFormat depthFormat)
 {
     // A primitive's material — and so its shader and cull mode — never changes after load,
     // so one resolution per primitive is enough and a failed build is not retried.
@@ -2776,11 +3210,8 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     const auto shader = shaderObjects.find(shaderId);
     if (shader == shaderObjects.end() || shader->second.fullscreen)
     {
-        if (!scenePipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan shader object {} is not a scene shader; primitives using it are not drawn", shaderId);
-            scenePipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&] { return "shader object " + std::to_string(shaderId) + " is not a scene shader"; });
 
         return VK_NULL_HANDLE;
     }
@@ -2833,8 +3264,12 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
         binding.boundOffsets.push_back(0);
     }
 
+    // The pipeline's rendering formats are part of its identity, so they are part of the key:
+    // the attachments they come from are the ones FboAttachment::internalFormat asked for.
     const auto key = std::to_string(shaderId) + "|" + std::to_string(cullMode) + "|" +
-                     std::to_string(static_cast<int>(binding.topology)) + "|rgba16f+d32|" + binding.signature;
+                     std::to_string(static_cast<int>(binding.topology)) + "|" +
+                     std::to_string(static_cast<int>(colorFormat)) + "+" +
+                     std::to_string(static_cast<int>(depthFormat)) + "|" + binding.signature;
     const auto cachedPipeline = scenePipelines.find(key);
     if (cachedPipeline != scenePipelines.end())
     {
@@ -2916,12 +3351,11 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    const auto colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachmentFormats = &colorFormat;
-    renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+    renderingInfo.depthAttachmentFormat = depthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -2942,13 +3376,13 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     const auto createResult = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
     if (createResult != VK_SUCCESS)
     {
-        if (!scenePipelineUnavailableLogged)
-        {
-            logger.warn("Vulkan scene pipeline for shader {} was not created (VkResult {}); primitives using it are "
-                        "not drawn",
-                        shaderId, static_cast<int>(createResult));
-            scenePipelineUnavailableLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
+                           [&]
+                           {
+                               return "shader object " + std::to_string(shaderId) +
+                                      ", vkCreateGraphicsPipelines returned VkResult " +
+                                      std::to_string(static_cast<int>(createResult));
+                           });
 
         return VK_NULL_HANDLE;
     }
@@ -2958,18 +3392,38 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     return pipeline;
 }
 
-void VulkanRenderer::setViewport(const int width, const int height)
+VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const VkFormat colorFormat)
 {
-    // The resize callback calls this before it recreates the camera and post-process
-    // framebuffers, so a frame still open here (a step with no presenter pass) is closed
-    // now rather than left holding command references to images about to be destroyed.
-    if (frameOpen)
+    const auto key = (static_cast<uint64_t>(shaderId) << 32u) | static_cast<uint32_t>(colorFormat);
+    const auto cached = offscreenPipelines.find(key);
+    if (cached != offscreenPipelines.end())
     {
-        endFrame(VK_NULL_HANDLE);
+        return cached->second;
     }
 
-    // Resize callbacks fire inside glfwPollEvents mid-step; recreation happens lazily at
-    // the next draw, so only the requested extent is recorded here.
+    const auto shader = shaderObjects.find(shaderId);
+    if (shader == shaderObjects.end() || !shader->second.fullscreen)
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const auto pipeline =
+        buildFullscreenPipeline(shader->second.vertexModule, shader->second.fragmentModule, colorFormat);
+    if (pipeline != VK_NULL_HANDLE)
+    {
+        offscreenPipelines.emplace(key, pipeline);
+    }
+
+    return pipeline;
+}
+
+void VulkanRenderer::setViewport(const int width, const int height)
+{
+    // Recording the extent is all this does. It used to have to close an open frame first,
+    // because the resize callback destroys the framebuffers a half-recorded command buffer
+    // still names — but the callback fires from glfwPollEvents, which the window pumps after
+    // Engine::step has already closed the frame it opened. Recreation stays lazy: the next
+    // beginFrame rebuilds the swapchain if this extent no longer matches it.
     requestedExtent = VkExtent2D{static_cast<uint32_t>(std::max(width, 0)), static_cast<uint32_t>(std::max(height, 0))};
 }
 
@@ -2978,13 +3432,13 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
     auto& frame = frames[frameIndex];
     if (frame.drawDataSlotsUsed >= drawDataRingSlots)
     {
-        if (!drawDataRingExhaustedLogged)
-        {
-            logger.warn("Vulkan draw-data ring exhausted: {} slots of {} bytes; draws beyond the ring are skipped "
-                        "for the rest of the frame",
-                        drawDataRingSlots, drawDataStride);
-            drawDataRingExhaustedLogged = true;
-        }
+        diagnostics.record(FrameDiagnostic::DrawDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(drawDataRingSlots) + " slots of " +
+                                      std::to_string(drawDataStride) + " bytes";
+                           });
+
         return std::nullopt;
     }
 
@@ -2993,7 +3447,27 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
     return offset;
 }
 
-std::optional<std::vector<uint32_t>>
+std::optional<VkDeviceSize> VulkanRenderer::allocateFrameDataSlot()
+{
+    auto& frame = frames[frameIndex];
+    if (frame.frameDataSlotsUsed >= frameDataRingSlots)
+    {
+        diagnostics.record(FrameDiagnostic::FrameDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(frameDataRingSlots) + " slots of " +
+                                      std::to_string(frameDataStride) + " bytes";
+                           });
+
+        return std::nullopt;
+    }
+
+    const auto offset = static_cast<VkDeviceSize>(frame.frameDataSlotsUsed) * frameDataStride;
+    frame.frameDataSlotsUsed++;
+    return offset;
+}
+
+std::expected<std::vector<uint32_t>, std::string>
 VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_kind kind, const char* stageName)
 {
     // The C++ RAII wrapper over the C API: results release themselves, and both stay
@@ -3007,12 +3481,21 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     // reports the mismatch on every pipeline built from the pair.
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
+    // Every Vulkan source is compiled with the contract macros predefined, so no shader
+    // spells a set index, a binding, an attribute location or an array bound that C++ also
+    // holds. The GL path splices the same list in as text (withShaderContractMacros).
+    for (const auto& macro : shaderContractMacros(GraphicsApi::Vulkan))
+    {
+        options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
+    }
+
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success)
     {
-        // A Vulkan source that will not compile is a real failure on this backend.
-        logger.error("Vulkan {} shader compilation did not succeed: {}", stageName, result.GetErrorMessage());
-        return std::nullopt;
+        // A Vulkan source that will not compile is a real failure on this backend, and shaderc's
+        // message names the line — which is the whole value of it, and what was being logged and
+        // then left out of what the caller reported.
+        return std::unexpected(result.GetErrorMessage());
     }
 
     if (result.GetNumWarnings() > 0)
@@ -3127,48 +3610,60 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     return pipeline;
 }
 
-std::optional<unsigned int> VulkanRenderer::createShaderObject(const ShaderDescriptor& shaderDescriptor)
+std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(const ShaderDescriptor& shaderDescriptor)
 {
-    if (shaderDescriptor.vulkanVertexShaderSource.empty() || shaderDescriptor.vulkanFragmentShaderSource.empty())
+    try
     {
-        // Expected per vulkan-abi.md: a descriptor without the Vulkan dialect cannot
-        // produce a shader object on this backend.
-        logger.error("Vulkan backend cannot create a shader object: the descriptor is missing "
-                     "vulkanVertexShaderSource and/or vulkanFragmentShaderSource");
-        return std::nullopt;
-    }
+        if (shaderDescriptor.vulkanVertexShaderSource.empty() || shaderDescriptor.vulkanFragmentShaderSource.empty())
+        {
+            // Expected per vulkan-abi.md: a descriptor without the Vulkan dialect cannot
+            // produce a shader object on this backend.
+            return std::unexpected("the shader descriptor carries no vulkanVertexShaderSource and/or "
+                                   "vulkanFragmentShaderSource, which this backend cannot substitute");
+        }
 
-    const auto vertexSpirv =
-        compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
-    const auto fragmentSpirv =
-        compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
-    if (!vertexSpirv.has_value() || !fragmentSpirv.has_value())
+        const auto vertexSpirv =
+            compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
+        if (!vertexSpirv)
+        {
+            return std::unexpected("the Vulkan-dialect vertex source did not compile to SPIR-V: " +
+                                   vertexSpirv.error());
+        }
+
+        const auto fragmentSpirv =
+            compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
+        if (!fragmentSpirv)
+        {
+            return std::unexpected("the Vulkan-dialect fragment source did not compile to SPIR-V: " +
+                                   fragmentSpirv.error());
+        }
+
+        ShaderObject shaderObject;
+        shaderObject.vertexModule = createShaderModule(vertexSpirv.value());
+        shaderObject.fragmentModule = createShaderModule(fragmentSpirv.value());
+        shaderObject.vertexInputLocations = spirvVertexInputLocations(vertexSpirv.value());
+        shaderObject.fullscreen = shaderObject.vertexInputLocations.empty();
+
+        if (shaderObject.fullscreen)
+        {
+            shaderObject.swapchainTargetPipeline =
+                buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
+        }
+
+        const auto id = nextResourceId++;
+        shaderObjects.emplace(id, shaderObject);
+
+        logger.info("Vulkan shader object {} ready: vertex {} + fragment {} SPIR-V words; {}", id, vertexSpirv->size(),
+                    fragmentSpirv->size(),
+                    shaderObject.fullscreen
+                        ? "swapchain fullscreen pipeline built; offscreen targets build on first use"
+                        : "scene pipeline awaits vertex input from the draw path");
+        return id;
+    }
+    catch (const std::exception& exception)
     {
-        return std::nullopt;
+        return std::unexpected(exception.what());
     }
-
-    ShaderObject shaderObject;
-    shaderObject.vertexModule = createShaderModule(vertexSpirv.value());
-    shaderObject.fragmentModule = createShaderModule(fragmentSpirv.value());
-    shaderObject.vertexInputLocations = spirvVertexInputLocations(vertexSpirv.value());
-    shaderObject.fullscreen = shaderObject.vertexInputLocations.empty();
-
-    if (shaderObject.fullscreen)
-    {
-        shaderObject.swapchainTargetPipeline =
-            buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
-        shaderObject.offscreenTargetPipeline = buildFullscreenPipeline(
-            shaderObject.vertexModule, shaderObject.fragmentModule, VK_FORMAT_R16G16B16A16_SFLOAT);
-    }
-
-    const auto id = nextResourceId++;
-    shaderObjects.emplace(id, shaderObject);
-
-    logger.info("Vulkan shader object {} ready: vertex {} + fragment {} SPIR-V words; {}", id, vertexSpirv->size(),
-                fragmentSpirv->size(),
-                shaderObject.fullscreen ? "fullscreen pipelines built for swapchain and RGBA16F targets"
-                                        : "scene pipeline awaits vertex input from the draw path");
-    return id;
 }
 
 VkCommandBuffer VulkanRenderer::beginUploadCommands() const
@@ -3219,23 +3714,27 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     const auto& first = *faces.front();
     const auto width = first.width;
     const auto height = first.height;
-    const auto isHdrFloat = first.pixelDataType == PixelDataType::Float;
     const auto layerCount = static_cast<uint32_t>(faces.size());
 
-    // 96bpp float RGB pads to RGBA32F unconditionally (vulkan-abi.md: RGB32F sampling
-    // support is not universal); the stbi_load path is RGBA8.
-    const auto format = isHdrFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    const auto texelBytes = static_cast<VkDeviceSize>(isHdrFloat ? 16 : 4);
+    const auto sourceChannels = static_cast<size_t>(channelCount(first.format));
+    const auto componentBytes = static_cast<size_t>(pixelComponentBytes(first.pixelDataType));
+    if (sourceChannels == 0)
+    {
+        throw std::runtime_error("sampled image source has no known channel layout");
+    }
+
+    const auto format = sampledImageFormat(first.pixelDataType);
+    const auto texelBytes = static_cast<VkDeviceSize>(componentBytes * 4);
     const auto texelCount = static_cast<size_t>(width) * height;
     const auto faceBytes = static_cast<VkDeviceSize>(texelCount) * texelBytes;
-    const auto sourceFaceBytes = isHdrFloat ? texelCount * 3 * sizeof(float) : texelCount * 4;
+    const auto sourceFaceBytes = texelCount * sourceChannels * componentBytes;
 
     for (const auto* face : faces)
     {
-        if (face->width != width || face->height != height ||
-            (face->pixelDataType == PixelDataType::Float) != isHdrFloat || face->data.size() < sourceFaceBytes)
+        if (face->width != width || face->height != height || face->pixelDataType != first.pixelDataType ||
+            face->format != first.format || face->data.size() < sourceFaceBytes)
         {
-            throw std::runtime_error("sampled image sources disagree on size or pixel type");
+            throw std::runtime_error("sampled image sources disagree on size, pixel type or channel layout");
         }
     }
 
@@ -3252,10 +3751,10 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     {
         mipLevels = mipLevelCount(width, height);
     }
-    else if (!mipGenerationUnavailableLogged)
+    else
     {
-        logger.warn("Vulkan mip generation unavailable for this format (no linear blit); sampling top level only");
-        mipGenerationUnavailableLogged = true;
+        diagnostics.record(FrameDiagnostic::MipGenerationUnavailable,
+                           [&] { return "VkFormat " + std::to_string(static_cast<int>(format)); });
     }
 
     VkImageCreateInfo imageInfo{};
@@ -3298,28 +3797,41 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
                            &stagingAllocationInfo),
            "vmaCreateBuffer");
 
+    // GL lets the driver expand a source with fewer than four components, filling the missing
+    // colour components with 0 and a missing alpha with 1. Vulkan has no such conversion, so
+    // the same rule is applied here, at the source's own precision.
+    std::array<unsigned char, 4> opaqueComponent{};
+    if (first.pixelDataType == PixelDataType::Float)
+    {
+        const auto one = 1.0f;
+        std::memcpy(opaqueComponent.data(), &one, sizeof(one));
+    }
+    else
+    {
+        opaqueComponent.fill(0xFF);
+    }
+
     for (size_t faceIndex = 0; faceIndex < faces.size(); faceIndex++)
     {
         const auto& face = *faces[faceIndex];
         auto* destination =
             static_cast<unsigned char*>(stagingAllocationInfo.pMappedData) + faceIndex * static_cast<size_t>(faceBytes);
 
-        if (isHdrFloat)
-        {
-            // Source rows are tightly-packed RGB floats (stbi_loadf, no row padding).
-            const auto* source = reinterpret_cast<const float*>(face.data.data());
-            auto* padded = reinterpret_cast<float*>(destination);
-            for (size_t texel = 0; texel < texelCount; texel++)
-            {
-                padded[texel * 4 + 0] = source[texel * 3 + 0];
-                padded[texel * 4 + 1] = source[texel * 3 + 1];
-                padded[texel * 4 + 2] = source[texel * 3 + 2];
-                padded[texel * 4 + 3] = 1.0f;
-            }
-        }
-        else
+        if (sourceChannels == 4)
         {
             std::memcpy(destination, face.data.data(), sourceFaceBytes);
+            continue;
+        }
+
+        // Source rows are tightly packed (stbi and tinygltf both emit them that way).
+        for (size_t texel = 0; texel < texelCount; texel++)
+        {
+            const auto* source = face.data.data() + texel * sourceChannels * componentBytes;
+            auto* target = destination + texel * componentBytes * 4;
+
+            std::memcpy(target, source, sourceChannels * componentBytes);
+            std::memset(target + sourceChannels * componentBytes, 0, (3 - sourceChannels) * componentBytes);
+            std::memcpy(target + 3 * componentBytes, opaqueComponent.data(), componentBytes);
         }
     }
     ensure(vmaFlushAllocation(allocator, stagingAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
@@ -3402,16 +3914,25 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     VkImageView view = VK_NULL_HANDLE;
     ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
-    // CLAMP_TO_EDGE + LINEAR with trilinear mips, matching the GL cube map parameters.
+    // LINEAR with trilinear mips, matching the GL texture parameters. Cube maps clamp so a
+    // face never samples across a seam; 2D textures repeat, which is the glTF sampler default
+    // and what KHR_texture_transform scaling relies on once a UV leaves 0..1. GL's anisotropy
+    // is applied to 2D textures only, and this matches that.
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    const auto addressMode = cube ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeU = addressMode;
+    samplerInfo.addressModeV = addressMode;
+    samplerInfo.addressModeW = addressMode;
     samplerInfo.maxLod = static_cast<float>(mipLevels);
+    if (!cube && samplerAnisotropySupported)
+    {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = deviceLimits.maxSamplerAnisotropy;
+    }
 
     VkSampler sampler = VK_NULL_HANDLE;
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
@@ -3422,30 +3943,32 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     return id;
 }
 
-unsigned int VulkanRenderer::createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                           const Texture& right, const Texture& top, const Texture& bottom) const
+std::expected<unsigned int, std::string> VulkanRenderer::createCubeMap(const Texture& front, const Texture& back,
+                                                                       const Texture& left, const Texture& right,
+                                                                       const Texture& top, const Texture& bottom)
 {
-    // GL uploads {right,left,bottom,top,front,back} onto +X..-Z with bottom deliberately
-    // on POSITIVE_Y; Vulkan cube layers 0..5 are +X..-Z under the same sampling
-    // convention, so the identical assignment preserves lookup parity (V4 adjudicates).
-    const std::array faces = {&right, &left, &bottom, &top, &front, &back};
-    const auto id = createSampledImage(faces, true);
-
-    // The GPU owns the texels now; shed the CPU copies the way the GL path sheds staged
-    // mesh buffers. The storage deque's elements are non-const objects, so the cast is
-    // defined behaviour.
-    for (const auto* face : faces)
+    try
     {
-        auto& texture = const_cast<Texture&>(*face);
-        texture.data.clear();
-        texture.data.shrink_to_fit();
-    }
+        // GL uploads {right,left,bottom,top,front,back} onto +X..-Z with bottom deliberately
+        // on POSITIVE_Y; Vulkan cube layers 0..5 are +X..-Z under the same sampling
+        // convention, so the identical assignment preserves lookup parity (V4 adjudicates).
+        const std::array faces = {&right, &left, &bottom, &top, &front, &back};
+        const auto id = createSampledImage(faces, true);
 
-    logger.info("Vulkan cube map {} uploaded: 6 faces {}x{}, {} mip levels", id, right.width, right.height,
-                imageResources.at(id).mipLevels);
-    return id;
+        // The faces' pixel data is CubeMapService's to drop, through the handles it holds; this
+        // used to const_cast the const Texture& it was handed and empty it here.
+        logger.info("Vulkan cube map {} uploaded: 6 faces {}x{}, {} mip levels", id, right.width, right.height,
+                    imageResources.at(id).mipLevels);
+        return id;
+    }
+    catch (const std::exception& exception)
+    {
+        return std::unexpected(exception.what());
+    }
 }
 
+// The image leaves the registry now — nothing may name it again — and is destroyed later, when
+// the frames that could still be sampling it have completed. See retire().
 void VulkanRenderer::destroyImageResource(const unsigned int id) const
 {
     const auto entry = imageResources.find(id);
@@ -3454,254 +3977,428 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
         return;
     }
 
-    // The cached fullscreen set names this image's view; recycle it with the image so a
-    // resize does not leak pool space (the pool carries FREE_DESCRIPTOR_SET for this).
+    RetiredResource retired;
+
+    // The cached fullscreen set names this image's view, so it is recycled with the image and on
+    // the same schedule: a descriptor set a submitted command buffer bound may not be freed
+    // either. The pool carries FREE_DESCRIPTOR_SET for this.
     const auto cachedSet = attachmentSets.find(id);
     if (cachedSet != attachmentSets.end())
     {
-        vkFreeDescriptorSets(device, descriptorPool, 1, &cachedSet->second);
+        retired.descriptorSet = cachedSet->second;
         attachmentSets.erase(cachedSet);
     }
 
     const auto& resource = entry->second;
-    if (resource.sampler != VK_NULL_HANDLE)
-    {
-        vkDestroySampler(device, resource.sampler, nullptr);
-    }
-    if (resource.view != VK_NULL_HANDLE)
-    {
-        vkDestroyImageView(device, resource.view, nullptr);
-    }
-    if (resource.image != VK_NULL_HANDLE)
-    {
-        vmaDestroyImage(allocator, resource.image, resource.allocation);
-    }
+    retired.sampler = resource.sampler;
+    retired.view = resource.view;
+    retired.image = resource.image;
+    retired.imageAllocation = resource.allocation;
+
     imageResources.erase(entry);
+    retire(retired);
 }
 
-unsigned int VulkanRenderer::createFbo(const Fbo& fbo) const
+std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fbo)
 {
-    FboResource fboResource;
-    auto loggedWidth = 0u;
-    auto loggedHeight = 0u;
-
-    for (const auto& attachmentKey : fbo.attachments)
+    try
     {
-        auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+        FboResource fboResource;
+        auto loggedWidth = 0u;
+        auto loggedHeight = 0u;
 
-        VkFormat format;
-        VkImageUsageFlags usage;
-        VkImageAspectFlags aspect;
-        switch (attachment.type)
+        for (const auto& attachmentKey : fbo.attachments)
         {
-        case FboAttachmentType::Color:
-            // The engine's colour attachment contract is RGBA capture into RGBA16F.
-            format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-            break;
-        case FboAttachmentType::Depth:
-            format = VK_FORMAT_D32_SFLOAT;
-            usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-            break;
-        default:
-        {
-            static auto warnedUnsupportedAttachment = false;
-            if (!warnedUnsupportedAttachment)
+            const auto* attachmentSlot = memoryStorageService.bufferAttachments.find(attachmentKey);
+            if (attachmentSlot == nullptr)
             {
-                logger.warn("Vulkan framebuffers support Color and Depth attachments only; skipping type {}",
-                            static_cast<int>(attachment.type));
-                warnedUnsupportedAttachment = true;
+                continue;
             }
-            continue;
+
+            const auto& attachment = *attachmentSlot;
+
+            VkImageUsageFlags usage;
+            VkImageAspectFlags aspect;
+            switch (attachment.type)
+            {
+            case FboAttachmentType::Color:
+                usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                break;
+            case FboAttachmentType::Depth:
+                usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+                break;
+            // Same reading as an internalFormat with no Vulkan equivalent below: a model this
+            // backend cannot serve, not a runtime condition. Skipping it built a framebuffer
+            // that was missing an attachment its owner had asked for and said so once.
+            case FboAttachmentType::Stencil:
+                throw std::runtime_error("Vulkan framebuffers carry Color and Depth attachments only; "
+                                         "FboAttachmentType::Stencil has no equivalent here");
+            }
+
+            // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no
+            // Vulkan equivalent is a model the backend cannot serve, not a runtime condition.
+            const auto requestedFormat = attachmentFormat(attachment.internalFormat);
+            if (!requestedFormat.has_value())
+            {
+                throw std::runtime_error("FboAttachment::internalFormat " +
+                                         std::to_string(static_cast<int>(attachment.internalFormat)) +
+                                         " has no Vulkan format");
+            }
+            const auto format = requestedFormat.value();
+
+            // A minimised window reports 0x0; a 1x1 image keeps the resource valid until the
+            // next real resize arrives.
+            const auto width = std::max(attachment.width, 1u);
+            const auto height = std::max(attachment.height, 1u);
+            loggedWidth = width;
+            loggedHeight = height;
+
+            VkImageCreateInfo imageInfo{};
+            imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = format;
+            imageInfo.extent = VkExtent3D{width, height, 1};
+            imageInfo.mipLevels = 1;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = usage;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo allocationCreateInfo{};
+            allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+            VkImage image = VK_NULL_HANDLE;
+            VmaAllocation allocation = nullptr;
+            ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
+                   "vmaCreateImage");
+
+            VkImageViewCreateInfo viewInfo{};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = format;
+            viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, 1, 0, 1};
+
+            VkImageView view = VK_NULL_HANDLE;
+            ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+            const auto attachmentId = nextResourceId++;
+            imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1,
+                                                               width, height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
+            fboResource.attachmentIds.push_back(attachmentId);
+
+            // Observable contract shared with GL: every attachment's id is written back
+            // through its Resource.
+            memoryStorageService.bufferAttachments.mutate(attachmentKey, [&](FboAttachment& target)
+                                                          { target.gpuResourceId = attachmentId; });
         }
-        }
 
-        // A minimised window reports 0x0; a 1x1 image keeps the resource valid until the
-        // next real resize arrives.
-        const auto width = std::max(attachment.width, 1u);
-        const auto height = std::max(attachment.height, 1u);
-        loggedWidth = width;
-        loggedHeight = height;
+        const auto id = nextResourceId++;
+        const auto attachmentCount = fboResource.attachmentIds.size();
+        fboResources.emplace(id, std::move(fboResource));
 
-        VkImageCreateInfo imageInfo{};
-        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = format;
-        imageInfo.extent = VkExtent3D{width, height, 1};
-        imageInfo.mipLevels = 1;
-        imageInfo.arrayLayers = 1;
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = usage;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        VmaAllocationCreateInfo allocationCreateInfo{};
-        allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-
-        VkImage image = VK_NULL_HANDLE;
-        VmaAllocation allocation = nullptr;
-        ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
-               "vmaCreateImage");
-
-        VkImageViewCreateInfo viewInfo{};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = image;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = format;
-        viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, 1, 0, 1};
-
-        VkImageView view = VK_NULL_HANDLE;
-        ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
-
-        const auto attachmentId = nextResourceId++;
-        imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1, width,
-                                                           height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
-        fboResource.attachmentIds.push_back(attachmentId);
-
-        // Observable contract shared with GL: every attachment's id is written back
-        // through its Resource.
-        attachment.gpuResourceId = attachmentId;
-        memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
+        logger.info("Vulkan framebuffer {} ready: {} attachment(s), {}x{}", id, attachmentCount, loggedWidth,
+                    loggedHeight);
+        return id;
     }
-
-    const auto id = nextResourceId++;
-    const auto attachmentCount = fboResource.attachmentIds.size();
-    fboResources.emplace(id, std::move(fboResource));
-
-    logger.info("Vulkan framebuffer {} ready: {} attachment(s), {}x{}", id, attachmentCount, loggedWidth, loggedHeight);
-    return id;
+    catch (const std::exception& exception)
+    {
+        return std::unexpected(exception.what());
+    }
 }
 
-void VulkanRenderer::deleteFbo(Fbo& fbo) const
+// No device idle any more. This used to stall the whole device on every resize, which was
+// tolerable at resize rate and would not be at unload rate — an FBO is also what a camera owns,
+// so unloading a scene deletes several. The retirement queue is the in-flight guard now, and it
+// costs the images two more frames of residency instead of the GPU a full drain.
+void VulkanRenderer::deleteFbo(Fbo& fbo)
 {
     if (device == VK_NULL_HANDLE)
     {
         return;
     }
 
-    // Resize-rate operation: a full device idle is the in-flight guard until the draw
-    // path gives a reason for deferred per-frame destruction (V3).
-    ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
-
     for (const auto& attachmentKey : fbo.attachments)
     {
-        const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-        if (attachment.gpuResourceId.has_value())
-        {
-            destroyImageResource(attachment.gpuResourceId.value());
-        }
+        memoryStorageService.bufferAttachments.mutate(attachmentKey,
+                                                      [&](FboAttachment& attachment)
+                                                      {
+                                                          if (!attachment.gpuResourceId.has_value())
+                                                          {
+                                                              return;
+                                                          }
+
+                                                          destroyImageResource(attachment.gpuResourceId.value());
+                                                          attachment.gpuResourceId.reset();
+                                                      });
     }
 
     if (fbo.gpuResourceId.has_value())
     {
         fboResources.erase(fbo.gpuResourceId.value());
+        fbo.gpuResourceId.reset();
     }
 }
 
-void VulkanRenderer::captureFrame(const std::string& path)
+void VulkanRenderer::releaseGpuResource(const GpuResourceKind kind, const unsigned int gpuResourceId)
 {
-    // Engine calls this after the presenter closed the frame; a frame still open would be
-    // a caller-order change, and finishing it keeps the swapchain consistent either way.
-    if (frameOpen)
+    if (device == VK_NULL_HANDLE)
     {
-        endFrame(VK_NULL_HANDLE);
-    }
-
-    recreateSwapchainIfNeeded();
-    if (swapchain == VK_NULL_HANDLE)
-    {
-        logger.warn("Vulkan frame capture skipped: no swapchain (window minimised?)");
         return;
     }
 
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VmaAllocation allocation = nullptr;
-    VmaAllocationInfo allocationInfo{};
-    auto width = 0u;
-    auto height = 0u;
-    VkDeviceSize byteCount = 0;
-
-    // A presented swapchain image may not be touched until it is reacquired, so the
-    // capture acquires a fresh image and replays the presenter's pass onto it: the HDR
-    // attachment it samples is a persistent image that still holds the presented frame,
-    // which makes the readback identical rather than merely similar.
-    auto presented = false;
-    for (auto attempt = 0; attempt < 2 && !presented; attempt++)
+    switch (kind)
     {
-        if (!beginFrame())
+    case GpuResourceKind::Buffer:
+    {
+        const auto entry = bufferResources.find(gpuResourceId);
+        if (entry == bufferResources.end())
         {
-            continue;
+            return;
         }
 
-        if (buffer == VK_NULL_HANDLE)
-        {
-            width = swapchainExtent.width;
-            height = swapchainExtent.height;
-            byteCount = static_cast<VkDeviceSize>(width) * height * 4;
-
-            VkBufferCreateInfo bufferInfo{};
-            bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bufferInfo.size = byteCount;
-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-            VmaAllocationCreateInfo allocationCreateInfo{};
-            allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-            allocationCreateInfo.flags =
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-            ensure(
-                vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation, &allocationInfo),
-                "vmaCreateBuffer");
-        }
-
-        if (lastPresentPass.has_value())
-        {
-            recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
-        }
-
-        presented = endFrame(buffer);
+        RetiredResource retired;
+        retired.buffer = entry->second.buffer;
+        retired.bufferAllocation = entry->second.allocation;
+        bufferResources.erase(entry);
+        retire(retired);
+        break;
     }
-    ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+    case GpuResourceKind::Texture:
+    case GpuResourceKind::CubeMap:
+        destroyImageResource(gpuResourceId);
+        break;
+    case GpuResourceKind::VertexArray:
+        // The Vulkan counterpart of a VAO owns no Vulkan object: it is the resolved vertex input
+        // plus copies of buffer handles the model owns and a pipeline the cache owns. Dropping the
+        // entry is the whole release, and it has to happen before the buffers it names.
+        primitiveBindings.erase(gpuResourceId);
+        break;
+    case GpuResourceKind::ShaderProgram:
+        releaseShaderObject(gpuResourceId);
+        break;
+    case GpuResourceKind::FrameBuffer:
+        fboResources.erase(gpuResourceId);
+        break;
+    }
+}
 
-    if (!presented || buffer == VK_NULL_HANDLE)
+// A shader owns its two modules and every pipeline built from them: the swapchain-target one, the
+// offscreen ones keyed by target format, and the scene ones keyed by shader, cull mode, topology,
+// formats and vertex-input signature — all of which start with this shader's id.
+void VulkanRenderer::releaseShaderObject(const unsigned int shaderId)
+{
+    auto destroyedPipelines = std::vector<VkPipeline>();
+
+    const auto entry = shaderObjects.find(shaderId);
+    if (entry != shaderObjects.end())
     {
-        if (buffer != VK_NULL_HANDLE)
+        if (entry->second.swapchainTargetPipeline != VK_NULL_HANDLE)
         {
-            vmaDestroyBuffer(allocator, buffer, allocation);
+            destroyedPipelines.push_back(entry->second.swapchainTargetPipeline);
         }
 
-        logger.warn("Vulkan frame capture skipped: no swapchain image available");
+        RetiredResource vertexModule;
+        vertexModule.shaderModule = entry->second.vertexModule;
+        retire(vertexModule);
+
+        RetiredResource fragmentModule;
+        fragmentModule.shaderModule = entry->second.fragmentModule;
+        retire(fragmentModule);
+
+        shaderObjects.erase(entry);
+    }
+
+    std::erase_if(offscreenPipelines,
+                  [&](const auto& pipeline)
+                  {
+                      if ((pipeline.first >> 32u) != shaderId)
+                      {
+                          return false;
+                      }
+
+                      destroyedPipelines.push_back(pipeline.second);
+
+                      return true;
+                  });
+
+    const auto scenePrefix = std::to_string(shaderId) + "|";
+    std::erase_if(scenePipelines,
+                  [&](const auto& pipeline)
+                  {
+                      if (!pipeline.first.starts_with(scenePrefix))
+                      {
+                          return false;
+                      }
+
+                      destroyedPipelines.push_back(pipeline.second);
+
+                      return true;
+                  });
+
+    // A primitive binding caches the pipeline it resolved to. Any binding that resolved to one of
+    // these has to resolve again — a model still drawing with a released shader is a caller bug,
+    // but it must not be a dangling VkPipeline.
+    for (auto& [id, binding] : primitiveBindings)
+    {
+        if (std::ranges::find(destroyedPipelines, binding.pipeline) != destroyedPipelines.end())
+        {
+            binding.pipeline = VK_NULL_HANDLE;
+            binding.resolved = false;
+        }
+    }
+
+    for (const auto pipeline : destroyedPipelines)
+    {
+        RetiredResource retired;
+        retired.pipeline = pipeline;
+        retire(retired);
+    }
+}
+
+// Every descriptor set and uniform buffer this backend cached against the material's slot, for
+// whatever environment it was bound with. The slot is about to be reused by a different material.
+void VulkanRenderer::releaseMaterial(const Resource<Material>& material)
+{
+    if (device == VK_NULL_HANDLE)
+    {
         return;
     }
 
-    ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
+    const auto slot = static_cast<uint64_t>(material.index);
 
-    auto pixels = std::vector<unsigned char>(static_cast<size_t>(byteCount));
-    std::memcpy(pixels.data(), allocationInfo.pMappedData, pixels.size());
-    vmaDestroyBuffer(allocator, buffer, allocation);
+    std::erase_if(materialResources,
+                  [&](const auto& entry)
+                  {
+                      if ((entry.first >> 32u) != slot)
+                      {
+                          return false;
+                      }
 
-    if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_UNORM || surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB)
+                      RetiredResource retired;
+                      retired.buffer = entry.second.buffer;
+                      retired.bufferAllocation = entry.second.allocation;
+                      retired.descriptorSet = entry.second.set;
+                      retire(retired);
+
+                      return true;
+                  });
+}
+
+GpuResourceCensus VulkanRenderer::gpuResourceCensus() const
+{
+    return GpuResourceCensus{.buffers = static_cast<unsigned int>(bufferResources.size()),
+                             .textures = static_cast<unsigned int>(imageResources.size()),
+                             .vertexArrays = static_cast<unsigned int>(primitiveBindings.size()),
+                             .shaderPrograms = static_cast<unsigned int>(shaderObjects.size()),
+                             .frameBuffers = static_cast<unsigned int>(fboResources.size())};
+}
+
+std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string& path)
+{
+    try
     {
-        for (size_t pixelStart = 0; pixelStart < pixels.size(); pixelStart += 4)
+        // Engine calls this after endFrame presented, so no frame is open here: the capture
+        // opens one of its own below.
+        recreateSwapchainIfNeeded();
+        if (swapchain == VK_NULL_HANDLE)
         {
-            std::swap(pixels[pixelStart], pixels[pixelStart + 2]);
+            return std::unexpected("there is no swapchain to read back from (window minimised?)");
         }
-    }
 
-    // Vulkan images are already top-down; rows go straight out.
-    const auto rowBytes = static_cast<int>(width) * 4;
-    if (stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height), 4, pixels.data(), rowBytes) ==
-        0)
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VmaAllocationInfo allocationInfo{};
+        auto width = 0u;
+        auto height = 0u;
+        VkDeviceSize byteCount = 0;
+
+        // A presented swapchain image may not be touched until it is reacquired, so the
+        // capture acquires a fresh image and replays the presenter's pass onto it: the HDR
+        // attachment it samples is a persistent image that still holds the presented frame,
+        // which makes the readback identical rather than merely similar.
+        auto presented = false;
+        for (auto attempt = 0; attempt < 2 && !presented; attempt++)
+        {
+            if (!beginFrame())
+            {
+                continue;
+            }
+
+            if (buffer == VK_NULL_HANDLE)
+            {
+                width = swapchainExtent.width;
+                height = swapchainExtent.height;
+                byteCount = static_cast<VkDeviceSize>(width) * height * 4;
+
+                VkBufferCreateInfo bufferInfo{};
+                bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bufferInfo.size = byteCount;
+                bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+                VmaAllocationCreateInfo allocationCreateInfo{};
+                allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+                allocationCreateInfo.flags =
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+                ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation,
+                                       &allocationInfo),
+                       "vmaCreateBuffer");
+            }
+
+            if (lastPresentPass.has_value())
+            {
+                recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
+            }
+
+            presented = submitAndPresent(buffer);
+        }
+        ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+
+        if (!presented || buffer == VK_NULL_HANDLE)
+        {
+            if (buffer != VK_NULL_HANDLE)
+            {
+                vmaDestroyBuffer(allocator, buffer, allocation);
+            }
+
+            return std::unexpected("no swapchain image could be acquired to replay the present pass onto");
+        }
+
+        ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
+
+        auto pixels = std::vector<unsigned char>(static_cast<size_t>(byteCount));
+        std::memcpy(pixels.data(), allocationInfo.pMappedData, pixels.size());
+        vmaDestroyBuffer(allocator, buffer, allocation);
+
+        if (surfaceFormat.format == VK_FORMAT_B8G8R8A8_UNORM || surfaceFormat.format == VK_FORMAT_B8G8R8A8_SRGB)
+        {
+            for (size_t pixelStart = 0; pixelStart < pixels.size(); pixelStart += 4)
+            {
+                std::swap(pixels[pixelStart], pixels[pixelStart + 2]);
+            }
+        }
+
+        // Vulkan images are already top-down; rows go straight out.
+        const auto rowBytes = static_cast<int>(width) * 4;
+        if (stbi_write_png(path.c_str(), static_cast<int>(width), static_cast<int>(height), 4, pixels.data(),
+                           rowBytes) == 0)
+        {
+            return std::unexpected("stb_image_write could not write the frame dump to " + path);
+        }
+
+        logger.info("Frame dump written to {}", path);
+        return {};
+    }
+    catch (const std::exception& exception)
     {
-        logger.error("Failed to write frame dump to {}", path);
-        std::exit(1);
+        return std::unexpected(exception.what());
     }
-
-    logger.info("Frame dump written to {}", path);
 }
 
 } // namespace raceengine

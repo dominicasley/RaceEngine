@@ -5,11 +5,10 @@ module;
 
 #include <GLFW/glfw3.h>
 
-#include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <optional>
 #include <ranges>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,9 +20,16 @@ module;
 #include <spdlog/logger.h>
 #include <stb_image_write.h>
 
-export module raceengine.graphics:OpenGLRenderer;
+// An implementation partition, not an interface one: naming it `export module` put the whole
+// backend — and glad and GLFW with it — into the interface closure of raceengine.graphics, and
+// so into every translation unit that imports raceengine. Only :RenderBackendFactoryImpl imports
+// this, and nothing outside this module can.
+module raceengine.graphics:OpenGLRenderer;
 
-import :IRenderer;
+import :FrameDiagnostics;
+import :GraphicsApi;
+import :IRenderBackend;
+import :RenderContract;
 import :SceneManagerService;
 import :RenderableEntityService;
 import raceengine.graphics.models;
@@ -59,11 +65,14 @@ struct UniformKeyEqual
 
 typedef std::unordered_map<std::pair<unsigned int, std::string>, int, UniformKeyHash, UniformKeyEqual> UniformPool;
 
-export class OpenGLRenderer : public IRenderer
+class OpenGLRenderer : public IRenderBackend
 {
 private:
     UniformPool uniformPool;
     spdlog::logger& logger;
+    // Every skipped draw, view or pass is counted here instead of at a per-site boolean; see
+    // FrameDiagnostics for why the sites do not throttle themselves any more.
+    FrameDiagnostics& diagnostics;
     MemoryStorageService& memoryStorageService;
     RenderableEntityService& renderableEntityService;
     SceneManagerService& sceneManagerService;
@@ -79,36 +88,60 @@ private:
     std::vector<unsigned int> createdPrograms;
     std::vector<unsigned int> createdVaos;
     std::vector<unsigned int> createdVbos;
-    mutable std::vector<unsigned int> createdTextures;
-    mutable std::vector<unsigned int> createdFbos;
+    std::vector<unsigned int> createdTextures;
+    std::vector<unsigned int> createdFbos;
+    // Whether this frame recorded a present pass. GL has no swapchain to acquire, so the
+    // frame is bookkeeping only — but the fallback it drives is real: a frame with no
+    // presenter leaves the window showing the clear colour rather than whatever the driver
+    // left in the back buffer, which is what Vulkan's clear-only pass already guaranteed.
+    bool presentRecorded = false;
 
 public:
-    explicit OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
-                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
+    explicit OpenGLRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics,
+                            RenderableEntityService& renderableEntityService, SceneManagerService& sceneManagerService,
+                            MemoryStorageService& memoryStorageService);
     ~OpenGLRenderer() override;
 
-    bool init() override;
-    void draw(Scene& scene, Camera& camera, float delta) override;
-    void drawFullScreenQuad(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) const override;
+    [[nodiscard]] std::expected<void, std::string> init() override;
     void setViewport(int width, int height) override;
-    std::optional<unsigned int> createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
-    [[nodiscard]] unsigned int createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                             const Texture& right, const Texture& top,
-                                             const Texture& bottom) const override;
-    [[nodiscard]] unsigned int createFbo(const Fbo& fbo) const override;
-    void deleteFbo(Fbo& fbo) const override;
-    void captureFrame(const std::string& path) override;
+
+    [[nodiscard]] bool beginFrame() override;
+    void recordView(Scene& scene, Camera& camera, float delta) override;
+    void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) override;
+    void endFrame() override;
+
+    [[nodiscard]] std::expected<unsigned int, std::string>
+    createShaderObject(const ShaderDescriptor& shaderDescriptor) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createCubeMap(const Texture& front, const Texture& back,
+                                                                         const Texture& left, const Texture& right,
+                                                                         const Texture& top,
+                                                                         const Texture& bottom) override;
+    [[nodiscard]] std::expected<unsigned int, std::string> createFbo(const Fbo& fbo) override;
+    void deleteFbo(Fbo& fbo) override;
+    void releaseGpuResource(GpuResourceKind kind, unsigned int gpuResourceId) override;
+    void releaseMaterial(const Resource<Material>& material) override;
+    [[nodiscard]] GpuResourceCensus gpuResourceCensus() const override;
+
+    [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
 
 private:
-    void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
-    void bindMaterial(const Resource<Material>& material);
+    // False means the pass was not recorded because its shader handle names nothing; the caller
+    // knows which pass it was asking for and counts it.
+    [[nodiscard]] bool drawFullScreenQuad(const Resource<Shader>& shader,
+                                          const std::vector<Resource<FboAttachment>>& textures) const;
+    void bindMaterial(const Material& material, unsigned int programId);
+    void uploadLights(unsigned int programId, const Scene& scene);
     void upload(const Resource<Model>& model);
-    [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
+    void uploadMaterialTextures(const Resource<Material>& material);
+    void uploadTexture(const Resource<Texture>& texture);
+    [[nodiscard]] unsigned int createTexture(const Texture& texture);
     [[nodiscard]] unsigned int getTextureDataType(PixelDataType texture) const;
     [[nodiscard]] unsigned int getTextureFormat(TextureFormat texture) const;
     [[nodiscard]] unsigned int getInternalFormatFromBitsPerPixel(int bitsPerPixel) const;
     void createQuad();
-    bool compileShader(unsigned int id, const std::string& source);
+    // Reports the compiler's own words rather than logging them: the only caller already has an
+    // error channel, and a stage that would not compile is the reason the program will not link.
+    [[nodiscard]] std::expected<void, std::string> compileShader(unsigned int id, const std::string& source);
     int getUniformLocation(unsigned int, const char*);
     void setProgramUniform(unsigned int, const char*, int);
     void setProgramUniform(unsigned int, const char*, float data);
@@ -123,10 +156,46 @@ private:
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::vec4>& data);
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat3>& data);
     void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat4>& data);
+    void setProgramUniform(unsigned int, const char*, const std::vector<glm::mat4>& data, size_t count);
 };
 
 namespace
 {
+
+struct LightUniformNames
+{
+    std::string position;
+    std::string diffuse;
+    std::string specular;
+    std::string ambient;
+    std::string attenuation;
+};
+
+// GL addresses a struct-array uniform by name, so the names are built once and the draw path
+// pays only the uniform-pool lookup.
+const std::vector<LightUniformNames> lightUniformNames = []
+{
+    std::vector<LightUniformNames> names;
+    names.reserve(maxLights);
+
+    for (auto index = 0u; index < maxLights; index++)
+    {
+        const auto prefix = "lights[" + std::to_string(index) + "].";
+        names.push_back(LightUniformNames{.position = prefix + "position",
+                                          .diffuse = prefix + "diffuse",
+                                          .specular = prefix + "specular",
+                                          .ambient = prefix + "ambient",
+                                          .attenuation = prefix + "attenuation"});
+    }
+
+    return names;
+}();
+
+[[nodiscard]] GLenum textureUnit(const MaterialTextureSlot slot)
+{
+    return static_cast<GLenum>(GL_TEXTURE0) + textureBinding(slot, GraphicsApi::OpenGL);
+}
+
 void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei,
                                         const GLchar* message, const void* userParam)
 {
@@ -148,9 +217,11 @@ void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, G
 }
 } // namespace
 
-OpenGLRenderer::OpenGLRenderer(spdlog::logger& logger, RenderableEntityService& renderableEntityService,
+OpenGLRenderer::OpenGLRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics,
+                               RenderableEntityService& renderableEntityService,
                                SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
+    diagnostics(diagnostics),
     memoryStorageService(memoryStorageService),
     renderableEntityService(renderableEntityService),
     sceneManagerService(sceneManagerService)
@@ -185,12 +256,11 @@ OpenGLRenderer::~OpenGLRenderer()
     }
 }
 
-bool OpenGLRenderer::init()
+std::expected<void, std::string> OpenGLRenderer::init()
 {
     if (gladLoadGL(glfwGetProcAddress) == 0)
     {
-        logger.error("Failed to initialize OpenGL");
-        throw std::runtime_error("Failed to initialize OpenGL");
+        return std::unexpected("glad could not load the OpenGL entry points from the GLFW context");
     }
 
     if (glDebugMessageCallback != nullptr)
@@ -202,7 +272,7 @@ bool OpenGLRenderer::init()
 
     glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAnisotropy);
 
-    glClearColor(255.f / 255.f, 255.f / 255.f, 255.f / 255.f, 1.0f);
+    glClearColor(clearColour[0], clearColour[1], clearColour[2], clearColour[3]);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
@@ -215,103 +285,189 @@ bool OpenGLRenderer::init()
 
     createQuad();
 
+    return {};
+}
+
+// GL has no image to acquire and no command buffer to open: the context is always ready, so
+// the frame exists to say when it started and to let endFrame see whether anything presented.
+bool OpenGLRenderer::beginFrame()
+{
+    presentRecorded = false;
     return true;
 }
 
-void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
+// Nothing to submit — GL commands went to the driver as they were issued — and nothing to
+// present either: the buffer swap belongs to the window, which owns the surface. What is
+// left is the frame's guarantee that something reached the back buffer.
+void OpenGLRenderer::endFrame()
+{
+    if (presentRecorded)
+    {
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, viewportWidth, viewportHeight);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+// Handles are indices now, so `resource->field` would be a storage lookup — and a mutex — per
+// field. Every resolution in this pass is therefore hoisted to the outermost loop where its
+// handle is constant: the model and the instance shader once per entity, the mesh once per mesh,
+// the material once per primitive because that is where it varies. The pass costs
+// O(entities + meshes + primitives) lookups instead of the ~15 pointer chases per primitive it
+// used to make, and each lookup is one compare against the slot's generation.
+//
+// A borrow taken here stays valid for the rest of the pass: removal is a main-thread operation
+// between frames, and upload() writes through mutate(), which writes the element in place rather
+// than assigning a new one over it.
+void OpenGLRenderer::recordView(Scene& scene, Camera& camera, float delta)
 {
     currentlyBoundMaterial.reset();
 
     sceneEnvironmentGpuId.reset();
     if (scene.environment.has_value())
     {
-        sceneEnvironmentGpuId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
+        if (const auto* environment = memoryStorageService.cubeMaps.find(scene.environment.value());
+            environment != nullptr)
+        {
+            sceneEnvironmentGpuId = environment->gpuResourceId;
+        }
     }
 
+    // The pass states its own target and its own state instead of inheriting either. A view
+    // is one of N recorded into the same frame, so what the previous view left bound — the
+    // default framebuffer, or culling switched off by its last non-opaque material — says
+    // nothing about what this one needs.
+    auto target = 0u;
     if (camera.output.has_value())
     {
-        if (camera.output.value()->gpuResourceId.has_value())
+        const auto* output = memoryStorageService.frameBuffers.find(camera.output.value());
+
+        if (output != nullptr && output->gpuResourceId.has_value())
         {
-            glBindFramebuffer(GL_FRAMEBUFFER, camera.output.value()->gpuResourceId.value());
+            target = output->gpuResourceId.value();
         }
         else
         {
-            static auto warnedMissingCameraOutput = false;
-            if (!warnedMissingCameraOutput)
-            {
-                logger.warn("Camera output framebuffer has no GPU resource; drawing to default framebuffer");
-                warnedMissingCameraOutput = true;
-            }
+            diagnostics.record(FrameDiagnostic::MissingCameraOutput,
+                               [] { return std::string("drawing to the default framebuffer instead"); });
         }
     }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, target);
+    glViewport(0, 0, viewportWidth, viewportHeight);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     for (auto& entity : scene.models)
     {
-        auto& model = entity.model;
-
-        for (auto& mesh : entity.meshes)
+        // One resolution per entity for the whole nest below. A stale handle here — the model was
+        // unloaded while its renderable is still in the scene — is what an entity with nothing
+        // left to draw looks like, and skipping it is the only correct answer: the slot it names
+        // may already hold a different model.
+        const auto* model = memoryStorageService.models.find(entity.model);
+        const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
+        if (model == nullptr || instanceShader == nullptr)
         {
-            if (!mesh.mesh->gpuResourceId.has_value())
-            {
-                upload(model);
-            }
+            diagnostics.record(FrameDiagnostic::StaleModelHandle,
+                               [&] { return "model slot " + std::to_string(entity.model.index); });
 
-            if (!mesh.mesh->gpuResourceId.has_value())
+            continue;
+        }
+
+        // The instance's shader, not the material's: materials live in shared storage, so two
+        // renderables built from one model would otherwise restyle each other.
+        const auto programId = instanceShader->gpuResourceId;
+
+        if (entity.beforeDraw.has_value())
+        {
+            (*entity.beforeDraw)();
+        }
+
+        for (auto& renderableMesh : entity.meshes)
+        {
+            const auto* mesh = memoryStorageService.meshes.find(renderableMesh.mesh);
+            if (mesh == nullptr)
             {
-                static auto warnedMissingMeshUpload = false;
-                if (!warnedMissingMeshUpload)
-                {
-                    logger.warn("Skipping mesh without a GPU resource: {}", mesh.mesh->name);
-                    warnedMissingMeshUpload = true;
-                }
+                diagnostics.record(FrameDiagnostic::StaleMeshHandle,
+                                   [&] { return "mesh slot " + std::to_string(renderableMesh.mesh.index); });
 
                 continue;
             }
 
-            auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
+            if (!mesh->gpuResourceId.has_value())
+            {
+                // upload() writes through mutate(), which writes the element in place — so this
+                // borrow still names it, now carrying the ids the upload produced. Under the old
+                // update() the element was copy-assigned and everything inside it was freed, and
+                // this loop was safe only because it re-read through the handle afterwards.
+                upload(entity.model);
+            }
 
-            const auto joints = renderableEntityService.joints(mesh, delta);
+            if (!mesh->gpuResourceId.has_value())
+            {
+                diagnostics.record(FrameDiagnostic::MeshNotUploaded, [&] { return "mesh " + mesh->name; });
 
-            for (auto& primitive : mesh.mesh->meshPrimitives)
+                continue;
+            }
+
+            auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix;
+
+            // Bound by reference into the mesh's palette buffer: copying it here would undo the
+            // per-frame allocation the service avoids. The clamp limits the upload count instead.
+            const auto& joints = renderableEntityService.joints(renderableMesh, delta);
+            const auto jointCount = std::min(joints.size(), static_cast<size_t>(maxJoints));
+
+            if (joints.size() > maxJoints)
+            {
+                diagnostics.record(FrameDiagnostic::JointLimitExceeded,
+                                   [&]
+                                   {
+                                       return "the GL joint uniform array holds " + std::to_string(maxJoints) +
+                                              " of the " + std::to_string(joints.size()) + " supplied for mesh " +
+                                              mesh->name;
+                                   });
+            }
+
+            for (const auto& primitive : mesh->meshPrimitives)
             {
                 if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::MeshBufferNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
-                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value())
+                const auto* material = primitive.material.has_value()
+                                           ? memoryStorageService.materials.find(primitive.material.value())
+                                           : nullptr;
+
+                if (material == nullptr || !material->shader.has_value())
                 {
-                    static auto warnedMissingMaterial = false;
-                    if (!warnedMissingMaterial)
-                    {
-                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh.mesh->name);
-                        warnedMissingMaterial = true;
-                    }
+                    diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial, [&] { return "mesh " + mesh->name; });
 
                     continue;
                 }
 
-                auto material = primitive.material.value();
-                auto shader = material->shader.value();
-
-                setProgramUniform(shader->gpuResourceId, "localToScreen4x4Matrix",
+                setProgramUniform(programId, "localToScreen4x4Matrix",
                                   camera.modelViewProjectionMatrix * entityModelMatrix);
-                setProgramUniform(shader->gpuResourceId, "localToView4x4Matrix",
-                                  camera.modelViewMatrix * entityModelMatrix);
-                setProgramUniform(shader->gpuResourceId, "localToWorld4x4Matrix", entityModelMatrix);
+                setProgramUniform(programId, "localToView4x4Matrix", camera.modelViewMatrix * entityModelMatrix);
+                setProgramUniform(programId, "localToWorld4x4Matrix", entityModelMatrix);
 
-                setProgramUniform(shader->gpuResourceId, "normalMatrix",
+                setProgramUniform(programId, "normalMatrix",
                                   glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))));
-                setProgramUniform(shader->gpuResourceId, "jointTransformationMatrixes", joints);
-                setProgramUniform(shader->gpuResourceId, "animated", !joints.empty());
+                setProgramUniform(programId, "jointTransformationMatrixes", joints, jointCount);
+                setProgramUniform(programId, "animated", !joints.empty());
 
-                setProgramUniform(shader->gpuResourceId, "textureTransform", material->transform);
+                setProgramUniform(programId, "textureTransform", material->transform);
 
-                if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value().id != material.id)
+                if (!currentlyBoundMaterial.has_value() || currentlyBoundMaterial.value() != primitive.material.value())
                 {
-                    bindMaterial(material);
+                    bindMaterial(*material, programId);
 
                     if (!material->opaque)
                     {
@@ -322,24 +478,22 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
                         glEnable(GL_CULL_FACE);
                     }
 
-                    setProgramUniform(shader->gpuResourceId, "u_baseColour", material->baseColour);
-                    setProgramUniform(shader->gpuResourceId, "u_metalness", material->metalness);
-                    setProgramUniform(shader->gpuResourceId, "u_roughness", material->roughness);
+                    setProgramUniform(programId, "u_baseColour", material->baseColour);
+                    setProgramUniform(programId, "u_metalness", material->metalness);
+                    setProgramUniform(programId, "u_roughness", material->roughness);
 
-                    currentlyBoundMaterial = material;
+                    currentlyBoundMaterial = primitive.material.value();
 
-                    setProgramUniform(shader->gpuResourceId, "cameraPosition", camera.position);
-                    setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
-                    setProgramUniform(shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
-                    setProgramUniform(shader->gpuResourceId, "lights.diffuse",
-                                      glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5));
-                    setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
-                    setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
-                    setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
+                    setProgramUniform(programId, "cameraPosition", camera.position);
+                    setProgramUniform(programId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
+
+                    uploadLights(programId, scene);
                 }
 
                 if (!primitive.gpuVao.has_value())
                 {
+                    diagnostics.record(FrameDiagnostic::PrimitiveNotUploaded, [&] { return "mesh " + mesh->name; });
+
                     continue;
                 }
 
@@ -351,274 +505,315 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
         }
 
         glBindVertexArray(0);
+
+        if (entity.afterDraw.has_value())
+        {
+            (*entity.afterDraw)();
+        }
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    for (const auto& postProcess : camera.postProcesses)
+    // Each link of the chain binds the buffer it writes; a post-process with no output of its
+    // own writes the default framebuffer, which is what it did when it inherited the binding
+    // the scene pass left behind.
+    for (const auto& postProcessKey : camera.postProcesses)
     {
+        const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+        if (postProcess == nullptr)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&] { return "post-process slot " + std::to_string(postProcessKey.index); });
+
+            continue;
+        }
+
+        auto postProcessTarget = 0u;
         if (postProcess->output.has_value())
         {
-            auto frameBuffer = postProcess->output.value();
-
-            if (frameBuffer->gpuResourceId.has_value())
+            const auto* output = memoryStorageService.frameBuffers.find(postProcess->output.value());
+            if (output != nullptr && output->gpuResourceId.has_value())
             {
-                glBindFramebuffer(GL_FRAMEBUFFER, frameBuffer->gpuResourceId.value());
+                postProcessTarget = output->gpuResourceId.value();
             }
         }
 
-        drawFullScreenQuad(postProcess->shader, postProcess->inputs);
+        glBindFramebuffer(GL_FRAMEBUFFER, postProcessTarget);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (!drawFullScreenQuad(postProcess->shader, postProcess->inputs))
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&] { return "shader slot " + std::to_string(postProcess->shader.index); });
+        }
     }
 }
 
-void OpenGLRenderer::bindMaterial(const Resource<Material>& material)
+// The frame's last pass. It binds the default framebuffer itself rather than relying on a
+// view having left it bound, which is what made the presenter depend on a scene pass running
+// first.
+void OpenGLRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
 {
-    auto shader = material->shader.value();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    glUseProgram(shader->gpuResourceId);
-
-    if (material->albedo.has_value())
+    if (!drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey}))
     {
-        auto albedo = material->albedo.value();
+        diagnostics.record(FrameDiagnostic::PresentPassSkipped,
+                           [&] { return "shader slot " + std::to_string(shaderKey.index); });
 
-        if (albedo->gpuResourceId.has_value())
+        return;
+    }
+
+    presentRecorded = true;
+}
+
+// A scene with no lights uploads lightCount 0: both shader loops then contribute nothing and
+// the ambient floor is zero, leaving the image-based term as the only lighting. That is a
+// legitimate scene, not a failure, so nothing is logged.
+void OpenGLRenderer::uploadLights(const unsigned int programId, const Scene& scene)
+{
+    auto uploaded = 0u;
+    auto declared = 0u;
+
+    for (const auto& light : scene.lights)
+    {
+        declared++;
+
+        if (uploaded >= maxLights)
         {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(albedo->gpuResourceId.value()));
-            setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", true);
+            continue;
         }
-    }
-    else
-    {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", false);
+
+        const auto& names = lightUniformNames[uploaded];
+        setProgramUniform(programId, names.position.c_str(), light.position);
+        setProgramUniform(programId, names.diffuse.c_str(), light.diffuse);
+        setProgramUniform(programId, names.specular.c_str(), light.specular);
+        setProgramUniform(programId, names.ambient.c_str(), light.ambient);
+        setProgramUniform(programId, names.attenuation.c_str(), light.attenuation);
+        uploaded++;
     }
 
-    if (material->normal.has_value())
+    if (declared > maxLights)
     {
-        auto normal = material->normal.value();
+        diagnostics.record(FrameDiagnostic::LightLimitExceeded,
+                           [&]
+                           {
+                               return "the GL light uniform array holds " + std::to_string(maxLights) + " of the " +
+                                      std::to_string(declared) + " declared";
+                           });
+    }
 
-        if (normal->gpuResourceId.has_value())
+    setProgramUniform(programId, "lightCount", static_cast<int>(uploaded));
+}
+
+void OpenGLRenderer::bindMaterial(const Material& material, const unsigned int programId)
+{
+    glUseProgram(programId);
+
+    // One resolution per slot, and a slot whose handle has gone stale reads exactly like a slot
+    // the material never had: nothing bound, and the shader's use-flag off. The behaviour for a
+    // slot present but not yet uploaded is unchanged — the unit keeps whatever was there, which
+    // is what the missing else branch has always meant here.
+    const auto bindSlot =
+        [&](const std::optional<Resource<Texture>>& textureKey, const MaterialTextureSlot slot, const char* useUniform)
+    {
+        const auto* texture = textureKey.has_value() ? memoryStorageService.textures.find(textureKey.value()) : nullptr;
+
+        if (texture == nullptr)
         {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(normal->gpuResourceId.value()));
-            setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", true);
+            glActiveTexture(textureUnit(slot));
+            glBindTexture(GL_TEXTURE_2D, 0);
+            setProgramUniform(programId, useUniform, false);
+
+            return;
         }
-    }
-    else
-    {
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", false);
-    }
 
-    if (material->metallicRoughness.has_value())
-    {
-        auto metallicRoughness = material->metallicRoughness.value();
-
-        if (metallicRoughness->gpuResourceId.has_value())
+        if (texture->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(metallicRoughness->gpuResourceId.value()));
-            setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", true);
+            glActiveTexture(textureUnit(slot));
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture->gpuResourceId.value()));
+            setProgramUniform(programId, useUniform, true);
         }
-    }
-    else
-    {
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", false);
-    }
+    };
 
-    if (material->emissive.has_value())
-    {
-        auto emissive = material->emissive.value();
+    bindSlot(material.albedo, MaterialTextureSlot::Diffuse, "u_useDiffuseTexture");
+    bindSlot(material.normal, MaterialTextureSlot::Normal, "u_useNormalTexture");
+    bindSlot(material.metallicRoughness, MaterialTextureSlot::Specular, "u_useSpecularTexture");
+    bindSlot(material.emissive, MaterialTextureSlot::Emissive, "u_useEmissiveTexture");
+    bindSlot(material.occlusion, MaterialTextureSlot::Occlusion, "u_useOcclusionTexture");
 
-        if (emissive->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE3);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(emissive->gpuResourceId.value()));
-            setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", true);
-        }
-    }
-    else
-    {
-        glActiveTexture(GL_TEXTURE3);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", false);
-    }
+    const auto* materialEnvironment =
+        material.environment.has_value() ? memoryStorageService.cubeMaps.find(material.environment.value()) : nullptr;
 
-    if (material->occlusion.has_value())
+    glActiveTexture(textureUnit(MaterialTextureSlot::Environment));
+    if (materialEnvironment != nullptr)
     {
-        auto occlusion = material->occlusion.value();
-
-        if (occlusion->gpuResourceId.has_value())
-        {
-            glActiveTexture(GL_TEXTURE4);
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(occlusion->gpuResourceId.value()));
-            setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", true);
-        }
-    }
-    else
-    {
-        glActiveTexture(GL_TEXTURE4);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", false);
-    }
-
-    if (material->environment.has_value())
-    {
-        const auto environment = material->environment.value();
-
-        glActiveTexture(GL_TEXTURE5);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, environment->gpuResourceId);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, materialEnvironment->gpuResourceId);
     }
     else if (sceneEnvironmentGpuId.has_value())
     {
-        glActiveTexture(GL_TEXTURE5);
         glBindTexture(GL_TEXTURE_CUBE_MAP, sceneEnvironmentGpuId.value());
     }
     else
     {
-        glActiveTexture(GL_TEXTURE5);
         glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     }
 
-    for (auto i = 0u; i < material->textures.size(); i++)
+    for (auto i = 0u; i < material.textures.size(); i++)
     {
-        auto texture = material->textures[i];
+        const auto* texture = memoryStorageService.textures.find(material.textures[i]);
 
-        if (texture->gpuResourceId.has_value())
+        if (texture != nullptr && texture->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE5 + i + 1);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Environment) + i + 1);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture->gpuResourceId.value()));
         }
     }
 }
 
+// The whole upload runs inside one mutate() of the model, with a nested mutate() per mesh. That
+// is not incidental: it is the only shape in which the ids can be written to the elements the
+// draw path reads without either copying an 18 MB model out and back — which is what
+// get()/update() did on the first draw — or const_casting the storage's own reference.
+//
+// Lock nesting is models -> meshes and models -> materials -> textures, always in that order and
+// never back into the same storage, which is the rule mutate() states.
 void OpenGLRenderer::upload(const Resource<Model>& modelKey)
 {
-    auto model = memoryStorageService.models.get(modelKey);
+    memoryStorageService.models.mutate(
+        modelKey,
+        [&](Model& model)
+        {
+            for (const auto& meshKey : model.meshes)
+            {
+                memoryStorageService.meshes.mutate(
+                    meshKey,
+                    [&](Mesh& mesh)
+                    {
+                        if (mesh.gpuResourceId.has_value())
+                        {
+                            return;
+                        }
 
-    for (const auto& meshKey : model.meshes)
+                        for (auto& buffer : model.meshBuffers)
+                        {
+                            if (buffer.gpuId.has_value())
+                            {
+                                continue;
+                            }
+
+                            GLuint vbo;
+                            glGenBuffers(1, &vbo);
+                            createdVbos.push_back(vbo);
+                            glBindBuffer(static_cast<GLenum>(buffer.target), vbo);
+                            glBufferData(static_cast<GLenum>(buffer.target),
+                                         static_cast<GLsizeiptr>(buffer.data.size()), buffer.data.data(),
+                                         GL_STATIC_DRAW);
+
+                            buffer.gpuId = vbo;
+                            buffer.data.clear();
+                            buffer.data.shrink_to_fit();
+                        }
+
+                        // draw()'s "already uploaded" sentinel. Nothing binds it — each primitive
+                        // owns its VAO in gpuVao — but it has to be assigned outside the loop
+                        // below: GLTFService drops non-indexed primitives, so meshPrimitives can
+                        // be empty, and an unset sentinel makes draw() re-enter upload() on every
+                        // frame.
+                        auto uploadedSentinel = 0u;
+
+                        for (auto& primitive : mesh.meshPrimitives)
+                        {
+                            GLuint vao;
+                            glGenVertexArrays(1, &vao);
+                            glBindVertexArray(vao);
+                            createdVaos.push_back(vao);
+
+                            for (const auto& attribute : primitive.attributes)
+                            {
+                                glBindBuffer(
+                                    GL_ARRAY_BUFFER,
+                                    model.meshBuffers[static_cast<size_t>(attribute.bufferIndex)].gpuId.value());
+
+                                if (attribute.attributeType.has_value())
+                                {
+                                    glEnableVertexAttribArray(static_cast<GLuint>(attribute.attributeType.value()));
+                                    glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()),
+                                                          attribute.size, attribute.componentType,
+                                                          attribute.normalized ? GL_TRUE : GL_FALSE, attribute.stride,
+                                                          reinterpret_cast<const void*>(attribute.offset));
+                                }
+                            }
+
+                            // The element buffer binding is VAO state; baking it here removes the
+                            // per-draw rebind.
+                            glBindBuffer(
+                                GL_ELEMENT_ARRAY_BUFFER,
+                                static_cast<GLuint>(
+                                    model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
+
+                            primitive.gpuVao = vao;
+                            uploadedSentinel = vao;
+
+                            glBindVertexArray(0);
+                        }
+
+                        mesh.gpuResourceId = uploadedSentinel;
+                    });
+            }
+
+            for (const auto& materialKey : model.materials)
+            {
+                uploadMaterialTextures(materialKey);
+            }
+        });
+}
+
+void OpenGLRenderer::uploadMaterialTextures(const Resource<Material>& materialKey)
+{
+    const auto* material = memoryStorageService.materials.find(materialKey);
+    if (material == nullptr)
     {
-        auto mesh = memoryStorageService.meshes.get(meshKey);
-
-        if (mesh.gpuResourceId.has_value())
-            continue;
-
-        for (auto& buffer : model.meshBuffers)
-        {
-            if (buffer.gpuId.has_value())
-            {
-                continue;
-            }
-
-            GLuint vbo;
-            glGenBuffers(1, &vbo);
-            createdVbos.push_back(vbo);
-            glBindBuffer(static_cast<GLenum>(buffer.target), vbo);
-            glBufferData(static_cast<GLenum>(buffer.target), static_cast<GLsizeiptr>(buffer.data.size()),
-                         buffer.data.data(), GL_STATIC_DRAW);
-
-            buffer.gpuId = vbo;
-            buffer.data.clear();
-            buffer.data.shrink_to_fit();
-        }
-
-        memoryStorageService.models.update(modelKey, model);
-
-        for (auto& primitive : mesh.meshPrimitives)
-        {
-            GLuint vao;
-            glGenVertexArrays(1, &vao);
-            glBindVertexArray(vao);
-            createdVaos.push_back(vao);
-
-            for (const auto& attribute : primitive.attributes)
-            {
-                glBindBuffer(GL_ARRAY_BUFFER,
-                             model.meshBuffers[static_cast<size_t>(attribute.bufferIndex)].gpuId.value());
-
-                if (attribute.attributeType.has_value())
-                {
-                    glEnableVertexAttribArray(static_cast<GLuint>(attribute.attributeType.value()));
-                    glVertexAttribPointer(static_cast<GLuint>(attribute.attributeType.value()), attribute.size,
-                                          attribute.componentType, attribute.normalized ? GL_TRUE : GL_FALSE,
-                                          attribute.stride, reinterpret_cast<const void*>(attribute.offset));
-                }
-            }
-
-            // The element buffer binding is VAO state; baking it here removes the per-draw rebind.
-            glBindBuffer(
-                GL_ELEMENT_ARRAY_BUFFER,
-                static_cast<GLuint>(model.meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.value()));
-
-            primitive.gpuVao = vao;
-            mesh.gpuResourceId = vao;
-
-            glBindVertexArray(0);
-        }
-
-        memoryStorageService.meshes.update(meshKey, mesh);
+        return;
     }
 
-    for (const auto& resource : model.materials)
+    for (const auto& textureKey :
+         {material->albedo, material->normal, material->metallicRoughness, material->emissive, material->occlusion})
     {
-        auto material = memoryStorageService.materials.get(resource);
-
-        if (material.albedo.has_value() && memoryStorageService.textures.exists(material.albedo.value()))
+        if (textureKey.has_value())
         {
-            auto albedo = memoryStorageService.textures.get(material.albedo.value());
-            albedo.gpuResourceId = createTexture(albedo);
-            memoryStorageService.textures.update(material.albedo.value(), albedo);
+            uploadTexture(textureKey.value());
         }
+    }
 
-        if (material.normal.has_value() && memoryStorageService.textures.exists(material.normal.value()))
-        {
-            auto normal = memoryStorageService.textures.get(material.normal.value());
-            normal.gpuResourceId = createTexture(normal);
-            memoryStorageService.textures.update(material.normal.value(), normal);
-        }
-
-        if (material.metallicRoughness.has_value() &&
-            memoryStorageService.textures.exists(material.metallicRoughness.value()))
-        {
-            auto metallicRoughness = memoryStorageService.textures.get(material.metallicRoughness.value());
-            metallicRoughness.gpuResourceId = createTexture(metallicRoughness);
-            memoryStorageService.textures.update(material.metallicRoughness.value(), metallicRoughness);
-        }
-
-        if (material.emissive.has_value() && memoryStorageService.textures.exists(material.emissive.value()))
-        {
-            auto emissive = memoryStorageService.textures.get(material.emissive.value());
-            emissive.gpuResourceId = createTexture(emissive);
-            memoryStorageService.textures.update(material.emissive.value(), emissive);
-        }
-
-        if (material.occlusion.has_value() && memoryStorageService.textures.exists(material.occlusion.value()))
-        {
-            auto occlusion = memoryStorageService.textures.get(material.occlusion.value());
-            occlusion.gpuResourceId = createTexture(occlusion);
-            memoryStorageService.textures.update(material.occlusion.value(), occlusion);
-        }
-
-        for (auto& i : material.textures)
-        {
-            auto texture = memoryStorageService.textures.get(i);
-            if (!texture.gpuResourceId.has_value())
-            {
-                texture.gpuResourceId = createTexture(texture);
-                memoryStorageService.textures.update(i, texture);
-            }
-        }
+    for (const auto& textureKey : material->textures)
+    {
+        uploadTexture(textureKey);
     }
 }
 
-std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
+void OpenGLRenderer::uploadTexture(const Resource<Texture>& textureKey)
+{
+    // In place: the id is written and the pixels dropped inside the element, so a multi-megabyte
+    // payload is never copied through the storage. The const_cast this needed is gone with
+    // update() — mutate() is the API that says "write this element", and it is the only one.
+    // A stale handle is not an upload that failed, it is a texture that is no longer loaded, so
+    // the mutate simply does not run.
+    memoryStorageService.textures.mutate(textureKey,
+                                         [&](Texture& texture)
+                                         {
+                                             if (texture.gpuResourceId.has_value())
+                                             {
+                                                 return;
+                                             }
+
+                                             texture.gpuResourceId = createTexture(texture);
+
+                                             // The GPU owns the texels now; shed the CPU copy the
+                                             // way the mesh buffers above do.
+                                             texture.data.clear();
+                                             texture.data.shrink_to_fit();
+                                         });
+}
+
+std::expected<unsigned int, std::string> OpenGLRenderer::createShaderObject(const ShaderDescriptor& object)
 {
     const auto programId = glCreateProgram();
     const auto vertexShaderId = glCreateShader(GL_VERTEX_SHADER);
@@ -628,9 +823,32 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     const auto computeShaderId = glCreateShader(GL_COMPUTE_SHADER);
     const auto geometryShaderId = glCreateShader(GL_GEOMETRY_SHADER);
 
+    // Every GL source is compiled with the contract macros spliced in, so no shader spells a
+    // binding index, an attribute location or an array bound the C++ side also holds.
+    const auto contract = [](const std::string& source)
+    {
+        return withShaderContractMacros(source, GraphicsApi::OpenGL);
+    };
+
+    // A stage that will not compile is why the link below fails, so its message is carried to
+    // the caller with the link log rather than logged here and lost from the report.
+    std::string stageDiagnostics;
+    const auto compile = [&](const unsigned int shaderId, const std::string& source, const char* stage)
+    {
+        const auto compiled = compileShader(shaderId, contract(source));
+        if (compiled)
+        {
+            return true;
+        }
+
+        stageDiagnostics += (stageDiagnostics.empty() ? "" : "; ") + std::string(stage) + " stage: " + compiled.error();
+
+        return false;
+    };
+
     if (!object.vertexShaderSource.empty())
     {
-        if (compileShader(vertexShaderId, object.vertexShaderSource))
+        if (compile(vertexShaderId, object.vertexShaderSource, "vertex"))
         {
             glAttachShader(programId, vertexShaderId);
         }
@@ -638,7 +856,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.fragmentShaderSource.empty())
     {
-        if (compileShader(fragmentShaderId, object.fragmentShaderSource))
+        if (compile(fragmentShaderId, object.fragmentShaderSource, "fragment"))
         {
             glAttachShader(programId, fragmentShaderId);
         }
@@ -646,8 +864,12 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.tessellationControlShaderSource.empty() && !object.tessellationEvaluationShaderSource.empty())
     {
-        if (compileShader(tessellationControlShaderId, object.tessellationControlShaderSource) &&
-            compileShader(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource))
+        const auto control =
+            compile(tessellationControlShaderId, object.tessellationControlShaderSource, "tessellation control");
+        const auto evaluation = compile(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource,
+                                        "tessellation evaluation");
+
+        if (control && evaluation)
         {
             glAttachShader(programId, tessellationControlShaderId);
             glAttachShader(programId, tessellationEvaluationShaderId);
@@ -656,7 +878,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.computeShaderSource.empty())
     {
-        if (compileShader(computeShaderId, object.computeShaderSource))
+        if (compile(computeShaderId, object.computeShaderSource, "compute"))
         {
             glAttachShader(programId, computeShaderId);
         }
@@ -664,7 +886,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.geometryShaderSource.empty())
     {
-        if (compileShader(geometryShaderId, object.geometryShaderSource))
+        if (compile(geometryShaderId, object.geometryShaderSource, "geometry"))
         {
             glAttachShader(programId, geometryShaderId);
         }
@@ -677,18 +899,18 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     glGetProgramiv(programId, GL_LINK_STATUS, &result);
     glGetProgramiv(programId, GL_INFO_LOG_LENGTH, &infoLogLength);
 
+    std::string linkLog;
     if (infoLogLength > 1)
     {
         std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
         glGetProgramInfoLog(programId, infoLogLength, nullptr, infoLog.data());
+        linkLog = infoLog.data();
 
+        // A log on a program that linked is a driver remark, not a failure; only the failing
+        // case is reported to the caller, so a warning here is the whole story.
         if (result == GL_TRUE)
         {
-            logger.warn("shader link log: {}", infoLog.data());
-        }
-        else
-        {
-            logger.error("shader link error: {}", infoLog.data());
+            logger.warn("shader link log: {}", linkLog);
         }
     }
 
@@ -702,7 +924,18 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     if (result != GL_TRUE)
     {
         glDeleteProgram(programId);
-        return {};
+
+        auto reason = std::string("the GL program did not link");
+        if (!linkLog.empty())
+        {
+            reason += ": " + linkLog;
+        }
+        if (!stageDiagnostics.empty())
+        {
+            reason += " (" + stageDiagnostics + ")";
+        }
+
+        return std::unexpected(reason);
     }
 
     createdPrograms.push_back(programId);
@@ -710,7 +943,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     return programId;
 }
 
-unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
+unsigned int OpenGLRenderer::createTexture(const Texture& texture)
 {
     unsigned int textureId;
 
@@ -721,14 +954,30 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
 
     auto format = getTextureFormat(texture.format);
     auto type = getTextureDataType(texture.pixelDataType);
-    auto internalFormat = texture.pixelDataType == PixelDataType::Float
-                              ? getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel))
-                              : static_cast<unsigned int>(GL_RGBA);
+    auto internalFormat = static_cast<unsigned int>(GL_RGBA);
+    switch (texture.pixelDataType)
+    {
+    case PixelDataType::Float:
+        internalFormat = getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel));
+        break;
+    case PixelDataType::UnsignedShort:
+        // A 16-bit glTF image keeps its bits: the unsized GL_RGBA would have let the driver
+        // pick 8, throwing away half of what the asset carries (Vulkan uploads R16G16B16A16).
+        internalFormat = static_cast<unsigned int>(GL_RGBA16);
+        break;
+    default:
+        break;
+    }
 
     glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), texture.width, texture.height, NULL, format,
                  type, texture.data.data());
 
     glGenerateMipmap(GL_TEXTURE_2D);
+    // GL_REPEAT is GL's default and was previously left implicit. It is the glTF sampler
+    // default too, and the wrap KHR_texture_transform scaling depends on once a UV leaves
+    // 0..1, so it is stated rather than inherited (Vulkan sets the same mode explicitly).
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, maxAnisotropy);
@@ -738,8 +987,9 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
     return textureId;
 }
 
-unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& back, const Texture& left,
-                                           const Texture& right, const Texture& top, const Texture& bottom) const
+std::expected<unsigned int, std::string> OpenGLRenderer::createCubeMap(const Texture& front, const Texture& back,
+                                                                       const Texture& left, const Texture& right,
+                                                                       const Texture& top, const Texture& bottom)
 {
     unsigned int textureId;
     glGenTextures(1, &textureId);
@@ -766,10 +1016,14 @@ unsigned int OpenGLRenderer::createCubeMap(const Texture& front, const Texture& 
 
     glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
 
+    // The faces' pixel data is CubeMapService's to drop, through the handles it holds. This used
+    // to const_cast the const Texture& it was handed and empty it here — which is also what made
+    // a texture shared between a cube face and a material slot upload from an empty vector, since
+    // nothing wrote a gpuResourceId to say the pixels had gone.
     return textureId;
 }
 
-unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
+std::expected<unsigned int, std::string> OpenGLRenderer::createFbo(const Fbo& fbo)
 {
     unsigned int fboGpuResourceId;
     glGenFramebuffers(1, &fboGpuResourceId);
@@ -779,51 +1033,54 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
     auto colourAttachmentIndex = 0u;
     std::vector<unsigned int> drawBuffers;
 
-    for (auto& attachmentKey : fbo.attachments)
+    for (const auto& attachmentKey : fbo.attachments)
     {
-        auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+        memoryStorageService.bufferAttachments.mutate(
+            attachmentKey,
+            [&](FboAttachment& attachment)
+            {
+                unsigned int attachmentGpuResourceId;
+                glGenTextures(1, &attachmentGpuResourceId);
+                createdTextures.push_back(attachmentGpuResourceId);
+                glBindTexture(GL_TEXTURE_2D, attachmentGpuResourceId);
 
-        unsigned int attachmentGpuResourceId;
-        glGenTextures(1, &attachmentGpuResourceId);
-        createdTextures.push_back(attachmentGpuResourceId);
-        glBindTexture(GL_TEXTURE_2D, attachmentGpuResourceId);
+                glTexImage2D(GL_TEXTURE_2D, 0, getTextureFormat(attachment.internalFormat), attachment.width,
+                             attachment.height, 0, getTextureFormat(attachment.captureFormat), GL_FLOAT, nullptr);
 
-        glTexImage2D(GL_TEXTURE_2D, 0, getTextureFormat(attachment.internalFormat), attachment.width, attachment.height,
-                     0, getTextureFormat(attachment.captureFormat), GL_FLOAT, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                // No default: every FboAttachmentType has a GL attachment point, and a new
+                // enumerator must be given one here rather than discovered at run time as a
+                // framebuffer that reported complete with an attachment bound to point 0.
+                unsigned int attachmentType = 0;
+                switch (attachment.type)
+                {
+                case FboAttachmentType::Color:
+                    attachmentType = GL_COLOR_ATTACHMENT0 + colourAttachmentIndex;
+                    colourAttachmentIndex++;
+                    drawBuffers.push_back(attachmentType);
+                    break;
+                case FboAttachmentType::Depth:
+                    attachmentType = GL_DEPTH_ATTACHMENT;
+                    break;
+                case FboAttachmentType::Stencil:
+                    attachmentType = GL_STENCIL_ATTACHMENT;
+                    break;
+                }
 
-        unsigned int attachmentType = 0;
-        switch (attachment.type)
-        {
-        case FboAttachmentType::Color:
-            attachmentType = GL_COLOR_ATTACHMENT0 + colourAttachmentIndex;
-            colourAttachmentIndex++;
-            drawBuffers.push_back(attachmentType);
-            break;
-        case FboAttachmentType::Depth:
-            attachmentType = GL_DEPTH_ATTACHMENT;
-            break;
-        case FboAttachmentType::Stencil:
-            attachmentType = GL_STENCIL_ATTACHMENT;
-            break;
-        default:
-            logger.error("Unknown FBO attachment type {}", static_cast<int>(attachment.type));
-            break;
-        }
-
-        glFramebufferTexture2D(GL_FRAMEBUFFER, attachmentType, GL_TEXTURE_2D, attachmentGpuResourceId, 0);
-        attachment.gpuResourceId = attachmentGpuResourceId;
-
-        memoryStorageService.bufferAttachments.update(attachmentKey, attachment);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, attachmentType, GL_TEXTURE_2D, attachmentGpuResourceId, 0);
+                attachment.gpuResourceId = attachmentGpuResourceId;
+            });
     }
 
     glDrawBuffers(static_cast<GLsizei>(drawBuffers.size()), drawBuffers.data());
 
     const auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     if (status != GL_FRAMEBUFFER_COMPLETE)
     {
         const auto* statusName = "unknown status";
@@ -857,32 +1114,97 @@ unsigned int OpenGLRenderer::createFbo(const Fbo& fbo) const
             break;
         }
 
-        logger.error("Framebuffer incomplete: {} (0x{:x})", statusName, status);
+        return std::unexpected(std::string("the framebuffer is incomplete: ") + statusName + " (" +
+                               std::to_string(status) + ")");
     }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     return fboGpuResourceId;
 }
 
-void OpenGLRenderer::deleteFbo(Fbo& fbo) const
+void OpenGLRenderer::deleteFbo(Fbo& fbo)
 {
+    // GL recycles a deleted name immediately, and createFbo regenerates these objects right
+    // after this returns: an id left in the tracking vectors would make the destructor delete
+    // whatever live object inherited the name.
     if (fbo.gpuResourceId.has_value())
     {
-        glDeleteFramebuffers(1, &fbo.gpuResourceId.value());
+        releaseGpuResource(GpuResourceKind::FrameBuffer, fbo.gpuResourceId.value());
+        fbo.gpuResourceId.reset();
     }
 
-    for (auto& attachmentKey : fbo.attachments)
+    for (const auto& attachmentKey : fbo.attachments)
     {
-        auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
-        if (attachment.gpuResourceId.has_value())
-        {
-            glDeleteTextures(1, &attachment.gpuResourceId.value());
-        }
+        memoryStorageService.bufferAttachments.mutate(attachmentKey,
+                                                      [&](FboAttachment& attachment)
+                                                      {
+                                                          if (!attachment.gpuResourceId.has_value())
+                                                          {
+                                                              return;
+                                                          }
+
+                                                          releaseGpuResource(GpuResourceKind::Texture,
+                                                                             attachment.gpuResourceId.value());
+                                                          attachment.gpuResourceId.reset();
+                                                      });
     }
 }
 
-bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
+// GL frees at the call: the driver retires a name that is still referenced by commands already
+// issued, so there is nothing to defer. The tracking vector is what the destructor deletes from,
+// and a name left in it after a delete would make teardown delete whatever live object inherited
+// the name — which is exactly what the resize path used to do.
+void OpenGLRenderer::releaseGpuResource(const GpuResourceKind kind, const unsigned int gpuResourceId)
+{
+    switch (kind)
+    {
+    case GpuResourceKind::Buffer:
+        glDeleteBuffers(1, &gpuResourceId);
+        std::erase(createdVbos, gpuResourceId);
+        break;
+    case GpuResourceKind::Texture:
+    case GpuResourceKind::CubeMap:
+        glDeleteTextures(1, &gpuResourceId);
+        std::erase(createdTextures, gpuResourceId);
+        break;
+    case GpuResourceKind::VertexArray:
+        glDeleteVertexArrays(1, &gpuResourceId);
+        std::erase(createdVaos, gpuResourceId);
+        break;
+    case GpuResourceKind::ShaderProgram:
+        glDeleteProgram(gpuResourceId);
+        std::erase(createdPrograms, gpuResourceId);
+        // Uniform locations are per program and the pool caches them — including the permanent
+        // -1 for a name the program does not carry. A recycled program id would inherit them.
+        std::erase_if(uniformPool, [&](const auto& entry) { return entry.first.first == gpuResourceId; });
+        break;
+    case GpuResourceKind::FrameBuffer:
+        glDeleteFramebuffers(1, &gpuResourceId);
+        std::erase(createdFbos, gpuResourceId);
+        break;
+    }
+}
+
+// GL keys nothing on a material handle except the latch that skips rebinding an unchanged
+// material, and that latch has to drop: the next material to land in this slot is a different
+// material wearing the same index.
+void OpenGLRenderer::releaseMaterial(const Resource<Material>& material)
+{
+    if (currentlyBoundMaterial.has_value() && currentlyBoundMaterial.value() == material)
+    {
+        currentlyBoundMaterial.reset();
+    }
+}
+
+GpuResourceCensus OpenGLRenderer::gpuResourceCensus() const
+{
+    return GpuResourceCensus{.buffers = static_cast<unsigned int>(createdVbos.size()),
+                             .textures = static_cast<unsigned int>(createdTextures.size()),
+                             .vertexArrays = static_cast<unsigned int>(createdVaos.size()),
+                             .shaderPrograms = static_cast<unsigned int>(createdPrograms.size()),
+                             .frameBuffers = static_cast<unsigned int>(createdFbos.size())};
+}
+
+std::expected<void, std::string> OpenGLRenderer::compileShader(const unsigned int id, const std::string& source)
 {
     auto shaderSource = source.c_str();
     glShaderSource(id, 1, &shaderSource, nullptr);
@@ -893,22 +1215,27 @@ bool OpenGLRenderer::compileShader(const unsigned int id, const std::string& sou
     glGetShaderiv(id, GL_COMPILE_STATUS, &result);
     glGetShaderiv(id, GL_INFO_LOG_LENGTH, &infoLogLength);
 
+    std::string compileLog;
     if (infoLogLength > 1)
     {
         std::vector<char> infoLog(static_cast<size_t>(infoLogLength) + 1);
         glGetShaderInfoLog(id, infoLogLength, nullptr, infoLog.data());
-
-        if (result == GL_TRUE)
-        {
-            logger.warn("Shader compile log: {}", infoLog.data());
-        }
-        else
-        {
-            logger.error("Shader compile error: {}", infoLog.data());
-        }
+        compileLog = infoLog.data();
     }
 
-    return result == GL_TRUE;
+    if (result != GL_TRUE)
+    {
+        return std::unexpected(compileLog.empty() ? std::string("the stage did not compile") : compileLog);
+    }
+
+    // A log on a stage that compiled is a driver remark, not a failure, and there is no caller
+    // decision attached to it.
+    if (!compileLog.empty())
+    {
+        logger.warn("Shader compile log: {}", compileLog);
+    }
+
+    return {};
 }
 
 int OpenGLRenderer::getUniformLocation(const unsigned int programId, const char* uniformName)
@@ -999,7 +1326,15 @@ void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char*
 void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
                                        const std::vector<glm::mat4>& data)
 {
-    glProgramUniformMatrix4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(data.size()),
+    setProgramUniform(programId, uniformName, data, data.size());
+}
+
+// Uploading fewer elements than the vector holds is how the joint palette is clamped to the
+// shader's array bound without copying it.
+void OpenGLRenderer::setProgramUniform(const unsigned int programId, const char* uniformName,
+                                       const std::vector<glm::mat4>& data, const size_t count)
+{
+    glProgramUniformMatrix4fv(programId, getUniformLocation(programId, uniformName), static_cast<GLsizei>(count),
                               GL_FALSE, reinterpret_cast<const float*>(data.data()));
 }
 
@@ -1010,7 +1345,7 @@ void OpenGLRenderer::setViewport(int width, int height)
     glViewport(0, 0, width, height);
 }
 
-void OpenGLRenderer::captureFrame(const std::string& path)
+std::expected<void, std::string> OpenGLRenderer::captureFrame(const std::string& path)
 {
     // viewportWidth/Height track the window size: set from the window state at startup
     // and updated by the resize callback before any capture can run.
@@ -1036,11 +1371,11 @@ void OpenGLRenderer::captureFrame(const std::string& path)
 
     if (stbi_write_png(path.c_str(), width, height, 4, pixels.data(), static_cast<int>(rowBytes)) == 0)
     {
-        logger.error("Failed to write frame dump to {}", path);
-        std::exit(1);
+        return std::unexpected("stb_image_write could not write the frame dump to " + path);
     }
 
     logger.info("Frame dump written to {}", path);
+    return {};
 }
 
 unsigned int OpenGLRenderer::getTextureDataType(PixelDataType type) const
@@ -1125,19 +1460,25 @@ void OpenGLRenderer::createQuad()
     glBindVertexArray(0);
 }
 
-void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shader,
-                                        const std::vector<Resource<FboAttachment>>& attachments) const
+bool OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
+                                        const std::vector<Resource<FboAttachment>>& attachmentKeys) const
 {
+    const auto* shader = memoryStorageService.shaders.find(shaderKey);
+    if (shader == nullptr)
+    {
+        return false;
+    }
+
     glViewport(0, 0, viewportWidth, viewportHeight);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     glUseProgram(shader->gpuResourceId);
 
-    for (size_t i = 0; i < attachments.size(); i++)
+    for (size_t i = 0; i < attachmentKeys.size(); i++)
     {
-        auto attachment = attachments[i];
+        const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKeys[i]);
 
-        if (attachment->gpuResourceId.has_value())
+        if (attachment != nullptr && attachment->gpuResourceId.has_value())
         {
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(i));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(attachment->gpuResourceId.value()));
@@ -1146,12 +1487,8 @@ void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shader,
 
     glBindVertexArray(quadVao);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 4));
-}
 
-void OpenGLRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
-                                        const Resource<FboAttachment>& attachmentKey) const
-{
-    drawFullScreenQuad(shaderKey, std::vector<Resource<FboAttachment>>{attachmentKey});
+    return true;
 }
 
 } // namespace raceengine

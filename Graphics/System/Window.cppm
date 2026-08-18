@@ -17,6 +17,7 @@ module;
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -53,6 +54,13 @@ export enum class Key : int {
     LeftControl = GLFW_KEY_LEFT_CONTROL
 };
 
+// Captured hides the cursor and frees it from the screen's edges, which is what mouse-look
+// needs: the platform reports unbounded motion instead of a position that stops at the
+// desktop boundary. Warping the cursor to the window centre each frame is the alternative
+// and it does not work — on X11 the warp is a request to the server, so a read-back in the
+// same frame can report the requested centre while the pointer has not moved yet.
+export enum class CursorMode { Normal, Captured };
+
 export class IWindow
 {
 public:
@@ -60,8 +68,11 @@ public:
     virtual void makeContextCurrent() = 0;
     virtual void swapBuffers() const = 0;
     virtual void setMousePosition(int x, int y) = 0;
-    [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
-    [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
+    virtual void setCursorMode(CursorMode mode) = 0;
+    // Motion since the previous call, in pixels. Zero when the window is not focused, when
+    // the run is unattended, and on the first call after either changes — a controller that
+    // steers from this can never be handed a jump it did not earn.
+    [[nodiscard]] virtual std::tuple<double, double> mouseDelta() = 0;
     [[nodiscard]] virtual bool shouldClose() const = 0;
     [[nodiscard]] virtual bool keyPressed(Key key) const = 0;
     [[nodiscard]] virtual const WindowState& state() const = 0;
@@ -77,7 +88,25 @@ protected:
     std::vector<std::function<void(int, int)>> resizeCallbacks;
 };
 
-export class GLFWWindow : public IWindow
+// The window's Vulkan half, kept off IWindow for the same reason the renderer's three seams are
+// not one interface: IWindow is what Engine::window() hands the game, and a game has no business
+// being able to make a VkSurfaceKHR. Only the Vulkan backend takes this, and only the
+// composition root — which owns the concrete window — is in a position to hand it over.
+export class IVulkanSurfaceSource
+{
+public:
+    IVulkanSurfaceSource() = default;
+    IVulkanSurfaceSource(const IVulkanSurfaceSource&) = delete;
+    IVulkanSurfaceSource(IVulkanSurfaceSource&&) = delete;
+    IVulkanSurfaceSource& operator=(const IVulkanSurfaceSource&) = delete;
+    IVulkanSurfaceSource& operator=(IVulkanSurfaceSource&&) = delete;
+    virtual ~IVulkanSurfaceSource() = default;
+
+    [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
+    [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
+};
+
+export class GLFWWindow : public IWindow, public IVulkanSurfaceSource
 {
 private:
     mutable double _delta;
@@ -94,6 +123,13 @@ private:
     // It also makes captures reproducible, since controllers see a cursor that never moves.
     bool unattended;
     mutable bool windowShown = false;
+    CursorMode cursorMode = CursorMode::Normal;
+    // Baseline for mouseDelta. resyncCursor forces the next call to re-baseline and report
+    // no motion: the platform's cursor position jumps when capture is entered or left, and
+    // that jump is not something the user did.
+    double lastCursorX = 0.0;
+    double lastCursorY = 0.0;
+    bool resyncCursor = true;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
@@ -105,6 +141,8 @@ public:
     void makeContextCurrent() override;
     void swapBuffers() const override;
     void setMousePosition(int x, int y) override;
+    void setCursorMode(CursorMode mode) override;
+    [[nodiscard]] std::tuple<double, double> mouseDelta() override;
     [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
     [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
@@ -124,10 +162,11 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     graphicsApi(graphicsApi),
     unattended(std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
 {
+    // Thrown rather than logged and thrown: the exception is the report, and main's boundary is
+    // where it is read. Two channels for one problem reads as two problems.
     if (!glfwInit())
     {
-        logger.error("GLFW failed to initialize!");
-        throw std::runtime_error("GLFW failed to initialize!");
+        throw std::runtime_error("GLFW would not initialise");
     }
 
     if (glfwVulkanSupported())
@@ -159,9 +198,14 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
 
     if (!window)
     {
-        logger.error("GLFW failed to create a window!");
+        const char* description = nullptr;
+        const auto code = glfwGetError(&description);
+
         glfwTerminate();
-        throw std::runtime_error("GLFW failed to create a window!");
+
+        throw std::runtime_error(
+            "GLFW would not create a window: " + std::string(description == nullptr ? "no description" : description) +
+            " (code " + std::to_string(code) + ")");
     }
 
     glfwSetWindowPos(window, 150, 150);
@@ -190,14 +234,17 @@ VkSurfaceKHR GLFWWindow::generateVulkanSurface(const VkInstance& vkInstance)
 {
     VkSurfaceKHR vkSurfaceKhr;
 
+    // GLFW's own words travel with the exception rather than being logged beside a message that
+    // dropped them: the caller (VulkanRenderer::init) turns this into the reported reason the
+    // device would not come up, and "failed to create window surface!" said nothing about why.
     if (glfwCreateWindowSurface(vkInstance, window, nullptr, &vkSurfaceKhr) != VK_SUCCESS)
     {
-        const char* description;
-        int code = glfwGetError(&description);
+        const char* description = nullptr;
+        const auto code = glfwGetError(&description);
 
-        logger.error("{}, {}", code, description);
-
-        throw std::runtime_error("failed to create window surface!");
+        throw std::runtime_error("GLFW would not create a Vulkan window surface: " +
+                                 std::string(description == nullptr ? "no description" : description) + " (code " +
+                                 std::to_string(code) + ")");
     }
 
     return vkSurfaceKhr;
@@ -284,6 +331,58 @@ void GLFWWindow::setMousePosition(int x, int y)
     }
 
     glfwSetCursorPos(window, x, y);
+}
+
+void GLFWWindow::setCursorMode(const CursorMode mode)
+{
+    // An unattended run owns no cursor, so capturing one would take the pointer away from
+    // whoever is actually using the machine.
+    if (unattended)
+    {
+        return;
+    }
+
+    cursorMode = mode;
+    glfwSetInputMode(window, GLFW_CURSOR, mode == CursorMode::Captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+
+    // Raw motion skips the desktop's pointer acceleration, which is calibrated for a cursor
+    // travelling to a target rather than for a camera. Only meaningful while captured.
+    if (glfwRawMouseMotionSupported())
+    {
+        glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, mode == CursorMode::Captured ? GLFW_TRUE : GLFW_FALSE);
+    }
+
+    resyncCursor = true;
+}
+
+std::tuple<double, double> GLFWWindow::mouseDelta()
+{
+    if (unattended || !focused())
+    {
+        // Losing focus also loses the capture, so the position on return is unrelated to the
+        // one we left.
+        resyncCursor = true;
+        return std::make_tuple(0.0, 0.0);
+    }
+
+    double x, y;
+    glfwGetCursorPos(window, &x, &y);
+
+    if (resyncCursor)
+    {
+        lastCursorX = x;
+        lastCursorY = y;
+        resyncCursor = false;
+
+        return std::make_tuple(0.0, 0.0);
+    }
+
+    const auto deltaX = x - lastCursorX;
+    const auto deltaY = y - lastCursorY;
+    lastCursorX = x;
+    lastCursorY = y;
+
+    return std::make_tuple(deltaX, deltaY);
 }
 
 bool GLFWWindow::focused() const
