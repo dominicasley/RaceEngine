@@ -53,6 +53,13 @@ export enum class Key : int {
     LeftControl = GLFW_KEY_LEFT_CONTROL
 };
 
+// Captured hides the cursor and frees it from the screen's edges, which is what mouse-look
+// needs: the platform reports unbounded motion instead of a position that stops at the
+// desktop boundary. Warping the cursor to the window centre each frame is the alternative
+// and it does not work — on X11 the warp is a request to the server, so a read-back in the
+// same frame can report the requested centre while the pointer has not moved yet.
+export enum class CursorMode { Normal, Captured };
+
 export class IWindow
 {
 public:
@@ -60,6 +67,11 @@ public:
     virtual void makeContextCurrent() = 0;
     virtual void swapBuffers() const = 0;
     virtual void setMousePosition(int x, int y) = 0;
+    virtual void setCursorMode(CursorMode mode) = 0;
+    // Motion since the previous call, in pixels. Zero when the window is not focused, when
+    // the run is unattended, and on the first call after either changes — a controller that
+    // steers from this can never be handed a jump it did not earn.
+    [[nodiscard]] virtual std::tuple<double, double> mouseDelta() = 0;
     [[nodiscard]] virtual VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) = 0;
     [[nodiscard]] virtual VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() = 0;
     [[nodiscard]] virtual bool shouldClose() const = 0;
@@ -94,6 +106,13 @@ private:
     // It also makes captures reproducible, since controllers see a cursor that never moves.
     bool unattended;
     mutable bool windowShown = false;
+    CursorMode cursorMode = CursorMode::Normal;
+    // Baseline for mouseDelta. resyncCursor forces the next call to re-baseline and report
+    // no motion: the platform's cursor position jumps when capture is entered or left, and
+    // that jump is not something the user did.
+    double lastCursorX = 0.0;
+    double lastCursorY = 0.0;
+    bool resyncCursor = true;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
@@ -105,6 +124,8 @@ public:
     void makeContextCurrent() override;
     void swapBuffers() const override;
     void setMousePosition(int x, int y) override;
+    void setCursorMode(CursorMode mode) override;
+    [[nodiscard]] std::tuple<double, double> mouseDelta() override;
     [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
     [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
@@ -284,6 +305,58 @@ void GLFWWindow::setMousePosition(int x, int y)
     }
 
     glfwSetCursorPos(window, x, y);
+}
+
+void GLFWWindow::setCursorMode(const CursorMode mode)
+{
+    // An unattended run owns no cursor, so capturing one would take the pointer away from
+    // whoever is actually using the machine.
+    if (unattended)
+    {
+        return;
+    }
+
+    cursorMode = mode;
+    glfwSetInputMode(window, GLFW_CURSOR, mode == CursorMode::Captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+
+    // Raw motion skips the desktop's pointer acceleration, which is calibrated for a cursor
+    // travelling to a target rather than for a camera. Only meaningful while captured.
+    if (glfwRawMouseMotionSupported())
+    {
+        glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, mode == CursorMode::Captured ? GLFW_TRUE : GLFW_FALSE);
+    }
+
+    resyncCursor = true;
+}
+
+std::tuple<double, double> GLFWWindow::mouseDelta()
+{
+    if (unattended || !focused())
+    {
+        // Losing focus also loses the capture, so the position on return is unrelated to the
+        // one we left.
+        resyncCursor = true;
+        return std::make_tuple(0.0, 0.0);
+    }
+
+    double x, y;
+    glfwGetCursorPos(window, &x, &y);
+
+    if (resyncCursor)
+    {
+        lastCursorX = x;
+        lastCursorY = y;
+        resyncCursor = false;
+
+        return std::make_tuple(0.0, 0.0);
+    }
+
+    const auto deltaX = x - lastCursorX;
+    const auto deltaY = y - lastCursorY;
+    lastCursorX = x;
+    lastCursorY = y;
+
+    return std::make_tuple(deltaX, deltaY);
 }
 
 bool GLFWWindow::focused() const
