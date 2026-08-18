@@ -11,6 +11,7 @@ module;
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,8 @@ module;
 export module raceengine.graphics:VulkanRenderer;
 
 import :IRenderer;
+import :RenderableEntityService;
+import :SceneManagerService;
 import :Window;
 import raceengine.graphics.models;
 import raceengine.shared;
@@ -78,6 +81,32 @@ struct DrawDataUbo
 };
 
 static_assert(sizeof(DrawDataUbo) == 8464);
+// The per-draw fill writes the three regions directly into the mapped ring slot; the
+// offsets are asserted so the writes cannot drift away from the shader's block layout.
+static_assert(offsetof(DrawDataUbo, localToWorld) == 0);
+static_assert(offsetof(DrawDataUbo, animated) == 256);
+static_assert(offsetof(DrawDataUbo, jointTransforms) == 272);
+
+// Set 1 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
+struct MaterialDataUbo
+{
+    glm::vec4 baseColour;
+    glm::vec4 repeatRoughMetal;
+    glm::ivec4 useTextures;
+    glm::ivec4 useTextures2;
+};
+
+static_assert(sizeof(MaterialDataUbo) == 64);
+
+// CameraService keeps the GL depth convention (z in -w..w); Vulkan clips against 0..w.
+// Column-major glm: z' = 0.5z + 0.5w (vulkan-abi.md).
+[[nodiscard]] glm::mat4 clipCorrection()
+{
+    auto correction = glm::mat4(1.0f);
+    correction[2][2] = 0.5f;
+    correction[3][2] = 0.5f;
+    return correction;
+}
 
 void ensure(const VkResult result, const char* call)
 {
@@ -138,8 +167,10 @@ void ensure(const VkResult result, const char* call)
 
 // Fullscreen shaders read gl_VertexIndex only: no Input variable carries a Location
 // decoration. Builtins (which are also Input storage) carry BuiltIn instead, so the scan
-// keys on Location-decorated ids specifically.
-[[nodiscard]] bool spirvHasVertexInputLocations(const std::vector<uint32_t>& spirv)
+// keys on Location-decorated ids specifically. The returned locations are the ones the
+// pipeline must supply: a declared-but-unfed vertex input is invalid, so primitives
+// lacking an attribute get a constant dummy binding for it.
+[[nodiscard]] std::vector<uint32_t> spirvVertexInputLocations(const std::vector<uint32_t>& spirv)
 {
     constexpr uint32_t opDecorate = 71;
     constexpr uint32_t opVariable = 59;
@@ -147,7 +178,8 @@ void ensure(const VkResult result, const char* call)
     constexpr uint32_t storageClassInput = 1;
     constexpr size_t headerWords = 5;
 
-    std::vector<uint32_t> locationDecoratedIds;
+    std::vector<std::pair<uint32_t, uint32_t>> decoratedLocations;
+    std::vector<uint32_t> locations;
     for (auto pass = 0; pass < 2; pass++)
     {
         auto word = headerWords;
@@ -160,22 +192,27 @@ void ensure(const VkResult result, const char* call)
                 break;
             }
 
-            if (pass == 0 && opcode == opDecorate && wordCount >= 3 && spirv[word + 2] == decorationLocation)
+            if (pass == 0 && opcode == opDecorate && wordCount >= 4 && spirv[word + 2] == decorationLocation)
             {
-                locationDecoratedIds.push_back(spirv[word + 1]);
+                decoratedLocations.emplace_back(spirv[word + 1], spirv[word + 3]);
             }
 
-            if (pass == 1 && opcode == opVariable && wordCount >= 4 && spirv[word + 3] == storageClassInput &&
-                std::ranges::find(locationDecoratedIds, spirv[word + 2]) != locationDecoratedIds.end())
+            if (pass == 1 && opcode == opVariable && wordCount >= 4 && spirv[word + 3] == storageClassInput)
             {
-                return true;
+                const auto decorated =
+                    std::ranges::find(decoratedLocations, spirv[word + 2], &std::pair<uint32_t, uint32_t>::first);
+                if (decorated != decoratedLocations.end() &&
+                    std::ranges::find(locations, decorated->second) == locations.end())
+                {
+                    locations.push_back(decorated->second);
+                }
             }
 
             word += wordCount;
         }
     }
 
-    return false;
+    return locations;
 }
 
 // GL component-type enums exactly as GLTFService stores them (tinygltf keeps GL values).
@@ -408,6 +445,77 @@ static_assert(
     }(),
     "vertex input translation must derive tight strides and USCALED joint formats");
 
+// Index accessors keep their GL component-type enums; VK_INDEX_TYPE_UINT8 needs an
+// extension this backend does not enable, so unsigned-byte indices are reported and
+// skipped (no asset in the sandbox uses them).
+constexpr int glUnsignedInt = 0x1405;
+
+[[nodiscard]] constexpr std::optional<VkIndexType> indexType(const int componentType)
+{
+    switch (componentType)
+    {
+    case glUnsignedShort:
+        return VK_INDEX_TYPE_UINT16;
+    case glUnsignedInt:
+        return VK_INDEX_TYPE_UINT32;
+    default:
+        return std::nullopt;
+    }
+}
+
+// MeshPrimitive::mode carries the GL/glTF draw mode; GL_LINE_LOOP has no Vulkan topology.
+[[nodiscard]] constexpr std::optional<VkPrimitiveTopology> primitiveTopology(const int mode)
+{
+    switch (mode)
+    {
+    case 0:
+        return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 1:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case 3:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 4:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case 5:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 6:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    default:
+        return std::nullopt;
+    }
+}
+
+struct StageAccess
+{
+    VkPipelineStageFlags2 stage;
+    VkAccessFlags2 access;
+};
+
+// Layout is the single piece of state tracked per image, so the barrier's stage/access
+// masks are derived from it: every layout this backend uses has exactly one producer or
+// consumer kind.
+[[nodiscard]] constexpr StageAccess stageAccessFor(const VkImageLayout layout)
+{
+    switch (layout)
+    {
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT};
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        return {VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE};
+    default:
+        return {VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE};
+    }
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL vulkanDebugMessageHandler(const VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                          const VkDebugUtilsMessageTypeFlagsEXT type,
                                                          const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
@@ -512,6 +620,9 @@ private:
         VkShaderModule vertexModule = VK_NULL_HANDLE;
         VkShaderModule fragmentModule = VK_NULL_HANDLE;
         bool fullscreen = false;
+        // Vertex input locations the vertex shader declares; the scene pipeline must feed
+        // every one of them, dummy binding included.
+        std::vector<uint32_t> vertexInputLocations;
         // Fullscreen pipelines exist per reachable target format (presenter writes the
         // swapchain, post-processes write RGBA16F); the draw path picks by actual target.
         // Scene pipelines are vertex-input-dependent and are built by the draw path.
@@ -520,7 +631,8 @@ private:
     };
 
     // Cube maps and FBO attachments share this shape; attachments use the shared
-    // attachmentSampler and keep their own field VK_NULL_HANDLE.
+    // attachmentSampler and keep their own field VK_NULL_HANDLE. layout is the tracked
+    // current layout: the draw path derives every barrier from it.
     struct ImageResource
     {
         VkImage image = VK_NULL_HANDLE;
@@ -529,6 +641,10 @@ private:
         VkSampler sampler = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t mipLevels = 1;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
 
     struct FboResource
@@ -536,10 +652,56 @@ private:
         std::vector<unsigned int> attachmentIds;
     };
 
+    struct BufferResource
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+    };
+
+    // One UBO + one descriptor set per (material, environment) pair, allocated on first
+    // use and kept for the process lifetime: material contents are load-time constant.
+    struct MaterialResource
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+
+    // The Vulkan counterpart of the GL path's per-primitive VAO: everything a draw needs
+    // that does not change once the primitive is uploaded. pipeline/boundBuffers resolve
+    // on the first draw because they also depend on the material's shader.
+    struct PrimitiveBinding
+    {
+        VertexInputDescription input;
+        std::vector<VkBuffer> vertexBuffers;
+        std::vector<VkDeviceSize> vertexOffsets;
+        std::string signature;
+        VkBuffer indexBuffer = VK_NULL_HANDLE;
+        VkDeviceSize indexOffset = 0;
+        VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+        uint32_t indexCount = 0;
+        VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        bool drawable = false;
+        bool resolved = false;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::vector<VkBuffer> boundBuffers;
+        std::vector<VkDeviceSize> boundOffsets;
+    };
+
+    // What the presenter drew last: captureFrame replays exactly this pass onto a freshly
+    // acquired image, because the presented one may not be touched again.
+    struct PresentPass
+    {
+        unsigned int shaderId = 0;
+        unsigned int attachmentImageId = 0;
+    };
+
     // Declaration order is dependency order; the destructor tears down in reverse.
     spdlog::logger& logger;
     IWindow& window;
     MemoryStorageService& memoryStorageService;
+    RenderableEntityService& renderableEntityService;
+    SceneManagerService& sceneManagerService;
     bool validationLayerEnabled = false;
     VkInstance instance = VK_NULL_HANDLE;
     PFN_vkDestroyDebugUtilsMessengerEXT destroyDebugUtilsMessenger = nullptr;
@@ -581,11 +743,41 @@ private:
     std::unordered_map<unsigned int, ShaderObject> shaderObjects;
     mutable std::unordered_map<unsigned int, ImageResource> imageResources;
     mutable std::unordered_map<unsigned int, FboResource> fboResources;
+    std::unordered_map<unsigned int, BufferResource> bufferResources;
+    std::unordered_map<unsigned int, PrimitiveBinding> primitiveBindings;
+    // Key packs the material's Resource id with the environment cube map's image id: the
+    // scene environment is the fallback binding, so it is part of the set's identity.
+    std::unordered_map<uint64_t, MaterialResource> materialResources;
+    mutable std::unordered_map<unsigned int, VkDescriptorSet> attachmentSets;
+    std::unordered_map<std::string, VkPipeline> scenePipelines;
+    unsigned int dummyTextureId = 0;
+    unsigned int dummyCubeMapId = 0;
+    BufferResource dummyVertexBuffer{};
+    std::optional<unsigned int> sceneEnvironmentImageId;
+    // Frame recording state: draw() opens the frame and records the scene and post
+    // passes, drawFullScreenQuad() records the swapchain pass and closes it.
+    bool frameOpen = false;
+    bool swapchainPassRecorded = false;
+    uint32_t currentImageIndex = 0;
+    std::optional<PresentPass> lastPresentPass;
     mutable bool mipGenerationUnavailableLogged = false;
     bool drawDataRingExhaustedLogged = false;
+    bool missingCameraOutputLogged = false;
+    bool missingMeshUploadLogged = false;
+    bool missingMaterialLogged = false;
+    bool unsupportedIndexTypeLogged = false;
+    bool unsupportedTopologyLogged = false;
+    bool unsupportedTextureLayoutLogged = false;
+    bool jointLimitLogged = false;
+    bool scenePipelineUnavailableLogged = false;
+    bool fullscreenPipelineUnavailableLogged = false;
+    bool descriptorSetUnavailableLogged = false;
+    bool missingPostProcessTargetLogged = false;
+    bool drawSummaryLogged = false;
 
 public:
-    explicit VulkanRenderer(spdlog::logger& logger, IWindow& window, MemoryStorageService& memoryStorageService);
+    explicit VulkanRenderer(spdlog::logger& logger, IWindow& window, RenderableEntityService& renderableEntityService,
+                            SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService);
     ~VulkanRenderer() override;
 
     bool init() override;
@@ -611,8 +803,28 @@ private:
     void createFrameResources();
     void createDescriptorInfrastructure();
     void recreateSwapchainIfNeeded();
-    void recordFrame(VkCommandBuffer commandBuffer, uint32_t imageIndex, VkBuffer captureBuffer) const;
-    bool renderAndPresentFrame(VkBuffer captureBuffer);
+    [[nodiscard]] bool beginFrame();
+    bool endFrame(VkBuffer captureBuffer);
+    void recordClearOnlySwapchainPass();
+    void recordScenePass(Scene& scene, Camera& camera, float delta);
+    void recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix, const Camera& camera,
+                    const std::vector<glm::mat4>& joints);
+    bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
+                              VkPipeline pipeline);
+    void presentAndCloseFrame(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey);
+    bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
+    void transitionTracked(VkCommandBuffer commandBuffer, unsigned int imageId, VkImageLayout newLayout);
+    void upload(const Resource<Model>& modelKey);
+    [[nodiscard]] BufferResource createDeviceLocalBuffer(const void* data, VkDeviceSize size) const;
+    [[nodiscard]] unsigned int uploadMeshBuffer(const MeshBuffer& meshBuffer);
+    [[nodiscard]] PrimitiveBinding makePrimitiveBinding(const Model& model, const MeshPrimitive& primitive);
+    void uploadMaterialTextures(const Resource<Material>& materialKey);
+    [[nodiscard]] std::optional<unsigned int> uploadTexture(const Resource<Texture>& textureKey);
+    [[nodiscard]] VkDescriptorSet materialSet(const Resource<Material>& materialKey, unsigned int environmentImageId);
+    [[nodiscard]] VkDescriptorSet attachmentSet(unsigned int imageId);
+    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode);
+    [[nodiscard]] unsigned int dummyTexture();
+    [[nodiscard]] unsigned int dummyCubeMap();
     [[nodiscard]] std::optional<std::vector<uint32_t>> compileToSpirv(const std::string& source,
                                                                       shaderc_shader_kind kind, const char* stageName);
     [[nodiscard]] VkShaderModule createShaderModule(const std::vector<uint32_t>& spirv) const;
@@ -627,10 +839,14 @@ private:
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
 };
 
-VulkanRenderer::VulkanRenderer(spdlog::logger& logger, IWindow& window, MemoryStorageService& memoryStorageService) :
+VulkanRenderer::VulkanRenderer(spdlog::logger& logger, IWindow& window,
+                               RenderableEntityService& renderableEntityService,
+                               SceneManagerService& sceneManagerService, MemoryStorageService& memoryStorageService) :
     logger(logger),
     window(window),
-    memoryStorageService(memoryStorageService)
+    memoryStorageService(memoryStorageService),
+    renderableEntityService(renderableEntityService),
+    sceneManagerService(sceneManagerService)
 {
 }
 
@@ -659,6 +875,32 @@ VulkanRenderer::~VulkanRenderer()
         {
             vkDestroyShaderModule(device, shader.fragmentModule, nullptr);
         }
+    }
+
+    for (const auto& [key, pipeline] : scenePipelines)
+    {
+        vkDestroyPipeline(device, pipeline, nullptr);
+    }
+
+    for (const auto& [key, material] : materialResources)
+    {
+        if (material.buffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, material.buffer, material.allocation);
+        }
+    }
+
+    for (const auto& [id, buffer] : bufferResources)
+    {
+        if (buffer.buffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
+        }
+    }
+
+    if (dummyVertexBuffer.buffer != VK_NULL_HANDLE)
+    {
+        vmaDestroyBuffer(allocator, dummyVertexBuffer.buffer, dummyVertexBuffer.allocation);
     }
 
     for (const auto& [id, image] : imageResources)
@@ -1361,6 +1603,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
+    // GL leaves a disabled vertex attribute at the generic default (0, 0, 0, 1); Vulkan
+    // demands a real binding for every declared input, so absent attributes read this
+    // constant through a zero-stride binding.
+    const std::array<float, 4> defaultVertexAttribute = {0.0f, 0.0f, 0.0f, 1.0f};
+    dummyVertexBuffer = createDeviceLocalBuffer(defaultVertexAttribute.data(), sizeof(defaultVertexAttribute));
+
     logger.info("Vulkan descriptor machinery ready: scene sets 0-2 + fullscreen set, pool for {} sets, "
                 "draw-data ring {} slots x {} bytes per frame in flight",
                 descriptorPoolMaxSets, drawDataRingSlots, drawDataStride);
@@ -1382,75 +1630,13 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
     recreateNeeded = false;
 }
 
-void VulkanRenderer::recordFrame(const VkCommandBuffer commandBuffer, const uint32_t imageIndex,
-                                 const VkBuffer captureBuffer) const
+bool VulkanRenderer::beginFrame()
 {
-    const auto image = swapchainImages[imageIndex];
-
-    transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-
-    VkRenderingAttachmentInfo colorAttachment{};
-    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView = swapchainImageViews[imageIndex];
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // Matches the GL path's glClearColor(1, 1, 1, 1).
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
-
-    VkRenderingInfo renderingInfo{};
-    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, swapchainExtent};
-    renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &colorAttachment;
-
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
-
-    // GL-convention Y-flip via negative viewport height (vulkan-abi.md); established now
-    // so the prebuilt pipelines inherit the state unchanged.
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = static_cast<float>(swapchainExtent.height);
-    viewport.width = static_cast<float>(swapchainExtent.width);
-    viewport.height = -static_cast<float>(swapchainExtent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-
-    const VkRect2D scissor{VkOffset2D{0, 0}, swapchainExtent};
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
-    vkCmdEndRendering(commandBuffer);
-
-    if (captureBuffer != VK_NULL_HANDLE)
+    if (frameOpen)
     {
-        transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
-                        VK_ACCESS_2_TRANSFER_READ_BIT);
-
-        VkBufferImageCopy region{};
-        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = VkExtent3D{swapchainExtent.width, swapchainExtent.height, 1};
-        vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffer, 1, &region);
-
-        transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE);
+        return true;
     }
-    else
-    {
-        transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE);
-    }
-}
 
-bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
-{
     recreateSwapchainIfNeeded();
     if (swapchain == VK_NULL_HANDLE)
     {
@@ -1464,9 +1650,8 @@ bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
     // the draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
 
-    uint32_t imageIndex = 0;
     const auto acquireResult =
-        vkAcquireNextImageKHR(device, swapchain, waitForever, frame.imageAvailable, VK_NULL_HANDLE, &imageIndex);
+        vkAcquireNextImageKHR(device, swapchain, waitForever, frame.imageAvailable, VK_NULL_HANDLE, &currentImageIndex);
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR)
     {
         recreateNeeded = true;
@@ -1488,8 +1673,90 @@ bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     ensure(vkBeginCommandBuffer(frame.commandBuffer, &beginInfo), "vkBeginCommandBuffer");
-    recordFrame(frame.commandBuffer, imageIndex, captureBuffer);
+
+    frameOpen = true;
+    swapchainPassRecorded = false;
+    return true;
+}
+
+void VulkanRenderer::recordClearOnlySwapchainPass()
+{
+    // Fallback for a frame that produced no presenter pass (no presenter yet, or a scene
+    // whose assets have not landed): the window still gets the GL clear colour.
+    auto& frame = frames[frameIndex];
+    const auto image = swapchainImages[currentImageIndex];
+
+    transitionImage(frame.commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = swapchainImageViews[currentImageIndex];
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // Matches the GL path's glClearColor(1, 1, 1, 1).
+    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, swapchainExtent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+
+    vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+    vkCmdEndRendering(frame.commandBuffer);
+
+    swapchainPassRecorded = true;
+}
+
+bool VulkanRenderer::endFrame(const VkBuffer captureBuffer)
+{
+    if (!frameOpen)
+    {
+        return false;
+    }
+
+    auto& frame = frames[frameIndex];
+    if (!swapchainPassRecorded)
+    {
+        recordClearOnlySwapchainPass();
+    }
+
+    const auto image = swapchainImages[currentImageIndex];
+    if (captureBuffer != VK_NULL_HANDLE)
+    {
+        transitionImage(frame.commandBuffer, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = VkExtent3D{swapchainExtent.width, swapchainExtent.height, 1};
+        vkCmdCopyImageToBuffer(frame.commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffer, 1,
+                               &region);
+
+        transitionImage(frame.commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE);
+    }
+    else
+    {
+        transitionImage(frame.commandBuffer, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                        VK_ACCESS_2_NONE);
+    }
+
     ensure(vkEndCommandBuffer(frame.commandBuffer), "vkEndCommandBuffer");
+
+    // No-ops on the coherent memory VMA picks here, but the uniform writes this frame made
+    // must be flushed before the submit on any host-cached heap.
+    ensure(vmaFlushAllocation(allocator, frame.frameDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+    ensure(vmaFlushAllocation(allocator, frame.drawDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
     VkSemaphoreSubmitInfo waitSemaphoreInfo{};
     waitSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -1498,7 +1765,7 @@ bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
 
     VkSemaphoreSubmitInfo signalSemaphoreInfo{};
     signalSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signalSemaphoreInfo.semaphore = renderFinishedSemaphores[imageIndex];
+    signalSemaphoreInfo.semaphore = renderFinishedSemaphores[currentImageIndex];
     signalSemaphoreInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkCommandBufferSubmitInfo commandBufferInfo{};
@@ -1519,10 +1786,10 @@ bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &renderFinishedSemaphores[imageIndex];
+    presentInfo.pWaitSemaphores = &renderFinishedSemaphores[currentImageIndex];
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &swapchain;
-    presentInfo.pImageIndices = &imageIndex;
+    presentInfo.pImageIndices = &currentImageIndex;
 
     const auto presentResult = vkQueuePresentKHR(presentQueue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
@@ -1534,29 +1801,1168 @@ bool VulkanRenderer::renderAndPresentFrame(const VkBuffer captureBuffer)
         ensure(presentResult, "vkQueuePresentKHR");
     }
 
+    frameOpen = false;
     frameIndex = (frameIndex + 1) % framesInFlight;
     return true;
 }
 
-void VulkanRenderer::draw(Scene&, Camera&, float)
+void VulkanRenderer::draw(Scene& scene, Camera& camera, float delta)
 {
-    // One acquire->present cycle per call. With multiple cameras this would present once
-    // per camera per step; a single scene+camera holds until V3 adds offscreen targets.
-    renderAndPresentFrame(VK_NULL_HANDLE);
+    // draw() opens the frame; the presenter's fullscreen pass closes it. A frame still
+    // open here belongs to a step that never presented (no presenter, or a second camera),
+    // so it is finished as recorded before this one starts.
+    if (frameOpen)
+    {
+        endFrame(VK_NULL_HANDLE);
+    }
+
+    if (!beginFrame())
+    {
+        return;
+    }
+
+    recordScenePass(scene, camera, delta);
 }
 
-void VulkanRenderer::drawFullScreenQuad(const Resource<Shader>&, const Resource<FboAttachment>&) const
+void VulkanRenderer::drawFullScreenQuad(const Resource<Shader>& shaderKey,
+                                        const Resource<FboAttachment>& attachmentKey) const
 {
-    static auto logged = false;
-    if (!logged)
+    // IRenderer declares this const for the GL backend, where a fullscreen quad is a pure
+    // draw. On Vulkan it is the frame's closing pass: it records, submits and presents.
+    // The renderer is never held by const reference (Engine owns it through a non-const
+    // unique_ptr, PresenterService through a non-const reference), so the cast is defined.
+    const_cast<VulkanRenderer*>(this)->presentAndCloseFrame(shaderKey, attachmentKey);
+}
+
+void VulkanRenderer::presentAndCloseFrame(const Resource<Shader>& shaderKey,
+                                          const Resource<FboAttachment>& attachmentKey)
+{
+    if (!beginFrame())
     {
-        logger.info("Vulkan backend: fullscreen passes are stubs until V3; presenting the clear colour");
-        logged = true;
+        return;
     }
+
+    const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+    if (attachment.gpuResourceId.has_value())
+    {
+        recordPresentPass(shaderKey->gpuResourceId, attachment.gpuResourceId.value());
+    }
+
+    endFrame(VK_NULL_HANDLE);
+}
+
+bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsigned int attachmentImageId)
+{
+    const auto shader = shaderObjects.find(shaderId);
+    if (shader == shaderObjects.end() || shader->second.swapchainTargetPipeline == VK_NULL_HANDLE ||
+        !imageResources.contains(attachmentImageId))
+    {
+        if (!fullscreenPipelineUnavailableLogged)
+        {
+            logger.warn("Vulkan presenter pass skipped: shader {} has no swapchain pipeline or attachment image {} is "
+                        "unknown; presenting the clear colour",
+                        shaderId, attachmentImageId);
+            fullscreenPipelineUnavailableLogged = true;
+        }
+        return false;
+    }
+
+    // Resolved before the swapchain image is touched: a pass that cannot bind its source
+    // must leave the image untouched so the clear fallback can still take it.
+    if (attachmentSet(attachmentImageId) == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    auto& frame = frames[frameIndex];
+    transitionImage(frame.commandBuffer, swapchainImages[currentImageIndex], VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    recordFullScreenPass(attachmentImageId, swapchainImageViews[currentImageIndex], swapchainExtent,
+                         shader->second.swapchainTargetPipeline);
+
+    swapchainPassRecorded = true;
+    lastPresentPass = PresentPass{shaderId, attachmentImageId};
+    return true;
+}
+
+void VulkanRenderer::transitionTracked(const VkCommandBuffer commandBuffer, const unsigned int imageId,
+                                       const VkImageLayout newLayout)
+{
+    const auto entry = imageResources.find(imageId);
+    if (entry == imageResources.end())
+    {
+        return;
+    }
+
+    auto& resource = entry->second;
+    const auto source = stageAccessFor(resource.layout);
+    const auto destination = stageAccessFor(newLayout);
+
+    // Emitted even when the layout already matches: consecutive frames write the same
+    // attachment images, and the barrier is what orders this frame's access against the
+    // previous submission's.
+    transitionImage(commandBuffer, resource.image, resource.layout, newLayout, source.stage, source.access,
+                    destination.stage, destination.access,
+                    VkImageSubresourceRange{resource.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
+    resource.layout = newLayout;
+}
+
+void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float delta)
+{
+    auto& frame = frames[frameIndex];
+
+    sceneEnvironmentImageId.reset();
+    if (scene.environment.has_value())
+    {
+        const auto environmentImageId = memoryStorageService.cubeMaps.get(scene.environment.value()).gpuResourceId;
+        if (imageResources.contains(environmentImageId))
+        {
+            sceneEnvironmentImageId = environmentImageId;
+        }
+    }
+
+    std::optional<unsigned int> colorImageId;
+    std::optional<unsigned int> depthImageId;
+    if (camera.output.has_value())
+    {
+        const auto& outputBuffer = memoryStorageService.frameBuffers.get(camera.output.value());
+        for (const auto& attachmentKey : outputBuffer.attachments)
+        {
+            const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+            if (!attachment.gpuResourceId.has_value())
+            {
+                continue;
+            }
+
+            if (attachment.type == FboAttachmentType::Color && !colorImageId.has_value())
+            {
+                colorImageId = attachment.gpuResourceId;
+            }
+            else if (attachment.type == FboAttachmentType::Depth && !depthImageId.has_value())
+            {
+                depthImageId = attachment.gpuResourceId;
+            }
+        }
+    }
+
+    if (!colorImageId.has_value() || !imageResources.contains(colorImageId.value()))
+    {
+        if (!missingCameraOutputLogged)
+        {
+            logger.warn("Camera output framebuffer has no colour image; the scene pass is skipped this session");
+            missingCameraOutputLogged = true;
+        }
+        return;
+    }
+
+    // Values mirror the GL renderer's hardcoded per-shader uploads (OpenGLRenderer::draw).
+    FrameDataUbo frameData{};
+    frameData.viewMatrix = camera.modelViewMatrix;
+    frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
+    frameData.lightPosition = glm::vec4(glm::vec3(0.0f, 350.0f, 350.0f), 1.0f);
+    frameData.lightDiffuse = glm::vec4(glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5), 0.0f);
+    frameData.lightSpecular = glm::vec4(glm::vec3(1.2859, 1.2973, 1.3), 0.0f);
+    frameData.lightAmbientAttenuation = glm::vec4(glm::vec3(0.29859, 0.29973, 0.3), 1.0f);
+    std::memcpy(frame.frameDataMapped, &frameData, sizeof(frameData));
+
+    transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (depthImageId.has_value())
+    {
+        transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    }
+
+    // Copied, not referenced: the lazy uploads below insert into imageResources, and a
+    // rehash would leave a reference into it dangling.
+    const auto colorImage = imageResources.at(colorImageId.value());
+    const VkExtent2D extent{colorImage.width, colorImage.height};
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = colorImage.view;
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // GL clears the camera FBO with glClearColor(1, 1, 1, 1) and depth 1.
+    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
+    if (depthImageId.has_value())
+    {
+        depthAttachment.imageView = imageResources.at(depthImageId.value()).view;
+    }
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, extent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    if (depthImageId.has_value())
+    {
+        renderingInfo.pDepthAttachment = &depthAttachment;
+    }
+
+    vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+
+    // GL-convention Y-flip via negative viewport height (vulkan-abi.md): the scene lands
+    // in the attachment the same way up as GL leaves it, so the fullscreen chain that
+    // samples it stays an identity mapping.
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = static_cast<float>(extent.height);
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = -static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{VkOffset2D{0, 0}, extent};
+    vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+    auto recordedDraws = 0u;
+    for (auto& entity : scene.models)
+    {
+        auto& model = entity.model;
+
+        for (auto& mesh : entity.meshes)
+        {
+            if (!mesh.mesh->gpuResourceId.has_value())
+            {
+                upload(model);
+            }
+
+            if (!mesh.mesh->gpuResourceId.has_value())
+            {
+                if (!missingMeshUploadLogged)
+                {
+                    logger.warn("Skipping mesh without a GPU resource: {}", mesh.mesh->name);
+                    missingMeshUploadLogged = true;
+                }
+
+                continue;
+            }
+
+            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh.mesh->modelMatrix;
+            const auto joints = renderableEntityService.joints(mesh, delta);
+
+            for (const auto& primitive : mesh.mesh->meshPrimitives)
+            {
+                if (!model->meshBuffers[static_cast<size_t>(primitive.meshBufferIndex)].gpuId.has_value())
+                {
+                    continue;
+                }
+
+                if (!primitive.material.has_value() || !primitive.material.value()->shader.has_value())
+                {
+                    if (!missingMaterialLogged)
+                    {
+                        logger.warn("Skipping primitive without a material and shader in mesh: {}", mesh.mesh->name);
+                        missingMaterialLogged = true;
+                    }
+
+                    continue;
+                }
+
+                if (!primitive.gpuVao.has_value())
+                {
+                    continue;
+                }
+
+                recordDraw(primitive, entityModelMatrix, camera, joints);
+                recordedDraws++;
+            }
+        }
+    }
+
+    vkCmdEndRendering(frame.commandBuffer);
+
+    transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    for (const auto& postProcessKey : camera.postProcesses)
+    {
+        const auto& postProcess = memoryStorageService.postProcesses.get(postProcessKey);
+
+        // GL binds every input to units 0..n; the Vulkan fullscreen layout carries exactly
+        // one sampler (vulkan-abi.md), and the HDR shader declares only binding 0, so the
+        // camera depth attachment GL also binds is deliberately left unbound.
+        std::optional<unsigned int> sourceImageId;
+        if (!postProcess.inputs.empty())
+        {
+            sourceImageId = memoryStorageService.bufferAttachments.get(postProcess.inputs.front()).gpuResourceId;
+        }
+
+        std::optional<unsigned int> targetImageId;
+        if (postProcess.output.has_value())
+        {
+            const auto& targetBuffer = memoryStorageService.frameBuffers.get(postProcess.output.value());
+            for (const auto& attachmentKey : targetBuffer.attachments)
+            {
+                const auto& attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
+                if (attachment.type == FboAttachmentType::Color && attachment.gpuResourceId.has_value())
+                {
+                    targetImageId = attachment.gpuResourceId;
+                    break;
+                }
+            }
+        }
+
+        const auto shader = shaderObjects.find(postProcess.shader->gpuResourceId);
+        const auto usable = sourceImageId.has_value() && targetImageId.has_value() &&
+                            imageResources.contains(sourceImageId.value()) &&
+                            imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
+                            shader->second.offscreenTargetPipeline != VK_NULL_HANDLE;
+        if (!usable)
+        {
+            if (!missingPostProcessTargetLogged)
+            {
+                logger.warn("Vulkan post-process pass skipped: it needs an input attachment, an RGBA16F output "
+                            "attachment and a fullscreen shader");
+                missingPostProcessTargetLogged = true;
+            }
+
+            continue;
+        }
+
+        transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        const auto& targetImage = imageResources.at(targetImageId.value());
+        recordFullScreenPass(sourceImageId.value(), targetImage.view, VkExtent2D{targetImage.width, targetImage.height},
+                             shader->second.offscreenTargetPipeline);
+
+        transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    if (!drawSummaryLogged && recordedDraws > 0)
+    {
+        logger.info("Vulkan scene pass recorded: {} draw(s) into {}x{} RGBA16F, {} post-process pass(es), {} scene "
+                    "pipeline(s), {} material set(s)",
+                    recordedDraws, extent.width, extent.height, camera.postProcesses.size(), scenePipelines.size(),
+                    materialResources.size());
+        drawSummaryLogged = true;
+    }
+}
+
+void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const glm::mat4& entityModelMatrix,
+                                const Camera& camera, const std::vector<glm::mat4>& joints)
+{
+    const auto bound = primitiveBindings.find(primitive.gpuVao.value());
+    if (bound == primitiveBindings.end() || !bound->second.drawable)
+    {
+        return;
+    }
+
+    const auto material = primitive.material.value();
+    const auto shaderId = material->shader.value()->gpuResourceId;
+    const VkCullModeFlags cullMode = material->opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+
+    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode);
+    if (pipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // GL's bindMaterial falls back to the scene environment when the material has none.
+    auto environmentImageId = sceneEnvironmentImageId.value_or(0u);
+    if (material->environment.has_value())
+    {
+        environmentImageId = memoryStorageService.cubeMaps.get(material->environment.value()).gpuResourceId;
+    }
+    if (!imageResources.contains(environmentImageId))
+    {
+        environmentImageId = dummyCubeMap();
+    }
+
+    const auto set = materialSet(material, environmentImageId);
+    if (set == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const auto slot = allocateDrawDataSlot();
+    if (!slot.has_value())
+    {
+        return;
+    }
+
+    auto& frame = frames[frameIndex];
+    auto* target = static_cast<unsigned char*>(frame.drawDataMapped) + slot.value();
+
+    const std::array<glm::mat4, 4> matrices = {
+        entityModelMatrix, camera.modelViewMatrix * entityModelMatrix,
+        clipCorrection() * camera.modelViewProjectionMatrix * entityModelMatrix,
+        // The shader reads mat3(normalMatrix); the mat4 slot carries the upper 3x3.
+        glm::mat4(glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))))};
+    std::memcpy(target, matrices.data(), sizeof(matrices));
+
+    auto jointCount = joints.size();
+    if (jointCount > maxJoints)
+    {
+        if (!jointLimitLogged)
+        {
+            logger.warn("Vulkan draw data carries at most {} joints; {} were supplied and the rest are ignored",
+                        maxJoints, jointCount);
+            jointLimitLogged = true;
+        }
+
+        jointCount = maxJoints;
+    }
+
+    const auto animated = glm::ivec4(joints.empty() ? 0 : 1, 0, 0, 0);
+    std::memcpy(target + offsetof(DrawDataUbo, animated), &animated, sizeof(animated));
+    if (jointCount > 0)
+    {
+        std::memcpy(target + offsetof(DrawDataUbo, jointTransforms), joints.data(), jointCount * sizeof(glm::mat4));
+    }
+
+    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    if (!bound->second.boundBuffers.empty())
+    {
+        vkCmdBindVertexBuffers(frame.commandBuffer, 0, static_cast<uint32_t>(bound->second.boundBuffers.size()),
+                               bound->second.boundBuffers.data(), bound->second.boundOffsets.data());
+    }
+
+    vkCmdBindIndexBuffer(frame.commandBuffer, bound->second.indexBuffer, bound->second.indexOffset,
+                         bound->second.indexType);
+
+    const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet};
+    const auto dynamicOffset = static_cast<uint32_t>(slot.value());
+    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout, 0,
+                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 1, &dynamicOffset);
+
+    vkCmdDrawIndexed(frame.commandBuffer, bound->second.indexCount, 1, 0, 0, 0);
+}
+
+bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, const VkImageView targetView,
+                                          const VkExtent2D targetExtent, const VkPipeline pipeline)
+{
+    const auto set = attachmentSet(sourceImageId);
+    if (set == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    auto& frame = frames[frameIndex];
+    transitionTracked(frame.commandBuffer, sourceImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = targetView;
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // GL's drawFullScreenQuad clears before the quad; the quad covers the target anyway.
+    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, targetExtent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+
+    vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+
+    // Positive height here: the fullscreen shaders derive their texture coordinates from
+    // gl_VertexIndex in Vulkan's own y-down clip space, so the scene attachment (already
+    // stored the GL way up) maps through one-to-one.
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(targetExtent.width);
+    viewport.height = static_cast<float>(targetExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{VkOffset2D{0, 0}, targetExtent};
+    vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullscreenPipelineLayout, 0, 1, &set,
+                            0, nullptr);
+    vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
+
+    vkCmdEndRendering(frame.commandBuffer);
+    return true;
+}
+
+VulkanRenderer::BufferResource VulkanRenderer::createDeviceLocalBuffer(const void* data, const VkDeviceSize size) const
+{
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    // glTF buffer views carry an optional target and GLTFService infers the rest, so every
+    // uploaded buffer is tagged for both roles rather than trusting the inference twice.
+    bufferInfo.usage =
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationCreateInfo{};
+    allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    BufferResource resource;
+    ensure(
+        vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &resource.buffer, &resource.allocation, nullptr),
+        "vmaCreateBuffer");
+
+    VkBufferCreateInfo stagingInfo{};
+    stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingInfo.size = size;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo stagingAllocationCreateInfo{};
+    stagingAllocationCreateInfo.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    stagingAllocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingAllocation = nullptr;
+    VmaAllocationInfo stagingAllocationInfo{};
+    ensure(vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocationCreateInfo, &stagingBuffer, &stagingAllocation,
+                           &stagingAllocationInfo),
+           "vmaCreateBuffer");
+
+    std::memset(stagingAllocationInfo.pMappedData, 0, static_cast<size_t>(size));
+    if (data != nullptr)
+    {
+        std::memcpy(stagingAllocationInfo.pMappedData, data, static_cast<size_t>(size));
+    }
+    ensure(vmaFlushAllocation(allocator, stagingAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+
+    const auto commandBuffer = beginUploadCommands();
+
+    VkBufferCopy region{};
+    region.size = size;
+    vkCmdCopyBuffer(commandBuffer, stagingBuffer, resource.buffer, 1, &region);
+
+    // The fence in finishUploadCommands orders execution; the barrier is what makes the
+    // copy visible to the vertex input stage of every later submission.
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = resource.buffer;
+    barrier.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo dependencyInfo{};
+    dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyInfo.bufferMemoryBarrierCount = 1;
+    dependencyInfo.pBufferMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
+
+    finishUploadCommands(commandBuffer);
+    vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
+
+    return resource;
+}
+
+unsigned int VulkanRenderer::uploadMeshBuffer(const MeshBuffer& meshBuffer)
+{
+    // A zero-length view still gets an allocation so its id exists and the primitives
+    // referencing it stay in the same skip/draw logic as the GL path.
+    const auto size = std::max<VkDeviceSize>(meshBuffer.data.size(), 4);
+    const auto id = nextResourceId++;
+    bufferResources.emplace(id,
+                            createDeviceLocalBuffer(meshBuffer.data.empty() ? nullptr : meshBuffer.data.data(), size));
+    return id;
+}
+
+VulkanRenderer::PrimitiveBinding VulkanRenderer::makePrimitiveBinding(const Model& model,
+                                                                      const MeshPrimitive& primitive)
+{
+    PrimitiveBinding binding;
+    binding.input = translateVertexInput(primitive.attributes);
+    binding.indexCount = static_cast<uint32_t>(primitive.elementCount);
+    binding.indexOffset = static_cast<VkDeviceSize>(primitive.byteOffset);
+
+    const auto topology = primitiveTopology(primitive.mode);
+    if (!topology.has_value())
+    {
+        if (!unsupportedTopologyLogged)
+        {
+            logger.warn("Vulkan has no topology for glTF draw mode {}; primitives using it are not drawn",
+                        primitive.mode);
+            unsupportedTopologyLogged = true;
+        }
+
+        return binding;
+    }
+    binding.topology = topology.value();
+
+    const auto indices = indexType(primitive.componentType);
+    if (!indices.has_value())
+    {
+        if (!unsupportedIndexTypeLogged)
+        {
+            logger.warn("Vulkan index component type 0x{:x} is outside this backend's uint16/uint32 support; "
+                        "primitives using it are not drawn",
+                        primitive.componentType);
+            unsupportedIndexTypeLogged = true;
+        }
+
+        return binding;
+    }
+    binding.indexType = indices.value();
+
+    const auto bufferHandle = [&](const int bufferIndex) -> VkBuffer
+    {
+        if (bufferIndex < 0 || std::cmp_greater_equal(bufferIndex, model.meshBuffers.size()))
+        {
+            return VK_NULL_HANDLE;
+        }
+
+        const auto& gpuId = model.meshBuffers[static_cast<size_t>(bufferIndex)].gpuId;
+        if (!gpuId.has_value())
+        {
+            return VK_NULL_HANDLE;
+        }
+
+        const auto resource = bufferResources.find(gpuId.value());
+        return resource == bufferResources.end() ? VK_NULL_HANDLE : resource->second.buffer;
+    };
+
+    binding.indexBuffer = bufferHandle(primitive.meshBufferIndex);
+    if (binding.indexBuffer == VK_NULL_HANDLE)
+    {
+        return binding;
+    }
+
+    for (const auto& bufferBind : binding.input.bufferBinds)
+    {
+        const auto handle = bufferHandle(bufferBind.bufferIndex);
+        if (handle == VK_NULL_HANDLE)
+        {
+            return binding;
+        }
+
+        binding.vertexBuffers.push_back(handle);
+        binding.vertexOffsets.push_back(bufferBind.byteOffset);
+    }
+
+    // Pipeline cache key part: the vertex input signature. Target formats and the shader
+    // are the other two parts, added where the pipeline is built.
+    for (const auto& attribute : binding.input.attributes)
+    {
+        binding.signature += std::to_string(attribute.location) + ":" + std::to_string(attribute.binding) + ":" +
+                             std::to_string(static_cast<int>(attribute.format)) + ":" +
+                             std::to_string(binding.input.bindings[attribute.binding].stride) + ";";
+    }
+
+    binding.drawable = true;
+    return binding;
+}
+
+void VulkanRenderer::upload(const Resource<Model>& modelKey)
+{
+    auto model = memoryStorageService.models.get(modelKey);
+    auto uploadedBuffers = 0u;
+
+    for (const auto& meshKey : model.meshes)
+    {
+        auto mesh = memoryStorageService.meshes.get(meshKey);
+
+        if (mesh.gpuResourceId.has_value())
+        {
+            continue;
+        }
+
+        for (auto& buffer : model.meshBuffers)
+        {
+            if (buffer.gpuId.has_value())
+            {
+                continue;
+            }
+
+            buffer.gpuId = uploadMeshBuffer(buffer);
+            buffer.data.clear();
+            buffer.data.shrink_to_fit();
+            uploadedBuffers++;
+        }
+
+        memoryStorageService.models.update(modelKey, model);
+
+        for (auto& primitive : mesh.meshPrimitives)
+        {
+            const auto id = nextResourceId++;
+            primitiveBindings.emplace(id, makePrimitiveBinding(model, primitive));
+            primitive.gpuVao = id;
+            mesh.gpuResourceId = id;
+        }
+
+        memoryStorageService.meshes.update(meshKey, mesh);
+    }
+
+    for (const auto& materialKey : model.materials)
+    {
+        uploadMaterialTextures(materialKey);
+    }
+
+    logger.info("Vulkan model uploaded: {} buffer(s), {} mesh(es), {} material(s)", uploadedBuffers,
+                model.meshes.size(), model.materials.size());
+}
+
+std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture>& textureKey)
+{
+    const auto& texture = memoryStorageService.textures.get(textureKey);
+    if (texture.gpuResourceId.has_value())
+    {
+        return texture.gpuResourceId;
+    }
+
+    const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
+    if (texelCount == 0 || texture.pixelDataType != PixelDataType::UnsignedByte || texture.data.size() < texelCount * 4)
+    {
+        if (!unsupportedTextureLayoutLogged)
+        {
+            logger.warn("Vulkan texture upload skipped for {}: {}x{} with {} byte(s) is not the 8-bit RGBA layout this "
+                        "backend uploads",
+                        texture.name, texture.width, texture.height, texture.data.size());
+            unsupportedTextureLayoutLogged = true;
+        }
+
+        return std::nullopt;
+    }
+
+    const std::array faces = {&texture};
+    const auto id = createSampledImage(faces, false);
+
+    // MemoryStorage hands out const references to non-const elements; writing the id back
+    // in place keeps the GL-visible contract without copying a multi-megabyte payload
+    // through get/update (same justification as createCubeMap's face clearing).
+    const_cast<Texture&>(texture).gpuResourceId = id;
+    return id;
+}
+
+void VulkanRenderer::uploadMaterialTextures(const Resource<Material>& materialKey)
+{
+    const auto& material = memoryStorageService.materials.get(materialKey);
+
+    for (const auto& textureKey :
+         {material.albedo, material.normal, material.metallicRoughness, material.emissive, material.occlusion})
+    {
+        if (textureKey.has_value() && memoryStorageService.textures.exists(textureKey.value()))
+        {
+            static_cast<void>(uploadTexture(textureKey.value()));
+        }
+    }
+
+    for (const auto& textureKey : material.textures)
+    {
+        if (memoryStorageService.textures.exists(textureKey))
+        {
+            static_cast<void>(uploadTexture(textureKey));
+        }
+    }
+}
+
+unsigned int VulkanRenderer::dummyTexture()
+{
+    if (dummyTextureId != 0)
+    {
+        return dummyTextureId;
+    }
+
+    // GL binds texture 0 for a material slot with no image; Vulkan needs a real descriptor
+    // even where the shader gates the sampler behind useTextures.
+    const auto texture = Texture{.name = "vulkan dummy texture",
+                                 .format = TextureFormat::RGBA,
+                                 .pixelDataType = PixelDataType::UnsignedByte,
+                                 .width = 1,
+                                 .height = 1,
+                                 .bitsPerPixel = 32,
+                                 .data = {255, 255, 255, 255}};
+    const std::array faces = {&texture};
+    dummyTextureId = createSampledImage(faces, false);
+    return dummyTextureId;
+}
+
+unsigned int VulkanRenderer::dummyCubeMap()
+{
+    if (dummyCubeMapId != 0)
+    {
+        return dummyCubeMapId;
+    }
+
+    const auto texture = Texture{.name = "vulkan dummy cube map",
+                                 .format = TextureFormat::RGBA,
+                                 .pixelDataType = PixelDataType::UnsignedByte,
+                                 .width = 1,
+                                 .height = 1,
+                                 .bitsPerPixel = 32,
+                                 .data = {0, 0, 0, 255}};
+    const std::array faces = {&texture, &texture, &texture, &texture, &texture, &texture};
+    dummyCubeMapId = createSampledImage(faces, true);
+    return dummyCubeMapId;
+}
+
+VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKey,
+                                            const unsigned int environmentImageId)
+{
+    const auto key = (static_cast<uint64_t>(materialKey.id) << 32u) | static_cast<uint64_t>(environmentImageId);
+    const auto cached = materialResources.find(key);
+    if (cached != materialResources.end())
+    {
+        return cached->second.set;
+    }
+
+    const auto& material = memoryStorageService.materials.get(materialKey);
+
+    const auto textureImage = [&](const std::optional<Resource<Texture>>& textureKey) -> std::optional<unsigned int>
+    {
+        if (!textureKey.has_value() || !textureKey.value()->gpuResourceId.has_value() ||
+            !imageResources.contains(textureKey.value()->gpuResourceId.value()))
+        {
+            return std::nullopt;
+        }
+
+        return textureKey.value()->gpuResourceId;
+    };
+
+    const auto diffuse = textureImage(material.albedo);
+    const auto normal = textureImage(material.normal);
+    const auto specular = textureImage(material.metallicRoughness);
+    const auto emissive = textureImage(material.emissive);
+    const auto occlusion = textureImage(material.occlusion);
+
+    // Resolved before any reference into imageResources is taken: creating a dummy inserts
+    // into that map.
+    const auto fallbackTexture = dummyTexture();
+    const auto environment = imageResources.contains(environmentImageId) ? environmentImageId : dummyCubeMap();
+
+    VkDescriptorSetAllocateInfo setAllocateInfo{};
+    setAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setAllocateInfo.descriptorPool = descriptorPool;
+    setAllocateInfo.descriptorSetCount = 1;
+    setAllocateInfo.pSetLayouts = &materialSetLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
+    {
+        if (!descriptorSetUnavailableLogged)
+        {
+            logger.warn("Vulkan descriptor pool has no room for another material set; those primitives are not drawn");
+            descriptorSetUnavailableLogged = true;
+        }
+
+        return VK_NULL_HANDLE;
+    }
+
+    MaterialResource resource;
+    resource.set = set;
+    void* mapped = nullptr;
+    createHostVisibleUniformBuffer(sizeof(MaterialDataUbo), resource.buffer, resource.allocation, mapped);
+
+    MaterialDataUbo materialData{};
+    materialData.baseColour = material.baseColour;
+    materialData.repeatRoughMetal = glm::vec4(material.repeat, material.roughness, material.metalness);
+    materialData.useTextures = glm::ivec4(diffuse.has_value() ? 1 : 0, normal.has_value() ? 1 : 0,
+                                          specular.has_value() ? 1 : 0, emissive.has_value() ? 1 : 0);
+    materialData.useTextures2 = glm::ivec4(occlusion.has_value() ? 1 : 0, 0, 0, 0);
+    std::memcpy(mapped, &materialData, sizeof(materialData));
+    ensure(vmaFlushAllocation(allocator, resource.allocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+
+    const std::array sampledImages = {diffuse.value_or(fallbackTexture),   normal.value_or(fallbackTexture),
+                                      specular.value_or(fallbackTexture),  emissive.value_or(fallbackTexture),
+                                      occlusion.value_or(fallbackTexture), environment};
+
+    const VkDescriptorBufferInfo bufferInfo{resource.buffer, 0, sizeof(MaterialDataUbo)};
+    std::array<VkDescriptorImageInfo, 6> imageInfos{};
+    std::array<VkWriteDescriptorSet, 7> writes{};
+
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[0].pBufferInfo = &bufferInfo;
+
+    for (uint32_t binding = 1; binding <= 6; binding++)
+    {
+        const auto& image = imageResources.at(sampledImages[binding - 1]);
+        imageInfos[binding - 1] =
+            VkDescriptorImageInfo{image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+        writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[binding].dstSet = set;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorCount = 1;
+        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[binding].pImageInfo = &imageInfos[binding - 1];
+    }
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    materialResources.emplace(key, resource);
+    return set;
+}
+
+VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
+{
+    const auto cached = attachmentSets.find(imageId);
+    if (cached != attachmentSets.end())
+    {
+        return cached->second;
+    }
+
+    const auto image = imageResources.find(imageId);
+    if (image == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    VkDescriptorSetAllocateInfo setAllocateInfo{};
+    setAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setAllocateInfo.descriptorPool = descriptorPool;
+    setAllocateInfo.descriptorSetCount = 1;
+    setAllocateInfo.pSetLayouts = &fullscreenSetLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device, &setAllocateInfo, &set) != VK_SUCCESS)
+    {
+        if (!descriptorSetUnavailableLogged)
+        {
+            logger.warn("Vulkan descriptor pool has no room for another attachment set; that pass is skipped");
+            descriptorSetUnavailableLogged = true;
+        }
+
+        return VK_NULL_HANDLE;
+    }
+
+    const VkDescriptorImageInfo imageInfo{image->second.sampler != VK_NULL_HANDLE ? image->second.sampler
+                                                                                  : attachmentSampler,
+                                          image->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imageInfo;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+    attachmentSets.emplace(imageId, set);
+    return set;
+}
+
+VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding,
+                                         const VkCullModeFlags cullMode)
+{
+    // A primitive's material — and so its shader and cull mode — never changes after load,
+    // so one resolution per primitive is enough and a failed build is not retried.
+    if (binding.resolved)
+    {
+        return binding.pipeline;
+    }
+    binding.resolved = true;
+
+    const auto shader = shaderObjects.find(shaderId);
+    if (shader == shaderObjects.end() || shader->second.fullscreen)
+    {
+        if (!scenePipelineUnavailableLogged)
+        {
+            logger.warn("Vulkan shader object {} is not a scene shader; primitives using it are not drawn", shaderId);
+            scenePipelineUnavailableLogged = true;
+        }
+
+        return VK_NULL_HANDLE;
+    }
+
+    // Exactly the locations the vertex shader declares are fed, no more: a bound attribute
+    // the shader never reads is work the driver has to discard, and Vulkan reports it.
+    std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    binding.boundBuffers.clear();
+    binding.boundOffsets.clear();
+
+    for (const auto& attribute : binding.input.attributes)
+    {
+        const auto consumed = std::ranges::find(shader->second.vertexInputLocations, attribute.location) !=
+                              shader->second.vertexInputLocations.end();
+        if (!consumed)
+        {
+            continue;
+        }
+
+        const auto bindingIndex = static_cast<uint32_t>(bindings.size());
+        auto pipelineBinding = binding.input.bindings[attribute.binding];
+        pipelineBinding.binding = bindingIndex;
+        bindings.push_back(pipelineBinding);
+
+        auto pipelineAttribute = attribute;
+        pipelineAttribute.binding = bindingIndex;
+        attributes.push_back(pipelineAttribute);
+
+        binding.boundBuffers.push_back(binding.vertexBuffers[attribute.binding]);
+        binding.boundOffsets.push_back(binding.vertexOffsets[attribute.binding]);
+    }
+
+    // Vulkan rejects a vertex shader input that the pipeline does not feed; GL simply
+    // supplied the generic default (0, 0, 0, 1), which is what the dummy binding holds.
+    for (const auto location : shader->second.vertexInputLocations)
+    {
+        const auto present = std::ranges::any_of(attributes, [&](const VkVertexInputAttributeDescription& attribute)
+                                                 { return attribute.location == location; });
+        if (present)
+        {
+            continue;
+        }
+
+        const auto bindingIndex = static_cast<uint32_t>(bindings.size());
+        bindings.push_back(VkVertexInputBindingDescription{bindingIndex, 0, VK_VERTEX_INPUT_RATE_VERTEX});
+        attributes.push_back(
+            VkVertexInputAttributeDescription{location, bindingIndex, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
+        binding.boundBuffers.push_back(dummyVertexBuffer.buffer);
+        binding.boundOffsets.push_back(0);
+    }
+
+    const auto key = std::to_string(shaderId) + "|" + std::to_string(cullMode) + "|" +
+                     std::to_string(static_cast<int>(binding.topology)) + "|rgba16f+d32|" + binding.signature;
+    const auto cachedPipeline = scenePipelines.find(key);
+    if (cachedPipeline != scenePipelines.end())
+    {
+        binding.pipeline = cachedPipeline->second;
+        return binding.pipeline;
+    }
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = shader->second.vertexModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = shader->second.fragmentModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
+    vertexInput.pVertexBindingDescriptions = bindings.data();
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes.size());
+    vertexInput.pVertexAttributeDescriptions = attributes.data();
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = binding.topology;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterization{};
+    rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    // GL runs glEnable(GL_CULL_FACE) + glCullFace(GL_BACK) and drops culling for materials
+    // flagged non-opaque. GL's front face is the default CCW; the winding stays CCW here
+    // because the negative viewport height and Vulkan's downward framebuffer y cancel out
+    // (verified against the GL capture: CLOCKWISE culls the skybox interior and the
+    // building's outer walls, leaving the scene inside-out).
+    rasterization.cullMode = cullMode;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // GL enables GL_DEPTH_TEST globally and never touches the func or the write mask, so
+    // this is GL's default LESS with writes on.
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.maxDepthBounds = 1.0f;
+
+    // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled.
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.blendEnable = VK_TRUE;
+    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    blendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blendAttachment;
+
+    const std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    const auto colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &colorFormat;
+    renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlend;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = scenePipelineLayout;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto createResult = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+    if (createResult != VK_SUCCESS)
+    {
+        if (!scenePipelineUnavailableLogged)
+        {
+            logger.warn("Vulkan scene pipeline for shader {} was not created (VkResult {}); primitives using it are "
+                        "not drawn",
+                        shaderId, static_cast<int>(createResult));
+            scenePipelineUnavailableLogged = true;
+        }
+
+        return VK_NULL_HANDLE;
+    }
+
+    scenePipelines.emplace(key, pipeline);
+    binding.pipeline = pipeline;
+    return pipeline;
 }
 
 void VulkanRenderer::setViewport(const int width, const int height)
 {
+    // The resize callback calls this before it recreates the camera and post-process
+    // framebuffers, so a frame still open here (a step with no presenter pass) is closed
+    // now rather than left holding command references to images about to be destroyed.
+    if (frameOpen)
+    {
+        endFrame(VK_NULL_HANDLE);
+    }
+
     // Resize callbacks fire inside glfwPollEvents mid-step; recreation happens lazily at
     // the next draw, so only the requested extent is recorded here.
     requestedExtent = VkExtent2D{static_cast<uint32_t>(std::max(width, 0)), static_cast<uint32_t>(std::max(height, 0))};
@@ -1590,7 +2996,14 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     const shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    // Unoptimized on purpose: spirv-opt eliminates stage interface variables the shader
+    // declares but never reads (PbrFragmentShader computes an unused product of
+    // tangentBinormalNormalMatrix; ColourFragmentShader reads none of its inputs), which
+    // leaves the vertex stage writing outputs the fragment stage no longer declares and
+    // makes validation report the mismatch on every scene pipeline. Drivers optimize the
+    // module at pipeline creation regardless; the fix on the other side would be in the
+    // shader sources, which this backend does not own.
+    options.SetOptimizationLevel(shaderc_optimization_level_zero);
 
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success)
@@ -1735,7 +3148,8 @@ std::optional<unsigned int> VulkanRenderer::createShaderObject(const ShaderDescr
     ShaderObject shaderObject;
     shaderObject.vertexModule = createShaderModule(vertexSpirv.value());
     shaderObject.fragmentModule = createShaderModule(fragmentSpirv.value());
-    shaderObject.fullscreen = !spirvHasVertexInputLocations(vertexSpirv.value());
+    shaderObject.vertexInputLocations = spirvVertexInputLocations(vertexSpirv.value());
+    shaderObject.fullscreen = shaderObject.vertexInputLocations.empty();
 
     if (shaderObject.fullscreen)
     {
@@ -2001,7 +3415,8 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
 
     const auto id = nextResourceId++;
-    imageResources.emplace(id, ImageResource{image, imageAllocation, view, sampler, format, mipLevels});
+    imageResources.emplace(id, ImageResource{image, imageAllocation, view, sampler, format, mipLevels, width, height,
+                                             VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     return id;
 }
 
@@ -2035,6 +3450,15 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
     if (entry == imageResources.end())
     {
         return;
+    }
+
+    // The cached fullscreen set names this image's view; recycle it with the image so a
+    // resize does not leak pool space (the pool carries FREE_DESCRIPTOR_SET for this).
+    const auto cachedSet = attachmentSets.find(id);
+    if (cachedSet != attachmentSets.end())
+    {
+        vkFreeDescriptorSets(device, descriptorPool, 1, &cachedSet->second);
+        attachmentSets.erase(cachedSet);
     }
 
     const auto& resource = entry->second;
@@ -2131,7 +3555,8 @@ unsigned int VulkanRenderer::createFbo(const Fbo& fbo) const
         ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
         const auto attachmentId = nextResourceId++;
-        imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1});
+        imageResources.emplace(attachmentId, ImageResource{image, allocation, view, VK_NULL_HANDLE, format, 1, width,
+                                                           height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
         fboResource.attachmentIds.push_back(attachmentId);
 
         // Observable contract shared with GL: every attachment's id is written back
@@ -2176,6 +3601,13 @@ void VulkanRenderer::deleteFbo(Fbo& fbo) const
 
 void VulkanRenderer::captureFrame(const std::string& path)
 {
+    // Engine calls this after the presenter closed the frame; a frame still open would be
+    // a caller-order change, and finishing it keeps the swapchain consistent either way.
+    if (frameOpen)
+    {
+        endFrame(VK_NULL_HANDLE);
+    }
+
     recreateSwapchainIfNeeded();
     if (swapchain == VK_NULL_HANDLE)
     {
@@ -2183,38 +3615,63 @@ void VulkanRenderer::captureFrame(const std::string& path)
         return;
     }
 
-    const auto width = swapchainExtent.width;
-    const auto height = swapchainExtent.height;
-    const auto byteCount = static_cast<VkDeviceSize>(width) * height * 4;
-
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = byteCount;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    VmaAllocationCreateInfo allocationCreateInfo{};
-    allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    allocationCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = nullptr;
     VmaAllocationInfo allocationInfo{};
-    ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation, &allocationInfo),
-           "vmaCreateBuffer");
+    auto width = 0u;
+    auto height = 0u;
+    VkDeviceSize byteCount = 0;
 
-    // Presented swapchain images may not be touched until reacquired, so the capture
-    // renders one more identical cleared frame with the readback copy appended.
+    // A presented swapchain image may not be touched until it is reacquired, so the
+    // capture acquires a fresh image and replays the presenter's pass onto it: the HDR
+    // attachment it samples is a persistent image that still holds the presented frame,
+    // which makes the readback identical rather than merely similar.
     auto presented = false;
     for (auto attempt = 0; attempt < 2 && !presented; attempt++)
     {
-        presented = renderAndPresentFrame(buffer);
+        if (!beginFrame())
+        {
+            continue;
+        }
+
+        if (buffer == VK_NULL_HANDLE)
+        {
+            width = swapchainExtent.width;
+            height = swapchainExtent.height;
+            byteCount = static_cast<VkDeviceSize>(width) * height * 4;
+
+            VkBufferCreateInfo bufferInfo{};
+            bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bufferInfo.size = byteCount;
+            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+            VmaAllocationCreateInfo allocationCreateInfo{};
+            allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+            allocationCreateInfo.flags =
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+            ensure(
+                vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation, &allocationInfo),
+                "vmaCreateBuffer");
+        }
+
+        if (lastPresentPass.has_value())
+        {
+            recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
+        }
+
+        presented = endFrame(buffer);
     }
     ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
 
-    if (!presented)
+    if (!presented || buffer == VK_NULL_HANDLE)
     {
-        vmaDestroyBuffer(allocator, buffer, allocation);
+        if (buffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        }
+
         logger.warn("Vulkan frame capture skipped: no swapchain image available");
         return;
     }
