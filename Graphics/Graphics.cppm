@@ -2,6 +2,7 @@ export module raceengine.graphics;
 
 export import :Window;
 export import :GraphicsApi;
+export import :RenderContract;
 export import :IRenderer;
 export import :VulkanRenderer;
 export import :SceneManagerService;

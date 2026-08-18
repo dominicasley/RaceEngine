@@ -37,10 +37,22 @@ public:
     Entity(Entity&&) = default;
 };
 
+// An entity's behaviour on the fixed simulation tick: the entry point a game object carries
+// its logic in. State belongs in the subclass, which the entity owns, so a behaviour outlives
+// whatever builder registered it.
+export class Behaviour : public Component
+{
+public:
+    virtual void update(float delta) = 0;
+};
+
 export struct Drawable : public Component
 {
 public:
     RenderableEntity& renderableEntity;
+    // Invoked around the scene passes of the frame that draws this entity, not around its
+    // individual draw call: submission happens inside the renderer, which cannot see a
+    // Drawable without raceengine.graphics depending on raceengine.game.
     std::optional<std::function<void()>> beforeDraw;
     std::optional<std::function<void()>> afterDraw;
 
@@ -58,6 +70,9 @@ private:
 public:
     Entity& createEntity();
     [[nodiscard]] Entity& getEntity(unsigned long long entityId);
+    void update(float delta);
+    void beforeDraw() const;
+    void afterDraw() const;
 
     template <typename T> std::shared_ptr<T> addComponent(unsigned long long entityId)
     {
@@ -125,6 +140,53 @@ Entity& EntityService::getEntity(unsigned long long entityId)
     }
 
     return entities[entityId];
+}
+
+// Components are keyed by their *dynamic* type, so a Behaviour subclass is not reachable
+// through a type_index lookup for Behaviour and the sweep has to ask each component whether it
+// is one. That is the cost of the map's identity model, not of the tick.
+void EntityService::update(float delta)
+{
+    for (auto& entity : entities)
+    {
+        for (auto& component : entity.components)
+        {
+            if (auto* behaviour = dynamic_cast<Behaviour*>(component.second.get()))
+            {
+                behaviour->update(delta);
+            }
+        }
+    }
+}
+
+void EntityService::beforeDraw() const
+{
+    for (const auto& entity : entities)
+    {
+        for (const auto& component : entity.components)
+        {
+            if (const auto* drawable = dynamic_cast<const Drawable*>(component.second.get());
+                drawable != nullptr && drawable->beforeDraw.has_value())
+            {
+                (*drawable->beforeDraw)();
+            }
+        }
+    }
+}
+
+void EntityService::afterDraw() const
+{
+    for (const auto& entity : entities)
+    {
+        for (const auto& component : entity.components)
+        {
+            if (const auto* drawable = dynamic_cast<const Drawable*>(component.second.get());
+                drawable != nullptr && drawable->afterDraw.has_value())
+            {
+                (*drawable->afterDraw)();
+            }
+        }
+    }
 }
 
 } // namespace raceengine

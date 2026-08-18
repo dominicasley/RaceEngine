@@ -27,7 +27,9 @@ module;
 
 export module raceengine.graphics:VulkanRenderer;
 
+import :GraphicsApi;
 import :IRenderer;
+import :RenderContract;
 import :RenderableEntityService;
 import :SceneManagerService;
 import :Window;
@@ -42,8 +44,6 @@ namespace
 
 constexpr auto waitForever = std::numeric_limits<uint64_t>::max();
 constexpr const char* validationLayerName = "VK_LAYER_KHRONOS_validation";
-// Parity with the GL shaders' jointTransformationMatrixes[128] (vulkan-abi.md).
-constexpr uint32_t maxJoints = 128;
 // DrawData is ~8.5 KiB per draw; a few hundred draws per frame covers the sandbox scene
 // with generous headroom while keeping the ring under 5 MiB per frame in flight.
 constexpr uint32_t drawDataRingSlots = 512;
@@ -57,17 +57,27 @@ constexpr uint32_t descriptorPoolDynamicUniformBuffers = 16;
 constexpr uint32_t descriptorPoolCombinedImageSamplers = 4096;
 
 // Set 0 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
+// A std140 array of these has a 16-byte element alignment, which 64 bytes already satisfies.
+struct LightUbo
+{
+    glm::vec4 position;
+    glm::vec4 diffuse;
+    glm::vec4 specular;
+    glm::vec4 ambientAttenuation;
+};
+
 struct FrameDataUbo
 {
     glm::mat4 viewMatrix;
     glm::vec4 cameraPosition;
-    glm::vec4 lightPosition;
-    glm::vec4 lightDiffuse;
-    glm::vec4 lightSpecular;
-    glm::vec4 lightAmbientAttenuation;
+    glm::ivec4 lightCount;
+    std::array<LightUbo, maxLights> lights;
 };
 
-static_assert(sizeof(FrameDataUbo) == 144);
+static_assert(sizeof(LightUbo) == 64);
+static_assert(sizeof(FrameDataUbo) == 352);
+static_assert(offsetof(FrameDataUbo, lightCount) == 80);
+static_assert(offsetof(FrameDataUbo, lights) == 96);
 
 // Set 2 binding 0, dynamic-offset (vulkan-abi.md); ring-buffered per frame in flight.
 struct DrawDataUbo
@@ -101,6 +111,81 @@ struct MaterialDataUbo
 
 static_assert(sizeof(MaterialDataUbo) == 128);
 static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
+
+[[nodiscard]] constexpr uint32_t channelCount(const TextureFormat format)
+{
+    switch (format)
+    {
+    case TextureFormat::R:
+        return 1;
+    case TextureFormat::RG:
+        return 2;
+    case TextureFormat::RGB:
+        return 3;
+    case TextureFormat::RGBA:
+    case TextureFormat::RGBA16F:
+    case TextureFormat::RGBA32F:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+[[nodiscard]] constexpr uint32_t pixelComponentBytes(const PixelDataType type)
+{
+    switch (type)
+    {
+    case PixelDataType::UnsignedShort:
+        return 2;
+    case PixelDataType::Float:
+        return 4;
+    default:
+        return 1;
+    }
+}
+
+// Sampled images are always uploaded four-channel: the three-component formats
+// (R8G8B8/R16G16B16/R32G32B32) have no universal sampling support, so the source is expanded
+// on the CPU at its own precision instead — which is also what keeps a 16-bit glTF texture's
+// bits, where GL keeps them by asking for a 16-bit internal format.
+[[nodiscard]] constexpr VkFormat sampledImageFormat(const PixelDataType type)
+{
+    switch (type)
+    {
+    case PixelDataType::UnsignedShort:
+        return VK_FORMAT_R16G16B16A16_UNORM;
+    case PixelDataType::Float:
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    default:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+// FboAttachment::internalFormat is the model's request, exactly as GL passes it to
+// glTexImage2D. captureFormat has no Vulkan analogue: it is GL's client-side format for an
+// upload the attachment path never performs.
+[[nodiscard]] constexpr std::optional<VkFormat> attachmentFormat(const TextureFormat format)
+{
+    switch (format)
+    {
+    case TextureFormat::R:
+        return VK_FORMAT_R8_UNORM;
+    case TextureFormat::RG:
+        return VK_FORMAT_R8G8_UNORM;
+    case TextureFormat::RGB:
+        return VK_FORMAT_R8G8B8_UNORM;
+    case TextureFormat::RGBA:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case TextureFormat::RGBA16F:
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case TextureFormat::RGBA32F:
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case TextureFormat::DepthComponent:
+        return VK_FORMAT_D32_SFLOAT;
+    default:
+        return std::nullopt;
+    }
+}
 
 // CameraService keeps the GL depth convention (z in -w..w); Vulkan clips against 0..w.
 // Column-major glm: z' = 0.5z + 0.5w (vulkan-abi.md).
@@ -631,7 +716,6 @@ private:
         // swapchain, post-processes write RGBA16F); the draw path picks by actual target.
         // Scene pipelines are vertex-input-dependent and are built by the draw path.
         VkPipeline swapchainTargetPipeline = VK_NULL_HANDLE;
-        VkPipeline offscreenTargetPipeline = VK_NULL_HANDLE;
     };
 
     // Cube maps and FBO attachments share this shape; attachments use the shared
@@ -713,6 +797,7 @@ private:
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceLimits deviceLimits{};
+    bool samplerAnisotropySupported = false;
     uint32_t graphicsQueueFamily = 0;
     uint32_t presentQueueFamily = 0;
     VkDevice device = VK_NULL_HANDLE;
@@ -754,6 +839,10 @@ private:
     std::unordered_map<uint64_t, MaterialResource> materialResources;
     mutable std::unordered_map<unsigned int, VkDescriptorSet> attachmentSets;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
+    // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
+    // the target's format: the format comes from FboAttachment::internalFormat, which is not
+    // known when the shader object is built.
+    std::unordered_map<uint64_t, VkPipeline> offscreenPipelines;
     unsigned int dummyTextureId = 0;
     unsigned int dummyCubeMapId = 0;
     BufferResource dummyVertexBuffer{};
@@ -773,6 +862,7 @@ private:
     bool unsupportedTopologyLogged = false;
     bool unsupportedTextureLayoutLogged = false;
     bool jointLimitLogged = false;
+    bool lightLimitLogged = false;
     bool scenePipelineUnavailableLogged = false;
     bool fullscreenPipelineUnavailableLogged = false;
     bool descriptorSetUnavailableLogged = false;
@@ -812,7 +902,8 @@ private:
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
     void recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader, const glm::mat4& entityModelMatrix,
-                    const Camera& camera, const std::vector<glm::mat4>& joints);
+                    const Camera& camera, const std::vector<glm::mat4>& joints, VkFormat colorFormat,
+                    VkFormat depthFormat);
     bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
                               VkPipeline pipeline);
     void presentAndCloseFrame(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey);
@@ -826,7 +917,9 @@ private:
     [[nodiscard]] std::optional<unsigned int> uploadTexture(const Resource<Texture>& textureKey);
     [[nodiscard]] VkDescriptorSet materialSet(const Resource<Material>& materialKey, unsigned int environmentImageId);
     [[nodiscard]] VkDescriptorSet attachmentSet(unsigned int imageId);
-    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode);
+    [[nodiscard]] VkPipeline scenePipeline(unsigned int shaderId, PrimitiveBinding& binding, VkCullModeFlags cullMode,
+                                           VkFormat colorFormat, VkFormat depthFormat);
+    [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
     [[nodiscard]] std::optional<std::vector<uint32_t>> compileToSpirv(const std::string& source,
@@ -867,10 +960,7 @@ VulkanRenderer::~VulkanRenderer()
         {
             vkDestroyPipeline(device, shader.swapchainTargetPipeline, nullptr);
         }
-        if (shader.offscreenTargetPipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(device, shader.offscreenTargetPipeline, nullptr);
-        }
+
         if (shader.vertexModule != VK_NULL_HANDLE)
         {
             vkDestroyShaderModule(device, shader.vertexModule, nullptr);
@@ -882,6 +972,11 @@ VulkanRenderer::~VulkanRenderer()
     }
 
     for (const auto& [key, pipeline] : scenePipelines)
+    {
+        vkDestroyPipeline(device, pipeline, nullptr);
+    }
+
+    for (const auto& [key, pipeline] : offscreenPipelines)
     {
         vkDestroyPipeline(device, pipeline, nullptr);
     }
@@ -1132,6 +1227,7 @@ void VulkanRenderer::selectPhysicalDevice()
 
     VkPhysicalDevice chosen = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties chosenProperties{};
+    VkBool32 chosenSamplerAnisotropy = VK_FALSE;
     uint32_t chosenGraphicsFamily = 0;
     uint32_t chosenPresentFamily = 0;
 
@@ -1220,6 +1316,9 @@ void VulkanRenderer::selectPhysicalDevice()
         {
             chosen = candidate;
             chosenProperties = properties;
+            // Optional, not a selection criterion: GL falls back to 1x anisotropy on a driver
+            // that does not advertise the extension, and so does this backend.
+            chosenSamplerAnisotropy = features2.features.samplerAnisotropy;
             chosenGraphicsFamily = foundGraphicsFamily.value();
             chosenPresentFamily = foundPresentFamily.value();
         }
@@ -1233,12 +1332,16 @@ void VulkanRenderer::selectPhysicalDevice()
 
     physicalDevice = chosen;
     deviceLimits = chosenProperties.limits;
+    samplerAnisotropySupported = chosenSamplerAnisotropy == VK_TRUE;
     graphicsQueueFamily = chosenGraphicsFamily;
     presentQueueFamily = chosenPresentFamily;
 
-    logger.info("Vulkan device selected: {} ({}, api {}.{}.{})", std::string_view(chosenProperties.deviceName),
-                describeDeviceType(chosenProperties.deviceType), VK_API_VERSION_MAJOR(chosenProperties.apiVersion),
-                VK_API_VERSION_MINOR(chosenProperties.apiVersion), VK_API_VERSION_PATCH(chosenProperties.apiVersion));
+    // GL falls back to 1x where the anisotropy limit query yields it; so does this.
+    const auto anisotropy = samplerAnisotropySupported ? deviceLimits.maxSamplerAnisotropy : 1.0f;
+    logger.info("Vulkan device selected: {} ({}, api {}.{}.{}, anisotropic filtering {:g}x)",
+                std::string_view(chosenProperties.deviceName), describeDeviceType(chosenProperties.deviceType),
+                VK_API_VERSION_MAJOR(chosenProperties.apiVersion), VK_API_VERSION_MINOR(chosenProperties.apiVersion),
+                VK_API_VERSION_PATCH(chosenProperties.apiVersion), anisotropy);
 }
 
 void VulkanRenderer::createDevice()
@@ -1270,9 +1373,15 @@ void VulkanRenderer::createDevice()
 
     const std::array deviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
+    // GL applies GL_TEXTURE_MAX_ANISOTROPY to every model texture it uploads; the sampler
+    // path below can only ask for it if the feature is switched on here.
+    VkPhysicalDeviceFeatures features{};
+    features.samplerAnisotropy = samplerAnisotropySupported ? VK_TRUE : VK_FALSE;
+
     VkDeviceCreateInfo deviceCreateInfo{};
     deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceCreateInfo.pNext = &features13;
+    deviceCreateInfo.pEnabledFeatures = &features;
     deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
     deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
     deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
@@ -1495,14 +1604,16 @@ void VulkanRenderer::createDescriptorInfrastructure()
         0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     frameDataSetLayout = makeSetLayout(frameBindings);
 
-    // Scene set 1: MaterialData UBO + sampler2D bindings 1-5 + samplerCube binding 6.
-    std::array<VkDescriptorSetLayoutBinding, 7> materialBindings{};
+    // Scene set 1: MaterialData UBO at binding 0, then one sampler per material texture slot
+    // at the binding RenderContract assigns it.
+    std::array<VkDescriptorSetLayoutBinding, materialTextureSlotCount + 1> materialBindings{};
     materialBindings[0] =
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    for (uint32_t binding = 1; binding <= 6; binding++)
+    for (uint32_t slot = 0; slot < materialTextureSlotCount; slot++)
     {
-        materialBindings[binding] = VkDescriptorSetLayoutBinding{binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                                                 VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        const auto binding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        materialBindings[slot + 1] = VkDescriptorSetLayoutBinding{binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                                                  VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     }
     materialSetLayout = makeSetLayout(materialBindings);
 
@@ -1700,8 +1811,8 @@ void VulkanRenderer::recordClearOnlySwapchainPass()
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // Matches the GL path's glClearColor(1, 1, 1, 1).
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -1961,14 +2072,38 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         return;
     }
 
-    // Values mirror the GL renderer's hardcoded per-shader uploads (OpenGLRenderer::draw).
     FrameDataUbo frameData{};
     frameData.viewMatrix = camera.modelViewMatrix;
     frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
-    frameData.lightPosition = glm::vec4(glm::vec3(0.0f, 350.0f, 350.0f), 1.0f);
-    frameData.lightDiffuse = glm::vec4(glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5), 0.0f);
-    frameData.lightSpecular = glm::vec4(glm::vec3(1.2859, 1.2973, 1.3), 0.0f);
-    frameData.lightAmbientAttenuation = glm::vec4(glm::vec3(0.29859, 0.29973, 0.3), 1.0f);
+
+    // A scene with no lights uploads lightCount 0: both shader loops then contribute nothing
+    // and the ambient floor is zero, leaving the image-based term as the only lighting. That
+    // is a legitimate scene, not a failure, so nothing is logged.
+    auto uploadedLights = 0u;
+    auto declaredLights = 0u;
+    for (const auto& light : scene.lights)
+    {
+        declaredLights++;
+
+        if (uploadedLights >= maxLights)
+        {
+            continue;
+        }
+
+        frameData.lights[uploadedLights] =
+            LightUbo{glm::vec4(light.position, 1.0f), glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
+                     glm::vec4(light.ambient, light.attenuation)};
+        uploadedLights++;
+    }
+    frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
+
+    if (declaredLights > maxLights && !lightLimitLogged)
+    {
+        logger.warn("Vulkan frame data carries at most {} lights; {} were declared and the rest are ignored", maxLights,
+                    declaredLights);
+        lightLimitLogged = true;
+    }
+
     std::memcpy(frame.frameDataMapped, &frameData, sizeof(frameData));
 
     transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -1988,8 +2123,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // GL clears the camera FBO with glClearColor(1, 1, 1, 1) and depth 1.
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1997,9 +2132,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
+    // A camera with no depth attachment renders depth-less, which the pipeline has to be told.
+    auto depthFormat = VK_FORMAT_UNDEFINED;
     if (depthImageId.has_value())
     {
-        depthAttachment.imageView = imageResources.at(depthImageId.value()).view;
+        const auto& depthImage = imageResources.at(depthImageId.value());
+        depthAttachment.imageView = depthImage.view;
+        depthFormat = depthImage.format;
     }
 
     VkRenderingInfo renderingInfo{};
@@ -2081,7 +2220,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                     continue;
                 }
 
-                recordDraw(primitive, entity.shader, entityModelMatrix, camera, joints);
+                recordDraw(primitive, entity.shader, entityModelMatrix, camera, joints, colorImage.format, depthFormat);
                 recordedDraws++;
             }
         }
@@ -2123,12 +2262,18 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         const auto usable = sourceImageId.has_value() && targetImageId.has_value() &&
                             imageResources.contains(sourceImageId.value()) &&
                             imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
-                            shader->second.offscreenTargetPipeline != VK_NULL_HANDLE;
-        if (!usable)
+                            shader->second.fullscreen;
+        // The pipeline is built against the target attachment's own format, so a post-process
+        // buffer created with any FboAttachment::internalFormat renders rather than mismatching
+        // a hardcoded one.
+        const auto pipeline = usable ? offscreenPipeline(postProcess.shader->gpuResourceId,
+                                                         imageResources.at(targetImageId.value()).format)
+                                     : VK_NULL_HANDLE;
+        if (pipeline == VK_NULL_HANDLE)
         {
             if (!missingPostProcessTargetLogged)
             {
-                logger.warn("Vulkan post-process pass skipped: it needs an input attachment, an RGBA16F output "
+                logger.warn("Vulkan post-process pass skipped: it needs an input attachment, a colour output "
                             "attachment and a fullscreen shader");
                 missingPostProcessTargetLogged = true;
             }
@@ -2140,7 +2285,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
         const auto& targetImage = imageResources.at(targetImageId.value());
         recordFullScreenPass(sourceImageId.value(), targetImage.view, VkExtent2D{targetImage.width, targetImage.height},
-                             shader->second.offscreenTargetPipeline);
+                             pipeline);
 
         transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
@@ -2157,7 +2302,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 
 void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Shader>& shader,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
-                                const std::vector<glm::mat4>& joints)
+                                const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
+                                const VkFormat depthFormat)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -2171,7 +2317,7 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<S
     const auto shaderId = shader->gpuResourceId;
     const VkCullModeFlags cullMode = material->opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
-    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode);
+    const auto pipeline = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
     if (pipeline == VK_NULL_HANDLE)
     {
         return;
@@ -2268,7 +2414,8 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     // GL's drawFullScreenQuad clears before the quad; the quad covers the target anyway.
-    colorAttachment.clearValue.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -2539,14 +2686,19 @@ std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture
         return texture.gpuResourceId;
     }
 
+    // Any channel count at any of the three source precisions uploads (createSampledImage
+    // expands it the way GL's driver does); only a payload that cannot describe the image is
+    // rejected.
     const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
-    if (texelCount == 0 || texture.pixelDataType != PixelDataType::UnsignedByte || texture.data.size() < texelCount * 4)
+    const auto sourceBytes =
+        texelCount * static_cast<size_t>(channelCount(texture.format)) * pixelComponentBytes(texture.pixelDataType);
+    if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
     {
         if (!unsupportedTextureLayoutLogged)
         {
-            logger.warn("Vulkan texture upload skipped for {}: {}x{} with {} byte(s) is not the 8-bit RGBA layout this "
-                        "backend uploads",
-                        texture.name, texture.width, texture.height, texture.data.size());
+            logger.warn("Vulkan texture upload skipped for {}: {}x{} needs {} byte(s) for its declared layout and "
+                        "carries {}",
+                        texture.name, texture.width, texture.height, sourceBytes, texture.data.size());
             unsupportedTextureLayoutLogged = true;
         }
 
@@ -2703,8 +2855,8 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
                                       occlusion.value_or(fallbackTexture), environment};
 
     const VkDescriptorBufferInfo bufferInfo{resource.buffer, 0, sizeof(MaterialDataUbo)};
-    std::array<VkDescriptorImageInfo, 6> imageInfos{};
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    std::array<VkDescriptorImageInfo, materialTextureSlotCount> imageInfos{};
+    std::array<VkWriteDescriptorSet, materialTextureSlotCount + 1> writes{};
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
@@ -2713,18 +2865,19 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[0].pBufferInfo = &bufferInfo;
 
-    for (uint32_t binding = 1; binding <= 6; binding++)
+    // sampledImages is in MaterialTextureSlot order; the binding each lands on is the
+    // contract's, not this loop's index.
+    for (uint32_t slot = 0; slot < materialTextureSlotCount; slot++)
     {
-        const auto& image = imageResources.at(sampledImages[binding - 1]);
-        imageInfos[binding - 1] =
-            VkDescriptorImageInfo{image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const auto& image = imageResources.at(sampledImages[slot]);
+        imageInfos[slot] = VkDescriptorImageInfo{image.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-        writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[binding].dstSet = set;
-        writes[binding].dstBinding = binding;
-        writes[binding].descriptorCount = 1;
-        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[binding].pImageInfo = &imageInfos[binding - 1];
+        writes[slot + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[slot + 1].dstSet = set;
+        writes[slot + 1].dstBinding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        writes[slot + 1].descriptorCount = 1;
+        writes[slot + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[slot + 1].pImageInfo = &imageInfos[slot];
     }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -2782,7 +2935,8 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
 }
 
 VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding,
-                                         const VkCullModeFlags cullMode)
+                                         const VkCullModeFlags cullMode, const VkFormat colorFormat,
+                                         const VkFormat depthFormat)
 {
     // A primitive's material — and so its shader and cull mode — never changes after load,
     // so one resolution per primitive is enough and a failed build is not retried.
@@ -2852,8 +3006,12 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
         binding.boundOffsets.push_back(0);
     }
 
+    // The pipeline's rendering formats are part of its identity, so they are part of the key:
+    // the attachments they come from are the ones FboAttachment::internalFormat asked for.
     const auto key = std::to_string(shaderId) + "|" + std::to_string(cullMode) + "|" +
-                     std::to_string(static_cast<int>(binding.topology)) + "|rgba16f+d32|" + binding.signature;
+                     std::to_string(static_cast<int>(binding.topology)) + "|" +
+                     std::to_string(static_cast<int>(colorFormat)) + "+" +
+                     std::to_string(static_cast<int>(depthFormat)) + "|" + binding.signature;
     const auto cachedPipeline = scenePipelines.find(key);
     if (cachedPipeline != scenePipelines.end())
     {
@@ -2935,12 +3093,11 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    const auto colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachmentFormats = &colorFormat;
-    renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+    renderingInfo.depthAttachmentFormat = depthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -2974,6 +3131,31 @@ VkPipeline VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveB
 
     scenePipelines.emplace(key, pipeline);
     binding.pipeline = pipeline;
+    return pipeline;
+}
+
+VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const VkFormat colorFormat)
+{
+    const auto key = (static_cast<uint64_t>(shaderId) << 32u) | static_cast<uint32_t>(colorFormat);
+    const auto cached = offscreenPipelines.find(key);
+    if (cached != offscreenPipelines.end())
+    {
+        return cached->second;
+    }
+
+    const auto shader = shaderObjects.find(shaderId);
+    if (shader == shaderObjects.end() || !shader->second.fullscreen)
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const auto pipeline =
+        buildFullscreenPipeline(shader->second.vertexModule, shader->second.fragmentModule, colorFormat);
+    if (pipeline != VK_NULL_HANDLE)
+    {
+        offscreenPipelines.emplace(key, pipeline);
+    }
+
     return pipeline;
 }
 
@@ -3025,6 +3207,14 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     // stage leaves the vertex stage writing an output nothing consumes, and validation
     // reports the mismatch on every pipeline built from the pair.
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
+
+    // Every Vulkan source is compiled with the contract macros predefined, so no shader
+    // spells a set index, a binding, an attribute location or an array bound that C++ also
+    // holds. The GL path splices the same list in as text (withShaderContractMacros).
+    for (const auto& macro : shaderContractMacros(GraphicsApi::Vulkan))
+    {
+        options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
+    }
 
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success)
@@ -3176,8 +3366,6 @@ std::optional<unsigned int> VulkanRenderer::createShaderObject(const ShaderDescr
     {
         shaderObject.swapchainTargetPipeline =
             buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
-        shaderObject.offscreenTargetPipeline = buildFullscreenPipeline(
-            shaderObject.vertexModule, shaderObject.fragmentModule, VK_FORMAT_R16G16B16A16_SFLOAT);
     }
 
     const auto id = nextResourceId++;
@@ -3185,7 +3373,7 @@ std::optional<unsigned int> VulkanRenderer::createShaderObject(const ShaderDescr
 
     logger.info("Vulkan shader object {} ready: vertex {} + fragment {} SPIR-V words; {}", id, vertexSpirv->size(),
                 fragmentSpirv->size(),
-                shaderObject.fullscreen ? "fullscreen pipelines built for swapchain and RGBA16F targets"
+                shaderObject.fullscreen ? "swapchain fullscreen pipeline built; offscreen targets build on first use"
                                         : "scene pipeline awaits vertex input from the draw path");
     return id;
 }
@@ -3238,23 +3426,27 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     const auto& first = *faces.front();
     const auto width = first.width;
     const auto height = first.height;
-    const auto isHdrFloat = first.pixelDataType == PixelDataType::Float;
     const auto layerCount = static_cast<uint32_t>(faces.size());
 
-    // 96bpp float RGB pads to RGBA32F unconditionally (vulkan-abi.md: RGB32F sampling
-    // support is not universal); the stbi_load path is RGBA8.
-    const auto format = isHdrFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    const auto texelBytes = static_cast<VkDeviceSize>(isHdrFloat ? 16 : 4);
+    const auto sourceChannels = static_cast<size_t>(channelCount(first.format));
+    const auto componentBytes = static_cast<size_t>(pixelComponentBytes(first.pixelDataType));
+    if (sourceChannels == 0)
+    {
+        throw std::runtime_error("sampled image source has no known channel layout");
+    }
+
+    const auto format = sampledImageFormat(first.pixelDataType);
+    const auto texelBytes = static_cast<VkDeviceSize>(componentBytes * 4);
     const auto texelCount = static_cast<size_t>(width) * height;
     const auto faceBytes = static_cast<VkDeviceSize>(texelCount) * texelBytes;
-    const auto sourceFaceBytes = isHdrFloat ? texelCount * 3 * sizeof(float) : texelCount * 4;
+    const auto sourceFaceBytes = texelCount * sourceChannels * componentBytes;
 
     for (const auto* face : faces)
     {
-        if (face->width != width || face->height != height ||
-            (face->pixelDataType == PixelDataType::Float) != isHdrFloat || face->data.size() < sourceFaceBytes)
+        if (face->width != width || face->height != height || face->pixelDataType != first.pixelDataType ||
+            face->format != first.format || face->data.size() < sourceFaceBytes)
         {
-            throw std::runtime_error("sampled image sources disagree on size or pixel type");
+            throw std::runtime_error("sampled image sources disagree on size, pixel type or channel layout");
         }
     }
 
@@ -3317,28 +3509,41 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
                            &stagingAllocationInfo),
            "vmaCreateBuffer");
 
+    // GL lets the driver expand a source with fewer than four components, filling the missing
+    // colour components with 0 and a missing alpha with 1. Vulkan has no such conversion, so
+    // the same rule is applied here, at the source's own precision.
+    std::array<unsigned char, 4> opaqueComponent{};
+    if (first.pixelDataType == PixelDataType::Float)
+    {
+        const auto one = 1.0f;
+        std::memcpy(opaqueComponent.data(), &one, sizeof(one));
+    }
+    else
+    {
+        opaqueComponent.fill(0xFF);
+    }
+
     for (size_t faceIndex = 0; faceIndex < faces.size(); faceIndex++)
     {
         const auto& face = *faces[faceIndex];
         auto* destination =
             static_cast<unsigned char*>(stagingAllocationInfo.pMappedData) + faceIndex * static_cast<size_t>(faceBytes);
 
-        if (isHdrFloat)
-        {
-            // Source rows are tightly-packed RGB floats (stbi_loadf, no row padding).
-            const auto* source = reinterpret_cast<const float*>(face.data.data());
-            auto* padded = reinterpret_cast<float*>(destination);
-            for (size_t texel = 0; texel < texelCount; texel++)
-            {
-                padded[texel * 4 + 0] = source[texel * 3 + 0];
-                padded[texel * 4 + 1] = source[texel * 3 + 1];
-                padded[texel * 4 + 2] = source[texel * 3 + 2];
-                padded[texel * 4 + 3] = 1.0f;
-            }
-        }
-        else
+        if (sourceChannels == 4)
         {
             std::memcpy(destination, face.data.data(), sourceFaceBytes);
+            continue;
+        }
+
+        // Source rows are tightly packed (stbi and tinygltf both emit them that way).
+        for (size_t texel = 0; texel < texelCount; texel++)
+        {
+            const auto* source = face.data.data() + texel * sourceChannels * componentBytes;
+            auto* target = destination + texel * componentBytes * 4;
+
+            std::memcpy(target, source, sourceChannels * componentBytes);
+            std::memset(target + sourceChannels * componentBytes, 0, (3 - sourceChannels) * componentBytes);
+            std::memcpy(target + 3 * componentBytes, opaqueComponent.data(), componentBytes);
         }
     }
     ensure(vmaFlushAllocation(allocator, stagingAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
@@ -3421,16 +3626,25 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     VkImageView view = VK_NULL_HANDLE;
     ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
-    // CLAMP_TO_EDGE + LINEAR with trilinear mips, matching the GL cube map parameters.
+    // LINEAR with trilinear mips, matching the GL texture parameters. Cube maps clamp so a
+    // face never samples across a seam; 2D textures repeat, which is the glTF sampler default
+    // and what KHR_texture_transform scaling relies on once a UV leaves 0..1. GL's anisotropy
+    // is applied to 2D textures only, and this matches that.
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    const auto addressMode = cube ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeU = addressMode;
+    samplerInfo.addressModeV = addressMode;
+    samplerInfo.addressModeW = addressMode;
     samplerInfo.maxLod = static_cast<float>(mipLevels);
+    if (!cube && samplerAnisotropySupported)
+    {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = deviceLimits.maxSamplerAnisotropy;
+    }
 
     VkSampler sampler = VK_NULL_HANDLE;
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
@@ -3508,19 +3722,15 @@ unsigned int VulkanRenderer::createFbo(const Fbo& fbo) const
     {
         auto attachment = memoryStorageService.bufferAttachments.get(attachmentKey);
 
-        VkFormat format;
         VkImageUsageFlags usage;
         VkImageAspectFlags aspect;
         switch (attachment.type)
         {
         case FboAttachmentType::Color:
-            // The engine's colour attachment contract is RGBA capture into RGBA16F.
-            format = VK_FORMAT_R16G16B16A16_SFLOAT;
             usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
             aspect = VK_IMAGE_ASPECT_COLOR_BIT;
             break;
         case FboAttachmentType::Depth:
-            format = VK_FORMAT_D32_SFLOAT;
             usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
             aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
             break;
@@ -3536,6 +3746,17 @@ unsigned int VulkanRenderer::createFbo(const Fbo& fbo) const
             continue;
         }
         }
+
+        // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no
+        // Vulkan equivalent is a model the backend cannot serve, not a runtime condition.
+        const auto requestedFormat = attachmentFormat(attachment.internalFormat);
+        if (!requestedFormat.has_value())
+        {
+            throw std::runtime_error("FboAttachment::internalFormat " +
+                                     std::to_string(static_cast<int>(attachment.internalFormat)) +
+                                     " has no Vulkan format");
+        }
+        const auto format = requestedFormat.value();
 
         // A minimised window reports 0x0; a 1x1 image keeps the resource valid until the
         // next real resize arrives.

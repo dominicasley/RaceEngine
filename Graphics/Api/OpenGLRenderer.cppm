@@ -23,7 +23,9 @@ module;
 
 export module raceengine.graphics:OpenGLRenderer;
 
+import :GraphicsApi;
 import :IRenderer;
+import :RenderContract;
 import :SceneManagerService;
 import :RenderableEntityService;
 import raceengine.graphics.models;
@@ -102,6 +104,7 @@ public:
 private:
     void drawFullScreenQuad(const Resource<Shader>& shader, const std::vector<Resource<FboAttachment>>& textures) const;
     void bindMaterial(const Resource<Material>& material, const Resource<Shader>& shader);
+    void uploadLights(unsigned int programId, const Scene& scene);
     void upload(const Resource<Model>& model);
     void uploadTexture(const Resource<Texture>& texture) const;
     [[nodiscard]] unsigned int createTexture(const Texture& texture) const;
@@ -129,9 +132,40 @@ private:
 
 namespace
 {
-// Parity with the GL shaders' jointTransformationMatrixes[MAX_JOINTS] and Vulkan's
-// DrawDataUbo::jointTransforms (vulkan-abi.md).
-constexpr size_t maxJoints = 128;
+
+struct LightUniformNames
+{
+    std::string position;
+    std::string diffuse;
+    std::string specular;
+    std::string ambient;
+    std::string attenuation;
+};
+
+// GL addresses a struct-array uniform by name, so the names are built once and the draw path
+// pays only the uniform-pool lookup.
+const std::vector<LightUniformNames> lightUniformNames = []
+{
+    std::vector<LightUniformNames> names;
+    names.reserve(maxLights);
+
+    for (auto index = 0u; index < maxLights; index++)
+    {
+        const auto prefix = "lights[" + std::to_string(index) + "].";
+        names.push_back(LightUniformNames{.position = prefix + "position",
+                                          .diffuse = prefix + "diffuse",
+                                          .specular = prefix + "specular",
+                                          .ambient = prefix + "ambient",
+                                          .attenuation = prefix + "attenuation"});
+    }
+
+    return names;
+}();
+
+[[nodiscard]] GLenum textureUnit(const MaterialTextureSlot slot)
+{
+    return static_cast<GLenum>(GL_TEXTURE0) + textureBinding(slot, GraphicsApi::OpenGL);
+}
 
 void GLAD_API_PTR glDebugMessageHandler(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei,
                                         const GLchar* message, const void* userParam)
@@ -208,7 +242,7 @@ bool OpenGLRenderer::init()
 
     glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAnisotropy);
 
-    glClearColor(255.f / 255.f, 255.f / 255.f, 255.f / 255.f, 1.0f);
+    glClearColor(clearColour[0], clearColour[1], clearColour[2], clearColour[3]);
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
@@ -281,7 +315,7 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
             // Bound by reference into the mesh's palette buffer: copying it here would undo the
             // per-frame allocation the service avoids. The clamp limits the upload count instead.
             const auto& joints = renderableEntityService.joints(mesh, delta);
-            const auto jointCount = std::min(joints.size(), maxJoints);
+            const auto jointCount = std::min(joints.size(), static_cast<size_t>(maxJoints));
 
             if (joints.size() > maxJoints)
             {
@@ -353,12 +387,8 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
 
                     setProgramUniform(shader->gpuResourceId, "cameraPosition", camera.position);
                     setProgramUniform(shader->gpuResourceId, "modelView3x3Matrix", glm::mat3(camera.modelViewMatrix));
-                    setProgramUniform(shader->gpuResourceId, "lights.position", glm::vec3(0.0f, 350.0f, 350.0f));
-                    setProgramUniform(shader->gpuResourceId, "lights.diffuse",
-                                      glm::vec3(1.2859 * 2.5, 1.2973 * 2.5, 1.3 * 2.5));
-                    setProgramUniform(shader->gpuResourceId, "lights.specular", glm::vec3(1.2859, 1.2973, 1.3));
-                    setProgramUniform(shader->gpuResourceId, "lights.ambient", glm::vec3(0.29859, 0.29973, 0.3));
-                    setProgramUniform(shader->gpuResourceId, "lights.attenuation", 1.0f);
+
+                    uploadLights(shader->gpuResourceId, scene);
                 }
 
                 if (!primitive.gpuVao.has_value())
@@ -396,6 +426,46 @@ void OpenGLRenderer::draw(Scene& scene, Camera& camera, float delta)
     }
 }
 
+// A scene with no lights uploads lightCount 0: both shader loops then contribute nothing and
+// the ambient floor is zero, leaving the image-based term as the only lighting. That is a
+// legitimate scene, not a failure, so nothing is logged.
+void OpenGLRenderer::uploadLights(const unsigned int programId, const Scene& scene)
+{
+    auto uploaded = 0u;
+    auto declared = 0u;
+
+    for (const auto& light : scene.lights)
+    {
+        declared++;
+
+        if (uploaded >= maxLights)
+        {
+            continue;
+        }
+
+        const auto& names = lightUniformNames[uploaded];
+        setProgramUniform(programId, names.position.c_str(), light.position);
+        setProgramUniform(programId, names.diffuse.c_str(), light.diffuse);
+        setProgramUniform(programId, names.specular.c_str(), light.specular);
+        setProgramUniform(programId, names.ambient.c_str(), light.ambient);
+        setProgramUniform(programId, names.attenuation.c_str(), light.attenuation);
+        uploaded++;
+    }
+
+    if (declared > maxLights)
+    {
+        static auto warnedLightLimit = false;
+        if (!warnedLightLimit)
+        {
+            logger.warn("The GL light uniform array holds at most {} lights; {} were declared and the rest are ignored",
+                        maxLights, declared);
+            warnedLightLimit = true;
+        }
+    }
+
+    setProgramUniform(programId, "lightCount", static_cast<int>(uploaded));
+}
+
 void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Resource<Shader>& shader)
 {
     glUseProgram(shader->gpuResourceId);
@@ -406,14 +476,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (albedo->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE0);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Diffuse));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(albedo->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", true);
         }
     }
     else
     {
-        glActiveTexture(GL_TEXTURE0);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Diffuse));
         glBindTexture(GL_TEXTURE_2D, 0);
         setProgramUniform(shader->gpuResourceId, "u_useDiffuseTexture", false);
     }
@@ -424,14 +494,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (normal->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE1);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Normal));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(normal->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", true);
         }
     }
     else
     {
-        glActiveTexture(GL_TEXTURE1);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Normal));
         glBindTexture(GL_TEXTURE_2D, 0);
         setProgramUniform(shader->gpuResourceId, "u_useNormalTexture", false);
     }
@@ -442,14 +512,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (metallicRoughness->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE2);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Specular));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(metallicRoughness->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", true);
         }
     }
     else
     {
-        glActiveTexture(GL_TEXTURE2);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Specular));
         glBindTexture(GL_TEXTURE_2D, 0);
         setProgramUniform(shader->gpuResourceId, "u_useSpecularTexture", false);
     }
@@ -460,14 +530,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (emissive->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE3);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Emissive));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(emissive->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", true);
         }
     }
     else
     {
-        glActiveTexture(GL_TEXTURE3);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Emissive));
         glBindTexture(GL_TEXTURE_2D, 0);
         setProgramUniform(shader->gpuResourceId, "u_useEmissiveTexture", false);
     }
@@ -478,14 +548,14 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (occlusion->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE4);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Occlusion));
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(occlusion->gpuResourceId.value()));
             setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", true);
         }
     }
     else
     {
-        glActiveTexture(GL_TEXTURE4);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Occlusion));
         glBindTexture(GL_TEXTURE_2D, 0);
         setProgramUniform(shader->gpuResourceId, "u_useOcclusionTexture", false);
     }
@@ -494,17 +564,17 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
     {
         const auto environment = material->environment.value();
 
-        glActiveTexture(GL_TEXTURE5);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Environment));
         glBindTexture(GL_TEXTURE_CUBE_MAP, environment->gpuResourceId);
     }
     else if (sceneEnvironmentGpuId.has_value())
     {
-        glActiveTexture(GL_TEXTURE5);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Environment));
         glBindTexture(GL_TEXTURE_CUBE_MAP, sceneEnvironmentGpuId.value());
     }
     else
     {
-        glActiveTexture(GL_TEXTURE5);
+        glActiveTexture(textureUnit(MaterialTextureSlot::Environment));
         glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     }
 
@@ -514,7 +584,7 @@ void OpenGLRenderer::bindMaterial(const Resource<Material>& material, const Reso
 
         if (texture->gpuResourceId.has_value())
         {
-            glActiveTexture(GL_TEXTURE5 + i + 1);
+            glActiveTexture(textureUnit(MaterialTextureSlot::Environment) + i + 1);
             glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture->gpuResourceId.value()));
         }
     }
@@ -644,9 +714,16 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
     const auto computeShaderId = glCreateShader(GL_COMPUTE_SHADER);
     const auto geometryShaderId = glCreateShader(GL_GEOMETRY_SHADER);
 
+    // Every GL source is compiled with the contract macros spliced in, so no shader spells a
+    // binding index, an attribute location or an array bound the C++ side also holds.
+    const auto contract = [](const std::string& source)
+    {
+        return withShaderContractMacros(source, GraphicsApi::OpenGL);
+    };
+
     if (!object.vertexShaderSource.empty())
     {
-        if (compileShader(vertexShaderId, object.vertexShaderSource))
+        if (compileShader(vertexShaderId, contract(object.vertexShaderSource)))
         {
             glAttachShader(programId, vertexShaderId);
         }
@@ -654,7 +731,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.fragmentShaderSource.empty())
     {
-        if (compileShader(fragmentShaderId, object.fragmentShaderSource))
+        if (compileShader(fragmentShaderId, contract(object.fragmentShaderSource)))
         {
             glAttachShader(programId, fragmentShaderId);
         }
@@ -662,8 +739,8 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.tessellationControlShaderSource.empty() && !object.tessellationEvaluationShaderSource.empty())
     {
-        if (compileShader(tessellationControlShaderId, object.tessellationControlShaderSource) &&
-            compileShader(tessellationEvaluationShaderId, object.tessellationEvaluationShaderSource))
+        if (compileShader(tessellationControlShaderId, contract(object.tessellationControlShaderSource)) &&
+            compileShader(tessellationEvaluationShaderId, contract(object.tessellationEvaluationShaderSource)))
         {
             glAttachShader(programId, tessellationControlShaderId);
             glAttachShader(programId, tessellationEvaluationShaderId);
@@ -672,7 +749,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.computeShaderSource.empty())
     {
-        if (compileShader(computeShaderId, object.computeShaderSource))
+        if (compileShader(computeShaderId, contract(object.computeShaderSource)))
         {
             glAttachShader(programId, computeShaderId);
         }
@@ -680,7 +757,7 @@ std::optional<unsigned int> OpenGLRenderer::createShaderObject(const ShaderDescr
 
     if (!object.geometryShaderSource.empty())
     {
-        if (compileShader(geometryShaderId, object.geometryShaderSource))
+        if (compileShader(geometryShaderId, contract(object.geometryShaderSource)))
         {
             glAttachShader(programId, geometryShaderId);
         }
@@ -737,14 +814,30 @@ unsigned int OpenGLRenderer::createTexture(const Texture& texture) const
 
     auto format = getTextureFormat(texture.format);
     auto type = getTextureDataType(texture.pixelDataType);
-    auto internalFormat = texture.pixelDataType == PixelDataType::Float
-                              ? getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel))
-                              : static_cast<unsigned int>(GL_RGBA);
+    auto internalFormat = static_cast<unsigned int>(GL_RGBA);
+    switch (texture.pixelDataType)
+    {
+    case PixelDataType::Float:
+        internalFormat = getInternalFormatFromBitsPerPixel(static_cast<int>(texture.bitsPerPixel));
+        break;
+    case PixelDataType::UnsignedShort:
+        // A 16-bit glTF image keeps its bits: the unsized GL_RGBA would have let the driver
+        // pick 8, throwing away half of what the asset carries (Vulkan uploads R16G16B16A16).
+        internalFormat = static_cast<unsigned int>(GL_RGBA16);
+        break;
+    default:
+        break;
+    }
 
     glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internalFormat), texture.width, texture.height, NULL, format,
                  type, texture.data.data());
 
     glGenerateMipmap(GL_TEXTURE_2D);
+    // GL_REPEAT is GL's default and was previously left implicit. It is the glTF sampler
+    // default too, and the wrap KHR_texture_transform scaling depends on once a UV leaves
+    // 0..1, so it is stated rather than inherited (Vulkan sets the same mode explicitly).
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, maxAnisotropy);

@@ -1,8 +1,12 @@
 module;
 
+#include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <spdlog/async.h>
 #include <spdlog/logger.h>
@@ -21,6 +25,7 @@ export import raceengine.io;
 // Sandbox code names these unqualified in the global namespace; export import alone
 // only surfaces raceengine::X, so re-alias them globally.
 export using raceengine::awaitAll;
+export using raceengine::Behaviour;
 export using raceengine::Camera;
 export using raceengine::CreateRenderableModelDTO;
 export using raceengine::Drawable;
@@ -70,11 +75,43 @@ private:
     CameraService cameraService;
     SceneService sceneService;
     EntityService entityService;
+    // Simulation clock and the game's tick subscribers. Neither depends on a service, so
+    // they sit last: the callbacks are owned by the engine but written by the game, and
+    // being destroyed first means no service they reach into is gone while they still exist.
+    // Seeded with one step: the first frame's delta is zero, because the window clock has not
+    // ticked yet, and a frame that renders before any tick has run would show the state the
+    // level was built with rather than the state its first update produced.
+    float accumulator = fixedTimeStep;
+    float interpolationAlpha = 0.0f;
+    std::vector<std::function<void(float)>> updateCallbacks;
 
 public:
+    // Simulation tick length. 120 Hz: 8.33 ms keeps the stiff spring/damper integration a
+    // driving game needs stable, and 120 divides the refresh rates a vsynced frame actually
+    // lands on (60/120/240) so a frame consumes a whole number of ticks instead of beating
+    // against them. Games integrate against this constant, so it is part of the surface.
+    static constexpr float fixedTimeStep = 1.0f / 120.0f;
+    // Spiral-of-death guard: the most ticks one frame may run. Beyond it the surplus is
+    // discarded rather than deferred, so simulation slows down below ~15 fps instead of the
+    // catch-up work making the next frame longer, which makes the next catch-up longer. The
+    // frame this actually fires on is the first: delta there is the whole process startup,
+    // asset load included, which is thousands of ticks of "owed" time that never happened.
+    static constexpr int maxCatchUpSteps = 8;
+
     Engine();
     [[nodiscard]] bool running() const;
     void step();
+    // Game update logic on the fixed tick, run in registration order at the top of a tick —
+    // before entity behaviours and before the scene settles, and always before the frame
+    // that renders its effects. Registration is add-only, like the rest of the engine.
+    void onUpdate(std::function<void(float)> callback);
+
+    // Fraction of a fixed step that was left unsimulated when this frame was drawn, in
+    // [0, 1): what a renderer interpolates by to draw between two ticks.
+    [[nodiscard]] float interpolation() const
+    {
+        return interpolationAlpha;
+    }
 
     [[nodiscard]] IWindow& window()
     {
@@ -142,6 +179,8 @@ public:
     }
 
 private:
+    void update(float delta);
+    [[nodiscard]] float frameDelta() const;
     void dumpFrameIfRequested();
 };
 
@@ -191,7 +230,7 @@ Engine::Engine() :
     postProcessService(memoryStorageService, fboService, glfwWindow),
     presenterService(*renderer),
     cameraService(memoryStorageService, fboService, glfwWindow),
-    sceneService(renderableEntityService, cameraService)
+    sceneService(renderableEntityService, cameraService, sceneManagerService)
 {
     renderer->init();
     renderer->setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
@@ -223,9 +262,62 @@ bool Engine::running() const
     return !glfwWindow.shouldClose();
 }
 
+void Engine::onUpdate(std::function<void(float)> callback)
+{
+    updateCallbacks.push_back(std::move(callback));
+}
+
+// One tick of simulation, always fixedTimeStep long. Order is writers before readers: the
+// game's own logic, then the behaviour each entity carries, then the scene settling what
+// both of them moved.
+void Engine::update(float delta)
+{
+    for (const auto& callback : updateCallbacks)
+    {
+        callback(delta);
+    }
+
+    entityService.update(delta);
+
+    for (auto& scene : sceneManagerService.getScenes())
+    {
+        sceneService.update(scene, delta);
+    }
+}
+
+// The frame's real elapsed time — except under a frame capture, which is a gate that
+// compares two backends pixel for pixel. A simulation advanced by however fast each backend
+// happened to run would put the two captures at different simulated instants, so a capture
+// run advances exactly one tick per frame instead. That also makes a capture reproducible
+// across sessions rather than only within one.
+float Engine::frameDelta() const
+{
+    static const bool capturing = std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+
+    if (capturing)
+    {
+        return fixedTimeStep;
+    }
+
+    return glfwWindow.delta();
+}
+
 void Engine::step()
 {
-    const auto delta = glfwWindow.delta();
+    const auto delta = frameDelta();
+
+    // Clamping the accumulator, not the loop, is what bounds catch-up: time beyond the
+    // budget is dropped here, so the loop can never find more than maxCatchUpSteps of work
+    // and the leftover is always a fraction of one step.
+    accumulator = std::min(accumulator + delta, fixedTimeStep * static_cast<float>(maxCatchUpSteps));
+
+    while (accumulator >= fixedTimeStep)
+    {
+        update(fixedTimeStep);
+        accumulator -= fixedTimeStep;
+    }
+
+    interpolationAlpha = accumulator / fixedTimeStep;
 
     for (auto& scene : sceneManagerService.getScenes())
     {
@@ -235,6 +327,13 @@ void Engine::step()
         }
     }
 
+    // Drawable's hooks bracket the scene passes rather than the individual draw call: a
+    // model is submitted from inside IRenderer::draw, which takes the whole scene, and the
+    // renderers cannot reach a Drawable without raceengine.graphics importing
+    // raceengine.game and inverting the module graph. Once per frame around every pass that
+    // could draw the entity is the strongest guarantee this layering can express.
+    entityService.beforeDraw();
+
     for (auto& scene : sceneManagerService.getScenes())
     {
         for (auto& camera : scene.cameras)
@@ -242,6 +341,8 @@ void Engine::step()
             renderer->draw(scene, camera, delta);
         }
     }
+
+    entityService.afterDraw();
 
     presenterService.present();
 

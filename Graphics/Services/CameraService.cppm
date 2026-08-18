@@ -29,6 +29,7 @@ public:
     void rotate(Camera& camera, float x, float y, float z) const;
     void setRoll(Camera& camera, float x, float y, float z) const;
     void setAspectRatio(Camera& camera, float aspectRatio) const;
+    void setClippingPlanes(Camera& camera, float nearPlane, float farPlane) const;
     void recreateOutputBuffer(Camera& camera, int width, int height) const;
     void setFieldOfView(Camera& camera, float fov) const;
     void lookAtPoint(Camera& camera, float x, float y, float z) const;
@@ -52,10 +53,14 @@ Camera CameraService::createCamera()
     auto windowWidth = static_cast<unsigned int>(windowState.windowWidth);
     auto windowHeight = static_cast<unsigned int>(windowState.windowHeight);
 
+    // The clipping planes default to the values the projection used to hardcode, so wiring the
+    // fields changes no frame; a game that wants a different depth range now has one to set.
     return Camera{.iso = 6400,
                   .aspectRatio = 16.0f / 9.0f,
                   .aperture = 1.4f,
                   .fieldOfView = 75.f,
+                  .nearClippingPlane = 1.0f,
+                  .farClippingPlane = 5000.0f,
                   .direction = glm::vec3(0, 0, 1),
                   .roll = glm::vec3(0, 1, 0),
                   .output = fboService.create(
@@ -116,6 +121,14 @@ void CameraService::setAspectRatio(Camera& camera, float aspectRatio) const
     camera.aspectRatio = aspectRatio;
 }
 
+// Named nearPlane/farPlane, not near/far: those are still macros in the Windows headers the
+// window layer pulls in.
+void CameraService::setClippingPlanes(Camera& camera, float nearPlane, float farPlane) const
+{
+    camera.nearClippingPlane = nearPlane;
+    camera.farClippingPlane = farPlane;
+}
+
 void CameraService::recreateOutputBuffer(Camera& camera, int width, int height) const
 {
     auto windowWidth = static_cast<unsigned int>(width);
@@ -143,9 +156,9 @@ const glm::mat4& CameraService::updateModelViewMatrix(Camera& camera) const
 
 const glm::mat4& CameraService::updateModelViewProjectionMatrix(Camera& camera) const
 {
-    camera.modelViewProjectionMatrix =
-        glm::perspective(glm::radians(camera.fieldOfView), camera.aspectRatio, 1.0f, 5000.0f) *
-        updateModelViewMatrix(camera);
+    camera.modelViewProjectionMatrix = glm::perspective(glm::radians(camera.fieldOfView), camera.aspectRatio,
+                                                        camera.nearClippingPlane, camera.farClippingPlane) *
+                                       updateModelViewMatrix(camera);
 
     return camera.modelViewProjectionMatrix;
 }

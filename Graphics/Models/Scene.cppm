@@ -52,10 +52,17 @@ export struct SceneNode
 
 export struct Light
 {
-    glm::vec3 position;
-    glm::vec3 direction;
-    glm::vec3 color;
-    float strength;
+    glm::vec3 position{};
+    glm::vec3 direction{};
+    // The four terms both backends upload per light. They are stored as authored rather than
+    // derived from color/strength: the renderers hand them to the shaders verbatim, and a
+    // product would not reproduce an authored value bit for bit.
+    glm::vec3 diffuse{};
+    glm::vec3 specular{};
+    glm::vec3 ambient{};
+    float attenuation = 1.0f;
+    glm::vec3 color{};
+    float strength{};
 };
 
 export struct Camera
