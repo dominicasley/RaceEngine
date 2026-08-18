@@ -88,12 +88,16 @@ private:
     WindowState windowState;
     spdlog::logger& logger;
     GraphicsApi graphicsApi;
-    // Frame capture reports a fixed cursor and ignores warps, so mouse-look games hold
-    // their spawn view and a capture is reproducible whatever the physical mouse does.
-    bool frameCaptureActive;
+    // Unattended runs (smoke gates, frame captures) belong to no one at the keyboard: the
+    // window never appears and every input path reports nothing, so an automated run
+    // cannot steal focus, pull the cursor, or take keystrokes from the desktop session.
+    // It also makes captures reproducible, since controllers see a cursor that never moves.
+    bool unattended;
+    mutable bool windowShown = false;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
+    [[nodiscard]] bool focused() const;
 
 public:
     explicit GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi);
@@ -118,7 +122,7 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     windowState({0, 0, 0, 0}),
     logger(logger),
     graphicsApi(graphicsApi),
-    frameCaptureActive(std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
+    unattended(std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
 {
     if (!glfwInit())
     {
@@ -141,6 +145,13 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     }
+
+    // Games block on asset loading before the first frame, and nothing pumps events until
+    // then, so a window mapped here answers no window-manager pings and gets reported as
+    // hung. It stays hidden until the first frame is on screen, and does not steal focus
+    // when it appears.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
 
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
@@ -225,6 +236,14 @@ void GLFWWindow::swapBuffers() const
         glfwSwapBuffers(window);
     }
 
+    // Both backends have presented a frame by the time the loop reaches here, so the
+    // window reveals rendered content rather than the blank fill it was created with.
+    if (!windowShown && !unattended)
+    {
+        glfwShowWindow(window);
+        windowShown = true;
+    }
+
     glfwPollEvents();
 }
 
@@ -247,17 +266,29 @@ void GLFWWindow::windowResized(GLFWwindow* window, int width, int height)
 
 bool GLFWWindow::keyPressed(Key key) const
 {
+    if (unattended || !focused())
+    {
+        return false;
+    }
+
     return glfwGetKey(window, static_cast<int>(key)) == GLFW_PRESS;
 }
 
 void GLFWWindow::setMousePosition(int x, int y)
 {
-    if (frameCaptureActive)
+    // Warping the cursor of a window the user is not looking at pulls the pointer out of
+    // whatever they are actually doing.
+    if (unattended || !focused())
     {
         return;
     }
 
     glfwSetCursorPos(window, x, y);
+}
+
+bool GLFWWindow::focused() const
+{
+    return glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE;
 }
 
 const WindowState& GLFWWindow::state() const
@@ -268,6 +299,14 @@ const WindowState& GLFWWindow::state() const
 void GLFWWindow::cursorPositionChanged(GLFWwindow* window, double x, double y)
 {
     auto caller = reinterpret_cast<GLFWWindow*>(glfwGetWindowUserPointer(window));
+
+    // The cursor still travels across an unattended or unfocused window; letting that
+    // reach the state would hand controllers the movement mousePosition withholds.
+    if (caller->unattended || !caller->focused())
+    {
+        return;
+    }
+
     caller->windowState.mouseX = x;
     caller->windowState.mouseY = y;
 }
@@ -276,12 +315,18 @@ std::tuple<double, double> GLFWWindow::mousePosition()
 {
     double x, y;
 
-    if (frameCaptureActive)
+    // Controllers steer from the change between samples, so repeating the previous sample
+    // reads as no movement at all. Unattended runs render the spawn view however the mouse
+    // moves, and an unfocused window never swings the camera with motion meant elsewhere.
+    if (unattended)
     {
-        // Controllers steer from the change between samples, so a constant reads as no
-        // movement at all: the capture renders the spawn view however the mouse moves.
         x = windowState.windowWidth / 2.0;
         y = windowState.windowHeight / 2.0;
+    }
+    else if (!focused())
+    {
+        x = windowState.mouseX;
+        y = windowState.mouseY;
     }
     else
     {
