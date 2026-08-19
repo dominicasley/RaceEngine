@@ -53,6 +53,13 @@ export struct MeshPrimitive
     size_t byteOffset;
     int componentType;
     int meshBufferIndex;
+    // The centre of the primitive's own bounding box, in the mesh's local space, from the POSITION
+    // accessor's declared min/max. It is what the draw order sorts blended geometry by, and it has
+    // to be per *primitive* rather than per node: a car's glass panels are separate primitives
+    // hanging off nodes that all resolve to the same origin, so a node-based key sorts 79 draws by
+    // 79 copies of the same number. Zero when the accessor declares no bounds, which glTF permits
+    // for everything except POSITION and which then sorts that primitive by its own origin.
+    glm::vec3 boundsCentre{0.0f};
     std::vector<MeshPrimitiveAttribute> attributes{};
 };
 

@@ -121,18 +121,47 @@ std::expected<void, std::string> GLTFService::processNode(Model& model, const ti
         return &tinyGltfModel.nodes[static_cast<size_t>(index)];
     };
 
-    auto transform =
-        parentTransform *
-        ((node.translation.size() == 3
-              ? glm::translate(glm::mat4(1.0f),
-                               glm::vec3(node.translation[0], node.translation[1], node.translation[2]))
-              : glm::mat4(1.0f)) *
-         (node.rotation.size() == 4
-              ? glm::mat4_cast(glm::quat(static_cast<float>(node.rotation[3]), static_cast<float>(node.rotation[0]),
-                                         static_cast<float>(node.rotation[1]), static_cast<float>(node.rotation[2])))
-              : glm::mat4(1.0f)) *
-         (node.scale.size() == 3 ? glm::scale(glm::mat4(1.0f), glm::vec3(node.scale[0], node.scale[1], node.scale[2]))
-                                 : glm::mat4(1.0f)));
+    // glTF states a node's transform *either* as a 4x4 matrix *or* as translation/rotation/scale,
+    // never both, and an exporter picks one for the whole file: Blender writes TRS, the FBX and
+    // Collada paths most car models come through write matrices. Reading only the TRS form is not a
+    // partial implementation, it is a silent identity — every node collapses onto its parent, and
+    // the model comes out as its parts piled at the origin at whatever spread their local spaces
+    // happen to have. It reads as a wrong *scale* rather than as a wrong transform, because the
+    // pile's bounding box is the one thing about it that still looks plausible.
+    //
+    // The matrix is column-major in the file, which is glm's own order, so the sixteen doubles map
+    // straight across.
+    const auto localTransform = [&]
+    {
+        if (node.matrix.size() == 16)
+        {
+            glm::mat4 matrix(1.0f);
+            for (int column = 0; column < 4; column++)
+            {
+                for (int row = 0; row < 4; row++)
+                {
+                    matrix[column][row] = static_cast<float>(node.matrix[static_cast<size_t>(column * 4 + row)]);
+                }
+            }
+
+            return matrix;
+        }
+
+        return (node.translation.size() == 3
+                    ? glm::translate(glm::mat4(1.0f),
+                                     glm::vec3(node.translation[0], node.translation[1], node.translation[2]))
+                    : glm::mat4(1.0f)) *
+               (node.rotation.size() == 4
+                    ? glm::mat4_cast(
+                          glm::quat(static_cast<float>(node.rotation[3]), static_cast<float>(node.rotation[0]),
+                                    static_cast<float>(node.rotation[1]), static_cast<float>(node.rotation[2])))
+                    : glm::mat4(1.0f)) *
+               (node.scale.size() == 3
+                    ? glm::scale(glm::mat4(1.0f), glm::vec3(node.scale[0], node.scale[1], node.scale[2]))
+                    : glm::mat4(1.0f));
+    }();
+
+    auto transform = parentTransform * localTransform;
 
     if (node.mesh == -1)
     {
@@ -300,6 +329,19 @@ std::expected<void, std::string> GLTFService::processNode(Model& model, const ti
                 .normalized = accessor.normalized,
                 .offset = accessor.byteOffset,
             });
+
+            // glTF requires POSITION to declare min and max, which is a bounding box for free — no
+            // vertex data is read to get it. It is what orders blended geometry, and the order is
+            // only as good as this is: a primitive that declares none sorts by its own origin.
+            if (attributeType.value() == PrimitiveAttributeType::Position && accessor.minValues.size() == 3 &&
+                accessor.maxValues.size() == 3)
+            {
+                meshPrimitive.boundsCentre =
+                    glm::vec3(static_cast<float>(accessor.minValues[0] + accessor.maxValues[0]),
+                              static_cast<float>(accessor.minValues[1] + accessor.maxValues[1]),
+                              static_cast<float>(accessor.minValues[2] + accessor.maxValues[2])) *
+                    0.5f;
+            }
         }
 
         mesh.meshPrimitives.push_back(meshPrimitive);
@@ -406,7 +448,11 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
                                     tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[3]),
             .metalness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.metallicFactor),
             .roughness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.roughnessFactor),
-            .opaque = true,
+            // glTF's alphaMode, which was hardcoded true — so the one thing reading this field, the
+            // back-face cull decision, always took the opaque branch and the field was a constant
+            // wearing a material's name. MASK counts as not-opaque here: this engine has no alpha
+            // test, so a cut-out is carried by the same blend as a pane of glass.
+            .opaque = tinyGltfMaterial.alphaMode.empty() || tinyGltfMaterial.alphaMode == "OPAQUE",
             // One material-wide transform, read from the base colour reference. The extension is
             // per texture reference, so a material transforming its maps differently is flattened
             // to whatever base colour asks for.
