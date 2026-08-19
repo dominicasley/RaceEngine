@@ -23,6 +23,13 @@ export import raceengine.async;
 export import raceengine.game;
 export import raceengine.graphics;
 export import raceengine.io;
+// Re-exported for the reason every module above it is: a game that had to import a second module to
+// reach half the engine is a seam this file exists to close. The rule that keeps the Vulkan backend
+// out of here does not reach this one — that leak is 51 MB of vulkan.h, VMA, shaderc and GLFW in
+// every importer's BMI, and these partitions' global module fragments carry std and glm, both of
+// which the graphics closure already brings. Jolt stays where it is: it is reached through
+// `extern "C++"` free functions taking fundamental types, so its -mavx2 never touches a BMI.
+export import raceengine.physics;
 
 // Sandbox code names these unqualified in the global namespace; export import alone
 // only surfaces raceengine::X, so re-alias them globally.
@@ -138,6 +145,12 @@ public:
     static constexpr int maxCatchUpSteps = 8;
 
     Engine();
+    // Declared only because the physics backend's process-wide registry has to come down with the
+    // engine that stood it up. It makes Engine non-movable, which it already was in practice: a
+    // game holds one by value and the services below hold references into each other.
+    ~Engine();
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
     // False once the window has been closed or the engine has asked its own loop to stop. A
     // game's loop is `while (engine.running()) engine.step();` and nothing below it ends the
     // process, so every destructor between the loop and `main` still runs.
@@ -383,6 +396,21 @@ Engine::Engine() :
                 }
             }
         });
+
+    // Last in the body, so nothing above it can throw past a registry that is already up. Jolt's
+    // allocator, factory and type registry are process-wide and have to stand up before the first
+    // PhysicsWorld and come down after the last, which makes them the composition root's and
+    // nobody else's — two owners of a process-wide singleton is the bug it would be hiding. A game
+    // holds its worlds in members declared after its engine and is bracketed by that.
+    if (const auto physics = bringUpJolt(); !physics)
+    {
+        throw std::runtime_error(physics.error());
+    }
+}
+
+Engine::~Engine()
+{
+    tearDownJolt();
 }
 
 bool Engine::running() const
