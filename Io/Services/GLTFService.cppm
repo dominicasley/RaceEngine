@@ -45,7 +45,8 @@ public:
     [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
     [[nodiscard]] glm::mat3 toTextureTransform(const tinygltf::TextureInfo& textureInfo) const;
-    [[nodiscard]] std::expected<Texture, std::string> getImageFromIndex(const tinygltf::Model& model, int index) const;
+    [[nodiscard]] std::expected<Texture, std::string> getImageFromIndex(const tinygltf::Model& model, int index,
+                                                                        ColourSpace colourSpace) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
     [[nodiscard]] std::expected<void, std::string> processNode(Model& model, const tinygltf::Model& tinyGltfModel,
                                                                const tinygltf::Node& node,
@@ -331,6 +332,30 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
 
     std::map<int, Resource<Texture>> textureMap;
 
+    // glTF's own division: base colour and emissive are sRGB, normal and metallic-roughness and
+    // occlusion are measurements. The slot decides, but images are shared by source index and the
+    // Texture has to know before it is added — mutate() is the main thread's and this runs on a
+    // worker — so the colour slots are read off the materials first. An image used as both would
+    // land here and be decoded, which is the right way round: the colour slot is the visible one.
+    std::set<int> colourImageSources;
+    for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
+    {
+        for (const auto textureIndex :
+             {tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index, tinyGltfMaterial.emissiveTexture.index})
+        {
+            if (textureIndex < 0 || std::cmp_greater_equal(textureIndex, tinyGltfModel.textures.size()))
+            {
+                continue;
+            }
+
+            const auto source = tinyGltfModel.textures[static_cast<size_t>(textureIndex)].source;
+            if (source >= 0)
+            {
+                colourImageSources.insert(source);
+            }
+        }
+    }
+
     for (const auto& texture : tinyGltfModel.textures)
     {
         if (texture.source < 0)
@@ -338,7 +363,9 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
             continue;
         }
 
-        auto image = getImageFromIndex(tinyGltfModel, texture.source);
+        auto image =
+            getImageFromIndex(tinyGltfModel, texture.source,
+                              colourImageSources.contains(texture.source) ? ColourSpace::Srgb : ColourSpace::Linear);
         if (!image)
         {
             return std::unexpected(image.error());
@@ -576,7 +603,8 @@ glm::mat3 GLTFService::toTextureTransform(const tinygltf::TextureInfo& textureIn
     return translation * rotate * stretch;
 }
 
-std::expected<Texture, std::string> GLTFService::getImageFromIndex(const tinygltf::Model& model, int index) const
+std::expected<Texture, std::string> GLTFService::getImageFromIndex(const tinygltf::Model& model, int index,
+                                                                   const ColourSpace colourSpace) const
 {
     if (index < 0 || std::cmp_greater_equal(index, model.images.size()))
     {
@@ -592,6 +620,7 @@ std::expected<Texture, std::string> GLTFService::getImageFromIndex(const tinyglt
     return Texture{.name = image.name,
                    .format = toTextureFormat(image.component),
                    .pixelDataType = image.bits == 16 ? PixelDataType::UnsignedShort : PixelDataType::UnsignedByte,
+                   .colourSpace = colourSpace,
                    .width = width,
                    .height = height,
                    .data = image.image};

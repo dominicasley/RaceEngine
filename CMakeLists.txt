@@ -37,9 +37,6 @@ FetchContent_Declare(
         PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchOzzCMakeMinimum.cmake)
 FetchContent_MakeAvailable(ozz_animation)
 
-add_library(glad STATIC vendor/glad/src/gl.c)
-target_include_directories(glad SYSTEM PUBLIC vendor/glad/include)
-
 add_library (Engine STATIC
         Io/ThirdPartyImpl.cpp)
 
@@ -54,15 +51,19 @@ target_sources(Engine PUBLIC
         Graphics/Models/Models.cppm
         Graphics/Models/Dto.cppm
         Graphics/Models/Fbo.cppm
+        Graphics/Models/LightProbe.cppm
         Graphics/Models/Material.cppm
         Graphics/Models/Mesh.cppm
         Graphics/Models/Scene.cppm
         Graphics/Models/Shader.cppm
         Graphics/Models/Texture.cppm
         Graphics/System/Window.cppm
-        Graphics/Api/GraphicsApi.cppm
         Graphics/Api/RenderContract.cppm
+        Graphics/Api/SphericalHarmonics.cppm
         Graphics/Api/ShadowCascades.cppm
+        Graphics/Api/PostProcessing.cppm
+        Graphics/Api/LookupTable.cppm
+        Graphics/Api/PhysicalCamera.cppm
         Graphics/Api/FrameDiagnostics.cppm
         Graphics/Api/IFrameRecorder.cppm
         Graphics/Api/IGpuResourceFactory.cppm
@@ -74,15 +75,19 @@ target_sources(Engine PUBLIC
         # them and no consumer's module map names them.
         Graphics/Api/RenderBackendFactoryImpl.cppm
         Graphics/Api/VulkanRenderer.cppm
-        Graphics/Api/OpenGLRenderer.cppm
         Graphics/Services/SceneManagerService.cppm
         Graphics/Services/RenderableEntityService.cppm
         Graphics/Services/FboService.cppm
         Graphics/Services/ShaderService.cppm
         Graphics/Services/CubeMapService.cppm
+        Graphics/Services/LightProbeService.cppm
         Graphics/Services/PresenterService.cppm
         Graphics/Services/CameraService.cppm
         Graphics/Services/PostProcessService.cppm
+        Graphics/Services/AutoExposureService.cppm
+        Graphics/Services/AmbientOcclusionService.cppm
+        Graphics/Services/BloomService.cppm
+        Graphics/Services/ColourGradeService.cppm
         Graphics/Services/SceneService.cppm
         Graphics/Services/ShadowService.cppm
         Graphics/Services/AssetService.cppm
@@ -107,13 +112,6 @@ target_link_libraries(Engine PUBLIC Vulkan::Vulkan)
 target_link_libraries(Engine PRIVATE GPUOpen::VulkanMemoryAllocator)
 target_link_libraries(Engine PRIVATE unofficial::shaderc::shaderc)
 target_link_libraries(Engine PUBLIC ozz_animation ozz_base)
-target_link_libraries(Engine PRIVATE glad)
-if(WIN32)
-    target_link_libraries(Engine PRIVATE opengl32)
-else()
-    find_package(OpenGL REQUIRED)
-    target_link_libraries(Engine PRIVATE OpenGL::GL)
-endif()
 
 target_link_libraries(Engine PRIVATE raceengine_warnings)
 

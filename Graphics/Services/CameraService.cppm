@@ -11,6 +11,7 @@ module;
 export module raceengine.graphics:CameraService;
 
 import :FboService;
+import :PhysicalCamera;
 import :Window;
 import raceengine.graphics.models;
 import raceengine.shared;
@@ -35,6 +36,12 @@ public:
     // nothing presents, so a shadow cascade, a reflection probe and a post-FX pass all arrive
     // here.
     [[nodiscard]] std::expected<Camera, std::string> createCamera(const CreateCameraDTO& createCameraDTO);
+    void setExposure(Camera& camera, float exposure) const;
+    // The other two legs of the exposure triangle. Both hold the shutter and move the picture, as
+    // they do on a camera: two stops between f/1.4 and f/2.8, one per doubling of the film speed.
+    void setFilmSpeed(Camera& camera, unsigned int iso) const;
+    void setAperture(Camera& camera, float aperture) const;
+    void setToneCurve(Camera& camera, const ToneCurve& toneCurve) const;
     void setPosition(Camera& camera, float x, float y, float z) const;
     void setDirection(Camera& camera, float x, float y, float z) const;
     void translate(Camera& camera, float x, float y, float z) const;
@@ -130,9 +137,22 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
 
     // The clipping planes default to the values the projection used to hardcode, so wiring the
     // fields changes no frame; a game that wants a different depth range now has one to set.
-    return Camera{.iso = 6400,
+    // Exposure defaults to 1, meaning "hand the tone map the scene's own values". It was
+    // value-initialised to zero for as long as nothing read it, which is a black frame the moment
+    // something does — recorded in CLAUDE.md as a trap laid for whoever wired tone mapping. This
+    // is that wiring, so the default moves with it.
+    //
+    // The shutter is derived rather than chosen: the film speed and the aperture were already here
+    // and unread, and the exposure above is what the three of them together have to come out to.
+    constexpr auto filmSpeed = 6400u;
+    constexpr auto aperture = 1.4f;
+    constexpr auto exposure = 1.0f;
+
+    return Camera{.iso = filmSpeed,
                   .aspectRatio = 16.0f / 9.0f,
-                  .aperture = 1.4f,
+                  .aperture = aperture,
+                  .shutterTime = shutterTimeForExposure(exposure, filmSpeed, aperture),
+                  .exposure = exposure,
                   .fieldOfView = 75.f,
                   .role = createCameraDTO.role,
                   .overrideShader = createCameraDTO.overrideShader,
@@ -142,6 +162,46 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
                   .direction = glm::vec3(0, 0, 1),
                   .roll = glm::vec3(0, 1, 0),
                   .output = output.value()};
+}
+
+// A linear multiplier applied to the scene's radiance before the tone map, which is what an
+// exposure is: the renderer works in relative units, so the number that turns "sunlight is 3.2"
+// into a picture is the game's to state.
+//
+// It states it through the shutter rather than beside it. The multiplier is a function of all three
+// legs of the triangle (see PhysicalCamera), so writing it alone would leave a camera whose film
+// speed and aperture disagreed with its own picture — and auto exposure, which moves the shutter,
+// would then be adjusting a leg nothing was reading. Back-solving keeps one source of truth and
+// makes this call exactly what it reads as on a camera: the setting the meter starts from and, with
+// no meter, holds.
+void CameraService::setExposure(Camera& camera, const float exposure) const
+{
+    camera.exposure = exposure;
+    camera.shutterTime = shutterTimeForExposure(exposure, camera.iso, camera.aperture);
+    camera.autoExposure.adaptedLuminance = luminanceForExposure(exposure);
+}
+
+// Film speed and aperture hold the shutter and let the picture move, which is the way round a
+// camera works: opening up two stops is two stops brighter, and it is the metered case that then
+// puts the shutter back to hold the picture instead.
+void CameraService::setFilmSpeed(Camera& camera, const unsigned int iso) const
+{
+    camera.iso = iso;
+    camera.exposure = exposureFromTriangle(camera.iso, camera.aperture, camera.shutterTime);
+}
+
+void CameraService::setAperture(Camera& camera, const float aperture) const
+{
+    camera.aperture = aperture;
+    camera.exposure = exposureFromTriangle(camera.iso, camera.aperture, camera.shutterTime);
+}
+
+// The other half of the same decision, and separable from it: exposure says how much light the
+// frame has, this says what the curve does with it. The default is already the dramatic reading
+// (see ToneCurve), so a game calls this to soften the picture rather than to get one.
+void CameraService::setToneCurve(Camera& camera, const ToneCurve& toneCurve) const
+{
+    camera.toneCurve = toneCurve;
 }
 
 void CameraService::setPosition(Camera& camera, float x, float y, float z) const

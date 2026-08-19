@@ -39,10 +39,6 @@ public:
     {
     }
 
-    void makeContextCurrent() override
-    {
-    }
-
     void swapBuffers() const override
     {
     }

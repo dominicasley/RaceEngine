@@ -5,12 +5,14 @@ module;
 #include <vk_mem_alloc.h>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <shaderc/shaderc.hpp>
 #include <spdlog/logger.h>
 #include <stb_image_write.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -32,9 +34,11 @@ module;
 module raceengine.graphics:VulkanRenderer;
 
 import :FrameDiagnostics;
-import :GraphicsApi;
 import :IRenderBackend;
+import :LookupTable;
+import :PostProcessing;
 import :RenderContract;
+import :SphericalHarmonics;
 import :RenderableEntityService;
 import :ShadowCascades;
 import :SceneManagerService;
@@ -76,6 +80,30 @@ struct LightUbo
     glm::vec4 ambientAttenuation;
 };
 
+// Set 0 binding 0, the probe half (vulkan-abi.md). One of these per light probe the frame shades
+// from, std140-compatible so the C++ layout is the GPU layout.
+//
+// The irradiance is nine coefficients and the volume is six planes, and both are here rather than
+// in a buffer of their own because a probe is per *frame* on exactly the terms the lights are: the
+// shading loop reads every one of them for every fragment, and a second binding would buy a second
+// descriptor and nothing else. The prefiltered radiance cannot ride along — it is an image — so it
+// is one cube-array binding beside this block, and `position.w` is the slice of it this probe owns.
+struct ProbeUbo
+{
+    std::array<glm::vec4, shCoefficientCount> irradiance;
+    // xyz the influence box's world minimum, w the width of the band inside each face over which
+    // this probe's weight ramps up.
+    glm::vec4 boxMin;
+    // xyz the world maximum, w non-zero for the scene's global probe — the one with no bound,
+    // which every fragment falls back on for whatever weight the local probes left unaccounted.
+    glm::vec4 boxMax;
+    // xyz the point the environment was captured from, which is also the centre the specular
+    // reflection is parallax-corrected about; w the probe's slice of the array.
+    glm::vec4 position;
+};
+
+static_assert(sizeof(ProbeUbo) == 192);
+
 struct FrameDataUbo
 {
     glm::mat4 viewMatrix;
@@ -94,15 +122,21 @@ struct FrameDataUbo
     glm::vec4 shadowSplits;
     glm::vec4 shadowTexelWorldSize;
     glm::vec4 shadowDepthScale;
-    // x = cascades in use (0 = the view shades lit), y = which light they shadow.
+    // x = cascades in use (0 = the view shades lit), y = which light they shadow, z = non-zero when
+    // this view is a light probe capture. The sky reads z to leave the solar disc out of the cube:
+    // the sun's beam reaches a surface as the directional light, and a disc in the capture would
+    // hand the same sun to that surface a second time through the probe. See recordProbeFace.
     glm::ivec4 shadowParams;
+    // x = light probes in use (0 = the view has no image-based lighting at all).
+    glm::ivec4 probeParams;
+    std::array<ProbeUbo, maxIblProbes> probes;
 };
 
 // Four split distances, four texel sizes and four depth scales ride in one vec4 each, which is
 // what bounds the cascade count rather than any GPU limit.
 static_assert(shadowCascadeCount <= 4);
 static_assert(sizeof(LightUbo) == 64);
-static_assert(sizeof(FrameDataUbo) == 672);
+static_assert(sizeof(FrameDataUbo) == 2224);
 static_assert(offsetof(FrameDataUbo, lightCount) == 80);
 static_assert(offsetof(FrameDataUbo, lights) == 96);
 static_assert(offsetof(FrameDataUbo, shadowMatrices) == 352);
@@ -110,6 +144,8 @@ static_assert(offsetof(FrameDataUbo, shadowSplits) == 608);
 static_assert(offsetof(FrameDataUbo, shadowTexelWorldSize) == 624);
 static_assert(offsetof(FrameDataUbo, shadowDepthScale) == 640);
 static_assert(offsetof(FrameDataUbo, shadowParams) == 656);
+static_assert(offsetof(FrameDataUbo, probeParams) == 672);
+static_assert(offsetof(FrameDataUbo, probes) == 688);
 
 // Set 2 binding 0, dynamic-offset (vulkan-abi.md); ring-buffered per frame in flight.
 struct DrawDataUbo
@@ -143,6 +179,39 @@ struct MaterialDataUbo
 
 static_assert(sizeof(MaterialDataUbo) == 128);
 static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
+
+// The fullscreen layout's push constant (vulkan-abi.md). Three vec4s rather than the one this used
+// to be: the tone curve has a shape as well as a brightness, a pass that walks a mip chain has to be
+// told which level it is on, and a pass that reads a depth buffer has to be told what the camera
+// that filled it was looking through. A push constant rather than a block because it changes per
+// pass and is 48 bytes against the 128 every Vulkan implementation guarantees, and a fullscreen
+// shader that declares none of it simply does not see it — the range belongs to the layout.
+struct FullscreenPushConstants
+{
+    // x exposure, y contrast, z toe, w shoulder. See ToneCurve and evaluateToneCurve, which is the
+    // same function in C++.
+    glm::vec4 tone;
+    // x the mip level of the target being written, y the number of levels the target carries,
+    // z, w the target level's width and height in texels. A pass that samples one level and writes
+    // the next derives its filter footprint from these rather than from a resolution it assumed.
+    glm::vec4 pass;
+    // x, y the tangents of the half field of view horizontally and vertically, z the near plane,
+    // w the far plane. Together they are the inverse of the projection the view was rendered with,
+    // stated as the four numbers a fullscreen pass actually needs to turn a pixel and a view depth
+    // back into a position — which is less than a matrix and is the whole of what the occlusion
+    // gather asks for.
+    glm::vec4 view;
+    // `PostProcess::parameters`, verbatim: the pass's own numbers, and the one field here whose
+    // meaning belongs to the shader reading it rather than to the layout. It is a slot rather than a
+    // second push constant range because a range is per pipeline layout and every fullscreen pass
+    // shares one.
+    glm::vec4 effect;
+};
+
+static_assert(sizeof(FullscreenPushConstants) == 64);
+static_assert(offsetof(FullscreenPushConstants, pass) == 16);
+static_assert(offsetof(FullscreenPushConstants, view) == 32);
+static_assert(offsetof(FullscreenPushConstants, effect) == 48);
 
 [[nodiscard]] constexpr uint32_t channelCount(const TextureFormat format)
 {
@@ -180,7 +249,14 @@ static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
 // (R8G8B8/R16G16B16/R32G32B32) have no universal sampling support, so the source is expanded
 // on the CPU at its own precision instead — which is also what keeps a 16-bit glTF texture's
 // bits, where GL keeps them by asking for a 16-bit internal format.
-[[nodiscard]] constexpr VkFormat sampledImageFormat(const PixelDataType type)
+//
+// An _SRGB format moves the decode into the sampler, so it costs nothing and it also makes mip
+// generation right: the blit chain filters after decoding rather than averaging encoded bytes.
+// Only the eight-bit path can carry it — Vulkan has no sRGB variant at 16 bits, and a float
+// texture holds radiance, which has no encoding to undo — so a colour map at either of those
+// precisions samples as though linear. Nothing in this tree authors one; a 16-bit sRGB base
+// colour would need a CPU decode on the expansion pass instead.
+[[nodiscard]] constexpr VkFormat sampledImageFormat(const PixelDataType type, const ColourSpace colourSpace)
 {
     switch (type)
     {
@@ -189,7 +265,7 @@ static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
     case PixelDataType::Float:
         return VK_FORMAT_R32G32B32A32_SFLOAT;
     default:
-        return VK_FORMAT_R8G8B8A8_UNORM;
+        return colourSpace == ColourSpace::Srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     }
 }
 
@@ -275,16 +351,6 @@ void ensure(const VkResult result, const char* call)
 [[nodiscard]] const char* describeColorSpace(const VkColorSpaceKHR colorSpace)
 {
     return colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ? "SRGB_NONLINEAR" : "other";
-}
-
-[[nodiscard]] uint32_t mipLevelCount(const uint32_t width, const uint32_t height)
-{
-    auto levels = 1u;
-    for (auto extent = std::max(width, height); extent > 1; extent /= 2)
-    {
-        levels++;
-    }
-    return levels;
 }
 
 // Fullscreen shaders read gl_VertexIndex only: no Input variable carries a Location
@@ -713,6 +779,148 @@ void transitionImage(const VkCommandBuffer commandBuffer, const VkImage image, c
                     VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
 }
 
+// The prefilter's own shaders, as source. Engine-owned rather than game assets: a game authors
+// what the world looks like, and how a captured environment is reduced to a roughness chain is no
+// more its business than the layout of the draw-data ring is. They go through the same shaderc
+// path as everything else, so they receive the same contract macros.
+constexpr const char* probePrefilterVertexSource = R"GLSL(#version 450
+
+// The oversized triangle, from gl_VertexIndex: no vertex buffers, no bindings, nothing for a
+// pipeline to have to be fed.
+void main()
+{
+    const vec2 corner = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+)GLSL";
+
+constexpr const char* probePrefilterFragmentSource = R"GLSL(#version 450
+
+layout(location = 0) out vec4 fragColor;
+
+layout(set = 0, binding = 0) uniform samplerCube radianceCube;
+
+layout(push_constant) uniform PrefilterParams {
+    // x roughness, y the face being filtered, z the target's edge length, w the source's.
+    vec4 value;
+} params;
+
+const float PI = 3.141592653589793;
+// Enough to converge at this resolution, given that each sample reads a mip chosen from its own
+// footprint: the chain is what removes the variance, and more samples past this buy smoothness
+// the mip has already provided.
+const uint sampleCount = 64u;
+
+// The hardware's own face-to-direction mapping, and it has to be: what this pass writes is read
+// back by a sampler using it, and the C++ irradiance projection spells the same table again
+// (see :SphericalHarmonics). Three copies of one convention, none of which may drift.
+vec3 faceDirection(int face, vec2 st)
+{
+    if (face == 0) { return vec3(1.0, -st.y, -st.x); }
+    if (face == 1) { return vec3(-1.0, -st.y, st.x); }
+    if (face == 2) { return vec3(st.x, 1.0, st.y); }
+    if (face == 3) { return vec3(st.x, -1.0, -st.y); }
+    if (face == 4) { return vec3(st.x, -st.y, 1.0); }
+    return vec3(-st.x, -st.y, -1.0);
+}
+
+float radicalInverse(uint bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+float distributionGGX(float NdH, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = NdH * NdH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+// A half-vector drawn from the GGX distribution about `normal`, for the low-discrepancy point xi.
+vec3 importanceSampleGGX(vec2 xi, float roughness, vec3 normal)
+{
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    // Not named `half`: that is a reserved word in GLSL and the compile error it produces names
+    // the line and not the reason.
+    vec3 tangentSpace = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    vec3 reference = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(reference, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    return normalize(tangent * tangentSpace.x + bitangent * tangentSpace.y + normal * tangentSpace.z);
+}
+
+void main()
+{
+    float roughness = params.value.x;
+    int face = int(params.value.y);
+    float targetSize = params.value.z;
+    float sourceSize = params.value.w;
+
+    // gl_FragCoord is at the texel centre, so this is the same (s, t) the C++ side derives from a
+    // texel index — which is why the pass records a positive-height viewport, unlike every other
+    // pass here: framebuffer row 0 has to be the face's first stored row.
+    vec2 st = (gl_FragCoord.xy / targetSize) * 2.0 - 1.0;
+    vec3 normal = normalize(faceDirection(face, st));
+
+    // The split-sum approximation's one assumption: the view direction is the normal, so a
+    // prefiltered level depends on roughness alone and not on where it is looked at from. It is
+    // what costs grazing reflections their stretch, and what makes this a chain of six images
+    // rather than a function of two angles.
+    if (roughness <= 0.0)
+    {
+        fragColor = vec4(textureLod(radianceCube, normal, 0.0).rgb, 1.0);
+        return;
+    }
+
+    // The solid angle one source texel covers, which the mip selection below is measured against.
+    float texelSolidAngle = 4.0 * PI / (6.0 * sourceSize * sourceSize);
+
+    vec3 total = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (uint index = 0u; index < sampleCount; index++)
+    {
+        vec2 xi = vec2(float(index) / float(sampleCount), radicalInverse(index));
+        vec3 halfVector = importanceSampleGGX(xi, roughness, normal);
+        vec3 light = normalize(2.0 * dot(normal, halfVector) * halfVector - normal);
+
+        float NdL = dot(normal, light);
+        if (NdL <= 0.0)
+        {
+            continue;
+        }
+
+        float NdH = max(dot(normal, halfVector), 0.0);
+        // The density this sample was drawn at, and from it the solid angle it stands for. A
+        // sample that stands for more than one source texel reads a coarser mip, which is what
+        // stops a small bright feature surviving the filter as a firefly.
+        //
+        // The general density is D * NdH / (4 * dot(H, V)); with the view direction taken as the
+        // normal, dot(H, V) is NdH and the two cancel to D / 4.
+        float density = distributionGGX(NdH, roughness) * 0.25 + 0.0001;
+        float sampleSolidAngle = 1.0 / (float(sampleCount) * density);
+        float level = 0.5 * log2(sampleSolidAngle / texelSolidAngle);
+
+        total += textureLod(radianceCube, light, max(level, 0.0)).rgb * NdL;
+        totalWeight += NdL;
+    }
+
+    fragColor = vec4(total / max(totalWeight, 0.0001), 1.0);
+}
+)GLSL";
+
 } // namespace
 
 class VulkanRenderer : public IRenderBackend
@@ -755,8 +963,7 @@ private:
     };
 
     // Cube maps and FBO attachments share this shape; attachments use the shared
-    // attachmentSampler and keep their own field VK_NULL_HANDLE. layout is the tracked
-    // current layout: the draw path derives every barrier from it.
+    // attachmentSampler and keep their own field VK_NULL_HANDLE.
     struct ImageResource
     {
         VkImage image = VK_NULL_HANDLE;
@@ -768,7 +975,16 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // The tracked current layout, one entry per mip level: the draw path derives every barrier
+        // from it. Per level rather than per image because a chain is written one level at a time
+        // from the level above it, so mid-chain the image genuinely holds two layouts at once and a
+        // single field would be a lie about half of it. The light probe's scratch cube was the
+        // first place that happened and used to keep the bookkeeping by hand; it no longer does.
+        // Always mipLevels long, so an empty vector is an image that was never created.
+        std::vector<VkImageLayout> layouts;
+        // One single-level 2D view per mip, for the levels a pass renders into or samples on its
+        // own. Empty on a single-level image, whose `view` already is exactly that.
+        std::vector<VkImageView> levelViews;
     };
 
     struct FboResource
@@ -809,6 +1025,9 @@ private:
         VkCullModeFlags cullMode = 0;
         VkFormat colorFormat = VK_FORMAT_UNDEFINED;
         VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+        // Whether the fragment's alpha is a coverage to blend with. True for every pass that writes
+        // a colour, which was every pass there was; false for one that writes data.
+        bool blend = true;
         // VK_NULL_HANDLE is a build that failed and is not retried.
         VkPipeline pipeline = VK_NULL_HANDLE;
         std::vector<VkBuffer> boundBuffers;
@@ -844,6 +1063,11 @@ private:
     {
         unsigned int shaderId = 0;
         unsigned int attachmentImageId = 0;
+        // The presenter's own numbers and its colour grade, kept with the pass because the capture
+        // replays it: a frame dumped with a different grade from the one presented would be a
+        // picture of a frame this engine never drew.
+        glm::vec4 parameters{0.0f};
+        unsigned int lookupTableImageId = 0;
     };
 
     // A GPU object the engine has finished with, waiting for the GPU to finish with it too.
@@ -929,17 +1153,76 @@ private:
     // Key packs the material's Resource id with the environment cube map's image id: the
     // scene environment is the fallback binding, so it is part of the set's identity.
     std::unordered_map<uint64_t, MaterialResource> materialResources;
-    mutable std::unordered_map<unsigned int, VkDescriptorSet> attachmentSets;
-    // Cascade sets, keyed by the whole tuple of depth image ids. A vector rather than a map
-    // because there is one live entry in practice and `<map>` in a second global module fragment
-    // breaks the sandbox link on clang-19 (see CLAUDE.md).
-    mutable std::vector<std::pair<std::array<unsigned int, shadowCascadeCount>, VkDescriptorSet>> shadowSets;
+    // Fullscreen input sets, keyed by the whole array of (image, level) the set was written with
+    // rather than by one image id: the set carries postProcessInputCount samplers now, so its
+    // identity is the list. A vector scanned linearly, like shadowSets and for the same two
+    // reasons — a running game holds one entry per post-process and per presenter, and `<map>` in
+    // a second global module fragment breaks the sandbox link on clang-19 (see CLAUDE.md).
+    //
+    // The key has to be something stable, because the pool never frees a set that is still cached:
+    // a pass's inputs are fixed when the scene is built, so the number of distinct keys is the
+    // number of passes and not the number of frames.
+    mutable std::vector<
+        std::pair<std::pair<std::array<PostProcessBinding, postProcessInputCount>, unsigned int>, VkDescriptorSet>>
+        attachmentSets;
+    // Cascade sets, keyed by the whole tuple of depth image ids and the occlusion image bound
+    // beside them. A vector rather than a map because there are two live entries in practice — the
+    // shading view's and the fallback — and `<map>` in a second global module fragment breaks the
+    // sandbox link on clang-19 (see CLAUDE.md).
+    mutable std::vector<std::pair<std::pair<std::array<unsigned int, shadowCascadeCount>, unsigned int>,
+                                  VkDescriptorSet>>
+        shadowSets;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
     // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
     // the target's format: the format comes from FboAttachment::internalFormat, which is not
     // known when the shader object is built.
     std::unordered_map<uint64_t, VkPipeline> offscreenPipelines;
+    // Light probes. Capture draws into one scratch cube — one, because the scheduler captures one
+    // probe at a time and a per-probe scratch would be eight images held to hold nothing — and the
+    // prefiltered result lands in one slice of a cube *array*, which is what lets the shading loop
+    // pick a probe with a dynamic index instead of needing a descriptor per probe.
+    unsigned int probeRadianceImageId = 0;
+    unsigned int probeDepthImageId = 0;
+    unsigned int probeSpecularImageId = 0;
+    // The render targets: one 2D view per face of the scratch cube's top mip, and one per
+    // (slice, mip, face) of the array. Rendering into a cube means rendering into a single-layer
+    // 2D view of it, so every one of these has to exist before the pass that writes through it.
+    std::array<VkImageView, 6> probeRadianceFaceViews{};
+    std::vector<VkImageView> probeSpecularFaceViews;
+    VkDescriptorSetLayout probePrefilterSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout probePrefilterPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline probePrefilterPipeline = VK_NULL_HANDLE;
+    VkShaderModule probePrefilterVertexModule = VK_NULL_HANDLE;
+    VkShaderModule probePrefilterFragmentModule = VK_NULL_HANDLE;
+    VkDescriptorSet probeRadianceSet = VK_NULL_HANDLE;
+    VkSampler probeSampler = VK_NULL_HANDLE;
+    // Where the irradiance projection reads its radiance from. Host-visible and permanently
+    // mapped: it is written by a GPU copy and read by the CPU, once per probe capture.
+    BufferResource probeReadbackBuffer{};
+    void* probeReadbackMapped = nullptr;
+    unsigned int probeSlicesUsed = 0;
+    // The irradiance the last completed readback produced, per slice. Held here rather than
+    // written straight through to the LightProbe because the write happens frames after the copy
+    // was recorded, and a pointer into a scene's deque held across those frames would be a
+    // pointer into a scene that may have been destroyed. The probe collects it instead.
+    std::array<ShIrradiance, maxIblProbes> probeIrradiance{};
+    // Which submission has to complete before probeReadbackBuffer holds this capture's radiance.
+    // Same clock and same rule as the retirement queue: see retire().
+    uint64_t probeReadbackReadyAt = 0;
+    // The single texel a camera's luminance chain reduces a frame into, on its way to the CPU.
+    // Host-visible and permanently mapped, exactly as the probe's is, and eight bytes long: one
+    // RGBA16F texel, of which the meter wrote the red channel.
+    BufferResource luminanceReadbackBuffer{};
+    void* luminanceReadbackMapped = nullptr;
+    // Which image's chain the buffer is currently holding a copy of, and the submission that has
+    // to complete before it holds it. One buffer and one pending copy for every camera that
+    // meters, for the reason the probe path has one: the cameras are recorded in a fixed order, so
+    // which of them gets the buffer on which frame is a function of the frame number, and a second
+    // camera simply waits its turn rather than needing a second buffer to be deterministic in.
+    std::optional<unsigned int> luminanceReadbackOwner{};
+    uint64_t luminanceReadbackReadyAt = 0;
     unsigned int dummyTextureId = 0;
+    unsigned int neutralLookupTableId = 0;
     unsigned int dummyCubeMapId = 0;
     unsigned int dummyShadowMapId = 0;
     mutable VkDescriptorSet dummyShadowSet = VK_NULL_HANDLE;
@@ -971,7 +1254,10 @@ public:
 
     [[nodiscard]] bool beginFrame() override;
     void recordView(Scene& scene, Camera& camera, float delta) override;
-    void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) override;
+    void recordProbeCapture(Scene& scene, LightProbe& probe) override;
+    void recordAmbientOcclusion(Scene& scene, Camera& camera, float delta) override;
+    void recordAutoExposure(Camera& camera) override;
+    void recordPresent(const Presenter& presenter) override;
     void endFrame() override;
 
     [[nodiscard]] std::expected<unsigned int, std::string>
@@ -1005,14 +1291,68 @@ private:
     bool submitAndPresent(VkBuffer captureBuffer);
     void recordClearOnlySwapchainPass();
     void recordScenePass(Scene& scene, Camera& camera, float delta);
+    // Everything a light probe needs that outlives one capture: the scratch cube, the array, the
+    // views each pass renders through, and the prefilter pipeline. Built once, in init(), because
+    // its size is a contract constant rather than anything a scene decides — and because the
+    // frame descriptor set names the array, and that set is written once at bring-up.
+    void createProbeResources();
+    // The eight bytes a camera's exposure meter is read out of. Built once for the same reason the
+    // probe's is: it holds one texel whatever the chain in front of it looks like, and a buffer
+    // created on the first metering frame would be a buffer allocated inside a recorded frame.
+    void createExposureResources();
+    // One face of `probe`'s environment, from the probe's own position through a 90-degree
+    // frustum, into the scratch cube. A scene pass like any other: it shades, it samples the
+    // cascades, and it draws the sky — the difference is that it draws only what the scene marked
+    // static, because a probe is captured once and shaded from for many frames.
+    void recordProbeFace(Scene& scene, const LightProbe& probe, unsigned int face, float delta);
+    // The scratch cube's six faces are drawn: filter them down the roughness chain into the
+    // probe's slice of the array, and copy the mip the irradiance projection reads out to the
+    // readback buffer. Returns false if the pass could not be recorded at all.
+    bool recordProbePrefilter(const LightProbe& probe);
+    // Projects the radiance the readback buffer holds onto the spherical harmonic basis. Valid
+    // only once the submission that wrote it has completed, which probeReadbackReadyAt states.
+    [[nodiscard]] ShIrradiance projectProbeIrradiance() const;
+    // The scene's probes as the frame block carries them, written into `frameData`.
+    void uploadProbes(const Scene& scene, FrameDataUbo& frameData) const;
+    // The entity/mesh/primitive walk both a camera's view and a probe's face record. `staticOnly`
+    // is what a probe capture adds: a car baked into the environment goes on lighting the street
+    // from wherever it was parked when the capture ran.
+    [[nodiscard]] unsigned int recordSceneDraws(Scene& scene, const Camera& camera, float delta, bool shading,
+                                                bool staticOnly, unsigned int viewShaderId, VkFormat colorFormat,
+                                                VkFormat depthFormat, VkDescriptorSet shadowDescriptors);
+    [[nodiscard]] unsigned int createProbeImage(uint32_t resolution, uint32_t mipLevels, uint32_t layers,
+                                                VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                                                bool cube) const;
+    // A view over one mip of one layer, seen as a plain 2D image: what dynamic rendering takes to
+    // render into a cube face or into a level of a chain, and what a descriptor names to sample one
+    // level without the rest of the chain coming with it.
+    [[nodiscard]] VkImageView createLevelView(unsigned int imageId, uint32_t mip, uint32_t layer) const;
+    // The view a pass renders into or samples for one level of an image. Level 0 of a single-level
+    // image is its whole-image view, which is why nothing allocates a second one for it.
+    [[nodiscard]] VkImageView levelView(const ImageResource& resource, uint32_t level) const;
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
                     const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat,
-                    VkDescriptorSet shadowDescriptors);
-    bool recordFullScreenPass(unsigned int sourceImageId, VkImageView targetView, VkExtent2D targetExtent,
-                              VkPipeline pipeline);
-    bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId);
+                    VkDescriptorSet shadowDescriptors, bool doubleSided);
+    // One fullscreen pass: bind the inputs, push the parameters, draw the oversized triangle. The
+    // inputs are expected to be in SHADER_READ_ONLY_OPTIMAL already — the caller moves them,
+    // because it is the caller that knows whether one of them is a level of the image being
+    // written and must not be moved wholesale.
+    // `lookupTableImageId` is the colour grade this pass binds — the neutral identity for every
+    // pass but the last one, which is the only pass whose input is a display-referred image.
+    bool recordFullScreenPass(std::span<const PostProcessBinding> inputs, unsigned int lookupTableImageId,
+                              VkImageView targetView,
+                              VkExtent2D targetExtent, VkPipeline pipeline, const FullscreenPushConstants& parameters);
+    bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId, const glm::vec4& parameters,
+                           unsigned int lookupTableImageId);
+    // Moves the whole image to one layout, emitting one barrier per run of levels that share a
+    // current layout — which is a single barrier over the whole chain in every case but a
+    // half-written one.
     void transitionTracked(VkCommandBuffer commandBuffer, unsigned int imageId, VkImageLayout newLayout);
+    // Moves one mip level. The rest of the image keeps whatever layout it was in, which is the
+    // point: a chain pass reads one level of an image while rendering into another.
+    void transitionTrackedLevel(VkCommandBuffer commandBuffer, unsigned int imageId, uint32_t level,
+                                VkImageLayout newLayout);
     void upload(const Resource<Model>& modelKey);
     [[nodiscard]] BufferResource createDeviceLocalBuffer(const void* data, VkDeviceSize size) const;
     [[nodiscard]] unsigned int uploadMeshBuffer(const MeshBuffer& meshBuffer);
@@ -1020,12 +1360,21 @@ private:
     void uploadMaterialTextures(const Resource<Material>& materialKey);
     [[nodiscard]] std::optional<unsigned int> uploadTexture(const Resource<Texture>& textureKey);
     [[nodiscard]] VkDescriptorSet materialSet(const Resource<Material>& materialKey, unsigned int environmentImageId);
-    [[nodiscard]] VkDescriptorSet attachmentSet(unsigned int imageId);
+    // The fullscreen set a pass binds, given the images it reads in declaration order. Every
+    // element of the sampler array is written — the ones the pass did not name get the 1x1 dummy,
+    // exactly as a view with no cascades still binds a 1x1 depth image — because the shader
+    // declares the array whole and a pipeline that statically uses a descriptor must find one.
+    [[nodiscard]] VkDescriptorSet attachmentSet(std::span<const PostProcessBinding> inputs,
+                                                unsigned int lookupTableImageId);
     // The set 3 the scene pipelines bind. Given the cascades' depth images it caches one set per
     // tuple; given none it hands back the fallback, because a sampler2DShadow the pipeline
     // statically uses must have a descriptor whether or not the shader's cascade count says to
     // read it.
-    [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds);
+    [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
+                                            unsigned int occlusionImageId);
+    // The image a shading view samples its occlusion from, or the 1x1 white one when it gathers
+    // none. Not const: the fallback is created on first use, as every other dummy here is.
+    [[nodiscard]] unsigned int ambientOcclusionImage(const Camera& camera);
     [[nodiscard]] VkDescriptorSet fallbackShadowSet();
     [[nodiscard]] unsigned int dummyShadowMap();
     // The cascades' depth images in cascade order, or nothing if any of them is missing: a
@@ -1035,9 +1384,11 @@ private:
     // The pipeline this primitive is drawn with in this view, together with the vertex buffers
     // that pipeline expects. Borrowed from the binding's own cache and valid until the next call
     // for the same primitive, which is one draw's worth — recordDraw uses it and lets it go.
+    // `blend` is false for a pass whose fragment alpha is data rather than coverage; see the blend
+    // state in the definition.
     [[nodiscard]] const ResolvedPipeline* scenePipeline(unsigned int shaderId, PrimitiveBinding& binding,
                                                         VkCullModeFlags cullMode, VkFormat colorFormat,
-                                                        VkFormat depthFormat);
+                                                        VkFormat depthFormat, bool blend);
     [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
@@ -1054,6 +1405,12 @@ private:
     [[nodiscard]] VkCommandBuffer beginUploadCommands() const;
     void finishUploadCommands(VkCommandBuffer commandBuffer) const;
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
+    // A three-dimensional sampled image: one mip, clamped, linearly filtered. Only a colour grade
+    // is one of these, and the whole of what it needs is different enough from a picture's upload
+    // that sharing the path above would be two functions in a trench coat.
+    [[nodiscard]] unsigned int createVolumeImage(const Texture& texture) const;
+    // The grade that changes nothing, built once and bound by every pass that has none of its own.
+    [[nodiscard]] unsigned int neutralLookupTable();
     // The sampler an FboAttachment::depthComparison asks for. GL sets the same two pieces of
     // state on the texture object; here they belong to a sampler, so the image carries one of its
     // own rather than sharing `attachmentSampler` — which is what ImageResource::sampler is for
@@ -1148,11 +1505,61 @@ VulkanRenderer::~VulkanRenderer()
         vmaDestroyBuffer(allocator, dummyVertexBuffer.buffer, dummyVertexBuffer.allocation);
     }
 
+    // The probe render targets: one view per cube face of the scratch, and one per (slice, mip,
+    // face) of the array. They are not ImageResource::view — that is the sampling view each image
+    // carries — so the loop below does not reach them.
+    for (const auto view : probeRadianceFaceViews)
+    {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+        }
+    }
+    for (const auto view : probeSpecularFaceViews)
+    {
+        vkDestroyImageView(device, view, nullptr);
+    }
+    if (probeReadbackBuffer.buffer != VK_NULL_HANDLE)
+    {
+        vmaDestroyBuffer(allocator, probeReadbackBuffer.buffer, probeReadbackBuffer.allocation);
+    }
+    if (luminanceReadbackBuffer.buffer != VK_NULL_HANDLE)
+    {
+        vmaDestroyBuffer(allocator, luminanceReadbackBuffer.buffer, luminanceReadbackBuffer.allocation);
+    }
+    if (probePrefilterPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, probePrefilterPipeline, nullptr);
+    }
+    for (const auto shaderModule : {probePrefilterVertexModule, probePrefilterFragmentModule})
+    {
+        if (shaderModule != VK_NULL_HANDLE)
+        {
+            vkDestroyShaderModule(device, shaderModule, nullptr);
+        }
+    }
+    if (probePrefilterPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, probePrefilterPipelineLayout, nullptr);
+    }
+    if (probePrefilterSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, probePrefilterSetLayout, nullptr);
+    }
+    if (probeSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(device, probeSampler, nullptr);
+    }
+
     for (const auto& [id, image] : imageResources)
     {
         if (image.sampler != VK_NULL_HANDLE)
         {
             vkDestroySampler(device, image.sampler, nullptr);
+        }
+        for (const auto levelView : image.levelViews)
+        {
+            vkDestroyImageView(device, levelView, nullptr);
         }
         if (image.view != VK_NULL_HANDLE)
         {
@@ -1263,6 +1670,8 @@ std::expected<void, std::string> VulkanRenderer::init()
         createSwapchain();
         createFrameResources();
         createDescriptorInfrastructure();
+        createProbeResources();
+        createExposureResources();
         return {};
     }
     catch (const std::exception& exception)
@@ -1398,8 +1807,14 @@ void VulkanRenderer::selectPhysicalDevice()
 
         // shaderDemoteToHelperInvocation: SPIR-V 1.6 (vulkan1.3 shaderc target) lowers
         // GLSL discard to OpDemoteToHelperInvocation.
+        //
+        // imageCubeArray is a selection criterion rather than an optional extra, unlike
+        // samplerAnisotropy below: the light probe path reads every probe's prefiltered radiance
+        // out of one cube array, which is what lets the shading loop pick a probe by a dynamic
+        // index instead of needing a descriptor per probe. A device without it cannot run the
+        // scene shader at all, so there is no degraded mode to fall back to.
         if (features13.dynamicRendering == VK_FALSE || features13.synchronization2 == VK_FALSE ||
-            features13.shaderDemoteToHelperInvocation == VK_FALSE)
+            features13.shaderDemoteToHelperInvocation == VK_FALSE || features2.features.imageCubeArray == VK_FALSE)
         {
             continue;
         }
@@ -1474,8 +1889,8 @@ void VulkanRenderer::selectPhysicalDevice()
 
     if (chosen == VK_NULL_HANDLE)
     {
-        throw std::runtime_error("no Vulkan 1.3 device with dynamicRendering, synchronization2, a swapchain, "
-                                 "and graphics+present queues");
+        throw std::runtime_error("no Vulkan 1.3 device with dynamicRendering, synchronization2, imageCubeArray, "
+                                 "a swapchain, and graphics+present queues");
     }
 
     physicalDevice = chosen;
@@ -1525,6 +1940,8 @@ void VulkanRenderer::createDevice()
     // path below can only ask for it if the feature is switched on here.
     VkPhysicalDeviceFeatures features{};
     features.samplerAnisotropy = samplerAnisotropySupported ? VK_TRUE : VK_FALSE;
+    // Required, not optional: see selectPhysicalDevice. Every candidate that got this far has it.
+    features.imageCubeArray = VK_TRUE;
 
     VkDeviceCreateInfo deviceCreateInfo{};
     deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1749,9 +2166,15 @@ void VulkanRenderer::createDescriptorInfrastructure()
 
     // Scene set 0: FrameData UBO, read by both stages (vulkan-abi.md). Dynamic-offset like
     // set 2, because the frame holds one of these per view rather than one in total.
+    // Binding 1 is every light probe's prefiltered radiance, as one cube array. It belongs beside
+    // the frame block rather than in a set of its own because it is exactly as per-frame as the
+    // block is, and because one image serves every probe: the descriptor is written once at
+    // bring-up and a probe re-capturing rewrites its contents, never this.
     const std::array frameBindings = {
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
-                                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+                                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{probeSpecularBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     frameDataSetLayout = makeSetLayout(frameBindings);
 
     // Scene set 1: MaterialData UBO at binding 0, then one sampler per material texture slot
@@ -1761,7 +2184,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     for (uint32_t slot = 0; slot < materialTextureSlotCount; slot++)
     {
-        const auto binding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        const auto binding = textureBinding(static_cast<MaterialTextureSlot>(slot));
         materialBindings[slot + 1] = VkDescriptorSetLayoutBinding{binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                                                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     }
@@ -1778,14 +2201,32 @@ void VulkanRenderer::createDescriptorInfrastructure()
     // One binding holding an array of shadowCascadeCount samplers, not that many bindings: the
     // shader declares `sampler2DShadow shadowMaps[SHADOW_CASCADES]`, and a resource declared as an
     // array must be backed by a binding whose descriptorCount covers its whole length.
+    //
+    // Binding 1 is the view's ambient occlusion, and it is here for the same reason: it is one image
+    // per camera pass, produced earlier in this frame and read only by a view that shades. Set 0 is
+    // where it would otherwise belong and cannot hold it — that set is one descriptor addressed by a
+    // dynamic offset per view, and an image binding does not vary by offset.
     const std::array shadowBindings = {
-        VkDescriptorSetLayoutBinding{shadowMapBinding(GraphicsApi::Vulkan), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                     shadowCascadeCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        VkDescriptorSetLayoutBinding{shadowMapBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, shadowCascadeCount,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{ambientOcclusionBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     shadowSetLayout = makeSetLayout(shadowBindings);
 
-    // Fullscreen passes use their own single-set layout: one combined sampler.
-    const std::array fullscreenBindings = {VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                                                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    // Fullscreen passes use their own single-set layout: one binding holding an array of
+    // postProcessInputCount combined samplers, not that many bindings, because the shader declares
+    // `sampler2D inputs[POST_INPUTS]` and an array resource must be backed by a binding whose
+    // descriptorCount covers its whole length — the same shape and the same reason as set 3's
+    // cascades. A pass reads the elements it wants; every element is written regardless.
+    const std::array fullscreenBindings = {
+        VkDescriptorSetLayoutBinding{postProcessInputBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                     postProcessInputCount, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // The colour grade, which is a sampler3D and therefore cannot be an element of the array
+        // above: a descriptor array holds one type. Written for every pass — the neutral identity
+        // when the pass has no grade — because the pipeline's static use of it does not care which
+        // pass this is.
+        VkDescriptorSetLayoutBinding{lookupTableBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     fullscreenSetLayout = makeSetLayout(fullscreenBindings);
 
     const auto makePipelineLayout = [&](const std::span<const VkDescriptorSetLayout> setLayouts)
@@ -1802,8 +2243,22 @@ void VulkanRenderer::createDescriptorInfrastructure()
 
     const std::array sceneSetLayouts = {frameDataSetLayout, materialSetLayout, drawDataSetLayout, shadowSetLayout};
     scenePipelineLayout = makePipelineLayout(sceneSetLayouts);
-    const std::array fullscreenSetLayouts = {fullscreenSetLayout};
-    fullscreenPipelineLayout = makePipelineLayout(fullscreenSetLayouts);
+
+    // The fullscreen layout carries one push constant range: the tone curve the post chain maps
+    // through, and which level of a chain the pass is on. See FullscreenPushConstants. A push
+    // constant rather than a member of some block because it changes per pass and is 32 bytes
+    // against a guaranteed 128, and because a fullscreen shader that does not declare it costs
+    // nothing — the range belongs to the layout, and writing it is valid whether or not the
+    // pipeline reads it.
+    const VkPushConstantRange fullscreenPushConstants{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(FullscreenPushConstants)};
+    VkPipelineLayoutCreateInfo fullscreenLayoutInfo{};
+    fullscreenLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    fullscreenLayoutInfo.setLayoutCount = 1;
+    fullscreenLayoutInfo.pSetLayouts = &fullscreenSetLayout;
+    fullscreenLayoutInfo.pushConstantRangeCount = 1;
+    fullscreenLayoutInfo.pPushConstantRanges = &fullscreenPushConstants;
+    ensure(vkCreatePipelineLayout(device, &fullscreenLayoutInfo, nullptr, &fullscreenPipelineLayout),
+           "vkCreatePipelineLayout");
 
     const std::array poolSizes = {
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, descriptorPoolUniformBuffers},
@@ -1827,15 +2282,20 @@ void VulkanRenderer::createDescriptorInfrastructure()
     ensure(vkCreateCommandPool(device, &uploadPoolInfo, nullptr, &uploadCommandPool), "vkCreateCommandPool");
 
     // One shared sampler serves every FBO attachment read (mirrors GL's per-attachment
-    // CLAMP_TO_EDGE + LINEAR without mips).
+    // CLAMP_TO_EDGE + LINEAR). The LOD clamp is open rather than the implicit 0 a zeroed
+    // VkSamplerCreateInfo carries: a chain attachment is sampled level by level through a view of
+    // that level, and a sampler that could only ever reach level 0 would silently read the top of
+    // every chain. Nothing changes for the single-level attachments that are every other target —
+    // there is no second level for the clamp to have been keeping them off.
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &attachmentSampler), "vkCreateSampler");
 
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
@@ -2182,18 +2642,37 @@ void VulkanRenderer::recordView(Scene& scene, Camera& camera, const float delta)
     recordScenePass(scene, camera, delta);
 }
 
-void VulkanRenderer::recordPresent(const Resource<Shader>& shaderKey, const Resource<FboAttachment>& attachmentKey)
+void VulkanRenderer::recordPresent(const Presenter& presenter)
 {
-    const auto* shader = memoryStorageService.shaders.find(shaderKey);
-    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+    const auto* shader = memoryStorageService.shaders.find(presenter.shader);
+    const auto* attachment = memoryStorageService.bufferAttachments.find(presenter.output);
+
+    // The grade the presenter named, uploaded on the frame it is first presented with, or the
+    // neutral one. A table that has gone missing grades nothing rather than skipping the present:
+    // the frame reaching the screen matters more than the look reaching it.
+    auto lookupTableImageId = neutralLookupTable();
+    if (presenter.lookupTable.has_value())
+    {
+        if (const auto uploaded = uploadTexture(presenter.lookupTable.value()); uploaded.has_value())
+        {
+            lookupTableImageId = uploaded.value();
+        }
+        else
+        {
+            diagnostics.record(FrameDiagnostic::ColourGradeUnavailable,
+                               [] { return std::string("the presenter's colour grade is no longer loaded"); });
+        }
+    }
 
     if (shader != nullptr && attachment != nullptr && attachment->gpuResourceId.has_value())
     {
-        recordPresentPass(shader->gpuResourceId, attachment->gpuResourceId.value());
+        recordPresentPass(shader->gpuResourceId, attachment->gpuResourceId.value(), presenter.parameters,
+                          lookupTableImageId);
     }
 }
 
-bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsigned int attachmentImageId)
+bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsigned int attachmentImageId,
+                                       const glm::vec4& parameters, const unsigned int lookupTableImageId)
 {
     const auto shader = shaderObjects.find(shaderId);
     if (shader == shaderObjects.end() || shader->second.swapchainTargetPipeline == VK_NULL_HANDLE ||
@@ -2212,7 +2691,8 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
 
     // Resolved before the swapchain image is touched: a pass that cannot bind its source
     // must leave the image untouched so the clear fallback can still take it.
-    if (attachmentSet(attachmentImageId) == VK_NULL_HANDLE)
+    const std::array presentInputs = {PostProcessBinding{.gpuResourceId = attachmentImageId, .level = 0}};
+    if (attachmentSet(presentInputs, lookupTableImageId) == VK_NULL_HANDLE)
     {
         diagnostics.record(
             FrameDiagnostic::PresentPassSkipped,
@@ -2226,11 +2706,22 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
-    recordFullScreenPass(attachmentImageId, swapchainImageViews[currentImageIndex], swapchainExtent,
-                         shader->second.swapchainTargetPipeline);
+    transitionTracked(frame.commandBuffer, attachmentImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Neutral tone, every field: the present pass copies an image the post chain has already
+    // exposed and tone mapped, so any curve here would apply the whole of it twice. What is *not*
+    // neutral is `effect` — the lens and the grade belong to this pass, because this is the one
+    // pass whose input is a display-referred image.
+    const FullscreenPushConstants pushConstants{.tone = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f),
+                                                .pass = glm::vec4(0.0f, 1.0f, static_cast<float>(swapchainExtent.width),
+                                                                  static_cast<float>(swapchainExtent.height)),
+                                                .view = glm::vec4(0.0f),
+                                                .effect = parameters};
+    recordFullScreenPass(presentInputs, lookupTableImageId, swapchainImageViews[currentImageIndex], swapchainExtent,
+                         shader->second.swapchainTargetPipeline, pushConstants);
 
     swapchainPassRecorded = true;
-    lastPresentPass = PresentPass{shaderId, attachmentImageId};
+    lastPresentPass = PresentPass{shaderId, attachmentImageId, parameters, lookupTableImageId};
     return true;
 }
 
@@ -2244,16 +2735,54 @@ void VulkanRenderer::transitionTracked(const VkCommandBuffer commandBuffer, cons
     }
 
     auto& resource = entry->second;
-    const auto source = stageAccessFor(resource.layout);
     const auto destination = stageAccessFor(newLayout);
 
-    // Emitted even when the layout already matches: consecutive frames write the same
-    // attachment images, and the barrier is what orders this frame's access against the
-    // previous submission's.
-    transitionImage(commandBuffer, resource.image, resource.layout, newLayout, source.stage, source.access,
+    // One barrier per run of levels that share a current layout. A whole image in one layout —
+    // which is every image but one caught mid-chain — is a single run, and the barrier it emits
+    // covers VK_REMAINING_MIP_LEVELS exactly as this did before there were chains at all.
+    //
+    // Emitted even when the layout already matches: consecutive frames write the same attachment
+    // images, and the barrier is what orders this frame's access against the previous
+    // submission's.
+    for (auto level = 0u; level < resource.layouts.size();)
+    {
+        const auto runLayout = resource.layouts[level];
+        auto runEnd = level + 1;
+        while (runEnd < resource.layouts.size() && resource.layouts[runEnd] == runLayout)
+        {
+            runEnd++;
+        }
+
+        const auto source = stageAccessFor(runLayout);
+        const auto wholeImage = level == 0 && runEnd == resource.layouts.size();
+        transitionImage(commandBuffer, resource.image, runLayout, newLayout, source.stage, source.access,
+                        destination.stage, destination.access,
+                        VkImageSubresourceRange{resource.aspect, level,
+                                                wholeImage ? VK_REMAINING_MIP_LEVELS : runEnd - level, 0,
+                                                VK_REMAINING_ARRAY_LAYERS});
+        level = runEnd;
+    }
+
+    std::ranges::fill(resource.layouts, newLayout);
+}
+
+void VulkanRenderer::transitionTrackedLevel(const VkCommandBuffer commandBuffer, const unsigned int imageId,
+                                            const uint32_t level, const VkImageLayout newLayout)
+{
+    const auto entry = imageResources.find(imageId);
+    if (entry == imageResources.end() || level >= entry->second.layouts.size())
+    {
+        return;
+    }
+
+    auto& resource = entry->second;
+    const auto source = stageAccessFor(resource.layouts[level]);
+    const auto destination = stageAccessFor(newLayout);
+
+    transitionImage(commandBuffer, resource.image, resource.layouts[level], newLayout, source.stage, source.access,
                     destination.stage, destination.access,
-                    VkImageSubresourceRange{resource.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
-    resource.layout = newLayout;
+                    VkImageSubresourceRange{resource.aspect, level, 1, 0, VK_REMAINING_ARRAY_LAYERS});
+    resource.layouts[level] = newLayout;
 }
 
 void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float delta)
@@ -2351,15 +2880,21 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
+    uploadProbes(scene, frameData);
+
     // A cascade is a producer and samples nothing; only the views that shade read the maps, and a
     // cascade sampling its own attachment while rendering into it would be a feedback loop.
     const auto shading = camera.role == CameraRole::Scene;
     const auto cascadeImages = shading ? shadowCascadeImages(scene) : std::nullopt;
-    auto shadowDescriptors = cascadeImages.has_value() ? shadowSet(cascadeImages.value()) : VK_NULL_HANDLE;
+    // The occlusion this view samples rides in the same set, so it is resolved with the cascades and
+    // falls back with them: a view that gathers none binds white, and white is no occlusion at all.
+    const auto occlusionImage = shading ? ambientOcclusionImage(camera) : dummyTexture();
+    auto shadowDescriptors =
+        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), occlusionImage) : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
-        const auto correction = shadowLookupCorrection(GraphicsApi::Vulkan);
+        const auto correction = shadowLookupCorrection();
 
         for (auto cascade = 0u; cascade < shadowCascadeCount; cascade++)
         {
@@ -2427,14 +2962,19 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     const auto& extentSource = hasColor ? colorImage : depthImage;
     const VkExtent2D extent{extentSource.width, extentSource.height};
 
+    // A prepass clears to zero rather than to the scene's clear colour, and the difference matters:
+    // what it writes is geometry, not colour, and every consumer of it reads a zero distance as "the
+    // camera saw nothing here". Cleared to white, the sky would arrive at the gather as a surface
+    // one unit in front of the eye — which is not a subtle error but it is a plausible-looking one.
+    const auto& clear = camera.role == CameraRole::DepthNormalPrepass ? prepassClearColour : clearColour;
+
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView = colorImage.view;
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color =
-        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
+    colorAttachment.clearValue.color = VkClearColorValue{{clear[0], clear[1], clear[2], clear[3]}};
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2478,7 +3018,202 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     const VkRect2D scissor{VkOffset2D{0, 0}, extent};
     vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
 
-    // Same hoisting rule as the GL pass: every handle is resolved at the outermost loop where it
+    const auto recordedDraws =
+        recordSceneDraws(scene, camera, delta, shading, false, viewShader != nullptr ? viewShader->gpuResourceId : 0u,
+                         colorFormat, depthFormat, shadowDescriptors);
+
+    vkCmdEndRendering(frame.commandBuffer);
+
+    // Every attachment this view wrote ends the pass readable. The colour one has always moved
+    // here because the post chain and the presenter sample it; the depth one moves too, and that
+    // move is the whole of what "Vulkan can sample a depth attachment" needed — the image already
+    // carried SAMPLED usage, and the tracked layout is what emits the barrier and what puts it
+    // back to DEPTH_ATTACHMENT_OPTIMAL at the top of the next view that draws into it. Nothing
+    // samples the depth yet; the layout is what makes sampling it possible.
+    if (hasColor)
+    {
+        transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    if (hasDepth)
+    {
+        transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    for (const auto& postProcessKey : camera.postProcesses)
+    {
+        const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
+        const auto* postProcessShader =
+            postProcess == nullptr ? nullptr : memoryStorageService.shaders.find(postProcess->shader);
+        if (postProcess == nullptr || postProcessShader == nullptr)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "post-process slot " + std::to_string(postProcessKey.index) +
+                                          " or its shader is no longer loaded";
+                               });
+
+            continue;
+        }
+
+        // Every input the pass declared, in order, resolved to the image and level a descriptor
+        // names. GL bound these to texture units 0..n and this backend used to bind only the first
+        // of them; the fullscreen set is postProcessInputCount samplers wide now, and a shader
+        // reads the elements it declared an interest in.
+        std::vector<PostProcessBinding> inputs;
+        inputs.reserve(postProcess->inputs.size());
+        for (const auto& input : postProcess->inputs)
+        {
+            const auto* attachment = memoryStorageService.bufferAttachments.find(input.attachment);
+            if (attachment == nullptr || !attachment->gpuResourceId.has_value())
+            {
+                continue;
+            }
+
+            const auto image = imageResources.find(attachment->gpuResourceId.value());
+            if (image == imageResources.end())
+            {
+                continue;
+            }
+
+            // Clamped here rather than where the view is picked, so that the barrier and the
+            // descriptor cannot end up naming different subresources: one of them falling back to
+            // the whole image while the other moved a level is exactly the layout mismatch this
+            // per-level bookkeeping exists to prevent.
+            inputs.push_back(PostProcessBinding{.gpuResourceId = attachment->gpuResourceId.value(),
+                                                .level = std::min(input.level, image->second.mipLevels - 1u)});
+        }
+
+        if (inputs.size() > postProcessInputCount)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessInputsExceeded,
+                               [&]
+                               {
+                                   return "the fullscreen set carries " + std::to_string(postProcessInputCount) +
+                                          " of the " + std::to_string(inputs.size()) + " declared";
+                               });
+        }
+
+        std::optional<unsigned int> targetImageId;
+        if (postProcess->output.has_value())
+        {
+            const auto* targetBuffer = memoryStorageService.frameBuffers.find(postProcess->output.value());
+            if (targetBuffer != nullptr)
+            {
+                for (const auto& attachmentKey : targetBuffer->attachments)
+                {
+                    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
+                    if (attachment != nullptr && attachment->type == FboAttachmentType::Color &&
+                        attachment->gpuResourceId.has_value())
+                    {
+                        targetImageId = attachment->gpuResourceId;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const auto shader = shaderObjects.find(postProcessShader->gpuResourceId);
+        const auto usable = !inputs.empty() && targetImageId.has_value() &&
+                            imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
+                            shader->second.fullscreen;
+        // The pipeline is built against the target attachment's own format, so a post-process
+        // buffer created with any FboAttachment::internalFormat renders rather than mismatching
+        // a hardcoded one.
+        const auto pipeline = usable ? offscreenPipeline(postProcessShader->gpuResourceId,
+                                                         imageResources.at(targetImageId.value()).format)
+                                     : VK_NULL_HANDLE;
+        if (pipeline == VK_NULL_HANDLE)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
+                               [&]
+                               {
+                                   return "shader object " + std::to_string(postProcessShader->gpuResourceId) +
+                                          " has no fullscreen pipeline for this target";
+                               });
+
+            continue;
+        }
+
+        // A level past the end of the chain would leave the pass rendering through the whole-image
+        // view, which dynamic rendering rejects; clamping means a mis-stated level writes the last
+        // level of the chain rather than nothing at all. Read out rather than held by reference:
+        // the descriptor set the pass binds may create the fallback image, and that inserts into
+        // imageResources.
+        const auto& target = imageResources.at(targetImageId.value());
+        const auto targetLevel = std::min(postProcess->outputLevel, target.mipLevels - 1u);
+        const auto targetLevels = target.mipLevels;
+        const auto targetView = levelView(target, targetLevel);
+        const VkExtent2D targetExtent{std::max(target.width >> targetLevel, 1u),
+                                      std::max(target.height >> targetLevel, 1u)};
+
+        // Inputs first, then the level being written: if one of the inputs is a level of the target
+        // image — which is what a chain pass reading the level above the one it writes looks like —
+        // the second move has to be the one that lands.
+        for (const auto& input : inputs)
+        {
+            transitionTrackedLevel(frame.commandBuffer, input.gpuResourceId, input.level,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+
+        transitionTrackedLevel(frame.commandBuffer, targetImageId.value(), targetLevel,
+                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        // The projection this view was rendered with, as the pair of half-angle tangents a pass
+        // reconstructing a position from a depth needs. Orthographic views have no such pair and no
+        // pass that reads one; the field is what the perspective arm reports and zero otherwise.
+        const auto tanHalfVertical = camera.projection == CameraProjection::Perspective
+                                         ? std::tan(glm::radians(camera.fieldOfView) * 0.5f)
+                                         : 0.0f;
+
+        const FullscreenPushConstants parameters{
+            .tone =
+                glm::vec4(camera.exposure, camera.toneCurve.contrast, camera.toneCurve.toe, camera.toneCurve.shoulder),
+            .pass = glm::vec4(static_cast<float>(targetLevel), static_cast<float>(targetLevels),
+                              static_cast<float>(targetExtent.width), static_cast<float>(targetExtent.height)),
+            .view = glm::vec4(tanHalfVertical * camera.aspectRatio, tanHalfVertical, camera.nearClippingPlane,
+                              camera.farClippingPlane),
+            .effect = postProcess->parameters};
+
+        // Every pass before the present works in radiance, where a grade has no meaning.
+        recordFullScreenPass(inputs, neutralLookupTable(), targetView, targetExtent, pipeline, parameters);
+
+        transitionTrackedLevel(frame.commandBuffer, targetImageId.value(), targetLevel,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    if (!drawSummaryLogged && recordedDraws > 0)
+    {
+        const auto* attachments = hasColor ? (hasDepth ? "colour and depth" : "colour only") : "depth only";
+
+        logger.info("Vulkan scene pass recorded: {} draw(s) into {}x{} ({}), {} post-process pass(es), {} scene "
+                    "pipeline(s), {} material set(s)",
+                    recordedDraws, extent.width, extent.height, attachments, camera.postProcesses.size(),
+                    scenePipelines.size(), materialResources.size());
+        drawSummaryLogged = true;
+    }
+}
+
+// The entity/mesh/primitive walk, shared by a camera's view and a light probe's face.
+//
+// `viewShaderId` of zero means "each entity draws with its own"; `shading` is false only for a
+// depth pass; `staticOnly` is what a probe capture adds. The two filters are separate flags
+// because the sky is the case that differs between them: it must never cast a shadow, and it is
+// the single most important thing a probe records.
+//
+// `staticOnly` doubles as the double-sided flag it hands recordDraw, for a reason that is a
+// property of the pass rather than of the geometry: a cube face is rasterised with a positive
+// viewport height where every other pass here uses a negative one, so the winding a
+// back-face-culling pipeline was built against is inverted. Culling on inverted winding keeps the
+// far side of a wall and discards the near one, which reads as a probe seeing straight through
+// buildings. Culling nothing and letting the depth test decide is correct either way round.
+unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera, const float delta, const bool shading,
+                                              const bool staticOnly, const unsigned int viewShaderId,
+                                              const VkFormat colorFormat, const VkFormat depthFormat,
+                                              const VkDescriptorSet shadowDescriptors)
+{
+    // Same hoisting rule the GL pass had: every handle is resolved at the outermost loop where it
     // is constant and read through for the nest below, so the pass costs
     // O(entities + meshes + primitives) storage lookups rather than one per field. A handle that
     // has gone stale — a model unloaded while its renderable is still in the scene — is skipped
@@ -2489,6 +3224,14 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         // The depth pass draws casters. A skybox in the map fills it at the near plane and puts
         // the whole world in shadow.
         if (!shading && !entity.castsShadow)
+        {
+            continue;
+        }
+
+        // A probe's capture draws the world, not the traffic on it. Anything that moves would be
+        // baked into an environment shaded from for many frames afterwards, lighting the street
+        // from wherever it happened to be when the capture ran.
+        if (staticOnly && !entity.staticGeometry)
         {
             continue;
         }
@@ -2506,7 +3249,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         // The view's shader where it has one, otherwise the instance's — not the material's:
         // materials live in shared storage, so two renderables built from one model would
         // otherwise restyle each other.
-        const auto shaderId = viewShader != nullptr ? viewShader->gpuResourceId : instanceShader->gpuResourceId;
+        const auto shaderId = viewShaderId != 0 ? viewShaderId : instanceShader->gpuResourceId;
 
         // Around the entity's submission, which on this backend is where its commands are
         // recorded: the same point in the frame GL calls them at.
@@ -2573,7 +3316,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                 }
 
                 recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
-                           joints, colorFormat, depthFormat, shadowDescriptors);
+                           joints, colorFormat, depthFormat, shadowDescriptors, staticOnly);
                 recordedDraws++;
             }
         }
@@ -2584,115 +3327,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         }
     }
 
-    vkCmdEndRendering(frame.commandBuffer);
-
-    // Every attachment this view wrote ends the pass readable. The colour one has always moved
-    // here because the post chain and the presenter sample it; the depth one moves too, and that
-    // move is the whole of what "Vulkan can sample a depth attachment" needed — the image already
-    // carried SAMPLED usage, and the tracked layout is what emits the barrier and what puts it
-    // back to DEPTH_ATTACHMENT_OPTIMAL at the top of the next view that draws into it. Nothing
-    // samples the depth yet; the layout is what makes sampling it possible.
-    if (hasColor)
-    {
-        transitionTracked(frame.commandBuffer, colorImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    if (hasDepth)
-    {
-        transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    for (const auto& postProcessKey : camera.postProcesses)
-    {
-        const auto* postProcess = memoryStorageService.postProcesses.find(postProcessKey);
-        const auto* postProcessShader =
-            postProcess == nullptr ? nullptr : memoryStorageService.shaders.find(postProcess->shader);
-        if (postProcess == nullptr || postProcessShader == nullptr)
-        {
-            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
-                               [&]
-                               {
-                                   return "post-process slot " + std::to_string(postProcessKey.index) +
-                                          " or its shader is no longer loaded";
-                               });
-
-            continue;
-        }
-
-        // GL binds every input to units 0..n; the Vulkan fullscreen layout carries exactly
-        // one sampler (vulkan-abi.md), and the HDR shader declares only binding 0, so the
-        // camera depth attachment GL also binds is deliberately left unbound.
-        std::optional<unsigned int> sourceImageId;
-        if (!postProcess->inputs.empty())
-        {
-            if (const auto* input = memoryStorageService.bufferAttachments.find(postProcess->inputs.front());
-                input != nullptr)
-            {
-                sourceImageId = input->gpuResourceId;
-            }
-        }
-
-        std::optional<unsigned int> targetImageId;
-        if (postProcess->output.has_value())
-        {
-            const auto* targetBuffer = memoryStorageService.frameBuffers.find(postProcess->output.value());
-            if (targetBuffer != nullptr)
-            {
-                for (const auto& attachmentKey : targetBuffer->attachments)
-                {
-                    const auto* attachment = memoryStorageService.bufferAttachments.find(attachmentKey);
-                    if (attachment != nullptr && attachment->type == FboAttachmentType::Color &&
-                        attachment->gpuResourceId.has_value())
-                    {
-                        targetImageId = attachment->gpuResourceId;
-                        break;
-                    }
-                }
-            }
-        }
-
-        const auto shader = shaderObjects.find(postProcessShader->gpuResourceId);
-        const auto usable = sourceImageId.has_value() && targetImageId.has_value() &&
-                            imageResources.contains(sourceImageId.value()) &&
-                            imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
-                            shader->second.fullscreen;
-        // The pipeline is built against the target attachment's own format, so a post-process
-        // buffer created with any FboAttachment::internalFormat renders rather than mismatching
-        // a hardcoded one.
-        const auto pipeline = usable ? offscreenPipeline(postProcessShader->gpuResourceId,
-                                                         imageResources.at(targetImageId.value()).format)
-                                     : VK_NULL_HANDLE;
-        if (pipeline == VK_NULL_HANDLE)
-        {
-            diagnostics.record(FrameDiagnostic::PostProcessSkipped,
-                               [&]
-                               {
-                                   return "shader object " + std::to_string(postProcessShader->gpuResourceId) +
-                                          " has no fullscreen pipeline for this target";
-                               });
-
-            continue;
-        }
-
-        transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-        const auto& targetImage = imageResources.at(targetImageId.value());
-        recordFullScreenPass(sourceImageId.value(), targetImage.view, VkExtent2D{targetImage.width, targetImage.height},
-                             pipeline);
-
-        transitionTracked(frame.commandBuffer, targetImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    if (!drawSummaryLogged && recordedDraws > 0)
-    {
-        const auto* attachments = hasColor ? (hasDepth ? "colour and depth" : "colour only") : "depth only";
-
-        logger.info("Vulkan scene pass recorded: {} draw(s) into {}x{} ({}), {} post-process pass(es), {} scene "
-                    "pipeline(s), {} material set(s)",
-                    recordedDraws, extent.width, extent.height, attachments, camera.postProcesses.size(),
-                    scenePipelines.size(), materialResources.size());
-        drawSummaryLogged = true;
-    }
+    return recordedDraws;
 }
 
 // The material arrives already resolved — both the handle, which keys the descriptor set cache,
@@ -2701,7 +3336,8 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
                                 const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
-                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors)
+                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors,
+                                const bool doubleSided)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -2715,12 +3351,16 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
         return;
     }
 
-    const VkCullModeFlags cullMode = material.opaque ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    const VkCullModeFlags cullMode = (material.opaque && !doubleSided) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+
+    // A prepass writes geometry into its attachment — a normal and a distance — and neither is a
+    // colour with a coverage in front of it. Blending them would read the distance as an opacity.
+    const auto blend = camera.role != CameraRole::DepthNormalPrepass;
 
     // Borrowed, and used before anything else can resolve a pipeline for this primitive: the
     // buffers to feed it are part of the same entry, and nothing between here and the draw
     // resolves one.
-    const auto* resolved = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat);
+    const auto* resolved = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat, blend);
     if (resolved->pipeline == VK_NULL_HANDLE)
     {
         diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
@@ -2825,10 +3465,954 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     vkCmdDrawIndexed(frame.commandBuffer, bound->second.indexCount, 1, 0, 0, 0);
 }
 
-bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, const VkImageView targetView,
-                                          const VkExtent2D targetExtent, const VkPipeline pipeline)
+// ---------------------------------------------------------------------------------------------
+// Light probes.
+//
+// A probe is captured the way the frame is rendered — six scene passes from the probe's position,
+// with the cascades bound, drawing the sky — and the result is reduced twice: down a GGX roughness
+// chain for the specular term, and onto nine spherical harmonic coefficients for the diffuse one.
+//
+// The reduction is what the shading side actually reads, and it is the whole point. The env term
+// this replaces sampled the sky cube directly along the reflection vector, at a fixed LOD, with
+// nothing in front of it: no geometry, no shadow, no occlusion. A surface in a building's shadow
+// got the same specular highlight as one in the open, because the only thing either sampled was
+// the sky. A probe standing in that shadow records the building, so its irradiance and its
+// prefiltered radiance are dark — the occlusion is in the data rather than applied to it.
+// ---------------------------------------------------------------------------------------------
+
+unsigned int VulkanRenderer::createProbeImage(const uint32_t resolution, const uint32_t mipLevels,
+                                              const uint32_t layers, const VkFormat format,
+                                              const VkImageUsageFlags usage, const VkImageAspectFlags aspect,
+                                              const bool cube) const
 {
-    const auto set = attachmentSet(sourceImageId);
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = VkExtent3D{resolution, resolution, 1};
+    imageInfo.mipLevels = mipLevels;
+    imageInfo.arrayLayers = layers;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = usage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    ensure(vmaCreateImage(allocator, &imageInfo, &allocationInfo, &image, &allocation, nullptr), "vmaCreateImage");
+
+    // The *sampling* view: whole mip chain, whole array. Cube or cube array, because that is how
+    // both the prefilter shader and the scene shader read these — the per-face 2D views the
+    // passes render through are separate objects, created alongside.
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType =
+        cube ? (layers > 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, mipLevels, 0, layers};
+
+    VkImageView view = VK_NULL_HANDLE;
+    ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+    const auto id = nextResourceId++;
+    imageResources.emplace(id,
+                           ImageResource{.image = image,
+                                         .allocation = allocation,
+                                         .view = view,
+                                         .sampler = VK_NULL_HANDLE,
+                                         .format = format,
+                                         .mipLevels = mipLevels,
+                                         .width = resolution,
+                                         .height = resolution,
+                                         .aspect = aspect,
+                                         .layouts = std::vector<VkImageLayout>(mipLevels, VK_IMAGE_LAYOUT_UNDEFINED),
+                                         .levelViews = {}});
+    return id;
+}
+
+VkImageView VulkanRenderer::createLevelView(const unsigned int imageId, const uint32_t mip, const uint32_t layer) const
+{
+    const auto& resource = imageResources.at(imageId);
+
+    // One mip, one layer, seen as a plain 2D image. Rendering into a cube face is exactly this and
+    // so is rendering into one level of a chain: dynamic rendering takes an image view, and the
+    // view is what says which subresource. A descriptor naming the same view is what makes the
+    // layout of that one level the layout the sampler is promised.
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = resource.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = resource.format;
+    viewInfo.subresourceRange = VkImageSubresourceRange{resource.aspect, mip, 1, layer, 1};
+
+    VkImageView view = VK_NULL_HANDLE;
+    ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+    return view;
+}
+
+VkImageView VulkanRenderer::levelView(const ImageResource& resource, const uint32_t level) const
+{
+    return level < resource.levelViews.size() ? resource.levelViews[level] : resource.view;
+}
+
+void VulkanRenderer::createProbeResources()
+{
+    constexpr auto radianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr auto depthFormat = VK_FORMAT_D32_SFLOAT;
+
+    // The scratch cube the capture draws into and the prefilter reads from. Its mip chain is
+    // generated by blit and exists for one reason: the prefilter picks a source mip from the
+    // solid angle each of its samples covers, which is what stops a bright, small feature — a sun
+    // disc, a window — from becoming a firefly at high roughness.
+    probeRadianceImageId = createProbeImage(probeCubeResolution, probeSpecularMipCount, 6, radianceFormat,
+                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                            VK_IMAGE_ASPECT_COLOR_BIT, true);
+
+    probeDepthImageId = createProbeImage(probeCubeResolution, 1, 1, depthFormat,
+                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, false);
+
+    // TRANSFER_DST is for the initial clear alone: a slice no probe has captured yet is still
+    // named by every frame's descriptor, and black is the only value that reads as "no probe here"
+    // rather than as whatever the allocator handed over.
+    probeSpecularImageId = createProbeImage(
+        probeCubeResolution, probeSpecularMipCount, 6 * maxIblProbes, radianceFormat,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, true);
+
+    for (auto face = 0u; face < 6u; face++)
+    {
+        probeRadianceFaceViews[face] = createLevelView(probeRadianceImageId, 0, face);
+    }
+
+    probeSpecularFaceViews.reserve(static_cast<size_t>(maxIblProbes) * probeSpecularMipCount * 6);
+    for (auto slice = 0u; slice < maxIblProbes; slice++)
+    {
+        for (auto mip = 0u; mip < probeSpecularMipCount; mip++)
+        {
+            for (auto face = 0u; face < 6u; face++)
+            {
+                probeSpecularFaceViews.push_back(createLevelView(probeSpecularImageId, mip, slice * 6u + face));
+            }
+        }
+    }
+
+    // Trilinear across the roughness chain: the shading side reads a fractional LOD, and a nearest
+    // mip filter there is a visible step in the reflection as roughness varies across a surface.
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = static_cast<float>(probeSpecularMipCount);
+    ensure(vkCreateSampler(device, &samplerInfo, nullptr, &probeSampler), "vkCreateSampler");
+
+    // The prefilter's own set layout and pipeline layout: one cube sampler, and a push constant
+    // carrying the roughness and the face this invocation is filtering. Push constants rather
+    // than a uniform buffer because there are six faces times six mips of them per capture and
+    // each is four floats — a ring of thirty-six tiny UBO slots to say that would be absurd.
+    const std::array prefilterBindings = {VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                                                       VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo prefilterSetInfo{};
+    prefilterSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    prefilterSetInfo.bindingCount = static_cast<uint32_t>(prefilterBindings.size());
+    prefilterSetInfo.pBindings = prefilterBindings.data();
+    ensure(vkCreateDescriptorSetLayout(device, &prefilterSetInfo, nullptr, &probePrefilterSetLayout),
+           "vkCreateDescriptorSetLayout");
+
+    const VkPushConstantRange pushConstants{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::vec4)};
+    VkPipelineLayoutCreateInfo prefilterLayoutInfo{};
+    prefilterLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    prefilterLayoutInfo.setLayoutCount = 1;
+    prefilterLayoutInfo.pSetLayouts = &probePrefilterSetLayout;
+    prefilterLayoutInfo.pushConstantRangeCount = 1;
+    prefilterLayoutInfo.pPushConstantRanges = &pushConstants;
+    ensure(vkCreatePipelineLayout(device, &prefilterLayoutInfo, nullptr, &probePrefilterPipelineLayout),
+           "vkCreatePipelineLayout");
+
+    // The prefilter's shaders are the backend's own, not a game asset: the game authors what the
+    // world looks like, and how a probe is reduced to nine coefficients and a roughness chain is
+    // no more the game's business than the layout of the draw-data ring is. Compiled through the
+    // same shaderc path as everything else, so it gets the same contract macros.
+    const auto vertexSpirv = compileToSpirv(probePrefilterVertexSource, shaderc_glsl_vertex_shader, "probe vertex");
+    const auto fragmentSpirv =
+        compileToSpirv(probePrefilterFragmentSource, shaderc_glsl_fragment_shader, "probe fragment");
+
+    if (!vertexSpirv || !fragmentSpirv)
+    {
+        // Reported through the diagnostics rather than thrown: an engine that cannot prefilter is
+        // an engine whose probes stay dark, which is a degraded picture and not a dead process.
+        diagnostics.record(FrameDiagnostic::ProbeCaptureSkipped,
+                           [&] { return vertexSpirv ? fragmentSpirv.error() : vertexSpirv.error(); });
+        return;
+    }
+
+    probePrefilterVertexModule = createShaderModule(vertexSpirv.value());
+    probePrefilterFragmentModule = createShaderModule(fragmentSpirv.value());
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = probePrefilterVertexModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = probePrefilterFragmentModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterization{};
+    rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+    // No blending: this pass *is* the result, and the frame's global source-alpha blend would
+    // multiply a radiance the capture wrote with alpha 1 by an alpha that means nothing here.
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.blendEnable = VK_FALSE;
+    blendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blendAttachment;
+
+    const std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &radianceFormat;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlend;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = probePrefilterPipelineLayout;
+
+    ensure(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &probePrefilterPipeline),
+           "vkCreateGraphicsPipelines");
+
+    // The set the prefilter reads the scratch cube through. One, for the process: the cube is one
+    // image and the prefilter is the only thing that samples it.
+    VkDescriptorSetAllocateInfo setAllocateInfo{};
+    setAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setAllocateInfo.descriptorPool = descriptorPool;
+    setAllocateInfo.descriptorSetCount = 1;
+    setAllocateInfo.pSetLayouts = &probePrefilterSetLayout;
+    ensure(vkAllocateDescriptorSets(device, &setAllocateInfo, &probeRadianceSet), "vkAllocateDescriptorSets");
+
+    const VkDescriptorImageInfo radianceInfo{probeSampler, imageResources.at(probeRadianceImageId).view,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet radianceWrite{};
+    radianceWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    radianceWrite.dstSet = probeRadianceSet;
+    radianceWrite.dstBinding = 0;
+    radianceWrite.descriptorCount = 1;
+    radianceWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    radianceWrite.pImageInfo = &radianceInfo;
+    vkUpdateDescriptorSets(device, 1, &radianceWrite, 0, nullptr);
+
+    // The probe array's descriptor, into every frame's set 0. Written once, here, and never
+    // again: the image is created at bring-up at a size the contract fixes, so a probe capturing
+    // rewrites its *contents* and never the descriptor that names it. That is the whole reason
+    // this is one array rather than a cube per probe — a time-of-day change re-captures every
+    // probe in the scene, and a descriptor rewrite per probe per change is what that would cost.
+    const VkDescriptorImageInfo specularInfo{probeSampler, imageResources.at(probeSpecularImageId).view,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    for (const auto& frame : frames)
+    {
+        VkWriteDescriptorSet specularWrite{};
+        specularWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        specularWrite.dstSet = frame.frameDataSet;
+        specularWrite.dstBinding = probeSpecularBinding;
+        specularWrite.descriptorCount = 1;
+        specularWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        specularWrite.pImageInfo = &specularInfo;
+        vkUpdateDescriptorSets(device, 1, &specularWrite, 0, nullptr);
+    }
+
+    // The staging buffer the irradiance is projected from. One mip's worth of one cube: at the
+    // mip the contract names that is 16x16x6 texels, which is 12 KiB and is read once per capture.
+    const auto readbackExtent = probeCubeResolution >> probeIrradianceSourceMip;
+    const auto readbackBytes = static_cast<VkDeviceSize>(readbackExtent) * readbackExtent * 6 * 4 * sizeof(uint16_t);
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = readbackBytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo readbackAllocationInfo{};
+    readbackAllocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    readbackAllocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VmaAllocationInfo mappedInfo{};
+    ensure(vmaCreateBuffer(allocator, &bufferInfo, &readbackAllocationInfo, &probeReadbackBuffer.buffer,
+                           &probeReadbackBuffer.allocation, &mappedInfo),
+           "vmaCreateBuffer");
+    probeReadbackMapped = mappedInfo.pMappedData;
+
+    // Both images start black and readable. The specular array is named by every frame's set 0
+    // from the first frame, and a scene shading through it before any probe has captured would be
+    // sampling an image in an undefined layout — the shader's probe count says not to read it,
+    // and "the pipeline statically uses this descriptor" does not care what the shader decides.
+    const auto commandBuffer = beginUploadCommands();
+    const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+    for (const auto imageId : {probeRadianceImageId, probeSpecularImageId})
+    {
+        transitionTracked(commandBuffer, imageId, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const auto& resource = imageResources.at(imageId);
+        const VkImageSubresourceRange whole{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                            VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(commandBuffer, resource.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
+        transitionTracked(commandBuffer, imageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    finishUploadCommands(commandBuffer);
+
+    logger.info("Vulkan light probe machinery ready: {} slices of a {}x{} cube array, {} roughness levels, "
+                "irradiance projected from mip {} ({}x{})",
+                maxIblProbes, probeCubeResolution, probeCubeResolution, probeSpecularMipCount, probeIrradianceSourceMip,
+                readbackExtent, readbackExtent);
+}
+
+void VulkanRenderer::createExposureResources()
+{
+    // One RGBA16F texel. The meter writes its reduction into the red channel and leaves the rest,
+    // but a buffer image copy transfers whole texels, so the buffer is the texel's width.
+    constexpr VkDeviceSize luminanceReadbackBytes = 4 * sizeof(uint16_t);
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = luminanceReadbackBytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VmaAllocationInfo mappedInfo{};
+    ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationInfo, &luminanceReadbackBuffer.buffer,
+                           &luminanceReadbackBuffer.allocation, &mappedInfo),
+           "vmaCreateBuffer");
+    luminanceReadbackMapped = mappedInfo.pMappedData;
+}
+
+// The image a shading view samples its occlusion from. A camera that gathers none — or one whose
+// buffer has gone out from under it — reads the 1x1 white image, which is a visibility term of one
+// everywhere and therefore no occlusion at all.
+unsigned int VulkanRenderer::ambientOcclusionImage(const Camera& camera)
+{
+    if (!camera.ambientOcclusion.enabled || !camera.ambientOcclusion.occlusion.issued())
+    {
+        return dummyTexture();
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(camera.ambientOcclusion.occlusion);
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value() ||
+        !imageResources.contains(attachment->gpuResourceId.value()))
+    {
+        diagnostics.record(FrameDiagnostic::AmbientOcclusionSkipped,
+                           [] { return std::string("the occlusion attachment is no longer loaded"); });
+
+        return dummyTexture();
+    }
+
+    return attachment->gpuResourceId.value();
+}
+
+// The view drawn a second time, for what its own geometry hides.
+//
+// A Camera on the stack rather than one the game keeps: every field of it except the target and the
+// shader belongs to the camera this is a prepass for, and a second Camera a game had to hold in step
+// would be a second answer to where the view is. What differs is exactly what the copy overwrites —
+// it renders the prepass buffer, with the prepass shader, under a role that says it does not shade,
+// and carries the gather and the blur as its post chain so recordScenePass runs them in order the
+// moment the geometry is down.
+void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const float delta)
+{
+    const auto& occlusion = camera.ambientOcclusion;
+
+    if (!frameOpen || !occlusion.enabled || !occlusion.prepass.has_value() || !occlusion.prepassShader.has_value())
+    {
+        return;
+    }
+
+    Camera prepass = camera;
+    prepass.role = CameraRole::DepthNormalPrepass;
+    prepass.output = occlusion.prepass.value();
+    prepass.overrideShader = occlusion.prepassShader.value();
+    // The gather and the blur, and not the tone map or the meter's reduction: those belong to the
+    // view that shades, and this one has not shaded anything. The occlusion settings stay on the
+    // copy because the gather reads its radius and strength out of them.
+    prepass.postProcesses = occlusion.passes;
+
+    recordScenePass(scene, prepass, delta);
+}
+
+// The meter's half of the deferred-readback pattern the probe path established: collect the copy
+// the last call queued if the submission carrying it has completed, then queue the next one. The
+// camera keeps the previous reading in between, so nothing here ever stalls the device and nothing
+// downstream ever sees an unwritten buffer.
+//
+// The lag is `framesInFlight + 1` submissions and it is a lag in *submissions*, not in wall time —
+// which is what makes it survive the frame gate: the schedule is a function of the frame number in
+// exactly the way the light probe scheduler's is.
+void VulkanRenderer::recordAutoExposure(Camera& camera)
+{
+    auto& meter = camera.autoExposure;
+
+    if (!frameOpen || !meter.enabled || !meter.chain.issued() || luminanceReadbackMapped == nullptr)
+    {
+        return;
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(meter.chain);
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value())
+    {
+        diagnostics.record(FrameDiagnostic::ExposureMeterSkipped,
+                           [] { return std::string("the chain attachment is no longer loaded"); });
+
+        return;
+    }
+
+    const auto imageId = attachment->gpuResourceId.value();
+    const auto image = imageResources.find(imageId);
+    if (image == imageResources.end())
+    {
+        diagnostics.record(FrameDiagnostic::ExposureMeterSkipped,
+                           [&] { return "chain attachment " + std::to_string(imageId) + " has no image"; });
+
+        return;
+    }
+
+    if (luminanceReadbackOwner == imageId && luminanceReadbackReadyAt <= submittedFrames)
+    {
+        ensure(vmaInvalidateAllocation(allocator, luminanceReadbackBuffer.allocation, 0, VK_WHOLE_SIZE),
+               "vmaInvalidateAllocation");
+
+        // Two channels: the weighted sum of log2 luminance, and the weight it was summed with. The
+        // ratio is the weighted mean of the logarithm, and undoing the logarithm on *that* is what
+        // makes the reading the weighted geometric mean of the frame — the average an exposure
+        // meter takes, and the one a handful of specular pinpricks cannot drag the whole picture
+        // off. Both channels came down the same tree of averages, so the division is the whole of
+        // what centre weighting costs on this side.
+        //
+        // A zero weight is a frame the reduction never wrote — the pass was skipped, or the chain
+        // is a frame behind a resize — and holding the previous reading is what every other
+        // not-yet-arrived case here does.
+        const auto* halves = static_cast<const uint16_t*>(luminanceReadbackMapped);
+        const auto weightedLogarithm = halfToFloat(halves[0]);
+        const auto weight = halfToFloat(halves[1]);
+
+        if (weight > 0.0f)
+        {
+            meter.measuredLuminance = std::exp2(weightedLogarithm / weight);
+        }
+        luminanceReadbackOwner.reset();
+    }
+
+    // Another camera's copy is still in flight. It will be collected on the frame it is ready, and
+    // this camera queues its own on the one after — a fixed rotation, not a race.
+    if (luminanceReadbackOwner.has_value())
+    {
+        return;
+    }
+
+    const auto vulkanImage = image->second.image;
+    const auto level = std::min(meter.chainLevel, image->second.mipLevels - 1u);
+    const auto& frame = frames[frameIndex];
+
+    transitionTrackedLevel(frame.commandBuffer, imageId, level, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    VkBufferImageCopy readback{};
+    readback.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    readback.imageExtent = VkExtent3D{1, 1, 1};
+    vkCmdCopyImageToBuffer(frame.commandBuffer, vulkanImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           luminanceReadbackBuffer.buffer, 1, &readback);
+
+    // Back to where the chain's passes expect to find it, so the next frame's barrier is the one
+    // the post-process path already emits rather than one derived from a transfer layout.
+    transitionTrackedLevel(frame.commandBuffer, imageId, level, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Same arithmetic as retire(): the copy is a command in a frame that has not been submitted, so
+    // the buffer holds this reading only once that submission has completed.
+    luminanceReadbackOwner = imageId;
+    luminanceReadbackReadyAt = submittedFrames + framesInFlight + 1;
+}
+
+void VulkanRenderer::recordProbeCapture(Scene& scene, LightProbe& probe)
+{
+    if (!frameOpen || probePrefilterPipeline == VK_NULL_HANDLE)
+    {
+        diagnostics.record(FrameDiagnostic::ProbeCaptureSkipped,
+                           [] { return std::string("no open frame or no prefilter pipeline"); });
+
+        // Ready with no slice contributes nothing and stops the scheduler retrying every frame;
+        // the diagnostic is what says the probe is dark rather than merely uninteresting.
+        probe.state = LightProbeState::Ready;
+        return;
+    }
+
+    if (!probe.arraySlice.has_value())
+    {
+        if (probeSlicesUsed >= maxIblProbes)
+        {
+            diagnostics.record(FrameDiagnostic::ProbeLimitExceeded, [&] { return "probe '" + probe.name + "'"; });
+
+            probe.state = LightProbeState::Ready;
+            return;
+        }
+
+        probe.arraySlice = probeSlicesUsed++;
+    }
+
+    // Waiting on the readback that the last call queued. It is the *only* thing this call does,
+    // because there is nothing else this probe needs: the specular chain is already in the array
+    // and the frame is already shading from it. What is missing is the diffuse half.
+    if (probe.state == LightProbeState::Projecting)
+    {
+        if (probeReadbackReadyAt > submittedFrames)
+        {
+            return;
+        }
+
+        probeIrradiance[probe.arraySlice.value()] = projectProbeIrradiance();
+        probe.irradiance = probeIrradiance[probe.arraySlice.value()];
+        probe.state = LightProbeState::Ready;
+
+        // Once per probe rather than once per process: a probe's mean irradiance is the one number
+        // that says the capture saw anything at all, and a scene where one probe is dark and the
+        // rest are not is the case worth being able to read straight off the log. Re-captures are
+        // silent — a time-of-day change would otherwise print the whole graph every few seconds.
+        if (!probe.captureLogged)
+        {
+            // Upwards, because that is the direction most of a scene's surfaces face and so the
+            // one whose value can be read straight off against what the sky looks like.
+            const auto upward = evaluateShIrradiance(probe.irradiance, glm::vec3(0.0f, 1.0f, 0.0f));
+            logger.info("Light probe '{}' captured into slice {}: six faces, {} roughness levels prefiltered, "
+                        "irradiance facing up {:.3f} {:.3f} {:.3f}",
+                        probe.name, probe.arraySlice.value(), probeSpecularMipCount, upward.r, upward.g, upward.b);
+            probe.captureLogged = true;
+        }
+
+        return;
+    }
+
+    if (probe.captureFace < 6)
+    {
+        recordProbeFace(scene, probe, probe.captureFace, 0.0f);
+        probe.captureFace++;
+        probe.state = LightProbeState::Capturing;
+        return;
+    }
+
+    if (!recordProbePrefilter(probe))
+    {
+        probe.state = LightProbeState::Ready;
+        return;
+    }
+
+    // Same arithmetic as retire(): the copy is a command in a frame that has not been submitted
+    // yet, so the buffer holds this capture's radiance only once that submission has completed.
+    probeReadbackReadyAt = submittedFrames + framesInFlight + 1;
+    probe.captureFace = 0;
+    probe.state = LightProbeState::Projecting;
+}
+
+void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, const unsigned int face, const float delta)
+{
+    auto& frame = frames[frameIndex];
+
+    // The six views, and the one place their handedness is decided.
+    //
+    // A cube map's faces are stored left-handed relative to the world — the legacy every graphics
+    // API carries — so a face rendered with the scene pass's usual negative-viewport flip comes
+    // out mirrored. The flip is dropped here instead: with Vulkan's native downward viewport, the
+    // texel row a face stores first is the row clip y = -1 rasterises to, and these six
+    // right-handed bases put the correct direction under it. The up vectors look wrong and are
+    // not; they are what makes cross(forward, up) point where the face's +s axis has to.
+    static constexpr std::array<glm::vec3, 6> faceForward = {glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(-1.0f, 0.0f, 0.0f),
+                                                             glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f),
+                                                             glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, -1.0f)};
+    static constexpr std::array<glm::vec3, 6> faceUp = {glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f),
+                                                        glm::vec3(0.0f, 0.0f, 1.0f),  glm::vec3(0.0f, 0.0f, -1.0f),
+                                                        glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f)};
+
+    // A camera, on the stack, because that is all a view is to everything below: recordDraw reads
+    // two matrices off it and the frame block reads a position. Building one here rather than
+    // putting six per probe into Scene::cameras keeps them out of every walk over that container
+    // — and out of a game's reach, which is right, since nothing about a cube face is authored.
+    Camera camera{};
+    camera.role = CameraRole::ProbeFace;
+    camera.position = probe.position;
+    camera.nearClippingPlane = probe.nearClippingPlane;
+    camera.farClippingPlane = probe.farClippingPlane;
+    camera.tracksWindowSize = false;
+    camera.modelViewMatrix = glm::lookAt(probe.position, probe.position + faceForward[face], faceUp[face]);
+    // Ninety degrees, square: six of them tile the sphere exactly, which is what a cube map is.
+    camera.modelViewProjectionMatrix =
+        glm::perspective(glm::radians(90.0f), 1.0f, probe.nearClippingPlane, probe.farClippingPlane) *
+        camera.modelViewMatrix;
+
+    FrameDataUbo frameData{};
+    frameData.viewMatrix = camera.modelViewMatrix;
+    frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
+
+    auto uploadedLights = 0u;
+    for (const auto& light : scene.lights)
+    {
+        if (uploadedLights >= maxLights)
+        {
+            break;
+        }
+
+        frameData.lights[uploadedLights] =
+            LightUbo{glm::vec4(light.position, 1.0f), glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
+                     glm::vec4(light.ambient, light.attenuation)};
+        uploadedLights++;
+    }
+    frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
+
+    // The capture is shaded, cascades and all: a probe that recorded the world unshadowed would
+    // put the sun's full radiance into the very shadow the direct term just removed, which is the
+    // defect this whole path exists to fix, reintroduced one level down.
+    // White for the occlusion beside them: a probe records the world's indirect light, and screen
+    // space has no answer for a face pointing somewhere the screen never looked.
+    const auto cascadeImages = shadowCascadeImages(scene);
+    auto shadowDescriptors =
+        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture()) : VK_NULL_HANDLE;
+
+    if (shadowDescriptors != VK_NULL_HANDLE)
+    {
+        const auto correction = shadowLookupCorrection();
+
+        for (auto cascade = 0u; cascade < shadowCascadeCount; cascade++)
+        {
+            const auto& slice = scene.shadows.cascades[cascade];
+            const auto index = static_cast<int>(cascade);
+            frameData.shadowMatrices[cascade] = correction * slice.camera->modelViewProjectionMatrix;
+            frameData.shadowSplits[index] = slice.splitDistance;
+            frameData.shadowTexelWorldSize[index] = slice.texelWorldSize;
+            frameData.shadowDepthScale[index] = slice.depthPerWorldUnit;
+        }
+
+        frameData.shadowParams =
+            glm::ivec4(static_cast<int>(shadowCascadeCount), static_cast<int>(scene.shadows.lightIndex), 0, 0);
+    }
+    else
+    {
+        shadowDescriptors = fallbackShadowSet();
+    }
+
+    // Set after the branch above and not inside it, because it is a fact about this view rather
+    // than about its cascades: a capture with no shadow maps still must not photograph the sun.
+    //
+    // What it turns off is the solar disc in the sky (see SkyboxFragmentShader). The disc is the
+    // scene light stated as a radiance — the same sun the direct term already delivers — so a
+    // capture that keeps it hands the surface its sun twice, and the aureole around it stays
+    // because that glow is scattered light and genuinely belongs to the sky. The double count is
+    // small in the mean and badly behaved in the tail: a face is 128 pixels across ninety degrees,
+    // so a texel is 0.70° against the disc's 0.53°, and whether the sun lands in a texel centre is
+    // a lottery that a capture would re-run every time the light moved.
+    frameData.shadowParams.z = 1;
+
+    // probeParams stays zero. A capture must not shade from probes — including from itself: a
+    // probe that read the array it is about to write would feed its own previous answer back in
+    // every capture, and the scene would brighten without bound.
+
+    const auto frameDataSlot = allocateFrameDataSlot();
+    if (!frameDataSlot.has_value())
+    {
+        return;
+    }
+
+    frame.frameDataOffset = frameDataSlot.value();
+    std::memcpy(static_cast<char*>(frame.frameDataMapped) + frame.frameDataOffset, &frameData, sizeof(frameData));
+
+    transitionTracked(frame.commandBuffer, probeRadianceImageId, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    transitionTracked(frame.commandBuffer, probeDepthImageId, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+
+    const VkExtent2D extent{probeCubeResolution, probeCubeResolution};
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = probeRadianceFaceViews[face];
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color =
+        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
+
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView = imageResources.at(probeDepthImageId).view;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, extent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+
+    // Positive height, unlike every other pass this backend records — see the basis table above.
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{VkOffset2D{0, 0}, extent};
+    vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+    static_cast<void>(recordSceneDraws(scene, camera, delta, true, true, 0,
+                                       imageResources.at(probeRadianceImageId).format,
+                                       imageResources.at(probeDepthImageId).format, shadowDescriptors));
+
+    vkCmdEndRendering(frame.commandBuffer);
+}
+
+bool VulkanRenderer::recordProbePrefilter(const LightProbe& probe)
+{
+    auto& frame = frames[frameIndex];
+    const auto slice = probe.arraySlice.value();
+
+    // The scratch cube's mip chain, by blit. The prefilter picks a source mip from the solid
+    // angle each of its samples covers: without the chain every sample reads the top mip, and a
+    // small bright feature — the sun, a window — survives 64 samples as a firefly instead of
+    // spreading into the lobe that was supposed to blur it.
+    //
+    // The layout bookkeeping below is per *mip*. Each level is written as a blit destination and
+    // then read as the next one's source, so mid-chain the image holds two layouts at once and one
+    // tracked layout for the whole image would be a lie about half of it. This used to be done by
+    // hand here, because it was the only place it happened; the tracking is per level now — see
+    // ImageResource — so the chain says what it is doing through the same call everything else
+    // does, and the fix-up that used to reunify the image afterwards is gone with it.
+    const auto radianceImage = imageResources.at(probeRadianceImageId).image;
+
+    transitionTracked(frame.commandBuffer, probeRadianceImageId, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    for (auto mip = 1u; mip < probeSpecularMipCount; mip++)
+    {
+        const auto sourceExtent = static_cast<int32_t>(probeCubeResolution >> (mip - 1));
+        const auto targetExtent = static_cast<int32_t>(probeCubeResolution >> mip);
+
+        transitionTrackedLevel(frame.commandBuffer, probeRadianceImageId, mip - 1,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, 0, 6};
+        blit.srcOffsets[1] = VkOffset3D{sourceExtent, sourceExtent, 1};
+        blit.dstSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 6};
+        blit.dstOffsets[1] = VkOffset3D{targetExtent, targetExtent, 1};
+
+        vkCmdBlitImage(frame.commandBuffer, radianceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, radianceImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+
+    // The last level was written and never read, so it is the one still in the destination layout.
+    // Moving it brings the whole image back to one layout, which is what makes the whole-image
+    // transitions below a single barrier again.
+    transitionTrackedLevel(frame.commandBuffer, probeRadianceImageId, probeSpecularMipCount - 1,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    // The irradiance projection's source: one small mip of one cube, which the CPU projects onto
+    // the harmonic basis a couple of frames from now. Its read is ordered against the blit that
+    // wrote it by that level's own destination-to-source barrier above — which is why the mip has
+    // to be one the chain reads from rather than the last one it writes.
+    static_assert(probeIrradianceSourceMip + 1 < probeSpecularMipCount);
+    const auto readbackExtent = probeCubeResolution >> probeIrradianceSourceMip;
+
+    VkBufferImageCopy readback{};
+    readback.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, probeIrradianceSourceMip, 0, 6};
+    readback.imageExtent = VkExtent3D{readbackExtent, readbackExtent, 1};
+    vkCmdCopyImageToBuffer(frame.commandBuffer, radianceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           probeReadbackBuffer.buffer, 1, &readback);
+
+    transitionTracked(frame.commandBuffer, probeRadianceImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transitionTracked(frame.commandBuffer, probeSpecularImageId, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, probePrefilterPipeline);
+    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, probePrefilterPipelineLayout, 0, 1,
+                            &probeRadianceSet, 0, nullptr);
+
+    for (auto mip = 0u; mip < probeSpecularMipCount; mip++)
+    {
+        const auto extent = probeCubeResolution >> mip;
+        // Mip 0 is the mirror: roughness zero, which the shader's importance sampling collapses to
+        // a single fetch along the reflection vector. The chain then walks to fully rough at the
+        // last level, and the shading side inverts exactly this mapping to pick its LOD.
+        const auto roughness = static_cast<float>(mip) / static_cast<float>(probeSpecularMipCount - 1);
+
+        for (auto face = 0u; face < 6u; face++)
+        {
+            const auto viewIndex = (static_cast<size_t>(slice) * probeSpecularMipCount + mip) * 6u + face;
+
+            VkRenderingAttachmentInfo colorAttachment{};
+            colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            colorAttachment.imageView = probeSpecularFaceViews[viewIndex];
+            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo renderingInfo{};
+            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, VkExtent2D{extent, extent}};
+            renderingInfo.layerCount = 1;
+            renderingInfo.colorAttachmentCount = 1;
+            renderingInfo.pColorAttachments = &colorAttachment;
+
+            vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+
+            // Positive height for the same reason the capture uses one: the shader derives its
+            // direction from gl_FragCoord, so framebuffer row 0 has to be the face's first texel
+            // row exactly as it was when the capture wrote it.
+            VkViewport viewport{};
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = static_cast<float>(extent);
+            viewport.height = static_cast<float>(extent);
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+            const VkRect2D scissor{VkOffset2D{0, 0}, VkExtent2D{extent, extent}};
+            vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+            const auto pushConstants = glm::vec4(roughness, static_cast<float>(face), static_cast<float>(extent),
+                                                 static_cast<float>(probeCubeResolution));
+            vkCmdPushConstants(frame.commandBuffer, probePrefilterPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(pushConstants), &pushConstants);
+
+            vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
+            vkCmdEndRendering(frame.commandBuffer);
+        }
+    }
+
+    transitionTracked(frame.commandBuffer, probeSpecularImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return true;
+}
+
+ShIrradiance VulkanRenderer::projectProbeIrradiance() const
+{
+    const auto extent = probeCubeResolution >> probeIrradianceSourceMip;
+    const auto texelsPerFace = static_cast<size_t>(extent) * extent;
+
+    if (probeReadbackMapped == nullptr)
+    {
+        return ShIrradiance{};
+    }
+
+    // R16G16B16A16_SFLOAT, tightly packed by vkCmdCopyImageToBuffer: face-major, four halves per
+    // texel. Decoded rather than blitted into a float image because the decode is exact, testable
+    // and about twenty lines, where the blit would be another image and another barrier.
+    const auto* halves = static_cast<const uint16_t*>(probeReadbackMapped);
+
+    std::array<std::vector<glm::vec3>, 6> storage;
+    std::array<std::span<const glm::vec3>, 6> faces{};
+
+    for (auto face = 0u; face < 6u; face++)
+    {
+        storage[face].reserve(texelsPerFace);
+
+        for (size_t texel = 0; texel < texelsPerFace; texel++)
+        {
+            const auto base = (static_cast<size_t>(face) * texelsPerFace + texel) * 4;
+            storage[face].emplace_back(halfToFloat(halves[base]), halfToFloat(halves[base + 1]),
+                                       halfToFloat(halves[base + 2]));
+        }
+
+        faces[face] = std::span<const glm::vec3>(storage[face]);
+    }
+
+    return projectCubeToIrradiance(std::span<const std::span<const glm::vec3>, 6>(faces), extent);
+}
+
+void VulkanRenderer::uploadProbes(const Scene& scene, FrameDataUbo& frameData) const
+{
+    auto uploaded = 0u;
+
+    for (const auto& probe : scene.probes)
+    {
+        // A probe with no slice never captured — the array was full — and one that has not
+        // reached Ready holds either nothing or a partial environment. Neither may shade: a
+        // half-captured probe lights the world from whichever faces happened to finish.
+        if (uploaded >= maxIblProbes || !probe.arraySlice.has_value() || probe.state == LightProbeState::Capturing)
+        {
+            continue;
+        }
+
+        auto& target = frameData.probes[uploaded];
+        target.irradiance = probe.irradiance;
+        target.boxMin = glm::vec4(probe.position - probe.halfExtents, probe.blendDistance);
+        target.boxMax = glm::vec4(probe.position + probe.halfExtents, probe.global ? 1.0f : 0.0f);
+        target.position = glm::vec4(probe.position, static_cast<float>(probe.arraySlice.value()));
+        uploaded++;
+    }
+
+    frameData.probeParams = glm::ivec4(static_cast<int>(uploaded), 0, 0, 0);
+}
+
+bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBinding> inputs,
+                                          const unsigned int lookupTableImageId,
+                                          const VkImageView targetView, const VkExtent2D targetExtent,
+                                          const VkPipeline pipeline, const FullscreenPushConstants& parameters)
+{
+    const auto set = attachmentSet(inputs, lookupTableImageId);
     if (set == VK_NULL_HANDLE)
     {
         // attachmentSet counted the pool exhaustion if that is what it was; an unknown image id
@@ -2837,7 +4421,6 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     }
 
     auto& frame = frames[frameIndex];
-    transitionTracked(frame.commandBuffer, sourceImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2876,6 +4459,13 @@ bool VulkanRenderer::recordFullScreenPass(const unsigned int sourceImageId, cons
     vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullscreenPipelineLayout, 0, 1, &set,
                             0, nullptr);
+
+    // Pushed for every fullscreen pass, read by the ones that tone map or walk a chain. A shader
+    // that does not declare the block simply does not see it; the range belongs to the layout, not
+    // the pipeline.
+    vkCmdPushConstants(frame.commandBuffer, fullscreenPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(parameters), &parameters);
+
     vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
 
     vkCmdEndRendering(frame.commandBuffer);
@@ -3144,7 +4734,7 @@ std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture
             // Any channel count at any of the three source precisions uploads (createSampledImage
             // expands it the way GL's driver does); only a payload that cannot describe the image
             // is rejected.
-            const auto texelCount = static_cast<size_t>(texture.width) * texture.height;
+            const auto texelCount = static_cast<size_t>(texture.width) * texture.height * std::max(texture.depth, 1u);
             const auto sourceBytes = texelCount * static_cast<size_t>(channelCount(texture.format)) *
                                      pixelComponentBytes(texture.pixelDataType);
             if (texelCount == 0 || channelCount(texture.format) == 0 || texture.data.size() < sourceBytes)
@@ -3161,8 +4751,12 @@ std::optional<unsigned int> VulkanRenderer::uploadTexture(const Resource<Texture
                 return;
             }
 
+            // A depth above one is a colour lookup table, and everything about its image differs
+            // from a picture's: three dimensions, no mip chain (a grade is interpolated, never
+            // minified) and a sampler that clamps rather than repeats, because the table's edges
+            // *are* black and white and a wrapped sample there would return the opposite corner.
             const std::array faces = {&std::as_const(texture)};
-            const auto id = createSampledImage(faces, false);
+            const auto id = texture.depth > 1 ? createVolumeImage(texture) : createSampledImage(faces, false);
             texture.gpuResourceId = id;
             uploadedId = id;
 
@@ -3216,6 +4810,34 @@ unsigned int VulkanRenderer::dummyTexture()
     const std::array faces = {&texture};
     dummyTextureId = createSampledImage(faces, false);
     return dummyTextureId;
+}
+
+// The identity grade, as a two-cube: it interpolates to exactly the input everywhere, so a pass
+// bound to it is a pass with no grade at all. Built here rather than shipped as a file because a
+// neutral table is a definition, not an asset, and one the engine can state itself cannot go
+// missing or arrive subtly wrong.
+unsigned int VulkanRenderer::neutralLookupTable()
+{
+    if (neutralLookupTableId != 0)
+    {
+        return neutralLookupTableId;
+    }
+
+    const auto identity = identityLookupTable(neutralLookupTableSize);
+
+    auto texture = Texture{.name = "vulkan neutral colour grade",
+                           .format = TextureFormat::RGB,
+                           .pixelDataType = PixelDataType::Float,
+                           .width = identity.size,
+                           .height = identity.size,
+                           .depth = identity.size,
+                           .bitsPerPixel = 96,
+                           .data = {}};
+    texture.data.resize(identity.entries.size() * sizeof(float));
+    std::memcpy(texture.data.data(), identity.entries.data(), texture.data.size());
+
+    neutralLookupTableId = createVolumeImage(texture);
+    return neutralLookupTableId;
 }
 
 unsigned int VulkanRenderer::dummyCubeMap()
@@ -3298,9 +4920,16 @@ unsigned int VulkanRenderer::dummyShadowMap()
     ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
     dummyShadowMapId = nextResourceId++;
-    imageResources.emplace(dummyShadowMapId,
-                           ImageResource{image, allocation, view, createComparisonSampler(format), format, 1, 1, 1,
-                                         VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    imageResources.emplace(dummyShadowMapId, ImageResource{.image = image,
+                                                           .allocation = allocation,
+                                                           .view = view,
+                                                           .sampler = createComparisonSampler(format),
+                                                           .format = format,
+                                                           .width = 1,
+                                                           .height = 1,
+                                                           .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                                                           .layouts = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                                           .levelViews = {}});
 
     return dummyShadowMapId;
 }
@@ -3314,19 +4943,21 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 
     std::array<unsigned int, shadowCascadeCount> images{};
     images.fill(dummyShadowMap());
-    dummyShadowSet = shadowSet(images);
+    dummyShadowSet = shadowSet(images, dummyTexture());
 
     return dummyShadowSet;
 }
 
-// Keyed by the whole tuple of depth image ids, so a rebuilt cascade target gets a new set rather
-// than a stale view. Linear scan over a list that holds one entry in a running game, and the one
-// the fallback added.
-VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds)
+// Keyed by the whole tuple of depth image ids and the occlusion image beside them, so a rebuilt
+// cascade target — or a view that gathers occlusion sharing the frame with one that does not — gets
+// a set of its own rather than a stale view. Linear scan over a list that holds one entry per view
+// in a running game, and the one the fallback added.
+VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
+                                          const unsigned int occlusionImageId)
 {
     for (const auto& [key, set] : shadowSets)
     {
-        if (key == imageIds)
+        if (key.first == imageIds && key.second == occlusionImageId)
         {
             return set;
         }
@@ -3363,20 +4994,43 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
         return VK_NULL_HANDLE;
     }
 
-    // One write covering the binding's whole array: the cascades are consecutive elements of a
-    // single binding, so imageInfos is handed over in one go rather than a write per cascade.
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = set;
-    write.dstBinding = shadowMapBinding(GraphicsApi::Vulkan);
-    write.dstArrayElement = 0;
-    write.descriptorCount = shadowCascadeCount;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = imageInfos.data();
+    // The occlusion image beside them, which is a plain sampled image where the cascades are
+    // comparison samplers — so it takes the shared attachment sampler, and a view that gathers no
+    // occlusion arrives here with the 1x1 white one, which reads as "nothing is in the way".
+    const auto occlusionImage = imageResources.find(occlusionImageId);
+    if (occlusionImage == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
 
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    const VkDescriptorImageInfo occlusionInfo{occlusionImage->second.sampler != VK_NULL_HANDLE
+                                                  ? occlusionImage->second.sampler
+                                                  : attachmentSampler,
+                                              occlusionImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-    shadowSets.emplace_back(imageIds, set);
+    // One write covering the cascade binding's whole array: they are consecutive elements of a
+    // single binding, so imageInfos is handed over in one go rather than a write per cascade. The
+    // occlusion is a second binding and therefore a second write.
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = shadowMapBinding;
+    writes[0].dstArrayElement = 0;
+    writes[0].descriptorCount = shadowCascadeCount;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = set;
+    writes[1].dstBinding = ambientOcclusionBinding;
+    writes[1].dstArrayElement = 0;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &occlusionInfo;
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+    shadowSets.emplace_back(std::pair{imageIds, occlusionImageId}, set);
 
     return set;
 }
@@ -3523,7 +5177,7 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 
         writes[slot + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[slot + 1].dstSet = set;
-        writes[slot + 1].dstBinding = textureBinding(static_cast<MaterialTextureSlot>(slot), GraphicsApi::Vulkan);
+        writes[slot + 1].dstBinding = textureBinding(static_cast<MaterialTextureSlot>(slot));
         writes[slot + 1].descriptorCount = 1;
         writes[slot + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[slot + 1].pImageInfo = &imageInfos[slot];
@@ -3534,18 +5188,37 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     return set;
 }
 
-VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
+VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessBinding> inputs,
+                                             const unsigned int lookupTableImageId)
 {
-    const auto cached = attachmentSets.find(imageId);
-    if (cached != attachmentSets.end())
+    // Resolved before any reference into imageResources is taken: creating the fallback inserts
+    // into that map, and the padding below names it.
+    const auto fallback = PostProcessBinding{.gpuResourceId = dummyTexture(), .level = 0};
+    const auto bindings = postProcessBindings(inputs, fallback);
+
+    for (const auto& [key, set] : attachmentSets)
     {
-        return cached->second;
+        if (key.first == bindings && key.second == lookupTableImageId)
+        {
+            return set;
+        }
     }
 
-    const auto image = imageResources.find(imageId);
-    if (image == imageResources.end())
+    std::array<VkDescriptorImageInfo, postProcessInputCount> imageInfos{};
+    for (auto slot = 0u; slot < postProcessInputCount; slot++)
     {
-        return VK_NULL_HANDLE;
+        const auto image = imageResources.find(bindings[slot].gpuResourceId);
+        if (image == imageResources.end())
+        {
+            // A named image that is not there leaves an element of the array unwritten, and an
+            // unwritten element is exactly what the pipeline's static use of the array would fault
+            // on. The pass records nothing instead.
+            return VK_NULL_HANDLE;
+        }
+
+        imageInfos[slot] = VkDescriptorImageInfo{
+            image->second.sampler != VK_NULL_HANDLE ? image->second.sampler : attachmentSampler,
+            levelView(image->second, bindings[slot].level), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     }
 
     VkDescriptorSetAllocateInfo setAllocateInfo{};
@@ -3563,37 +5236,56 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const unsigned int imageId)
         return VK_NULL_HANDLE;
     }
 
-    const VkDescriptorImageInfo imageInfo{image->second.sampler != VK_NULL_HANDLE ? image->second.sampler
-                                                                                  : attachmentSampler,
-                                          image->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const auto grade = imageResources.find(lookupTableImageId);
+    if (grade == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
 
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = set;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imageInfo;
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    const VkDescriptorImageInfo gradeInfo{grade->second.sampler, grade->second.view,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-    attachmentSets.emplace(imageId, set);
+    // One write covering the input binding's whole array, as the cascades are written: the inputs
+    // are consecutive elements of a single binding. The grade is a second binding and a second
+    // write.
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = postProcessInputBinding;
+    writes[0].dstArrayElement = 0;
+    writes[0].descriptorCount = postProcessInputCount;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = set;
+    writes[1].dstBinding = lookupTableBinding;
+    writes[1].dstArrayElement = 0;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &gradeInfo;
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+    attachmentSets.emplace_back(std::pair{bindings, lookupTableImageId}, set);
     return set;
 }
 
 const VulkanRenderer::ResolvedPipeline*
 VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding, const VkCullModeFlags cullMode,
-                              const VkFormat colorFormat, const VkFormat depthFormat)
+                              const VkFormat colorFormat, const VkFormat depthFormat, const bool blend)
 {
     // The whole of what a pipeline's identity adds to the primitive's own vertex input: the
-    // shader, the cull mode its material asked for, and the two formats of the target it is drawn
-    // into. The shader has to be in the key because a view may override it — a shadow cascade
-    // draws the same primitives through a depth-only shader — and the buffer list cached with the
-    // entry is the shader's, not the primitive's. A failed build is not retried: the miss below
-    // caches a VK_NULL_HANDLE pipeline too.
+    // shader, the cull mode its material asked for, the two formats of the target it is drawn
+    // into, and whether its alpha is a coverage. The shader has to be in the key because a view may
+    // override it — a shadow cascade draws the same primitives through a depth-only shader — and
+    // the buffer list cached with the entry is the shader's, not the primitive's. A failed build is
+    // not retried: the miss below caches a VK_NULL_HANDLE pipeline too.
     const auto matches = [&](const ResolvedPipeline& candidate)
     {
         return candidate.shaderId == shaderId && candidate.cullMode == cullMode &&
-               candidate.colorFormat == colorFormat && candidate.depthFormat == depthFormat;
+               candidate.colorFormat == colorFormat && candidate.depthFormat == depthFormat &&
+               candidate.blend == blend;
     };
 
     if (const auto resolved = std::ranges::find_if(binding.pipelines, matches); resolved != binding.pipelines.end())
@@ -3605,6 +5297,7 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
                            .cullMode = cullMode,
                            .colorFormat = colorFormat,
                            .depthFormat = depthFormat,
+                           .blend = blend,
                            .pipeline = VK_NULL_HANDLE,
                            .boundBuffers = {},
                            .boundOffsets = {}};
@@ -3671,7 +5364,8 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     const auto key = std::to_string(shaderId) + "|" + std::to_string(cullMode) + "|" +
                      std::to_string(static_cast<int>(binding.topology)) + "|" +
                      std::to_string(static_cast<int>(colorFormat)) + "+" +
-                     std::to_string(static_cast<int>(depthFormat)) + "|" + binding.signature;
+                     std::to_string(static_cast<int>(depthFormat)) + "|" + (blend ? "blend" : "opaque") + "|" +
+                     binding.signature;
     if (const auto cachedPipeline = scenePipelines.find(key); cachedPipeline != scenePipelines.end())
     {
         entry.pipeline = cachedPipeline->second;
@@ -3732,8 +5426,16 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     depthStencil.maxDepthBounds = 1.0f;
 
     // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled.
+    //
+    // Off for a pass that writes *data* rather than colour, which is what `blend` distinguishes.
+    // The distinction had no reason to exist while every scene pass wrote a colour whose alpha was
+    // a coverage between zero and one; the occlusion prepass writes a distance there, and blending
+    // by it multiplies the normal by a few hundred and drives the stored alpha to plus and then
+    // minus infinity as fragments land on top of each other. What that produces is not obviously
+    // broken: it is a buffer that reads as geometry on the triangles one fragment covered and as
+    // empty sky on the triangles two did.
     VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.blendEnable = VK_TRUE;
+    blendAttachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
     blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
     blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
@@ -3892,10 +5594,16 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     // reports the mismatch on every pipeline built from the pair.
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
-    // Every Vulkan source is compiled with the contract macros predefined, so no shader
-    // spells a set index, a binding, an attribute location or an array bound that C++ also
-    // holds. The GL path splices the same list in as text (withShaderContractMacros).
-    for (const auto& macro : shaderContractMacros(GraphicsApi::Vulkan))
+    // Every source is compiled with the contract macros predefined, so no shader spells a set
+    // index, a binding, an attribute location or an array bound that C++ also holds.
+    for (const auto& macro : shaderContractMacros())
+    {
+        options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
+    }
+
+    // The same list for the contract's non-integer numbers. std::to_string writes six decimal
+    // places, which is more than enough for a decimal literal to round back to the same float.
+    for (const auto& macro : shaderContractFloatMacros())
     {
         options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
     }
@@ -4025,28 +5733,24 @@ std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(cons
 {
     try
     {
-        if (shaderDescriptor.vulkanVertexShaderSource.empty() || shaderDescriptor.vulkanFragmentShaderSource.empty())
+        if (shaderDescriptor.vertexShaderSource.empty() || shaderDescriptor.fragmentShaderSource.empty())
         {
-            // Expected per vulkan-abi.md: a descriptor without the Vulkan dialect cannot
-            // produce a shader object on this backend.
-            return std::unexpected("the shader descriptor carries no vulkanVertexShaderSource and/or "
-                                   "vulkanFragmentShaderSource, which this backend cannot substitute");
+            return std::unexpected("the shader descriptor carries no vertexShaderSource and/or "
+                                   "fragmentShaderSource, which this backend cannot substitute");
         }
 
         const auto vertexSpirv =
-            compileToSpirv(shaderDescriptor.vulkanVertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
+            compileToSpirv(shaderDescriptor.vertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
         if (!vertexSpirv)
         {
-            return std::unexpected("the Vulkan-dialect vertex source did not compile to SPIR-V: " +
-                                   vertexSpirv.error());
+            return std::unexpected("the vertex source did not compile to SPIR-V: " + vertexSpirv.error());
         }
 
         const auto fragmentSpirv =
-            compileToSpirv(shaderDescriptor.vulkanFragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
+            compileToSpirv(shaderDescriptor.fragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
         if (!fragmentSpirv)
         {
-            return std::unexpected("the Vulkan-dialect fragment source did not compile to SPIR-V: " +
-                                   fragmentSpirv.error());
+            return std::unexpected("the fragment source did not compile to SPIR-V: " + fragmentSpirv.error());
         }
 
         ShaderObject shaderObject;
@@ -4120,6 +5824,138 @@ void VulkanRenderer::finishUploadCommands(const VkCommandBuffer commandBuffer) c
     vkFreeCommandBuffers(device, uploadCommandPool, 1, &commandBuffer);
 }
 
+// A colour grade's image. Three dimensions, one mip and a clamping sampler, and the three of those
+// are the whole reason it is not the function below: a grade is sampled at one level forever (a
+// minified grade is a different grade), and its edges hold black and white, where a repeating
+// address mode would fetch the opposite corner of the cube and put white in the shadows.
+unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
+{
+    // Four channels, float, because the table is authored in float and the padding rule is GL's:
+    // a source with three components gets zero in the fourth and this one gets one, which nothing
+    // reads.
+    const auto texelCount = static_cast<size_t>(texture.width) * texture.height * texture.depth;
+    const auto sourceChannels = static_cast<size_t>(channelCount(texture.format));
+    constexpr auto componentBytes = sizeof(float);
+    const auto uploadBytes = static_cast<VkDeviceSize>(texelCount * 4 * componentBytes);
+
+    if (sourceChannels == 0 || texture.data.size() < texelCount * sourceChannels * componentBytes)
+    {
+        throw std::runtime_error("colour grade source has no usable payload");
+    }
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_3D;
+    imageInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imageInfo.extent = VkExtent3D{texture.width, texture.height, texture.depth};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo imageAllocationInfo{};
+    imageAllocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation imageAllocation = nullptr;
+    ensure(vmaCreateImage(allocator, &imageInfo, &imageAllocationInfo, &image, &imageAllocation, nullptr),
+           "vmaCreateImage");
+
+    VkBufferCreateInfo stagingInfo{};
+    stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingInfo.size = uploadBytes;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo stagingAllocationCreateInfo{};
+    stagingAllocationCreateInfo.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    stagingAllocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingAllocation = nullptr;
+    VmaAllocationInfo stagingAllocationInfo{};
+    ensure(vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocationCreateInfo, &stagingBuffer, &stagingAllocation,
+                           &stagingAllocationInfo),
+           "vmaCreateBuffer");
+
+    auto* destination = static_cast<float*>(stagingAllocationInfo.pMappedData);
+    const auto* source = reinterpret_cast<const float*>(texture.data.data());
+    for (size_t texel = 0; texel < texelCount; texel++)
+    {
+        for (size_t channel = 0; channel < 3; channel++)
+        {
+            destination[texel * 4 + channel] =
+                channel < sourceChannels ? source[texel * sourceChannels + channel] : 0.0f;
+        }
+
+        destination[texel * 4 + 3] = 1.0f;
+    }
+    ensure(vmaFlushAllocation(allocator, stagingAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+
+    const auto commandBuffer = beginUploadCommands();
+    const VkImageSubresourceRange whole{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, whole);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = VkExtent3D{texture.width, texture.height, texture.depth};
+    vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    whole);
+
+    finishUploadCommands(commandBuffer);
+    vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = imageInfo.format;
+    viewInfo.subresourceRange = whole;
+
+    VkImageView view = VK_NULL_HANDLE;
+    ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 0.0f;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
+
+    const auto id = nextResourceId++;
+    imageResources.emplace(id, ImageResource{.image = image,
+                                             .allocation = imageAllocation,
+                                             .view = view,
+                                             .sampler = sampler,
+                                             .format = imageInfo.format,
+                                             .width = texture.width,
+                                             .height = texture.height,
+                                             .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                             .layouts = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                             .levelViews = {}});
+
+    logger.info("Vulkan colour grade {} uploaded: {} cube", id, texture.width);
+
+    return id;
+}
+
 unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* const> faces, const bool cube) const
 {
     const auto& first = *faces.front();
@@ -4134,7 +5970,7 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
         throw std::runtime_error("sampled image source has no known channel layout");
     }
 
-    const auto format = sampledImageFormat(first.pixelDataType);
+    const auto format = sampledImageFormat(first.pixelDataType, first.colourSpace);
     const auto texelBytes = static_cast<VkDeviceSize>(componentBytes * 4);
     const auto texelCount = static_cast<size_t>(width) * height;
     const auto faceBytes = static_cast<VkDeviceSize>(texelCount) * texelBytes;
@@ -4142,10 +5978,15 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
 
     for (const auto* face : faces)
     {
+        // Colour space joins the agreement check because one image carries every face: the
+        // sampler decodes for all six or for none, so a cube whose faces disagree has no
+        // representation rather than a merely inconvenient one.
         if (face->width != width || face->height != height || face->pixelDataType != first.pixelDataType ||
-            face->format != first.format || face->data.size() < sourceFaceBytes)
+            face->format != first.format || face->colourSpace != first.colourSpace ||
+            face->data.size() < sourceFaceBytes)
         {
-            throw std::runtime_error("sampled image sources disagree on size, pixel type or channel layout");
+            throw std::runtime_error("sampled image sources disagree on size, pixel type, channel layout or "
+                                     "colour space");
         }
     }
 
@@ -4349,8 +6190,18 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
 
     const auto id = nextResourceId++;
-    imageResources.emplace(id, ImageResource{image, imageAllocation, view, sampler, format, mipLevels, width, height,
-                                             VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    imageResources.emplace(
+        id, ImageResource{.image = image,
+                          .allocation = imageAllocation,
+                          .view = view,
+                          .sampler = sampler,
+                          .format = format,
+                          .mipLevels = mipLevels,
+                          .width = width,
+                          .height = height,
+                          .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                          .layouts = std::vector<VkImageLayout>(mipLevels, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+                          .levelViews = {}});
     return id;
 }
 
@@ -4421,23 +6272,37 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
 
     RetiredResource retired;
 
-    // The cached fullscreen set names this image's view, so it is recycled with the image and on
-    // the same schedule: a descriptor set a submitted command buffer bound may not be freed
-    // either. The pool carries FREE_DESCRIPTOR_SET for this.
-    const auto cachedSet = attachmentSets.find(id);
-    if (cachedSet != attachmentSets.end())
-    {
-        retired.descriptorSet = cachedSet->second;
-        attachmentSets.erase(cachedSet);
-    }
+    // A cached fullscreen set names up to postProcessInputCount views, so one destroyed image
+    // invalidates every set that mentions it — recycled with the image and on the same schedule,
+    // because a descriptor set a submitted command buffer bound may not be freed either. The pool
+    // carries FREE_DESCRIPTOR_SET for this.
+    std::erase_if(attachmentSets,
+                  [&](const auto& cached)
+                  {
+                      const auto names =
+                          std::ranges::any_of(cached.first.first, [&](const PostProcessBinding& binding)
+                                              { return binding.gpuResourceId == id; }) ||
+                          cached.first.second == id;
+                      if (!names)
+                      {
+                          return false;
+                      }
 
-    // A cascade set names up to shadowCascadeCount views, so one destroyed image invalidates every
-    // set that mentions it — on the same schedule and for the same reason as the fullscreen set
-    // above. The next frame that asks for a set with a live tuple builds a new one.
+                      RetiredResource retiredSet;
+                      retiredSet.descriptorSet = cached.second;
+                      retire(retiredSet);
+                      return true;
+                  });
+
+    // A cascade set names up to shadowCascadeCount views and the occlusion image beside them, so
+    // one destroyed image invalidates every set that mentions it — on the same schedule and for the
+    // same reason as the fullscreen set above. The next frame that asks for a set with a live tuple
+    // builds a new one.
     std::erase_if(shadowSets,
                   [&](const auto& entry)
                   {
-                      if (std::ranges::find(entry.first, id) == entry.first.end())
+                      if (std::ranges::find(entry.first.first, id) == entry.first.first.end() &&
+                          entry.first.second != id)
                       {
                           return false;
                       }
@@ -4455,6 +6320,18 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
                   });
 
     const auto& resource = entry->second;
+
+    // A chain's per-level views go on the same queue as everything else it owns: the frame that
+    // rendered through one of them may still be executing, so an eager vkDestroyImageView here is
+    // the same defect deferral exists to prevent. One entry each — RetiredResource carries a
+    // single object of each kind, which is what keeps collectRetiredResources a flat sweep.
+    for (const auto view : resource.levelViews)
+    {
+        RetiredResource retiredView;
+        retiredView.view = view;
+        retire(retiredView);
+    }
+
     retired.sampler = resource.sampler;
     retired.view = resource.view;
     retired.image = resource.image;
@@ -4486,8 +6363,14 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             VkImageAspectFlags aspect;
             switch (attachment.type)
             {
+            // TRANSFER_SRC beside the two that were always there: a colour attachment is also the
+            // thing the CPU occasionally needs one texel of, which is what the exposure meter's
+            // copy-back is. Stated for every colour target rather than only for a chain, because
+            // the usage a level of an image carries is the image's and a meter is not the last
+            // pass that will want to read one back.
             case FboAttachmentType::Color:
-                usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
                 aspect = VK_IMAGE_ASPECT_COLOR_BIT;
                 break;
             case FboAttachmentType::Depth:
@@ -4520,12 +6403,18 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             loggedWidth = width;
             loggedHeight = height;
 
+            // A chain no longer than the size supports, and at least one level: an attachment
+            // asking for more levels than halving can produce is asking for a subresource that
+            // cannot exist, and clamping is what the resize path needs anyway — a chain buffer
+            // rebuilt at a smaller window is shorter than the one it replaces.
+            const auto levels = std::clamp(attachment.levels, 1u, mipLevelCount(width, height));
+
             VkImageCreateInfo imageInfo{};
             imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             imageInfo.imageType = VK_IMAGE_TYPE_2D;
             imageInfo.format = format;
             imageInfo.extent = VkExtent3D{width, height, 1};
-            imageInfo.mipLevels = 1;
+            imageInfo.mipLevels = levels;
             imageInfo.arrayLayers = 1;
             imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
             imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -4546,7 +6435,7 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             viewInfo.image = image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
             viewInfo.format = format;
-            viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, 1, 0, 1};
+            viewInfo.subresourceRange = VkImageSubresourceRange{aspect, 0, levels, 0, 1};
 
             VkImageView view = VK_NULL_HANDLE;
             ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
@@ -4561,8 +6450,33 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             }
 
             const auto attachmentId = nextResourceId++;
-            imageResources.emplace(attachmentId, ImageResource{image, allocation, view, sampler, format, 1, width,
-                                                               height, aspect, VK_IMAGE_LAYOUT_UNDEFINED});
+            imageResources.emplace(
+                attachmentId, ImageResource{.image = image,
+                                            .allocation = allocation,
+                                            .view = view,
+                                            .sampler = sampler,
+                                            .format = format,
+                                            .mipLevels = levels,
+                                            .width = width,
+                                            .height = height,
+                                            .aspect = aspect,
+                                            .layouts = std::vector<VkImageLayout>(levels, VK_IMAGE_LAYOUT_UNDEFINED),
+                                            .levelViews = {}});
+
+            // A single-level attachment's whole-image view already is its level 0, so nothing is
+            // allocated for the case every camera and post-process target is. A chain gets one view
+            // per level, which is both what a pass renders through and what a descriptor names to
+            // read that level alone.
+            if (levels > 1)
+            {
+                auto& resource = imageResources.at(attachmentId);
+                resource.levelViews.reserve(levels);
+                for (auto level = 0u; level < levels; level++)
+                {
+                    resource.levelViews.push_back(createLevelView(attachmentId, level, 0));
+                }
+            }
+
             fboResource.attachmentIds.push_back(attachmentId);
 
             // Observable contract shared with GL: every attachment's id is written back
@@ -4831,7 +6745,8 @@ std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string&
 
             if (lastPresentPass.has_value())
             {
-                recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId);
+                recordPresentPass(lastPresentPass.value().shaderId, lastPresentPass.value().attachmentImageId,
+                                  lastPresentPass.value().parameters, lastPresentPass.value().lookupTableImageId);
             }
 
             presented = submitAndPresent(buffer);

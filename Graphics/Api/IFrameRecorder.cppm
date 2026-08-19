@@ -1,3 +1,9 @@
+module;
+
+// GMF-included because this interface *names* glm::vec4: reachability through another module's
+// interface is not visibility, which is the rule that makes a module unit state its own includes.
+#include <glm/glm.hpp>
+
 export module raceengine.graphics:IFrameRecorder;
 
 import raceengine.graphics.models;
@@ -34,9 +40,44 @@ public:
     // are independent of each other and of their order.
     virtual void recordView(Scene& scene, Camera& camera, float delta) = 0;
 
-    // The frame's last pass: `attachment` sampled through `shader` onto the backbuffer.
-    // Recording only — endFrame is what puts it on screen.
-    virtual void recordPresent(const Resource<Shader>& shader, const Resource<FboAttachment>& attachment) = 0;
+    // One step of a light probe's capture: draws the next face of `probe`'s environment, and,
+    // once the sixth has been drawn, prefilters the result and projects its irradiance. The
+    // probe's own state is what says which step this is, and the backend advances it.
+    //
+    // A step rather than a whole capture because six full scene passes in one frame is a hitch
+    // the eye sees, and because a probe is captured far more often than once: a time-of-day
+    // change invalidates every probe in the scene.
+    //
+    // Recorded before any Scene camera and after the cascades, for the reason CameraRole gives:
+    // a probe shades from the cascades, and the Scene cameras shade from the probe.
+    virtual void recordProbeCapture(Scene& scene, LightProbe& probe) = 0;
+
+    // The occlusion this camera is about to shade with: draws its view once more into the prepass
+    // buffer — view-space normals and depth, no shading, no sky — then runs the gather and the blur
+    // that turn that buffer into one visibility term per pixel.
+    //
+    // Recorded immediately *before* that camera's own recordView, which is the producer/consumer
+    // rule CameraRole states applied one more time: the shading pass samples the buffer this fills,
+    // and a consumer recorded first would read it before it was written. A camera with no occlusion
+    // enabled records nothing here and shades against the 1x1 white image the backend binds instead.
+    virtual void recordAmbientOcclusion(Scene& scene, Camera& camera, float delta) = 0;
+
+    // One step of a camera's exposure meter: copies the single texel its reduction chain was
+    // reduced into back towards the CPU, and collects the copy the last call queued once the
+    // submission carrying it has completed. The camera's own AutoExposure is where the collected
+    // reading lands, and it holds the previous one until then.
+    //
+    // Recorded immediately after that camera's own recordView, because the chain it copies from is
+    // the tail of that view's post-process passes and the copy has to be a command in the same
+    // frame. Deferred rather than waited on for the reason the light probe projection is: a fence
+    // taken in the middle of a frame is a stall, and the number is a frame or two stale either way.
+    virtual void recordAutoExposure(Camera& camera) = 0;
+
+    // The frame's last pass: the presenter's attachment sampled through its shader onto the
+    // backbuffer, with its own numbers and its colour grade. The whole Presenter rather than its
+    // parts because they travel together and a fourth loose argument is a fourth thing to keep in
+    // the same order at both ends. Recording only — endFrame is what puts it on screen.
+    virtual void recordPresent(const Presenter& presenter) = 0;
 
     // Submits everything recorded since beginFrame and presents it, closing the frame.
     virtual void endFrame() = 0;

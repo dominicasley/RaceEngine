@@ -26,6 +26,7 @@ export module raceengine.graphics.models:Scene;
 
 import raceengine.resource;
 import :Fbo;
+import :LightProbe;
 import :Mesh;
 import :Shader;
 import :Texture;
@@ -97,14 +98,187 @@ export struct OrthographicVolume
 // every one of them before any Scene camera whatever order they were appended to the scene in — a
 // depth target sampled by a view recorded earlier in the same command buffer would be read before
 // it was written, and on Vulkan the layout barrier would be on the wrong side of the read.
-export enum class CameraRole { Scene, ShadowCascade };
+//
+// ProbeFace is the same producer/consumer relationship one step further out: it draws one face of
+// a light probe's environment, which the Scene cameras then shade from. It is not a member of
+// Scene::cameras — the backend builds one on the stack per face, because the six views are a fixed
+// function of the probe's position and nothing about them is worth a game's authoring.
+// DepthNormalPrepass is the third of the same kind: it draws the view a Scene camera is about to
+// shade, from that camera's own position, writing surface normals and view depth and nothing else,
+// so the pass that gathers ambient occlusion has geometry to gather it from. Like ProbeFace it is
+// not a member of Scene::cameras — the backend builds one on the stack from the camera it is a
+// prepass for, because every one of its fields except the target and the shader is that camera's,
+// and a second Camera a game had to keep in step would be a second answer to where the view is.
+export enum class CameraRole { Scene, ShadowCascade, ProbeFace, DepthNormalPrepass };
+
+// The shape of the curve the post chain maps scene radiance through, once the camera's exposure
+// has said how much of it there is. All three leave black at black and white at white, so a change
+// here moves contrast rather than range, and all three are separable: contrast pivots at middle
+// grey, the toe grips the bottom of the output and the shoulder holds the top back.
+//
+// The defaults are not neutral. A neutral filmic transfer is the safe answer for an engine that
+// does not know what it is rendering, and this one does: an outdoor scene with a sun, deep
+// building shadow the light probes are meant to keep dark, and a sky with headroom above it. The
+// numbers below are the dramatic reading of that — see docs/vulkan-abi.md for what each does to
+// the frame.
+export struct ToneCurve
+{
+    // A power law about `toneGreyPivot` in the exposed scene-linear domain, which is a straight
+    // line in log-log: it moves nothing at the pivot and moves everything else symmetrically about
+    // it. One is the plain filmic transfer.
+    float contrast = 1.2f;
+    // How hard the curve grips the bottom of its output range. Zero is the plain filmic toe;
+    // raising it darkens what is already dark and leaves the highlights where they were.
+    float toe = 0.35f;
+    // How hard it holds the top back. Zero is the plain filmic shoulder; raising it keeps a bright
+    // sky off the clip rather than compressing the whole range to get there.
+    float shoulder = 0.1f;
+};
+
+// A camera that reads its own exposure off the frame it drew instead of being told one.
+//
+// The reading is taken from a mip chain the post-process passes reduce the scene colour down to,
+// one texel at the end of it, and it reaches the CPU a fixed number of submissions later — so
+// everything here is a lag, never a measurement of the frame being recorded. The adaptation that
+// closes that gap is advanced by simulation ticks rather than by elapsed time, for the reason the
+// light probe scheduler counts frames: the capture gate compares frame 120 exactly, and a camera
+// that adapted by however fast the machine happened to run would put a different image on disk.
+export struct AutoExposure
+{
+    bool enabled = false;
+    // Exposure compensation in stops, read exactly as the dial on a camera reads: positive opens
+    // up, negative holds back. Zero is what the meter itself says, which puts the frame's geometric
+    // mean where a reflected-light meter puts middle grey — the neutral answer, and the level's to
+    // move. It is a level's decision because the engine renders in relative radiance: how far the
+    // picture wants to sit from a photometric meter's reading depends on what a scene decided a sun
+    // was worth, which is not something the camera can know.
+    float compensation = 0.0f;
+    // How much the meter listens to the middle of the frame rather than to all of it, from zero —
+    // a flat average over everything, which is what this was — to one, where the corners count for
+    // almost nothing. It exists because the flat average is the answer to the wrong question: a
+    // player looking up gets a frame that is mostly sky, the mean rises, the meter closes down and
+    // the building he is walking past goes black. Every camera ever built weights the centre for
+    // exactly this reason, and the subject is in the middle of the frame because that is where the
+    // player put it.
+    float centreWeighting = 0.0f;
+    // How fast the adaptation closes on a new reading, in e-foldings per second of *simulated*
+    // time. Two speeds because adaptation is not symmetric: the eye handles a scene getting
+    // brighter far faster than one getting darker, which is why walking into sunlight is a moment
+    // and walking into a tunnel is not. Both are a great deal quicker here than an eye's, because a
+    // camera the player is looking through has to have caught up by the time he has.
+    float lightAdaptationSpeed = 6.0f;
+    float darkAdaptationSpeed = 3.0f;
+    // The range the meter may pick a shutter inside. A camera cannot hold the shutter open for
+    // arbitrarily long, and that limit is the one place a slow lens or a low film speed can fail
+    // to reach the exposure the meter asked for — which is what makes iso and aperture matter to
+    // the picture rather than only to the arithmetic. The scene's radiance is relative, not
+    // cd/m², so these bracket the range rather than calibrating it.
+    float minShutterTime = 1.0f / 8000.0f;
+    float maxShutterTime = 1.0f / 4.0f;
+    // The reduction chain the reading is copied out of, and which of its levels is the single
+    // texel. Written by AutoExposureService when it builds the chain; nothing else names them.
+    Resource<FboAttachment> chain{};
+    unsigned int chainLevel = 0;
+    // The last completed reading, written by the backend when its deferred copy lands, and zero
+    // until the first one does — which is what says "hold the exposure the level started with".
+    float measuredLuminance = 0.0f;
+    // What the adaptation is holding right now, which is the luminance the exposure below was
+    // derived from. Seeded from that exposure when metering is enabled, so a level's manual
+    // setExposure is where the adaptation starts rather than something it discards.
+    float adaptedLuminance = 0.0f;
+    // Whether the settled reading has been stated in the log. Once, when it settles: the number a
+    // level author wants is what the scene meters at, not what it read on the way there.
+    bool settleLogged = false;
+};
+
+// Ambient occlusion gathered from the view's own geometry, for the light the view's geometry does
+// not let in.
+//
+// It is a *camera* property rather than a scene one because it is measured in the screen the camera
+// renders: the prepass draws this camera's view into a buffer of view-space normals and depths, one
+// fullscreen pass gathers the horizon around every pixel of it, and a second smooths the result
+// along surfaces rather than across their edges. What comes out is bound to the shading pass beside
+// the shadow cascades, and the PBR shader folds it into the material's own occlusion term — so it
+// darkens indirect light and leaves the sun alone, which is what an occlusion factor means.
+export struct AmbientOcclusion
+{
+    bool enabled = false;
+    // How much of the gathered occlusion is applied, as a power on the result: 1 is the term the
+    // integral produced, above it deepens. A multiplier would darken the unoccluded parts of the
+    // image too, and the whole value of a visibility term is that it is 1 where nothing is in the
+    // way.
+    float strength = 1.0f;
+    // How far the horizon search reaches, in world units. It is a world distance rather than a
+    // pixel radius because occlusion is a property of the geometry and not of how close the camera
+    // happens to be standing: a corner of a building should darken by the same amount from across
+    // the street as from beside it. The default suits a scene measured in the tens of units.
+    float radius = 40.0f;
+    // The targets, written by AmbientOcclusionService when it builds them. `prepass` is the view's
+    // normals and depth, `occlusion` is what the shading pass samples, and the passes are the two
+    // that fill them — held here because the backend records them as this camera's prepass, in the
+    // order they are listed.
+    std::optional<Resource<Fbo>> prepass{};
+    std::optional<Resource<Shader>> prepassShader{};
+    Resource<FboAttachment> occlusion{};
+    std::vector<Resource<PostProcess>> passes{};
+};
+
+// The light a bright thing spills onto everything around it — a lens and an eye both do it, and a
+// frame without it reads as though nothing in it is actually bright, because a display cannot be.
+//
+// Two chains rather than one: the frame is thresholded and halved down through the first, then
+// carried back up the second, each level combining the one below it with the matching level of the
+// first. The usual formulation blends additively into a single chain, which needs a pass to read a
+// level it is writing; two chains say the same thing with the engine's own rule intact, and the
+// pass that combines them is the multi-input case the post-process seam already has.
+export struct Bloom
+{
+    bool enabled = false;
+    // Where a pixel starts spilling, in *exposed* radiance — the threshold pass multiplies by the
+    // camera's exposure first, so a scene that meters itself does not change how much of it blooms.
+    float threshold = 1.0f;
+    // How gradually it starts, as a width in the same units. A hard threshold makes a moving
+    // highlight pop in and out of the effect at its edge; the knee is what turns that into a fade.
+    float knee = 0.5f;
+    // How much of the result is added back to the frame before the tone curve.
+    float intensity = 0.05f;
+    // The most any one texel may contribute, in exposed radiance. The sun's disc is four orders of
+    // magnitude over the sky and the chain is stored in half floats, so an unclamped threshold pass
+    // reaches infinity on the way down and takes the whole frame white with it. It is also the knob
+    // that stops one specular pinprick spilling across the screen, which is the same problem at a
+    // smaller scale.
+    float maximum = 60.0f;
+    // How far each upsample reaches, in texels of the level it is reading. Above one the tent
+    // overlaps its neighbours and the spill widens without another level.
+    float spread = 1.0f;
+    // The buffers, and the passes over them. `result` is the top of the upsample chain and the
+    // attachment the tone map adds in; the rest is the engine's bookkeeping for a resize.
+    std::optional<Resource<Fbo>> downsample{};
+    std::optional<Resource<Fbo>> upsample{};
+    Resource<FboAttachment> result{};
+    std::vector<Resource<PostProcess>> passes{};
+};
 
 export struct Camera
 {
     unsigned int iso;
     float aspectRatio;
     float aperture;
+    // How long the shutter is open, in seconds: the third leg of the exposure triangle and the one
+    // the meter solves for. `exposure` below is derived from all three (see PhysicalCamera), so
+    // this is the state and that is the result — setExposure back-solves this so the two agree
+    // even when a game states the multiplier directly.
+    float shutterTime{};
     float exposure{};
+    // How the exposed radiance is mapped onto the display. Exposure above is how much light there
+    // is; this is what is done with it.
+    ToneCurve toneCurve{};
+    // Whether the exposure above is metered off the frame rather than stated by the level.
+    AutoExposure autoExposure{};
+    // Whether this view gathers its own ambient occlusion before it shades.
+    AmbientOcclusion ambientOcclusion{};
+    // Whether the bright parts of this view spill into the rest of it before the tone curve.
+    Bloom bloom{};
     float fieldOfView;
     CameraRole role = CameraRole::Scene;
     // The shader every draw in this view uses instead of the entity's own. A cascade renders
@@ -152,6 +326,13 @@ export struct RenderableEntity
     // rather than geometry: a skybox drawn into a cascade fills the whole map at the near plane
     // and puts the entire world in shadow, which is the first thing a shadow map does wrong.
     bool castsShadow = true;
+    // Whether a light probe's capture draws this entity. True for the world — buildings, ground,
+    // the sky — and false for anything that moves, because a probe is captured once and then
+    // shaded from for many frames: a car baked into the environment goes on lighting the street
+    // from wherever it was parked when the capture ran. It is a separate flag from castsShadow
+    // because the sky is the case that differs: it must not cast, and it is the single most
+    // important thing a probe records.
+    bool staticGeometry = true;
 
     explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
         type(type),
@@ -248,6 +429,11 @@ export struct Scene
     std::deque<Light> lights;
     std::deque<RenderableModel> models;
     std::deque<SceneNode> nodes;
+    // The image-based lighting graph. A deque on the same add-only terms as the rest: the backend
+    // keys a probe's captured radiance by the array slice recorded on the probe itself, and the
+    // scheduler walks these in order, so an address into this container is valid as long as the
+    // scene is.
+    std::deque<LightProbe> probes;
 
     std::optional<Resource<CubeMap>> environment{};
     ShadowCascades shadows{};
