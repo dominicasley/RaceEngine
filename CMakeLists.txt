@@ -123,6 +123,7 @@ target_sources(Engine PUBLIC
         Physics/Api/Coupling.cppm
         Physics/Api/Clutch.cppm
         Physics/Api/Driveline.cppm
+        Physics/Api/PublishedCars.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm

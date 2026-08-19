@@ -13,6 +13,7 @@ add_executable(EngineTests
         FrameDiagnosticsTests.cpp
         GltfColourSpaceTests.cpp
         GltfNodeTransformTests.cpp
+        GolfGtiTests.cpp
         HandlingTests.cpp
         JoltRuntimeTests.cpp
         LookupTableTests.cpp

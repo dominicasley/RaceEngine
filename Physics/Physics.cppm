@@ -13,3 +13,4 @@ export import :Vehicle;
 export import :Coupling;
 export import :Clutch;
 export import :Driveline;
+export import :PublishedCars;

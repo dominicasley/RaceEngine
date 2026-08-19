@@ -11,12 +11,12 @@ using raceengine::computeRollCentre;
 using raceengine::CornerHardpoints;
 using raceengine::CornerSetup;
 using raceengine::CornerSide;
+using raceengine::golfMk7FrontCorner;
+using raceengine::golfMk7RearCorner;
 using raceengine::solveCorner;
-using raceengine::SuspensionKind;
 using raceengine::sweepCorner;
 using raceengine::validateCorner;
 using raceengine::validateCornerSetup;
-using raceengine::Wishbone;
 
 // Acceptance criterion 3: the suspension solver against *published* geometry rather than against
 // numbers chosen to make it look good.
@@ -41,52 +41,27 @@ using raceengine::Wishbone;
 namespace
 {
 
-// Front: MacPherson strut. Track 1.539 m, tyre radius 0.3298 m, axle at +1.319 m.
-CornerHardpoints golfFront()
-{
-    auto corner = CornerHardpoints{};
-    corner.side = CornerSide::Right;
-    corner.kind = SuspensionKind::MacPhersonStrut;
-
-    corner.lower = Wishbone{.frontPivot = {0.361810, 0.220250, 1.333230},
-                            .rearPivot = {0.360060, 0.209630, 1.045270},
-                            .ballJoint = {0.697760, 0.192700, 1.331130}};
-    corner.strutTop = {0.515840, 0.879130, 1.276040};
-    corner.steeringRackOuter = {0.459500, 0.264340, 1.097000};
-    corner.steeringArm = {0.717500, 0.262230, 1.193140};
-    corner.wheelCentre = {0.769500, 0.329800, 1.319000};
-    corner.wheelRadius = 0.3298;
-
-    corner.droopAngle = -0.16;
-    corner.bumpAngle = 0.16;
-
-    return corner;
-}
-
-// Rear: double wishbone. Track 1.516 m, axle at -1.319 m.
+// The geometry itself lives in `Physics/Api/PublishedCars.cppm`, converted there from the file's own
+// pickup points, so that the car the engine builds and the car these curves are read off cannot come
+// apart. Front is a MacPherson strut on a 1.539 m track, rear a double wishbone on 1.516 m, both with
+// a 0.3298 m tyre and their axles at plus and minus half the 2.638 m wheelbase.
 //
 // A production Mk7.5 has a multi-link rear rather than a wishbone; the model approximates it as one,
 // which is why the lower arm's pivot axis is 0.74 m long — that is a trailing arm wearing a
 // wishbone's clothes. The approximation is a reasonable one and the curves it produces are a road
 // car's, but the geometry is a model of a model and it is worth knowing that.
+CornerHardpoints golfFront()
+{
+    return golfMk7FrontCorner(CornerSide::Right);
+}
+
 CornerHardpoints golfRear()
 {
-    auto corner = CornerHardpoints{};
-    corner.side = CornerSide::Right;
-
-    corner.lower = Wishbone{.frontPivot = {0.580980, 0.212940, -0.814800},
-                            .rearPivot = {0.180980, 0.212940, -1.434400},
-                            .ballJoint = {0.711980, 0.202740, -1.300300}};
-    corner.upper = Wishbone{.frontPivot = {0.409580, 0.423500, -1.097600},
-                            .rearPivot = {0.360000, 0.415200, -1.288200},
-                            .ballJoint = {0.691780, 0.430500, -1.325500}};
-    corner.steeringRackOuter = {0.177980, 0.231740, -1.424400};
-    corner.steeringArm = {0.685980, 0.225740, -1.414400};
-    corner.wheelCentre = {0.758000, 0.329800, -1.319000};
-    corner.wheelRadius = 0.3298;
-
-    corner.droopAngle = -0.14;
-    corner.bumpAngle = 0.14;
+    // The engine's rear corner carries damper mounts, which AC does not state and which the last case
+    // in this file is about. Stripped back off, this is the file's geometry and nothing else.
+    auto corner = golfMk7RearCorner(CornerSide::Right);
+    corner.damperChassis = glm::dvec3(0.0);
+    corner.damperWishbone = glm::dvec3(0.0);
 
     return corner;
 }
@@ -160,6 +135,14 @@ TEST_CASE("a production front strut solves and behaves like one", "[physics][pub
         REQUIRE(std::abs(steer) == Catch::Approx(0.097).margin(0.03));
     }
 
+    SECTION("the wheel scrubs sideways as it rises, which is what a strut does")
+    {
+        // Half-track change, so it is one wheel's lateral movement rather than the pair's.
+        const auto scrub = perTenMillimetres(sweep.value(), [](const auto& s) { return s.halfTrack * 1000.0; });
+
+        REQUIRE(scrub == Catch::Approx(1.63).margin(0.10));
+    }
+
     SECTION("the roll centre is above ground and falls as the car compresses")
     {
         auto atDroop = sweep->samples.front();
@@ -216,6 +199,13 @@ TEST_CASE("a production rear wishbone solves and behaves like one", "[physics][p
         }
 
         REQUIRE(worst < 0.45);
+    }
+
+    SECTION("and it scrubs half as much as the front")
+    {
+        const auto scrub = perTenMillimetres(sweep.value(), [](const auto& s) { return s.halfTrack * 1000.0; });
+
+        REQUIRE(scrub == Catch::Approx(0.85).margin(0.10));
     }
 
     SECTION("the roll centre is where a rear axle's belongs")
