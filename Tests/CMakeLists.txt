@@ -2,6 +2,11 @@
 # under test take their seams by reference, so a recording fake stands in for the backend and the
 # tests run anywhere. The GPU gates are the shell scripts in scripts/, and they are untouched by
 # this.
+#
+# InputDeviceProbeTests is the one exception and is hidden rather than excluded: its tag begins with
+# a dot, so Catch leaves it out of --list-tests and catch_discover_tests never registers it. It is
+# run by hand — `./EngineTests "[device]"` — because what it reports depends on what is plugged in,
+# and a suite whose count changes when somebody switches a wheel off is a suite nobody trusts.
 find_package(Catch2 3 CONFIG REQUIRED)
 
 add_executable(EngineTests
@@ -16,6 +21,9 @@ add_executable(EngineTests
         GltfNodeTransformTests.cpp
         GolfGtiTests.cpp
         HandlingTests.cpp
+        InputDeviceProbeTests.cpp
+        InputServiceTests.cpp
+        InputTests.cpp
         JoltRuntimeTests.cpp
         LookupTableTests.cpp
         MemoryStorageTests.cpp
@@ -41,7 +49,7 @@ add_executable(EngineTests
 target_sources(EngineTests PRIVATE
         FILE_SET CXX_MODULES
         BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-        FILES CapturedLog.cppm RecordingRenderBackend.cppm)
+        FILES CapturedLog.cppm RecordingRenderBackend.cppm RecordingInputBackend.cppm)
 
 target_link_libraries(EngineTests PRIVATE Engine)
 target_link_libraries(EngineTests PRIVATE Catch2::Catch2WithMain)

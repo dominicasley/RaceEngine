@@ -128,6 +128,19 @@ target_sources(Engine PUBLIC
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm
         Io/Utility/AccessorUtility.cppm # module raceengine.io.accessor, not a partition of raceengine.io
+        Input/Input.cppm
+        Input/Api/DriverInput.cppm
+        Input/Api/InputBackend.cppm
+        Input/Api/DeviceProfile.cppm
+        Input/Api/InputMapping.cppm
+        Input/Api/DirectInputContract.cppm
+        Input/Api/InputBackendFactory.cppm
+        # Implementation partitions, on the renderer's rule: both are built on both platforms so
+        # neither rots, and each one's system calls are the only part of it that is conditional.
+        Input/Api/InputBackendFactoryImpl.cppm
+        Input/Backend/EvdevInputBackend.cppm
+        Input/Backend/DirectInputBackend.cppm
+        Input/Services/InputService.cppm
         Shared/Shared.cppm
         Shared/Types/Resource.cppm)
 

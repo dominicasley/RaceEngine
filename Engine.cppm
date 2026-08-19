@@ -23,6 +23,10 @@ export import raceengine.async;
 export import raceengine.game;
 export import raceengine.graphics;
 export import raceengine.io;
+// The device layer. Same rule as the graphics one: the seam and the pure mapping are exported, the
+// two concrete backends are implementation partitions, so importing this costs nobody
+// <linux/input.h> or <dinput.h>.
+export import raceengine.input;
 // Re-exported for the reason every module above it is: a game that had to import a second module to
 // reach half the engine is a seam this file exists to close. The rule that keeps the Vulkan backend
 // out of here does not reach this one — that leak is 51 MB of vulkan.h, VMA, shaderc and GLFW in
@@ -114,6 +118,16 @@ private:
     ShadowService shadowService;
     SceneService sceneService;
     EntityService entityService;
+    // The device layer, and the last thing constructed because it is the first thing torn down: it
+    // owns a thread, and a thread member stops and joins before anything it could still be touching
+    // has been destroyed. It reaches only the logger and the window, both declared far above it, so
+    // the backend it was handed outlives it by exactly one member.
+    //
+    // A unique_ptr for the reason the renderer is one — the concrete backend is an implementation
+    // partition this file cannot name — and declared immediately above the service so that the
+    // service is destroyed first.
+    std::unique_ptr<IInputBackend> inputBackend;
+    InputService inputService;
     // Simulation clock and the game's tick subscribers. Neither depends on a service, so
     // they sit last: the callbacks are owned by the engine but written by the game, and
     // being destroyed first means no service they reach into is gone while they still exist.
@@ -275,6 +289,13 @@ public:
         return entityService;
     }
 
+    // Sampled once per fixed tick by whoever is driving. A wheel, a pad and the keyboard all come
+    // out of here as the same struct, and nothing below this line ever learns which it was.
+    [[nodiscard]] InputService& input()
+    {
+        return inputService;
+    }
+
 private:
     void update(float delta);
     [[nodiscard]] float frameDelta() const;
@@ -288,6 +309,42 @@ module :private;
 
 namespace raceengine
 {
+
+namespace
+{
+
+// What this run is allowed to do with the machine's input devices, and the same test every other
+// input path here makes: an unattended run owns no hands at the controls, so it opens no device,
+// starts no thread and writes no calibration into somebody's home directory. That is what keeps a
+// capture byte-identical with and without any of this.
+[[nodiscard]] InputOptions engineInputOptions()
+{
+    auto options = InputOptions{};
+
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+    options.profileDirectory = options.unattended ? std::string() : defaultProfileDirectory();
+
+    // The three the two platforms genuinely differ on, stated here rather than discovered as a
+    // force that never arrives. Constant force is what the force feedback coming after this needs;
+    // the rotation range is what maps a rim to a rack; the base's own tuning menu has no host-side
+    // route on either platform without the vendor's SDK, and on this base the driver creates no
+    // node for it at all. Each is a warning and a fallback, never a refusal to start — the string
+    // views are literals and outlive everything that reads them.
+    options.wanted = {CapabilityRequest{.capability = DeviceCapability::ConstantForce,
+                                        .purpose = "force feedback",
+                                        .fallback = "the wheel stays free"},
+                      CapabilityRequest{.capability = DeviceCapability::ReadRotationRange,
+                                        .purpose = "reading the wheel's own rotation range",
+                                        .fallback = "the range this device's profile states is used"},
+                      CapabilityRequest{.capability = DeviceCapability::TuningMenu,
+                                        .purpose = "following the base's own tuning profile",
+                                        .fallback = "the game's own settings stand alone"}};
+
+    return options;
+}
+
+} // namespace
 
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
@@ -310,7 +367,13 @@ Engine::Engine() :
     bloomService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
     colourGradeService(*logger, memoryStorageService),
     shadowService(cameraService),
-    sceneService(renderableEntityService, cameraService, sceneManagerService)
+    sceneService(renderableEntityService, cameraService, sceneManagerService),
+    // Null: DirectInput's cooperative level is set against a window and this composition root has no
+    // portable way to name one. A Windows build that wants exclusive access — which is what force
+    // feedback needs there — passes its HWND here, and that is a one-line change to this call rather
+    // than to the interface, which is the whole reason the parameter exists before its caller does.
+    inputBackend(createInputBackend(nullptr)),
+    inputService(*logger, *inputBackend, glfwWindow, engineInputOptions())
 {
     // An engine whose device would not come up has nothing left to do: every service below
     // was built against it, and there is no second backend to fall back to.
