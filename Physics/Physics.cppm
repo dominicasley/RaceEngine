@@ -10,4 +10,5 @@ export import :Tyre;
 export import :Contact;
 export import :Telemetry;
 export import :Vehicle;
+export import :Coupling;
 export import :Driveline;

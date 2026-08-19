@@ -120,6 +120,7 @@ target_sources(Engine PUBLIC
         Physics/Api/Contact.cppm
         Physics/Api/Telemetry.cppm
         Physics/Api/Vehicle.cppm
+        Physics/Api/Coupling.cppm
         Physics/Api/Driveline.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm

@@ -7,6 +7,7 @@ add_executable(EngineTests
         AccessorUtilityTests.cpp
         CameraServiceTests.cpp
         ContactPatchTests.cpp
+        CouplingTests.cpp
         DrivelineTests.cpp
         FrameDiagnosticsTests.cpp
         GltfColourSpaceTests.cpp
