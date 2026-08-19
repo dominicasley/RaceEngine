@@ -15,6 +15,7 @@ using raceengine::bringUpJolt;
 using raceengine::Feature;
 using raceengine::FeatureKind;
 using raceengine::generateProvingGround;
+using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
 using raceengine::placeholderSedan;
 using raceengine::ProvingGroundDescriptor;
@@ -68,7 +69,7 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
 
     for (auto step = 0; step < 1440; step++)
     {
-        REQUIRE(stepVehicle(setup, state, VehicleInput{}, world, tick).has_value());
+        REQUIRE(stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world, tick).has_value());
     }
 
     state.chassis.linearVelocity = glm::dvec3(0.0, 0.0, speed);
@@ -100,7 +101,7 @@ SteadyState hold(const VehicleSetup& setup, const PhysicsWorld& world, const dou
 
     for (auto step = 0; step < 1440; step++)
     {
-        const auto stepped = stepVehicle(setup, state, input, world, tick);
+        const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world, tick);
         REQUIRE(stepped.has_value());
 
         if (step >= 1080)
@@ -142,7 +143,7 @@ TEST_CASE("a car driven straight goes straight and keeps its speed", "[physics][
 
     for (auto step = 0; step < 1800; step++)
     {
-        REQUIRE(stepVehicle(setup.value(), state, VehicleInput{}, world.value(), tick).has_value());
+        REQUIRE(stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick).has_value());
     }
 
     // Five seconds and it has neither wandered nor sunk.
@@ -287,7 +288,7 @@ TEST_CASE("a step steer settles rather than ringing", "[physics][handling][steps
     auto history = std::vector<double>{};
     for (auto step = 0; step < 1080; step++)
     {
-        const auto stepped = stepVehicle(setup.value(), state, input, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
         history.push_back(stepped->telemetry.yawRate);
     }
@@ -354,7 +355,7 @@ TEST_CASE("the car is stable at walking pace and at a standstill", "[physics][ha
 
         for (auto step = 0; step < 3600; step++)
         {
-            const auto stepped = stepVehicle(setup.value(), state, input, world.value(), tick);
+            const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
             REQUIRE(stepped.has_value());
 
             const auto force = stepped->corners[0].contact.tyre.lateral;
@@ -377,14 +378,14 @@ TEST_CASE("the car is stable at walking pace and at a standstill", "[physics][ha
 
         for (auto step = 0; step < 3600; step++)
         {
-            REQUIRE(stepVehicle(setup.value(), state, input, world.value(), tick).has_value());
+            REQUIRE(stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick).has_value());
         }
 
         const auto resting = state.chassis.position;
 
         for (auto step = 0; step < 1800; step++)
         {
-            REQUIRE(stepVehicle(setup.value(), state, input, world.value(), tick).has_value());
+            REQUIRE(stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick).has_value());
         }
 
         // Five more seconds on the brakes and it has not crept, jittered or wandered.
@@ -424,14 +425,14 @@ TEST_CASE("a parked car holds a fifteen degree slope on its brakes", "[physics][
 
     for (auto step = 0; step < 3600; step++)
     {
-        REQUIRE(stepVehicle(setup.value(), state, input, world.value(), tick).has_value());
+        REQUIRE(stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick).has_value());
     }
 
     const auto resting = state.chassis.position;
 
     for (auto step = 0; step < 3600; step++)
     {
-        REQUIRE(stepVehicle(setup.value(), state, input, world.value(), tick).has_value());
+        REQUIRE(stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick).has_value());
     }
 
     // Ten seconds of settling and then ten more of standing still. A hair of creep is real — the
@@ -465,7 +466,7 @@ TEST_CASE("the coastdown recovers the coefficients it was given", "[physics][han
 
     for (auto step = 1; step <= 10800; step++)
     {
-        REQUIRE(stepVehicle(setup.value(), state, VehicleInput{}, world.value(), tick).has_value());
+        REQUIRE(stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick).has_value());
 
         if (step % 360 == 0)
         {
@@ -566,7 +567,7 @@ TEST_CASE("a wheel run across a kerb at an angle stays continuous", "[physics][h
 
     for (auto step = 0; step < 3600; step++)
     {
-        const auto stepped = stepVehicle(setup.value(), state, input, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
 
         const auto& corner = stepped->corners[static_cast<std::size_t>(1)]; // front right
@@ -655,7 +656,7 @@ TEST_CASE("off a ramp it flies cleanly and lands without being thrown", "[physic
 
     for (auto step = 0; step < 2400; step++)
     {
-        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
 
         auto anyContact = false;
@@ -755,7 +756,7 @@ TEST_CASE("one vehicle fits inside its tick budget", "[physics][handling][budget
     for (auto step = 0; step < 3600; step++)
     {
         const auto started = std::chrono::steady_clock::now();
-        const auto stepped = stepVehicle(setup.value(), state, input, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
         const auto finished = std::chrono::steady_clock::now();
 
         REQUIRE(stepped.has_value());
@@ -802,7 +803,7 @@ TEST_CASE("a car resting against a barrier stays where it is", "[physics][handli
     auto touched = false;
     for (auto step = 0; step < 1800; step++)
     {
-        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
         touched = touched || !stepped->contacts.points.empty();
     }
@@ -816,7 +817,7 @@ TEST_CASE("a car resting against a barrier stays where it is", "[physics][handli
     // Sixty seconds.
     for (auto step = 0; step < 21600; step++)
     {
-        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, world.value(), tick);
+        const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
 
         worstSpeed = std::max(worstSpeed, glm::length(state.chassis.linearVelocity));

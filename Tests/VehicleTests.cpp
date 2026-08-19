@@ -15,6 +15,7 @@ using raceengine::cornerCount;
 using raceengine::Curve;
 using raceengine::generateProvingGround;
 using raceengine::linearDamper;
+using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
 using raceengine::placeholderSedan;
 using raceengine::ProvingGroundDescriptor;
@@ -158,7 +159,7 @@ TEST_CASE("the car settles on its springs", "[physics][vehicle][settle]")
     // Six seconds, which is many times the ride frequency's period.
     for (auto tick = 0; tick < 2160; tick++)
     {
-        auto stepped = stepVehicle(setup.value(), state, input, world.value(), vehicleStep);
+        auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), vehicleStep);
         REQUIRE(stepped.has_value());
 
         last = stepped.value();
@@ -260,7 +261,7 @@ TEST_CASE("the vehicle tick is pure and deterministic", "[physics][vehicle][dete
             auto input = VehicleInput{};
             input.steering = std::sin(static_cast<double>(tick) * 0.01) * 0.4;
 
-            const auto stepped = stepVehicle(setup.value(), state, input, world.value(), vehicleStep);
+            const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), vehicleStep);
             REQUIRE(stepped.has_value());
         }
     };

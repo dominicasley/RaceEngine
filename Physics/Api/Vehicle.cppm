@@ -211,6 +211,22 @@ export struct VehicleSetup
     }
 };
 
+// The wheel inertias in corner order, from the one place they are stated. The driveline needs them
+// to refer an axle's inertia through the gearing, and a caller assembling that array by hand is a
+// second statement of a number that already has an owner — which is what it was, and nothing made
+// the two agree.
+export [[nodiscard]] std::array<double, cornerCount> wheelInertias(const VehicleSetup& setup)
+{
+    auto inertias = std::array<double, cornerCount>{};
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        inertias[index] = setup.corners[index].wheelInertia;
+    }
+
+    return inertias;
+}
+
 export struct CornerState
 {
     // The corner's whole degree of freedom: where the lower wishbone is, and how fast it is moving.
@@ -224,13 +240,15 @@ export struct CornerState
     TyreState tyre;
 };
 
+// The vehicle's own state and nothing else's. Engine speed lived here until the driveline was given
+// a state of its own: it was written by `stepDriveline`, read by nobody in this file but the
+// telemetry fill, and its being here made `:Vehicle` the keeper of a number belonging to a partition
+// it does not import. `DrivelineState` in `:Driveline` owns it now, and the caller that steps both
+// is what joins them.
 export struct VehicleState
 {
     RigidBodyState chassis;
     std::array<CornerState, cornerCount> corners{};
-    // Independent state from the start even though a locked clutch makes it derivable, because
-    // making it independent later is a restructure and making it independent now is free.
-    double engineSpeed = 0.0;
 };
 
 static_assert(std::is_trivially_copyable_v<VehicleState>, "the harness saves and restores this by copying its bytes");
@@ -244,6 +262,11 @@ export struct VehicleInput
     double brake = 0.0;
     std::int32_t gear = 0;
 };
+
+// Nothing driving the wheels: a car being pushed, coasted or dropped, and every tick taken before a
+// driveline exists. Named rather than written `{}` at the call, because a bare brace there reads as
+// an omission and this is a statement.
+export inline constexpr std::array<double, cornerCount> noDriveTorque{};
 
 export struct CornerForces
 {
@@ -543,15 +566,20 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 
 } // namespace
 
-// One tick of one vehicle. Pure in (setup, state, input, dt) and the world it is standing on: no
-// clock is read, no global is touched, nothing is random. The structure is the architecture the
-// brief asks for and everything later plugs into it — clear the accumulators, let every element
-// contribute a force, then integrate once at the bottom. No element writes a velocity or a
-// position.
-export [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const VehicleSetup& setup, VehicleState& state,
-                                                                         const VehicleInput& input,
-                                                                         const PhysicsWorld& world,
-                                                                         const double deltaTime)
+// One tick of one vehicle. Pure in (setup, state, input, driveTorques, dt) and the world it is
+// standing on: no clock is read, no global is touched, nothing is random. The structure is the
+// architecture the brief asks for and everything later plugs into it — clear the accumulators, let
+// every element contribute a force, then integrate once at the bottom. No element writes a velocity
+// or a position.
+//
+// `driveTorques` is what the driveline is putting on each wheel, in newton metres, and it arrives as
+// its own argument rather than as a field on `VehicleInput` deliberately. `VehicleInput` is the
+// driver's — steering, throttle, brake, gear — and is the packet a rollback netcode would transmit
+// and replay. Driveline torque is *derived* from state and must be recomputed on a replay rather
+// than trusted from the wire, so it has no business in the struct that gets sent.
+export [[nodiscard]] std::expected<VehicleStep, std::string>
+stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& input,
+            const std::array<double, cornerCount>& driveTorques, const PhysicsWorld& world, const double deltaTime)
 {
     auto result = VehicleStep{};
 
@@ -879,13 +907,23 @@ export [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const V
 
         // --- wheel spin ---
         //
-        // The road drives it: with no engine yet, the only torque on a rolling wheel is the tire's
-        // own reaction, which is self-correcting — a wheel turning too fast makes a forward force
-        // and is slowed by its reaction, a wheel turning too slow is spun up. Free rolling is the
-        // equilibrium and it finds it on its own.
+        // Two torques and one integration. The road's is the tire's own reaction and is
+        // self-correcting — a wheel turning too fast makes a forward force and is slowed by it, a
+        // wheel turning too slow is spun up — and the driveline's is whatever the chain handed in.
+        //
+        // They are summed here rather than applied in two places, and that is a correction. The
+        // driveline used to advance this field itself before the tick ran, which put it upstream of
+        // the tire's slip and upstream of the brake clamp below while the road's torque was
+        // downstream of both: the brake sized itself against one of the two and knew nothing of the
+        // other, so a wheel held on the brake still spun up under power for the tire to read as
+        // slip. Launch, creep and converter stall are all that case.
+        //
+        // The inertia is `setup.corners[i].wheelInertia` and only that. It was also stated a second
+        // time as an array the caller built for the driveline, with nothing to make the two agree.
         const auto& setupCorner = setup.corners[index];
         const auto roadTorque = -solution.contact.tyre.longitudinal * solution.contact.effectiveRadius;
-        corner.wheelSpeed += (roadTorque / std::max(setupCorner.wheelInertia, 1e-6)) * deltaTime;
+        corner.wheelSpeed +=
+            ((roadTorque + driveTorques[index]) / std::max(setupCorner.wheelInertia, 1e-6)) * deltaTime;
 
         // Braking, clamped so it can bring the wheel to a stop and not past it. Without the clamp a
         // hard brake application at low wheel speed drives the wheel *backwards* within one tick,
@@ -958,7 +996,9 @@ export [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const V
     frame.throttle = input.throttle;
     frame.brake = input.brake;
     frame.gear = input.gear;
-    frame.engineSpeed = state.engineSpeed;
+    // `TelemetryFrame::engineSpeed` and the driveline channels beside it are filled by whoever
+    // stepped the driveline: this partition does not import `:Driveline` and must not, and the
+    // frame is a by-value member of the returned step for exactly that reason.
 
     for (auto index = std::size_t{0}; index < cornerCount; index++)
     {

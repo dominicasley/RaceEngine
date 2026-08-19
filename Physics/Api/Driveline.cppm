@@ -3,7 +3,9 @@ module;
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -26,6 +28,10 @@ namespace raceengine
 // cost of writing it this way now is one extra state variable and one indirection.
 
 export enum class DrivenAxle : std::uint32_t { Front, Rear, All };
+
+// Front then rear, which is how many differentials a car without a centre one has. A centre
+// differential is the same interface a third time and is somebody else's milestone.
+export inline constexpr std::size_t axleCount = 2;
 
 export struct EngineModel
 {
@@ -97,6 +103,16 @@ export struct DifferentialTorques
     double right = 0.0;
 };
 
+// What the pack did last tick. The lock/slip machine in `:Coupling` is what will decide this
+// instead of the clamp in `split`, and these two are precisely the numbers it judges — how much the
+// pack was asked to carry against how much it could — so they are recorded where they are known
+// rather than recovered afterwards from torques that have already been split.
+export struct DifferentialState
+{
+    double transfer = 0.0;
+    double capacity = 0.0;
+};
+
 // The differential, asked a question rather than performing a division.
 //
 // One struct and one code path covers open, spool and clutch-pack, because the difference between
@@ -118,14 +134,26 @@ export struct Differential
     // friction element, and the limit is what shapes it, not the stiffness.
     double lockingStiffness = 400.0;
 
-    [[nodiscard]] DifferentialTorques split(const double leftSpeed, const double rightSpeed, const double input) const
+    // The state is the axle's, not the differential's: a `Differential` is setup and is handed
+    // around by const reference, and all-wheel drive asks the *same* one twice. Two axles sharing
+    // one state object would have the front's lock stamping on the rear's, which is why the state
+    // arrives here rather than living in the struct.
+    [[nodiscard]] DifferentialTorques split(DifferentialState& state, const double leftSpeed, const double rightSpeed,
+                                            const double input, const double deltaTime) const
     {
+        // The tick the lock/slip machine will want when it replaces the clamp below. Taken now
+        // because adding it later moves every call site, and consumed by nothing yet.
+        static_cast<void>(deltaTime);
+
         const auto ramp = input >= 0.0 ? powerRamp : coastRamp;
         const auto capacity = preload + ramp * std::abs(input);
 
         // Opposes the difference, up to what the pack can hold. Beyond that the diff is simply open
         // and the faster wheel keeps the extra.
         const auto transfer = std::clamp(lockingStiffness * (leftSpeed - rightSpeed), -capacity, capacity);
+
+        state.transfer = transfer;
+        state.capacity = capacity;
 
         return DifferentialTorques{.left = 0.5 * input - transfer, .right = 0.5 * input + transfer};
     }
@@ -173,6 +201,29 @@ export struct DrivelineSetup
     DrivenAxle driven = DrivenAxle::Front;
 };
 
+// The driveline's own state, and it is here rather than in `VehicleState` for the reason every
+// other split in this module is made: what integrates a quantity owns it. Engine speed sat in the
+// vehicle's state where nothing in the vehicle model read it or wrote it, which made `:Vehicle` the
+// keeper of a number belonging to a partition it does not even import.
+//
+// Trivially copyable and standard layout, and it stays that way — save and restore is a memcpy and
+// rollback will later lean on that. Scalars, enums and fixed arrays only: no `Curve`, no vector, no
+// string. The clutch's lock and dwell, the shift phase and timer, driveline wind-up, the gearbox
+// output shaft, the converter's turbine and the slip-energy ledger all belong here and none of them
+// is here yet.
+export struct DrivelineState
+{
+    // Independent state from the start even though a locked clutch makes it derivable, because
+    // making it independent later is a restructure and making it independent now is free.
+    double engineSpeed = 0.0;
+
+    // One per axle, and separate rather than shared, for the reason given at `split`.
+    std::array<DifferentialState, axleCount> differentials{};
+};
+
+static_assert(std::is_trivially_copyable_v<DrivelineState>, "the harness saves and restores this by copying its bytes");
+static_assert(std::is_standard_layout_v<DrivelineState>, "and rollback will later");
+
 export struct DrivelineTorques
 {
     // Per corner, in the same order as everything else.
@@ -191,7 +242,7 @@ export struct DrivelineTorques
 // driveline — the engine and the gearbox trade energy back and forth at the timestep's frequency
 // until one of them reaches infinity. Solved, it is unconditionally stable at any stiffness, which
 // is what lets "locked" mean locked rather than "stiff enough to look locked".
-export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup, double& engineSpeed,
+export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup, DrivelineState& state,
                                                     const std::array<double, cornerCount>& wheelSpeeds,
                                                     const std::array<double, cornerCount>& wheelInertias,
                                                     const double throttle, const std::int32_t gear,
@@ -199,14 +250,20 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
 {
     auto result = DrivelineTorques{};
 
-    const auto flywheel = engineTorque(setup.engine, engineSpeed, throttle);
+    const auto flywheel = engineTorque(setup.engine, state.engineSpeed, throttle);
     const auto reduction = setup.gearbox.reduction(gear);
 
     // Neutral: the engine is on its own, spinning against its own friction. No torque reaches the
     // wheels and none comes back.
+    //
+    // The floor at zero here and at the two sites below is the only thing stopping the engine
+    // turning backwards, and therefore the only thing stopping it stalling. It comes out together
+    // with the stall model and the idle controller and not before: removing it on its own leaves
+    // negative engine speeds with nothing to catch them.
     if (std::abs(reduction) < 1e-9)
     {
-        engineSpeed = std::max(0.0, engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
+        state.engineSpeed =
+            std::max(0.0, state.engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
         result.engine = flywheel;
 
         return result;
@@ -244,7 +301,8 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
 
     if (drivenCount == 0)
     {
-        engineSpeed = std::max(0.0, engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
+        state.engineSpeed =
+            std::max(0.0, state.engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
         return result;
     }
 
@@ -258,13 +316,13 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
     const auto engineInertia = std::max(setup.engine.inertia, 1e-9);
     const auto mobility = 1.0 / engineInertia + 1.0 / std::max(referredInertia, 1e-9);
 
-    auto slip = engineSpeed - clutchSideSpeed;
+    auto slip = state.engineSpeed - clutchSideSpeed;
     slip = (slip + deltaTime * (flywheel / engineInertia)) / (1.0 + deltaTime * setup.clutch.stiffness * mobility);
 
     const auto clutchTorque = std::clamp(setup.clutch.stiffness * slip, -setup.clutch.capacity, setup.clutch.capacity);
 
     // Engine takes what the clutch did not.
-    engineSpeed = std::max(0.0, engineSpeed + ((flywheel - clutchTorque) / engineInertia) * deltaTime);
+    state.engineSpeed = std::max(0.0, state.engineSpeed + ((flywheel - clutchTorque) / engineInertia) * deltaTime);
 
     // Through the gearing to the differential, and out to the wheels it decides between.
     const auto axleTorque = clutchTorque * reduction;
@@ -272,20 +330,25 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
     if (driven == DrivenAxle::All)
     {
         // Split evenly front to rear before each differential, which is a centre spool. A centre
-        // differential is the same interface again and is somebody else's milestone.
-        const auto front = setup.differential.split(wheelSpeeds[0], wheelSpeeds[1], 0.5 * axleTorque);
-        const auto rear = setup.differential.split(wheelSpeeds[2], wheelSpeeds[3], 0.5 * axleTorque);
+        // differential is the same interface again and is somebody else's milestone. The two
+        // differentials are the same setup asked twice and each keeps its own state.
+        const auto front = setup.differential.split(state.differentials[0], wheelSpeeds[0], wheelSpeeds[1],
+                                                    0.5 * axleTorque, deltaTime);
+        const auto rear = setup.differential.split(state.differentials[1], wheelSpeeds[2], wheelSpeeds[3],
+                                                   0.5 * axleTorque, deltaTime);
 
         result.wheel = {front.left, front.right, rear.left, rear.right};
     }
     else if (driven == DrivenAxle::Front)
     {
-        const auto split = setup.differential.split(wheelSpeeds[0], wheelSpeeds[1], axleTorque);
+        const auto split =
+            setup.differential.split(state.differentials[0], wheelSpeeds[0], wheelSpeeds[1], axleTorque, deltaTime);
         result.wheel = {split.left, split.right, 0.0, 0.0};
     }
     else
     {
-        const auto split = setup.differential.split(wheelSpeeds[2], wheelSpeeds[3], axleTorque);
+        const auto split =
+            setup.differential.split(state.differentials[1], wheelSpeeds[2], wheelSpeeds[3], axleTorque, deltaTime);
         result.wheel = {0.0, 0.0, split.left, split.right};
     }
 
@@ -320,17 +383,15 @@ export [[nodiscard]] DrivelineSetup placeholderDriveline()
     return setup;
 }
 
-// Drive the wheels, and hand back what the chain did. Called from the game's own loop rather than
-// from inside `stepVehicle`, because which wheels a car drives and how is a property of the car and
-// not of the suspension — and because keeping them apart is what let the whole vehicle be built and
-// validated before an engine existed at all.
-export void applyDrivelineTorques(VehicleState& state, const DrivelineTorques& torques,
-                                  const std::array<double, cornerCount>& wheelInertias, const double deltaTime)
-{
-    for (auto index = std::size_t{0}; index < cornerCount; index++)
-    {
-        state.corners[index].wheelSpeed += (torques.wheel[index] / std::max(wheelInertias[index], 1e-9)) * deltaTime;
-    }
-}
+// `DrivelineTorques::wheel` is handed straight to `stepVehicle`, which is the whole of how the
+// driveline reaches the road. It used to be applied here instead, integrating `wheelSpeed` before
+// the vehicle tick integrated the same field again from the road — so the brake clamp inside that
+// tick sized itself against one of the two torques and knew nothing of the other. Throttle and
+// brake together were therefore inconsistent, and launch, creep and converter stall are all exactly
+// that case.
+//
+// Calling this from the game's loop rather than from inside `stepVehicle` is unchanged and is still
+// the point: which wheels a car drives is a property of the car and not of its suspension, and
+// keeping them apart is what let the whole vehicle be built and validated before an engine existed.
 
 } // namespace raceengine
