@@ -6,14 +6,26 @@ find_package(Catch2 3 CONFIG REQUIRED)
 add_executable(EngineTests
         AccessorUtilityTests.cpp
         CameraServiceTests.cpp
+        ContactPatchTests.cpp
+        DrivelineTests.cpp
         FrameDiagnosticsTests.cpp
         GltfColourSpaceTests.cpp
+        HandlingTests.cpp
+        JoltRuntimeTests.cpp
         LookupTableTests.cpp
         MemoryStorageTests.cpp
         PhysicalCameraTests.cpp
+        PhysicsWorldTests.cpp
         PostProcessingTests.cpp
+        ProvingGroundTests.cpp
+        PublishedGeometryTests.cpp
         RendererSeamTests.cpp
+        RigidBodyTests.cpp
         SceneManagerServiceTests.cpp
+        SuspensionTests.cpp
+        TelemetryTests.cpp
+        TyreTests.cpp
+        VehicleTests.cpp
         SphericalHarmonicsTests.cpp
         ShadowCascadesTests.cpp)
 

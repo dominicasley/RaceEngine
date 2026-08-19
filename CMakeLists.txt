@@ -17,6 +17,12 @@ endif()
 find_package(spdlog CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
+# No features requested, and that is the safe answer rather than a lazy one: the port's debug
+# renderer, profiler and C++ RTTI options each change JPH_ prefixed preprocessor state that alters
+# the layout of Jolt's own types, so a consumer compiled against a different set than the library
+# was built with mismatches silently. The imported target propagates exactly what it was built
+# with, which is what keeps our translation units and the archive agreeing.
+find_package(Jolt CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(unofficial-shaderc CONFIG REQUIRED)
@@ -36,6 +42,18 @@ FetchContent_Declare(
         GIT_SHALLOW TRUE
         PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchOzzCMakeMinimum.cmake)
 FetchContent_MakeAvailable(ozz_animation)
+
+# The physics backend is its own plain (non-module) target, and that is load-bearing rather than
+# tidy. Jolt::Jolt carries `-mavx2 -mfma -mbmi -mlzcnt -mf16c -mpopcnt` and eight JPH_USE_* defines
+# as usage requirements, and a clang BMI records the target features it was built with — so linking
+# Jolt into Engine makes every translation unit that *imports* an Engine module fail to load the
+# BMI unless it is built with Jolt's instruction set too. That is the tests and the sandbox, neither
+# of which has anything to do with physics. Confining Jolt here keeps its usage requirements off
+# Engine's translation units, off Engine's BMIs, and off everything downstream of them, and leaves
+# the engine's own codegen exactly as it was.
+add_library(EnginePhysicsBackend STATIC Physics/Backend/JoltBackend.cpp)
+target_link_libraries(EnginePhysicsBackend PRIVATE Jolt::Jolt)
+target_link_libraries(EnginePhysicsBackend PRIVATE raceengine_warnings)
 
 add_library (Engine STATIC
         Io/ThirdPartyImpl.cpp)
@@ -91,6 +109,18 @@ target_sources(Engine PUBLIC
         Graphics/Services/SceneService.cppm
         Graphics/Services/ShadowService.cppm
         Graphics/Services/AssetService.cppm
+        Physics/Physics.cppm
+        Physics/Api/RigidBody.cppm
+        Physics/Api/JoltRuntime.cppm
+        Physics/Api/ProvingGround.cppm
+        Physics/Api/PhysicsWorld.cppm
+        Physics/Api/Suspension.cppm
+        Physics/Api/ContactPatch.cppm
+        Physics/Api/Tyre.cppm
+        Physics/Api/Contact.cppm
+        Physics/Api/Telemetry.cppm
+        Physics/Api/Vehicle.cppm
+        Physics/Api/Driveline.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm
@@ -112,6 +142,8 @@ target_link_libraries(Engine PUBLIC Vulkan::Vulkan)
 target_link_libraries(Engine PRIVATE GPUOpen::VulkanMemoryAllocator)
 target_link_libraries(Engine PRIVATE unofficial::shaderc::shaderc)
 target_link_libraries(Engine PUBLIC ozz_animation ozz_base)
+
+target_link_libraries(Engine PRIVATE EnginePhysicsBackend)
 
 target_link_libraries(Engine PRIVATE raceengine_warnings)
 
