@@ -11,4 +11,5 @@ export import :Contact;
 export import :Telemetry;
 export import :Vehicle;
 export import :Coupling;
+export import :Clutch;
 export import :Driveline;

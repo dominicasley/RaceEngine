@@ -142,7 +142,13 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
     frame.throttle = 0.5;
     frame.brake = 0.25;
     frame.gear = 3;
-    frame.engineSpeed = 4200.0;
+    // rad/s, which is what the model works in. The column says rpm and the conversion is this
+    // boundary's job — it was not being done, so every engine number in a file read 9.55 times low.
+    frame.engineSpeed = 440.0;
+    frame.engineTorque = 312.5;
+    frame.clutchTorque = -180.25;
+    frame.clutchSlip = 12.5;
+    frame.clutchSlipEnergy = 4820.0;
 
     frame.wheels[0].verticalLoad = 3400.0;
     frame.wheels[0].suspensionTravel = 0.025;
@@ -161,8 +167,32 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
     SECTION("every row has exactly as many fields as the header")
     {
         REQUIRE(header.size() == values.size());
-        // 23 chassis and driver channels, then twelve per corner.
-        REQUIRE(header.size() == 23 + 12 * cornerCount);
+        // 27 chassis, driver and driveline channels, then twelve per corner.
+        REQUIRE(header.size() == 27 + 12 * cornerCount);
+    }
+
+    SECTION("the engine column is rpm, as its name has always claimed")
+    {
+        const auto rpm = std::find(header.begin(), header.end(), "Engine RPM [rpm]");
+        REQUIRE(rpm != header.end());
+        REQUIRE(std::stod(values[static_cast<std::size_t>(rpm - header.begin())]) ==
+                Catch::Approx(4201.69).epsilon(1e-5));
+    }
+
+    SECTION("the driveline's own channels reach the file")
+    {
+        for (const auto& column : {std::string("Engine Torque [Nm]"), std::string("Clutch Torque [Nm]"),
+                                   std::string("Clutch Slip [rad/s]"), std::string("Clutch Slip Energy [J]")})
+        {
+            REQUIRE(std::find(header.begin(), header.end(), column) != header.end());
+        }
+
+        const auto torque = std::find(header.begin(), header.end(), "Clutch Torque [Nm]");
+        REQUIRE(std::stod(values[static_cast<std::size_t>(torque - header.begin())]) == Catch::Approx(-180.25));
+
+        // Accumulated rather than per tick, which is what makes it the hook a thermal model reads.
+        const auto energy = std::find(header.begin(), header.end(), "Clutch Slip Energy [J]");
+        REQUIRE(std::stod(values[static_cast<std::size_t>(energy - header.begin())]) == Catch::Approx(4820.0));
     }
 
     SECTION("each corner is named and named once")

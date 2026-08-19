@@ -6,6 +6,7 @@ find_package(Catch2 3 CONFIG REQUIRED)
 add_executable(EngineTests
         AccessorUtilityTests.cpp
         CameraServiceTests.cpp
+        ClutchTests.cpp
         ContactPatchTests.cpp
         CouplingTests.cpp
         DrivelineTests.cpp

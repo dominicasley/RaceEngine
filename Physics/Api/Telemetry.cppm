@@ -98,6 +98,16 @@ export struct TelemetryFrame
     std::int32_t gear = 0;
     double engineSpeed = 0.0;
 
+    // The driveline's channels. Filled by whoever stepped the driveline: the vehicle tick cannot,
+    // because `:Vehicle` does not import `:Driveline` and must not.
+    double engineTorque = 0.0;
+    double clutchTorque = 0.0;
+    double clutchSlip = 0.0;
+    // Accumulated rather than per tick, and in joules. It is the hook a clutch thermal model reads
+    // and nothing consumes it yet; a channel that had to be integrated by whoever plotted it is a
+    // channel that gets integrated differently twice.
+    double clutchSlipEnergy = 0.0;
+
     std::array<WheelTelemetry, cornerCount> wheels{};
 };
 
@@ -197,6 +207,9 @@ void appendInteger(std::string& text, const long long value)
 
 constexpr auto radiansToDegrees = 57.29577951308232;
 constexpr auto metresPerSecondToKilometresPerHour = 3.6;
+// The column has always said rpm and used to carry rad/s, which is a factor of 9.55 in a channel
+// every engine number is read against.
+constexpr auto radiansPerSecondToRevolutionsPerMinute = 9.549296585513721;
 constexpr auto gravity = 9.80665;
 
 } // namespace
@@ -216,7 +229,8 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
             "G Force Long [g],G Force Lat [g],G Force Vert [g],"
             "Yaw [deg],Pitch [deg],Roll [deg],"
             "Yaw Rate [deg/s],Pitch Rate [deg/s],Roll Rate [deg/s],"
-            "Steering Angle [deg],Throttle Pos [%],Brake Pos [%],Gear,Engine RPM [rpm]";
+            "Steering Angle [deg],Throttle Pos [%],Brake Pos [%],Gear,Engine RPM [rpm],"
+            "Engine Torque [Nm],Clutch Torque [Nm],Clutch Slip [rad/s],Clutch Slip Energy [J]";
 
     for (auto corner = std::size_t{0}; corner < cornerCount; corner++)
     {
@@ -279,7 +293,15 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
         text += ",";
         appendInteger(text, frame.gear);
         text += ",";
-        appendNumber(text, frame.engineSpeed, 1);
+        appendNumber(text, frame.engineSpeed * radiansPerSecondToRevolutionsPerMinute, 1);
+        text += ",";
+        appendNumber(text, frame.engineTorque, 2);
+        text += ",";
+        appendNumber(text, frame.clutchTorque, 2);
+        text += ",";
+        appendNumber(text, frame.clutchSlip, 4);
+        text += ",";
+        appendNumber(text, frame.clutchSlipEnergy, 1);
 
         for (const auto& wheel : frame.wheels)
         {

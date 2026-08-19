@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -20,6 +21,7 @@ using raceengine::DrivelineState;
 using raceengine::DrivenAxle;
 using raceengine::EngineModel;
 using raceengine::engineTorque;
+using raceengine::fillDrivelineTelemetry;
 using raceengine::generateProvingGround;
 using raceengine::noDriveTorque;
 using raceengine::openDifferential;
@@ -27,7 +29,9 @@ using raceengine::PhysicsWorld;
 using raceengine::placeholderDriveline;
 using raceengine::placeholderSedan;
 using raceengine::ProvingGroundDescriptor;
+using raceengine::roadTorques;
 using raceengine::spool;
+using raceengine::startEngine;
 using raceengine::stepDriveline;
 using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
@@ -41,9 +45,35 @@ namespace
 
 constexpr auto tick = 1.0 / 360.0;
 
+// No road under the wheels. The cases that use it hold the wheel speeds by hand, so there is no
+// tire reaction to feed back and none of what it would change is the question they are asking.
+constexpr std::array<double, cornerCount> noRoadTorque{};
+
 std::array<double, cornerCount> sameInertia(const double value)
 {
     return {value, value, value, value};
+}
+
+// The driver's packet, which is what the driveline tick takes. Every case below wants the clutch out
+// and left alone, so it says so once here rather than four times.
+VehicleInput driving(const double throttle, const std::int32_t gear)
+{
+    auto input = VehicleInput{};
+    input.throttle = throttle;
+    input.gear = gear;
+
+    return input;
+}
+
+// An engine that has been started and then set where the case wants it. `DrivelineState{}` is a car
+// with the key out and stays at rest however high a speed is written into it, which is the point.
+DrivelineState runningAt(const DrivelineSetup& setup, const double engineSpeed)
+{
+    auto state = DrivelineState{};
+    startEngine(setup, state);
+    state.engineSpeed = engineSpeed;
+
+    return state;
 }
 
 } // namespace
@@ -90,13 +120,14 @@ TEST_CASE("neutral disconnects the chain and nothing else changes", "[physics][d
     REQUIRE(setup.gearbox.reduction(1) > setup.gearbox.reduction(6));
     REQUIRE(setup.gearbox.reduction(-1) < 0.0);
 
-    auto state = DrivelineState{};
-    state.engineSpeed = 300.0;
-    const auto torques = stepDriveline(setup, state, {0.0, 0.0, 0.0, 0.0}, sameInertia(1.2), 1.0, 0, tick);
+    auto state = runningAt(setup, 300.0);
+    const auto torques =
+        stepDriveline(setup, state, {0.0, 0.0, 0.0, 0.0}, sameInertia(1.2), noRoadTorque, driving(1.0, 0), tick);
+    REQUIRE(torques.has_value());
 
     // The engine revs freely and no torque reaches the wheels.
     REQUIRE(state.engineSpeed > 300.0);
-    for (const auto wheel : torques.wheel)
+    for (const auto wheel : torques->wheel)
     {
         REQUIRE(wheel == 0.0);
     }
@@ -199,15 +230,15 @@ TEST_CASE("a locked clutch locks, and the engine keeps its own speed", "[physics
     const auto setup = placeholderDriveline();
     const auto inertias = sameInertia(1.2);
 
-    auto state = DrivelineState{};
-    state.engineSpeed = 100.0;
+    auto state = runningAt(setup, 100.0);
     const auto wheelSpeed = 30.0;
     const auto reduction = setup.gearbox.reduction(3);
 
     // Wheels held at a fixed speed, so the clutch has something to pull against.
     for (auto step = 0; step < 3600; step++)
     {
-        static_cast<void>(stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, 0.0, 3, tick));
+        REQUIRE(stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(0.0, 3), tick)
+                    .has_value());
     }
 
     // The engine has been dragged to the speed the gearing demands.
@@ -215,12 +246,12 @@ TEST_CASE("a locked clutch locks, and the engine keeps its own speed", "[physics
 
     SECTION("and it does so from either side")
     {
-        auto fast = DrivelineState{};
-        fast.engineSpeed = 600.0;
+        auto fast = runningAt(setup, 600.0);
 
         for (auto step = 0; step < 3600; step++)
         {
-            static_cast<void>(stepDriveline(setup, fast, sameInertia(wheelSpeed), inertias, 0.0, 3, tick));
+            REQUIRE(stepDriveline(setup, fast, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(0.0, 3), tick)
+                        .has_value());
         }
 
         REQUIRE(fast.engineSpeed == Catch::Approx(wheelSpeed * reduction).epsilon(0.02));
@@ -231,15 +262,18 @@ TEST_CASE("a locked clutch locks, and the engine keeps its own speed", "[physics
         // A locked clutch is a very stiff spring between two small inertias. Stepped explicitly the
         // two trade energy at the timestep's frequency until one reaches infinity; solved, it simply
         // converges. Started far out of step, with torque, and it must stay finite.
-        auto wild = DrivelineState{};
-        wild.engineSpeed = 700.0;
+        auto wild = runningAt(setup, 700.0);
         auto worst = 0.0;
 
         for (auto step = 0; step < 3600; step++)
         {
-            static_cast<void>(stepDriveline(setup, wild, sameInertia(5.0), inertias, 1.0, 1, tick));
+            REQUIRE(stepDriveline(setup, wild, sameInertia(5.0), inertias, noRoadTorque, driving(1.0, 1), tick)
+                        .has_value());
             worst = std::max(worst, std::abs(wild.engineSpeed));
             REQUIRE(std::isfinite(wild.engineSpeed));
+            // And never below zero, which is the property the three `std::max(0.0, ...)` floors used
+            // to hold by hand and the stall model now holds by construction.
+            REQUIRE(wild.engineSpeed >= 0.0);
         }
 
         REQUIRE(worst < 5000.0);
@@ -255,37 +289,42 @@ TEST_CASE("only the driven wheels are driven", "[physics][driveline]")
     // 300 rad/s with the wheels at 40 in a 9.09 reduction the *wheels* are dragging the engine up,
     // the clutch torque is negative, and every driven wheel correctly reports being braked.
     const auto wheelSpeed = 40.0;
-    auto state = DrivelineState{};
-    state.engineSpeed = wheelSpeed * setup.gearbox.reduction(2);
+    auto state = runningAt(setup, wheelSpeed * setup.gearbox.reduction(2));
 
     SECTION("front wheel drive")
     {
         setup.driven = DrivenAxle::Front;
-        const auto torques = stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, 1.0, 2, tick);
+        const auto torques =
+            stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(1.0, 2), tick);
+        REQUIRE(torques.has_value());
 
-        REQUIRE(torques.wheel[0] > 0.0);
-        REQUIRE(torques.wheel[1] > 0.0);
-        REQUIRE(torques.wheel[2] == 0.0);
-        REQUIRE(torques.wheel[3] == 0.0);
+        REQUIRE(torques->wheel[0] > 0.0);
+        REQUIRE(torques->wheel[1] > 0.0);
+        REQUIRE(torques->wheel[2] == 0.0);
+        REQUIRE(torques->wheel[3] == 0.0);
     }
 
     SECTION("rear wheel drive")
     {
         setup.driven = DrivenAxle::Rear;
-        const auto torques = stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, 1.0, 2, tick);
+        const auto torques =
+            stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(1.0, 2), tick);
+        REQUIRE(torques.has_value());
 
-        REQUIRE(torques.wheel[0] == 0.0);
-        REQUIRE(torques.wheel[1] == 0.0);
-        REQUIRE(torques.wheel[2] > 0.0);
-        REQUIRE(torques.wheel[3] > 0.0);
+        REQUIRE(torques->wheel[0] == 0.0);
+        REQUIRE(torques->wheel[1] == 0.0);
+        REQUIRE(torques->wheel[2] > 0.0);
+        REQUIRE(torques->wheel[3] > 0.0);
     }
 
     SECTION("all wheel drive")
     {
         setup.driven = DrivenAxle::All;
-        const auto torques = stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, 1.0, 2, tick);
+        const auto torques =
+            stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(1.0, 2), tick);
+        REQUIRE(torques.has_value());
 
-        for (const auto wheel : torques.wheel)
+        for (const auto wheel : torques->wheel)
         {
             REQUIRE(wheel > 0.0);
         }
@@ -298,7 +337,8 @@ TEST_CASE("only the driven wheels are driven", "[physics][driveline]")
         setup.driven = DrivenAxle::Rear;
         setup.differential = clutchPackLsd(60.0, 0.35, 0.15);
 
-        static_cast<void>(stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, 1.0, 2, tick));
+        REQUIRE(stepDriveline(setup, state, sameInertia(wheelSpeed), inertias, noRoadTorque, driving(1.0, 2), tick)
+                    .has_value());
 
         REQUIRE(state.differentials[0].capacity == 0.0);
         REQUIRE(state.differentials[1].capacity > 0.0);
@@ -342,8 +382,7 @@ TEST_CASE("the car accelerates on the throttle", "[physics][driveline][integrati
         REQUIRE(stepVehicle(vehicle.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick).has_value());
     }
 
-    auto drivelineState = DrivelineState{};
-    drivelineState.engineSpeed = 200.0;
+    auto drivelineState = runningAt(driveline, 200.0);
 
     // One statement of the wheel inertias, from the setup that owns them, rather than an array
     // assembled here that nothing made agree with what the vehicle tick integrates against.
@@ -355,24 +394,29 @@ TEST_CASE("the car accelerates on the throttle", "[physics][driveline][integrati
 
     auto peakSpeed = 0.0;
     auto lastFrame = TelemetryFrame{};
+    // The road's answer from the previous tick, which is what the clutch's constraint is solved
+    // against. Zero on the first one, before the tire has said anything.
+    auto road = noRoadTorque;
 
     for (auto step = 0; step < 3600; step++)
     {
         const auto torques = stepDriveline(driveline, drivelineState,
                                            {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed,
                                             state.corners[2].wheelSpeed, state.corners[3].wheelSpeed},
-                                           inertias, input.throttle, input.gear, tick);
+                                           inertias, road, input, tick);
+        REQUIRE(torques.has_value());
 
         // The chain's torque is an argument to the vehicle tick, not something applied to the wheels
         // behind its back. Wheel speed is integrated once, inside `stepVehicle`, where the brake
         // clamp can see everything acting on the wheel.
-        auto stepped = stepVehicle(vehicle.value(), state, input, torques.wheel, world.value(), tick);
+        auto stepped = stepVehicle(vehicle.value(), state, input, torques->wheel, world.value(), tick);
         REQUIRE(stepped.has_value());
 
         // And the driveline's telemetry channels are filled here, by the caller that owns the
         // driveline state. `:Vehicle` does not import `:Driveline` and cannot fill them itself,
         // which is exactly why `VehicleStep::telemetry` is a by-value member.
-        stepped->telemetry.engineSpeed = drivelineState.engineSpeed;
+        fillDrivelineTelemetry(stepped->telemetry, drivelineState, torques.value());
+        road = roadTorques(stepped.value());
         lastFrame = stepped->telemetry;
 
         peakSpeed = std::max(peakSpeed, state.chassis.linearVelocity.z);

@@ -5,6 +5,8 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -12,6 +14,9 @@ module;
 
 export module raceengine.physics:Driveline;
 
+import :Clutch;
+import :Coupling;
+import :Telemetry;
 import :Vehicle;
 
 namespace raceengine
@@ -33,6 +38,22 @@ export enum class DrivenAxle : std::uint32_t { Front, Rear, All };
 // differential is the same interface a third time and is somebody else's milestone.
 export inline constexpr std::size_t axleCount = 2;
 
+// The idle controller, and it is an air bypass rather than a governor on the fuelling because that
+// is the device. A real engine idles on a path *around* the closed throttle plate and a closed-loop
+// ECU runs a PI on that valve, so the brief's two options are the same object here. Stating it as the
+// bypass is also what makes its combination with the driver's pedal obvious: two parallel air paths
+// mean the engine sees whichever flows more and never their sum.
+export struct IdleGovernor
+{
+    // Sized on the engine's own torque at idle rather than guessed. About 145 N.m at full throttle
+    // at 89 rad/s against 0.15 kg.m^2 gives a natural frequency of sqrt(145 * ki / J) and a damping
+    // ratio of 145 * kp / (2 * J * wn), so these are 2 Hz and very nearly critical — fast enough that
+    // a clutch bite recovers in under half a second, slow enough that it is not fighting the driver.
+    double proportional = 0.022;
+    double integral = 0.15;
+    double maximumBypass = 1.0;
+};
+
 export struct EngineModel
 {
     // Torque against engine speed in rad/s, at full throttle. A curve rather than a peak and a
@@ -43,6 +64,11 @@ export struct EngineModel
     double inertia = 0.15;
     double idleSpeed = 89.0;     // ~850 rpm
     double limiterSpeed = 712.0; // ~6800 rpm
+    // Below this it is not turning slowly, it has stopped: no engine keeps itself alight at a third
+    // of its idle speed. ~380 rpm, under cranking speed.
+    double stallSpeed = 40.0;
+
+    IdleGovernor governor;
 
     // Engine braking: what it absorbs at the limiter with the throttle shut, falling linearly to
     // nothing at rest. Deliberately separate from the torque curve, which is a full-throttle
@@ -67,6 +93,23 @@ export [[nodiscard]] double engineTorque(const EngineModel& engine, const double
     const auto braking = pumping * engine.coastTorque * std::clamp(speed / engine.limiterSpeed, 0.0, 1.0);
 
     return driving - braking;
+}
+
+// How much bypass the governor is asking for, and the integral it is asking through. Exported and
+// taking its integral by reference because what holds an idle is worth pinning on its own, without a
+// driveline or a car around it.
+export [[nodiscard]] double idleBypass(const EngineModel& engine, const double speed, double& integral,
+                                       const double deltaTime)
+{
+    const auto error = engine.idleSpeed - speed;
+
+    // A valve can only add air, so the integral is clamped to the range the output can ever be asked
+    // for and never runs negative. An integrator left running while the output is saturated takes as
+    // long to come back as it took to wind up, which reads as an engine that hangs after every
+    // clutch release rather than as a controller fault.
+    integral = std::clamp(integral + engine.governor.integral * error * deltaTime, 0.0, engine.governor.maximumBypass);
+
+    return std::clamp(engine.governor.proportional * error + integral, 0.0, engine.governor.maximumBypass);
 }
 
 export struct Gearbox
@@ -176,30 +219,21 @@ export [[nodiscard]] Differential clutchPackLsd(const double preload, const doub
     return Differential{.preload = preload, .powerRamp = powerRamp, .coastRamp = coastRamp};
 }
 
-// The clutch, currently locked, and an element in the chain either way.
-//
-// A locked clutch is a rigid coupling and a slipping one is a friction element with a capacity
-// curve; both sit here, and both are `capacity`. The engine keeps its own speed through either,
-// which is why turning slip on later is a change to one number rather than to the shape of the
-// model.
-export struct Clutch
-{
-    // What it can hold before it slips. The placeholder is far past anything this engine makes, so
-    // it never does.
-    double capacity = 100000.0;
-    // How hard it pulls the two sides together. Solved implicitly below, so this can be as stiff as
-    // a locked clutch needs without the timestep caring.
-    double stiffness = 8000.0;
-};
-
 export struct DrivelineSetup
 {
     EngineModel engine;
     Gearbox gearbox;
-    Clutch clutch;
+    // The slot between the engine's inertia and the gearbox input, and this file names neither of the
+    // two things that can be in it after this line.
+    DriveCoupling coupling;
+    AutoClutch autoClutch;
     Differential differential = openDifferential();
     DrivenAxle driven = DrivenAxle::Front;
 };
+
+// Whether the engine is alight. An enum rather than a bool so that a cranking state has somewhere to
+// go, and so that `DrivelineState` stays trivially copyable either way.
+export enum class EngineState : std::uint32_t { Stalled, Running };
 
 // The driveline's own state, and it is here rather than in `VehicleState` for the reason every
 // other split in this module is made: what integrates a quantity owns it. Engine speed sat in the
@@ -208,14 +242,31 @@ export struct DrivelineSetup
 //
 // Trivially copyable and standard layout, and it stays that way — save and restore is a memcpy and
 // rollback will later lean on that. Scalars, enums and fixed arrays only: no `Curve`, no vector, no
-// string. The clutch's lock and dwell, the shift phase and timer, driveline wind-up, the gearbox
-// output shaft, the converter's turbine and the slip-energy ledger all belong here and none of them
-// is here yet.
+// string. The shift phase and timer, driveline wind-up, the gearbox output shaft and the converter's
+// turbine still belong here and are still not here.
 export struct DrivelineState
 {
     // Independent state from the start even though a locked clutch makes it derivable, because
     // making it independent later is a restructure and making it independent now is free.
     double engineSpeed = 0.0;
+
+    // A default-constructed driveline is a car with the key out: nothing has started this engine, so
+    // it is not turning. `startEngine` is what changes that, and it is deliberately not an input.
+    EngineState engine = EngineState::Stalled;
+
+    // The coupling's own lock/slip machine, whichever kind is fitted.
+    CouplingState clutch{};
+    // The pedal actually being held, which is the driver's when the driver is on it and the
+    // automation's when nobody is. Kept rather than recomputed so the handover between the two is
+    // continuous — see `advanceClutchPedal`.
+    double clutchPedal = 0.0;
+
+    double idleIntegral = 0.0;
+
+    // What the clutch has turned into heat since the run began, in joules. A running total rather
+    // than a per-tick figure: the thermal model that will read it integrates, and a channel that had
+    // to be integrated by whoever plots it is a channel that gets integrated differently twice.
+    double slipEnergy = 0.0;
 
     // One per axle, and separate rather than shared, for the reason given at `split`.
     std::array<DifferentialState, axleCount> differentials{};
@@ -230,44 +281,79 @@ export struct DrivelineTorques
     std::array<double, cornerCount> wheel{};
     double clutch = 0.0;
     double engine = 0.0;
-    // How far out of step the two sides of the clutch are. Zero while it is locked, and the channel
-    // that will say how much it is slipping when it is allowed to.
+    // How far out of step the two sides of the clutch are, in rad/s. It does not reach zero when the
+    // coupling locks: only the engine's half of the constraint is integrated here, the driveline's
+    // half being the vehicle tick's, so a locked clutch converges over a handful of ticks rather
+    // than within one.
     double clutchSlip = 0.0;
+    bool clutchLocked = false;
+    double slipEnergy = 0.0;
 };
 
-// One tick of the chain. Pure: state in, torques out, and the caller integrates.
+// How a stalled engine comes back, and it is a function the game calls rather than a field on
+// `VehicleInput`. There is no starter here and an ignition model is a milestone of its own; more to
+// the point a restart is a *command*, and `VehicleInput` is the packet a rollback netcode transmits
+// and replays every tick, where a level-triggered starter bit would fire again on every replayed
+// tick of the restart. When a cranking model does arrive this is what ends the crank, and nothing
+// above it moves.
+export void startEngine(const DrivelineSetup& setup, DrivelineState& state)
+{
+    state.engine = EngineState::Running;
+    state.engineSpeed = std::max(state.engineSpeed, setup.engine.idleSpeed);
+    state.idleIntegral = 0.0;
+}
+
+namespace
+{
+
+// What replaced the three `std::max(0.0, ...)` floors. They were the only thing keeping engine speed
+// off the negative axis, and removing them without this leaves nothing catching it — an engine
+// dragged below the speed at which it can keep itself alight does not turn slowly backwards, it
+// stops. So the floor is still there and it is now a consequence of the model rather than a clamp
+// bolted under it.
+void settleEngineSpeed(const EngineModel& engine, DrivelineState& state)
+{
+    if (state.engine == EngineState::Stalled || state.engineSpeed < engine.stallSpeed)
+    {
+        state.engine = EngineState::Stalled;
+        state.engineSpeed = 0.0;
+        state.idleIntegral = 0.0;
+    }
+}
+
+} // namespace
+
+// One tick of the chain. `state` in, torques out, and the caller integrates the wheels.
 //
-// The clutch is solved implicitly rather than stepped. A locked clutch is a very stiff coupling
-// between two small inertias, and stepped explicitly it is the single most unstable thing in a
-// driveline — the engine and the gearbox trade energy back and forth at the timestep's frequency
-// until one of them reaches infinity. Solved, it is unconditionally stable at any stiffness, which
-// is what lets "locked" mean locked rather than "stiff enough to look locked".
-export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup, DrivelineState& state,
-                                                    const std::array<double, cornerCount>& wheelSpeeds,
-                                                    const std::array<double, cornerCount>& wheelInertias,
-                                                    const double throttle, const std::int32_t gear,
-                                                    const double deltaTime)
+// Fallible, and the one thing that can fail is the coupling slot: a torque converter is a kind
+// `DriveCoupling` can be set to and is not a model this engine has yet, so it says so rather than
+// answering. Nothing else in here knows which coupling is fitted.
+//
+// The driver's packet arrives whole rather than as three loose scalars, because throttle, clutch and
+// gear are all its fields and passing them separately is three chances to pass them in the wrong
+// order. `roadTorques` is `roadTorques(previousStep)` and is what the road did to the wheels last
+// tick — passed rather than restated, exactly as `wheelInertias` is, and lagged by one tick because
+// the tire's answer for this one does not exist until the vehicle tick has run.
+export [[nodiscard]] std::expected<DrivelineTorques, std::string>
+stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::array<double, cornerCount>& wheelSpeeds,
+              const std::array<double, cornerCount>& wheelInertias, const std::array<double, cornerCount>& roadTorques,
+              const VehicleInput& input, const double deltaTime)
 {
     auto result = DrivelineTorques{};
 
-    const auto flywheel = engineTorque(setup.engine, state.engineSpeed, throttle);
-    const auto reduction = setup.gearbox.reduction(gear);
+    const auto engineInertia = std::max(setup.engine.inertia, 1e-9);
+    const auto running = state.engine == EngineState::Running;
 
-    // Neutral: the engine is on its own, spinning against its own friction. No torque reaches the
-    // wheels and none comes back.
-    //
-    // The floor at zero here and at the two sites below is the only thing stopping the engine
-    // turning backwards, and therefore the only thing stopping it stalling. It comes out together
-    // with the stall model and the idle controller and not before: removing it on its own leaves
-    // negative engine speeds with nothing to catch them.
-    if (std::abs(reduction) < 1e-9)
-    {
-        state.engineSpeed =
-            std::max(0.0, state.engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
-        result.engine = flywheel;
+    // The bypass and the driver's pedal are parallel air paths, so the engine gets the larger of the
+    // two and never their sum: a governor that added to a wide-open throttle would be making torque
+    // that no valve was opened for.
+    const auto bypass = running ? idleBypass(setup.engine, state.engineSpeed, state.idleIntegral, deltaTime) : 0.0;
+    const auto demand = std::max(std::clamp(input.throttle, 0.0, 1.0), bypass);
 
-        return result;
-    }
+    const auto flywheel = running ? engineTorque(setup.engine, state.engineSpeed, demand) : 0.0;
+    const auto reduction = setup.gearbox.reduction(input.gear);
+
+    result.engine = flywheel;
 
     const auto driven = setup.driven;
     const auto isDriven = [driven](const std::size_t index)
@@ -285,6 +371,7 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
     // shafts are rigid.
     auto axleSpeed = 0.0;
     auto axleInertia = 0.0;
+    auto axleRoadTorque = 0.0;
     auto drivenCount = 0;
 
     for (auto index = std::size_t{0}; index < cornerCount; index++)
@@ -296,33 +383,64 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
 
         axleSpeed += wheelSpeeds[index];
         axleInertia += wheelInertias[index];
+        axleRoadTorque += roadTorques[index];
         drivenCount++;
     }
 
-    if (drivenCount == 0)
+    const auto connected = std::abs(reduction) >= 1e-9 && drivenCount > 0;
+
+    axleSpeed = drivenCount > 0 ? axleSpeed / static_cast<double>(drivenCount) : 0.0;
+    const auto clutchSideSpeed = connected ? axleSpeed * reduction : 0.0;
+
+    // The pedal, whoever is on it, and the automation is a layer over exactly this one number.
+    const auto automatic = autoClutchPedal(setup.autoClutch, setup.engine.idleSpeed, clutchSideSpeed, state.engineSpeed,
+                                           input.throttle, connected);
+    state.clutchPedal = advanceClutchPedal(setup.autoClutch, state.clutchPedal, input.clutch, automatic, deltaTime);
+
+    result.slipEnergy = state.slipEnergy;
+
+    // Neutral, or a car with nothing driven: the engine is on its own, spinning against its own
+    // friction, and the coupling is holding no two things together to have a mode about.
+    if (!connected)
     {
-        state.engineSpeed =
-            std::max(0.0, state.engineSpeed + (flywheel / std::max(setup.engine.inertia, 1e-9)) * deltaTime);
+        state.clutch = CouplingState{};
+        state.engineSpeed += (flywheel / engineInertia) * deltaTime;
+        settleEngineSpeed(setup.engine, state);
+
         return result;
     }
 
-    axleSpeed /= static_cast<double>(drivenCount);
-
-    const auto clutchSideSpeed = axleSpeed * reduction;
+    // The wheels' own inertia and nothing else, which is the right one over a tick: the car's mass
+    // reaches the wheel through the tire, and the tire builds its force over a relaxation *length*
+    // rather than instantly. Folding the car in here instead — 122 kg.m^2 against the wheels' 2.4 —
+    // was tried and is unstable, because the vehicle tick then integrates the wheel against 1.2 while
+    // the coupling sized its torque against a hundred times that: measured, it turned a launch's one
+    // lock transition into forty of them banging between plus and minus the whole capacity.
     const auto referredInertia = axleInertia / (reduction * reduction);
 
-    // Implicit solve for the slip across the clutch. Both sides accelerate under the torque it
-    // carries, so the slip decays at a rate set by the stiffness and the two inertias.
-    const auto engineInertia = std::max(setup.engine.inertia, 1e-9);
-    const auto mobility = 1.0 / engineInertia + 1.0 / std::max(referredInertia, 1e-9);
+    const auto sides = CouplingSides{.drivingSpeed = state.engineSpeed,
+                                     .drivenSpeed = clutchSideSpeed,
+                                     .drivingInertia = engineInertia,
+                                     .drivenInertia = std::max(referredInertia, 1e-9),
+                                     .drivingTorque = flywheel,
+                                     .drivenTorque = axleRoadTorque / reduction,
+                                     .capacity = 0.0};
 
-    auto slip = state.engineSpeed - clutchSideSpeed;
-    slip = (slip + deltaTime * (flywheel / engineInertia)) / (1.0 + deltaTime * setup.clutch.stiffness * mobility);
+    const auto solved = stepDriveCoupling(setup.coupling, state.clutch, sides, state.clutchPedal, deltaTime);
+    if (!solved)
+    {
+        return std::unexpected(solved.error());
+    }
 
-    const auto clutchTorque = std::clamp(setup.clutch.stiffness * slip, -setup.clutch.capacity, setup.clutch.capacity);
+    const auto clutchTorque = solved->torque;
 
-    // Engine takes what the clutch did not.
-    state.engineSpeed = std::max(0.0, state.engineSpeed + ((flywheel - clutchTorque) / engineInertia) * deltaTime);
+    // The engine takes what the clutch did not. A stalled one takes nothing: `settleEngineSpeed`
+    // holds it at rest, which is what its own compression does, and the torque still crosses to the
+    // driveline — that is why a stalled car in gear drags itself to a stop rather than coasting.
+    state.engineSpeed += ((flywheel - clutchTorque) / engineInertia) * deltaTime;
+    settleEngineSpeed(setup.engine, state);
+
+    state.slipEnergy += std::abs(clutchTorque * solved->slipSpeed) * deltaTime;
 
     // Through the gearing to the differential, and out to the wheels it decides between.
     const auto axleTorque = clutchTorque * reduction;
@@ -353,10 +471,24 @@ export [[nodiscard]] DrivelineTorques stepDriveline(const DrivelineSetup& setup,
     }
 
     result.clutch = clutchTorque;
-    result.engine = flywheel;
-    result.clutchSlip = slip;
+    result.clutchSlip = solved->slipSpeed;
+    result.clutchLocked = solved->locked;
+    result.slipEnergy = state.slipEnergy;
 
     return result;
+}
+
+// The driveline's own telemetry channels, filled by whoever stepped it. `:Vehicle` fills the rest of
+// the frame and cannot fill these — it does not import this partition and must not — so a caller
+// stepping both is what joins them, and this is that caller's tool rather than five assignments
+// restated at every site.
+export void fillDrivelineTelemetry(TelemetryFrame& frame, const DrivelineState& state, const DrivelineTorques& torques)
+{
+    frame.engineSpeed = state.engineSpeed;
+    frame.engineTorque = torques.engine;
+    frame.clutchTorque = torques.clutch;
+    frame.clutchSlip = torques.clutchSlip;
+    frame.clutchSlipEnergy = torques.slipEnergy;
 }
 
 // The placeholder car's driveline: a small turbocharged four driving the front wheels through a
@@ -376,6 +508,10 @@ export [[nodiscard]] DrivelineSetup placeholderDriveline()
 
     setup.gearbox.ratios = {3.19, 2.08, 1.47, 1.20, 0.99, 0.80};
     setup.gearbox.finalDrive = 4.37;
+
+    // A single dry plate, and the defaults on `FrictionClutch` are this car's. Stated rather than
+    // left implied, because it is the line that says which kind is in the slot.
+    setup.coupling.kind = DriveCouplingKind::FrictionClutch;
 
     setup.driven = DrivenAxle::Front;
     setup.differential = openDifferential();

@@ -260,6 +260,10 @@ export struct VehicleInput
     double steering = 0.0;
     double throttle = 0.0;
     double brake = 0.0;
+    // 0 with a foot off it and 1 fully depressed, which is the way round the pedal works: pressing
+    // it *releases* the clutch. The auto-clutch layer fills it in when nobody is on it, and a driver
+    // past the pedal's free play takes it back outright.
+    double clutch = 0.0;
     std::int32_t gear = 0;
 };
 
@@ -312,6 +316,28 @@ export struct VehicleStep
     ContactManifold contacts;
     TelemetryFrame telemetry;
 };
+
+// What the road put on each wheel this tick — the tire's own reaction, from the one place it is
+// computed. Positive drives the wheel forward, so a rolling wheel's is negative.
+//
+// The driveline needs it, and passing it rather than letting the driveline guess is the same rule
+// `wheelInertias` follows. A coupling's constraint torque is `(Id*Te - Ie*Td)/(Ie+Id)`, and in first
+// gear the engine's reflected inertia is twelve times the wheels', so `Td` is most of the answer: the
+// term the engine's own torque contributes is 7.6% of it. Told `Td = 0`, the only thing left in the
+// constraint's arithmetic that can make up the difference is a speed difference, and a *locked*
+// clutch then carries a steady slip — measured at 18 rad/s in first gear, 170 rpm of engine speed
+// that should not be there.
+export [[nodiscard]] std::array<double, cornerCount> roadTorques(const VehicleStep& step)
+{
+    auto torques = std::array<double, cornerCount>{};
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        torques[index] = -step.corners[index].contact.tyre.longitudinal * step.corners[index].contact.effectiveRadius;
+    }
+
+    return torques;
+}
 
 // The spring free length that puts a corner in equilibrium at its design position under a given
 // sprung load. Not required — a car settles wherever its springs put it — but a setup whose design
