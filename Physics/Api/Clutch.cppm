@@ -333,6 +333,30 @@ stepDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, cons
     return std::unexpected("the drive coupling slot holds a kind this build has no model for");
 }
 
+// What the slot does on a tick where nothing is connected through it — neutral, a gear change, or a
+// car with no driven axle. It is here rather than in the driveline because the two kinds answer
+// differently and the driveline may not know which is fitted.
+//
+// A plate simply forgets which side of its hysteresis it was on: there is nothing to hold. A
+// converter's lockup *bleeds* rather than dropping, because the driveline used to clear this whole
+// struct and that put a step in the one channel a shift is judged by — a plate that vanished in a
+// tick and took half a second to come back, on every gear change, for no reason a transmission
+// controller would recognise.
+export void idleDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const double deltaTime)
+{
+    state.coupling = CouplingState{};
+
+    switch (coupling.kind)
+    {
+    case DriveCouplingKind::FrictionClutch:
+        state.lockupApply = 0.0;
+        break;
+    case DriveCouplingKind::TorqueConverter:
+        state.lockupApply = advanceLockup(coupling.converter.lockup, state.lockupApply, 0.0, 0, deltaTime);
+        break;
+    }
+}
+
 // A layer over the *pedal*, not around the clutch. It produces a pedal position and nothing else, so
 // the friction model underneath is identical whoever is pressing — which is the whole point, because
 // the rig has a real clutch pedal and a human slipping it from rest is the best test this model has.

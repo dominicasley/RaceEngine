@@ -394,6 +394,15 @@ TEST_CASE("the car accelerates on the throttle", "[physics][driveline][integrati
 
     auto peakSpeed = 0.0;
     auto lastFrame = TelemetryFrame{};
+    // Averaged over the last second rather than sampled at the end, because this car spends that
+    // second against the rev limiter and the limiter now has a cycle of its own: with a restore band
+    // under it the fuel comes and goes at a rate the engine's inertia sets, tens of milliseconds
+    // rather than the two ticks a bare threshold gave. Through a locked clutch the cut phase brakes
+    // the driven wheels below the free-rolling ones, so a single tick reports whichever half of that
+    // cycle it landed in. The mean is the claim being made.
+    auto drivenSum = 0.0;
+    auto rollingSum = 0.0;
+    auto sampled = 0;
     // The road's answer from the previous tick, which is what the clutch's constraint is solved
     // against. Zero on the first one, before the tire has said anything.
     auto road = noRoadTorque;
@@ -420,6 +429,13 @@ TEST_CASE("the car accelerates on the throttle", "[physics][driveline][integrati
         lastFrame = stepped->telemetry;
 
         peakSpeed = std::max(peakSpeed, state.chassis.linearVelocity.z);
+
+        if (step >= 3240)
+        {
+            drivenSum += state.corners[0].wheelSpeed;
+            rollingSum += state.corners[2].wheelSpeed;
+            sampled++;
+        }
     }
 
     SECTION("it goes")
@@ -432,7 +448,8 @@ TEST_CASE("the car accelerates on the throttle", "[physics][driveline][integrati
     {
         // Front wheel drive: the fronts are pushing and are turning a little faster than the road,
         // the rears are simply rolling with it.
-        REQUIRE(state.corners[0].wheelSpeed > state.corners[2].wheelSpeed);
+        REQUIRE(sampled == 360);
+        REQUIRE(drivenSum / static_cast<double>(sampled) > rollingSum / static_cast<double>(sampled));
         REQUIRE(state.corners[2].wheelSpeed > 0.0);
     }
 

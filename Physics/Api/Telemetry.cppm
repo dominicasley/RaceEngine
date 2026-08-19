@@ -96,6 +96,11 @@ export struct TelemetryFrame
     double throttle = 0.0;
     double brake = 0.0;
     std::int32_t gear = 0;
+    // Where the gearbox is between two gears, as `ShiftPhase`'s own order: 0 engaged, 1 disengaging,
+    // 2 neutral, 3 engaging. A number rather than the enum because this partition names nothing it
+    // does not import and `:Driveline` imports *this* one, not the other way about — and a channel
+    // is a number by the time anybody plots it anyway.
+    std::uint32_t shiftPhase = 0;
     double engineSpeed = 0.0;
 
     // The driveline's channels. Filled by whoever stepped the driveline: the vehicle tick cannot,
@@ -229,7 +234,7 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
             "G Force Long [g],G Force Lat [g],G Force Vert [g],"
             "Yaw [deg],Pitch [deg],Roll [deg],"
             "Yaw Rate [deg/s],Pitch Rate [deg/s],Roll Rate [deg/s],"
-            "Steering Angle [deg],Throttle Pos [%],Brake Pos [%],Gear,Engine RPM [rpm],"
+            "Steering Angle [deg],Throttle Pos [%],Brake Pos [%],Gear,Shift Phase [],Engine RPM [rpm],"
             "Engine Torque [Nm],Clutch Torque [Nm],Clutch Slip [rad/s],Clutch Slip Energy [J]";
 
     for (auto corner = std::size_t{0}; corner < cornerCount; corner++)
@@ -292,6 +297,8 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
         appendNumber(text, frame.brake * 100.0, 3);
         text += ",";
         appendInteger(text, frame.gear);
+        text += ",";
+        appendInteger(text, static_cast<long long>(frame.shiftPhase));
         text += ",";
         appendNumber(text, frame.engineSpeed * radiansPerSecondToRevolutionsPerMinute, 1);
         text += ",";

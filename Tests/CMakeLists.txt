@@ -1,6 +1,7 @@
-# The engine's unit tests. Nothing here opens a device, a window or a display: the services under
-# test take their seams by reference, so a recording fake stands in for the backend and the tests
-# run anywhere. The GPU gates are the shell scripts in scripts/, and they are untouched by this.
+# The engine's unit tests. Nothing ctest runs opens a device, a window or a display: the services
+# under test take their seams by reference, so a recording fake stands in for the backend and the
+# tests run anywhere. The GPU gates are the shell scripts in scripts/, and they are untouched by
+# this.
 find_package(Catch2 3 CONFIG REQUIRED)
 
 add_executable(EngineTests
@@ -26,6 +27,7 @@ add_executable(EngineTests
         RendererSeamTests.cpp
         RigidBodyTests.cpp
         SceneManagerServiceTests.cpp
+        ShiftTests.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp
         TorqueConverterTests.cpp

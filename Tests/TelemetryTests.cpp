@@ -167,8 +167,8 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
     SECTION("every row has exactly as many fields as the header")
     {
         REQUIRE(header.size() == values.size());
-        // 27 chassis, driver and driveline channels, then twelve per corner.
-        REQUIRE(header.size() == 27 + 12 * cornerCount);
+        // 28 chassis, driver and driveline channels, then twelve per corner.
+        REQUIRE(header.size() == 28 + 12 * cornerCount);
     }
 
     SECTION("the engine column is rpm, as its name has always claimed")
