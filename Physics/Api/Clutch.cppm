@@ -5,6 +5,7 @@ module;
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <type_traits>
 
 #include <glm/glm.hpp>
 
@@ -17,15 +18,15 @@ namespace raceengine
 {
 
 // The element between the engine's inertia and the gearbox input. It is an *element* rather than a
-// clutch because a torque converter lands in the same slot next, and nothing downstream may know
-// which is fitted: the driveline asks this for a torque and puts it on both sides, which is the same
+// clutch because a torque converter sits in the same slot, and nothing downstream may know which is
+// fitted: the driveline asks this what the engine felt and what the gearbox got, which is the same
 // sentence either way.
 //
 // Two kinds behind one function and one output struct, which is `SuspensionKind`'s shape and
-// deliberately not an abstract base's. What a driveline wants from this slot is a torque and whether
-// it is held, and that does not vary by type; the pedal a friction clutch reads and the impeller
-// speed a converter reads are already in the arguments. Value semantics throughout, so
-// `DrivelineSetup` stays assignable.
+// deliberately not an abstract base's. What a driveline wants from this slot does not vary by type;
+// the pedal a friction clutch reads and the gear a converter's lockup reads are both in the
+// arguments, and each kind discards the other's. Value semantics throughout, so `DrivelineSetup`
+// stays assignable.
 export enum class DriveCouplingKind : std::uint32_t { FrictionClutch, TorqueConverter };
 
 // Pedal travel against how much of the clamp load reaches the plate, and it is data rather than code
@@ -64,15 +65,165 @@ export [[nodiscard]] double clutchCapacity(const FrictionClutch& clutch, const d
                              static_cast<double>(clutch.faces) * engagement);
 }
 
-// The other kind, stated and not implemented. The three numbers a converter is quoted by are here so
-// that the slot's data is complete before anything reads them, and `stepDriveCoupling` refuses the
-// kind outright rather than answering for it.
+// The other kind, and it is not a variant of the friction clutch. A converter is a fluid coupling
+// with a third member, and all it shares with a plate is where it sits in the chain: the impeller
+// throws oil at the turbine, the stator turns what comes back and reacts the difference into the
+// housing, and that reaction is the extra torque. Nothing in here has a capacity, a pedal or a
+// sliding surface.
+//
+// **Both curves below are representative rather than measured**, which is a distinction nothing else
+// in this model has to make and is therefore worth making loudly. Every other number here comes out
+// of a real car's own data, and neither car on this machine is a torque-converter automatic — the
+// Golf is a dual clutch and the M3 is a manual — so there is nothing to extract these from. The
+// shape and the sizing are the published single-stage three-element characteristic for a mid-size
+// passenger car: Wong, *Theory of Ground Vehicles* 4th ed. ch. 3; Kotwicki, "Dynamic Models for
+// Torque Converter Equipped Vehicles", SAE 820393; Heisler, *Advanced Vehicle Technology* 2nd ed.
+// ch. 3.
+
+// Speed ratio against torque ratio. Just over two at stall, falling to one at the coupling point
+// near 0.88 and staying there — past that the stator freewheels and the converter is a plain fluid
+// coupling. Efficiency is the product of the two, and this shape reaches 0.90 by a speed ratio of
+// 0.8 — the published figure. Past that it keeps creeping toward one rather than turning over as a
+// measured curve does: slip is the only loss modelled here, and the churning and pumping losses that
+// bend a real curve back down would be a third table. There is next to no torque left up there to be
+// inefficient with, which is why the omission costs nothing and why a lockup clutch exists anyway.
+export [[nodiscard]] Curve converterTorqueRatio()
+{
+    return Curve{.points = {glm::dvec2(0.00, 2.10), glm::dvec2(0.20, 1.85), glm::dvec2(0.40, 1.60),
+                            glm::dvec2(0.60, 1.37), glm::dvec2(0.80, 1.13), glm::dvec2(0.88, 1.00),
+                            glm::dvec2(1.00, 1.00)}};
+}
+
+// Speed ratio against the capacity coefficient C = T_impeller / omega_impeller^2, in N.m per
+// (rad/s)^2.
+//
+// The literature quotes the *capacity factor* K = omega_impeller / sqrt(T_impeller) instead, and
+// this is that table squared and inverted: 140, 143, 150, 156, 166, 182, 212, 290 and infinity
+// rpm/sqrt(lb.ft) at the speed ratios below, which is an ordinary passenger-car converter. Held as C
+// rather than as K because K is *infinite* where the two wheels come into step. Interpolating a
+// piecewise-linear K toward a large finite stand-in instead collapses the torque to nothing well
+// before the speed ratio gets there — which is precisely the range a converter without a lockup
+// spends its life cruising in. C is zero there, which is both finite and the truth: no relative
+// motion, no flow, no torque.
+export [[nodiscard]] Curve converterCapacity()
+{
+    return Curve{.points = {glm::dvec2(0.00, 0.006308), glm::dvec2(0.20, 0.006046), glm::dvec2(0.40, 0.005495),
+                            glm::dvec2(0.50, 0.005080), glm::dvec2(0.60, 0.004486), glm::dvec2(0.70, 0.003732),
+                            glm::dvec2(0.80, 0.002751), glm::dvec2(0.90, 0.001470), glm::dvec2(1.00, 0.0)}};
+}
+
+// The plate that bridges impeller and turbine once there is nothing left to multiply. It is in
+// *parallel* with the fluid rather than downstream of it, which is what a real lockup clutch is
+// bolted across, and it is `stepCoupling`'s third consumer for the reason that partition names no
+// device: a lockup plate is a friction clutch with a different capacity in front of it.
+export struct ConverterLockup
+{
+    bool enabled = true;
+
+    // What the plate holds fully applied. 1.3 times what this engine makes, sized as the friction
+    // clutch's is and for the same reason.
+    double capacity = 450.0;
+
+    // Turbine speed, rad/s. Two of them, and the gap is not a refinement: a plate answering one
+    // threshold chatters every time the speed sits on it. Between them the apply level is simply
+    // held, which makes that level its own latch and is why nothing else has to carry one.
+    double releaseSpeed = 140.0;
+    double engageSpeed = 180.0;
+    // A lockup in first is a car with no launch device at all.
+    std::int32_t lowestGear = 3;
+
+    // Fractions of full apply per second. A real plate is ramped by the transmission controller over
+    // about half a second, and it is that ramp rather than any threshold that stops the engagement
+    // being a bang.
+    double applyRate = 2.5;
+    double releaseRate = 5.0;
+
+    // It will lock across far more slip than the gearbox plate will, and that is not a relaxation of
+    // the same rule. A friction clutch is closed by a driver who has already matched the two speeds,
+    // so a rad/s is all it should ever have to slam shut on; a lockup plate is closed against
+    // whatever slip the fluid has left it, which at a converter's coupling point is tens of rpm and
+    // never less. Held at a rad/s the plate simply never engages, which reads as a lockup that was
+    // never wired up.
+    CouplingSetup coupling{.lockSlipSpeed = 12.0};
+};
+
 export struct TorqueConverter
 {
-    double stallTorqueRatio = 2.0;
-    double capacityFactor = 150.0;
-    double lockupSpeed = 0.0;
+    Curve torqueRatio = converterTorqueRatio();
+    Curve capacity = converterCapacity();
+
+    // Reverse flow, where the turbine is the pump. Representative, like the curves: published
+    // reverse-region capacity is well under the forward figure, and this is why an automatic gives
+    // so little engine braking.
+    double overrunCapacityScale = 0.5;
+
+    ConverterLockup lockup;
 };
+
+// What the fluid is doing. `impeller` is what the converter takes off the engine and `turbine` what
+// it delivers to the gearbox input; they are not the same number, and the difference is what the
+// stator reacts into the housing.
+export struct ConverterFlow
+{
+    double impeller = 0.0;
+    double turbine = 0.0;
+};
+
+// The fluid path alone, with no lockup in it. Pure, so what a converter does can be swept and read
+// off without a car around it.
+export [[nodiscard]] ConverterFlow converterFlow(const TorqueConverter& converter, const double impellerSpeed,
+                                                 const double turbineSpeed)
+{
+    // The speed ratio is always formed over the *faster* side, so there is never a small number
+    // underneath it — an impeller at rest is only ill-conditioned if it is also the divisor. When
+    // both sides are near rest the answer is a torque going as the square of a speed near zero,
+    // which is nothing whatever ratio is read.
+    const auto overrun = std::abs(turbineSpeed) > std::abs(impellerSpeed);
+    const auto pumpSpeed = overrun ? turbineSpeed : impellerSpeed;
+
+    if (std::abs(pumpSpeed) < 1e-9)
+    {
+        return ConverterFlow{};
+    }
+
+    // Clamped below zero as well as above, which is a decision rather than hygiene: a negative speed
+    // ratio is the turbine turning against the impeller — a car rolling backwards in drive — and it
+    // is read as stall. Published data there sits a little above the stall figure, so this is the
+    // conservative side of it and the car still gets the full multiplication pushing it back up.
+    const auto ratio = std::clamp((overrun ? impellerSpeed : turbineSpeed) / pumpSpeed, 0.0, 1.0);
+
+    const auto scale = overrun ? converter.overrunCapacityScale : 1.0;
+    const auto pumped = std::copysign(scale * converter.capacity.at(ratio) * pumpSpeed * pumpSpeed, pumpSpeed);
+
+    if (!overrun)
+    {
+        return ConverterFlow{.impeller = pumped, .turbine = converter.torqueRatio.at(ratio) * pumped};
+    }
+
+    // Reverse flow: the turbine is driving and the stator's one-way clutch has let go, so there is
+    // no reaction member and nothing to multiply against. Both sides see the same torque and it
+    // opposes the turbine.
+    return ConverterFlow{.impeller = -pumped, .turbine = -pumped};
+}
+
+// Where the lockup's apply pressure goes next, given what the car is doing.
+export [[nodiscard]] double advanceLockup(const ConverterLockup& lockup, const double apply, const double turbineSpeed,
+                                          const std::int32_t gear, const double deltaTime)
+{
+    const auto bleed = std::max(apply - std::max(lockup.releaseRate * deltaTime, 0.0), 0.0);
+
+    if (!lockup.enabled || gear < lockup.lowestGear)
+    {
+        return bleed;
+    }
+
+    if (turbineSpeed >= lockup.engageSpeed)
+    {
+        return std::min(apply + std::max(lockup.applyRate * deltaTime, 0.0), 1.0);
+    }
+
+    return turbineSpeed <= lockup.releaseSpeed ? bleed : apply;
+}
 
 export struct DriveCoupling
 {
@@ -82,32 +233,104 @@ export struct DriveCoupling
     TorqueConverter converter;
 };
 
-// One tick of whatever is fitted. `pedal` is the clutch pedal, 0 released and 1 fully depressed; a
-// converter will ignore it, which is why the argument belongs to the slot rather than to the clutch.
-//
-// The converter case returns an error and does not fall through to the clutch's answer. A slot that
-// quietly returned zero for it would be a car that will not move for no stated reason, and one that
-// returned the clutch's answer would be a car that drives — which is worse, because it looks like
-// the converter works.
-export [[nodiscard]] std::expected<CouplingSolution, std::string>
-stepDriveCoupling(const DriveCoupling& coupling, CouplingState& state, const CouplingSides& sides, const double pedal,
-                  const double deltaTime)
+// The slot's own state. `CouplingState` is the lock/slip machine — the plate's for a clutch, the
+// lockup's for a converter — and the apply level beside it is the one thing a converter integrates
+// that a plate does not.
+export struct DriveCouplingState
+{
+    CouplingState coupling{};
+    double lockupApply = 0.0;
+};
+
+static_assert(std::is_trivially_copyable_v<DriveCouplingState>, "the driveline's state is saved by copying its bytes");
+static_assert(std::is_standard_layout_v<DriveCouplingState>, "and rollback will later");
+
+// What the slot is told each tick. Both fields are read by one kind and deliberately discarded by
+// the other, which is exactly why they arrive here rather than in either device's own setup: what
+// the driveline knows is that there is an element in the chain, and it may not know which.
+export struct DriveCouplingCommand
+{
+    // 0 released and 1 fully depressed.
+    double clutchPedal = 0.0;
+    std::int32_t gear = 0;
+};
+
+export struct DriveCouplingSolution
+{
+    // What the slot took off the engine, and what it delivered to the gearbox input. One number does
+    // for a friction clutch, whose two faces carry the same torque; a converter has a third member
+    // grounded to the housing and the difference between these two is precisely what it reacts. A
+    // slot reporting a single torque is a slot no converter can be honest in.
+    double drivingTorque = 0.0;
+    double drivenTorque = 0.0;
+
+    double slipSpeed = 0.0;
+
+    // Watts, and the caller integrates it. Each kind states its own loss because they are not the
+    // same arithmetic: a plate dissipates torque times slip, a converter dissipates the power in
+    // less the power out, and the two agree only where the torque ratio is one.
+    double slipPower = 0.0;
+
+    bool locked = false;
+};
+
+// One tick of whatever is fitted.
+export [[nodiscard]] std::expected<DriveCouplingSolution, std::string>
+stepDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const CouplingSides& sides,
+                  const DriveCouplingCommand& command, const double deltaTime)
 {
     switch (coupling.kind)
     {
     case DriveCouplingKind::FrictionClutch:
     {
-        auto loaded = sides;
-        loaded.capacity = clutchCapacity(coupling.clutch, pedal);
+        static_cast<void>(command.gear);
 
-        return stepCoupling(coupling.clutch.coupling, state, loaded, deltaTime);
+        auto loaded = sides;
+        loaded.capacity = clutchCapacity(coupling.clutch, command.clutchPedal);
+
+        const auto solution = stepCoupling(coupling.clutch.coupling, state.coupling, loaded, deltaTime);
+
+        return DriveCouplingSolution{.drivingTorque = solution.torque,
+                                     .drivenTorque = solution.torque,
+                                     .slipSpeed = solution.slipSpeed,
+                                     .slipPower = std::abs(solution.torque * solution.slipSpeed),
+                                     .locked = solution.locked};
     }
     case DriveCouplingKind::TorqueConverter:
-        break;
+    {
+        // A converter car has no third pedal, and this line is where that is said. Reading the field
+        // and dropping it is the difference between a pedal that is ignored and a pedal nobody wired
+        // up; fed into the fluid it would be a clutch that half works and reads as a feature.
+        static_cast<void>(command.clutchPedal);
+
+        const auto& converter = coupling.converter;
+        const auto flow = converterFlow(converter, sides.drivingSpeed, sides.drivenSpeed);
+
+        state.lockupApply =
+            advanceLockup(converter.lockup, state.lockupApply, sides.drivenSpeed, command.gear, deltaTime);
+
+        // The plate bridges the two sides, so what it has to hold is whatever the fluid has *not*
+        // already taken out of them — hand it the raw external torques and it would be asked to
+        // carry the fluid's work a second time.
+        auto bridged = sides;
+        bridged.drivingTorque = sides.drivingTorque - flow.impeller;
+        bridged.drivenTorque = sides.drivenTorque + flow.turbine;
+        bridged.capacity = std::max(converter.lockup.capacity, 0.0) * std::clamp(state.lockupApply, 0.0, 1.0);
+
+        const auto plate = stepCoupling(converter.lockup.coupling, state.coupling, bridged, deltaTime);
+
+        const auto slipSpeed = sides.drivingSpeed - sides.drivenSpeed;
+        const auto fluidHeat = flow.impeller * sides.drivingSpeed - flow.turbine * sides.drivenSpeed;
+
+        return DriveCouplingSolution{.drivingTorque = flow.impeller + plate.torque,
+                                     .drivenTorque = flow.turbine + plate.torque,
+                                     .slipSpeed = slipSpeed,
+                                     .slipPower = std::max(fluidHeat, 0.0) + std::abs(plate.torque * slipSpeed),
+                                     .locked = plate.locked};
+    }
     }
 
-    return std::unexpected("a torque converter is fitted and there is no converter model yet: it is the next "
-                           "element to land in this slot, and the friction clutch's answer is not its answer");
+    return std::unexpected("the drive coupling slot holds a kind this build has no model for");
 }
 
 // A layer over the *pedal*, not around the clutch. It produces a pedal position and nothing else, so

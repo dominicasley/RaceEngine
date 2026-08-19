@@ -28,6 +28,7 @@ add_executable(EngineTests
         SceneManagerServiceTests.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp
+        TorqueConverterTests.cpp
         TyreTests.cpp
         VehicleTests.cpp
         SphericalHarmonicsTests.cpp

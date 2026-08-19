@@ -2,7 +2,6 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
-#include <string>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -18,9 +17,9 @@ using raceengine::bringUpJolt;
 using raceengine::clutchCapacity;
 using raceengine::cornerCount;
 using raceengine::CouplingSides;
-using raceengine::CouplingState;
 using raceengine::DriveCoupling;
 using raceengine::DriveCouplingKind;
+using raceengine::DriveCouplingState;
 using raceengine::DrivelineSetup;
 using raceengine::DrivelineState;
 using raceengine::EngineState;
@@ -30,6 +29,7 @@ using raceengine::generateProvingGround;
 using raceengine::idleBypass;
 using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
+using raceengine::placeholderAutomatic;
 using raceengine::placeholderDriveline;
 using raceengine::placeholderSedan;
 using raceengine::ProvingGroundDescriptor;
@@ -157,6 +157,18 @@ void settle(const VehicleSetup& vehicle, const DrivelineSetup& driveline, const 
     }
 }
 
+// The same two sides turning at a given pair of speeds. A friction clutch's answer depends on the
+// difference and a converter's on both figures separately, so the cases that ask both have to be
+// able to say what each side is doing.
+CouplingSides withSpeeds(const CouplingSides& sides, const double driving, const double driven)
+{
+    auto moved = sides;
+    moved.drivingSpeed = driving;
+    moved.drivenSpeed = driven;
+
+    return moved;
+}
+
 std::size_t transitionsIn(const std::vector<Sample>& run)
 {
     auto count = std::size_t{0};
@@ -234,11 +246,12 @@ TEST_CASE("a clutch's capacity is a clamp load through a pedal curve", "[physics
     }
 }
 
-TEST_CASE("the coupling slot has two kinds, and one of them says it is not here yet", "[physics][clutch]")
+TEST_CASE("the coupling slot has two kinds and neither answers for the other", "[physics][clutch]")
 {
-    // The slot is an element rather than a clutch because the converter lands in it next. Nothing
-    // downstream may know which is fitted, so the only thing that can tell them apart from out here
-    // is that one of them refuses.
+    // The slot is an element rather than a clutch because a converter sits in it too. Nothing
+    // downstream may know which is fitted, so what tells them apart from out here is not the shape
+    // of the answer but what is in it: a plate's two faces carry one torque and a converter's three
+    // members carry two.
     auto coupling = DriveCoupling{};
 
     const auto sides = CouplingSides{.drivingSpeed = 0.0,
@@ -251,43 +264,54 @@ TEST_CASE("the coupling slot has two kinds, and one of them says it is not here 
 
     SECTION("the friction clutch answers, and the pedal is what it answers through")
     {
-        auto pressed = CouplingState{};
-        const auto held = stepDriveCoupling(coupling, pressed, sides, 0.0, tick);
+        auto pressed = DriveCouplingState{};
+        const auto held = stepDriveCoupling(coupling, pressed, sides, {.clutchPedal = 0.0, .gear = 1}, tick);
         REQUIRE(held.has_value());
-        REQUIRE(held->torque == Catch::Approx(100.0));
+        REQUIRE(held->drivenTorque == Catch::Approx(100.0));
+        // No third member, so there is no difference for one to react.
+        REQUIRE(held->drivingTorque == held->drivenTorque);
 
-        auto released = CouplingState{};
-        const auto none = stepDriveCoupling(coupling, released, sides, 1.0, tick);
+        auto released = DriveCouplingState{};
+        const auto none = stepDriveCoupling(coupling, released, sides, {.clutchPedal = 1.0, .gear = 1}, tick);
         REQUIRE(none.has_value());
-        REQUIRE(none->torque == 0.0);
+        REQUIRE(none->drivenTorque == 0.0);
     }
 
-    SECTION("and the converter refuses rather than answering for a model nobody has written")
+    SECTION("and the converter answers with two torques, because it has somewhere to put the difference")
     {
         coupling.kind = DriveCouplingKind::TorqueConverter;
 
-        auto state = CouplingState{};
-        const auto out = stepDriveCoupling(coupling, state, sides, 0.0, tick);
+        // Stalled: the engine turning and the gearbox held.
+        auto state = DriveCouplingState{};
+        const auto stalled =
+            stepDriveCoupling(coupling, state, withSpeeds(sides, 200.0, 0.0), {.clutchPedal = 0.0, .gear = 1}, tick);
 
-        REQUIRE_FALSE(out.has_value());
-        REQUIRE(out.error().find("converter") != std::string::npos);
+        REQUIRE(stalled.has_value());
+        REQUIRE(stalled->drivenTorque > stalled->drivingTorque);
+        REQUIRE(stalled->drivenTorque / stalled->drivingTorque == Catch::Approx(2.10).epsilon(0.01));
     }
 
-    SECTION("and a driveline with one fitted fails its tick rather than quietly driving")
+    SECTION("and a driveline with one fitted drives rather than refusing")
     {
-        auto setup = placeholderDriveline();
-        setup.coupling.kind = DriveCouplingKind::TorqueConverter;
+        auto setup = placeholderAutomatic();
 
         auto state = DrivelineState{};
         startEngine(setup, state);
+        // Above the turbine, which at 10 rad/s of wheel speed in this car's first gear is 133. Left
+        // at idle the wheels would be driving the engine and the answer would correctly be negative.
+        state.engineSpeed = 300.0;
 
         auto input = VehicleInput{};
         input.throttle = 1.0;
         input.gear = 1;
 
-        REQUIRE_FALSE(
-            stepDriveline(setup, state, {10.0, 10.0, 10.0, 10.0}, {1.2, 1.2, 1.2, 1.2}, noRoadTorque, input, tick)
-                .has_value());
+        const auto torques =
+            stepDriveline(setup, state, {10.0, 10.0, 10.0, 10.0}, {1.2, 1.2, 1.2, 1.2}, noRoadTorque, input, tick);
+
+        REQUIRE(torques.has_value());
+        REQUIRE(torques->wheel[0] > 0.0);
+        // And more came out than went in, which is the whole reason one is fitted.
+        REQUIRE(torques->clutch > torques->clutchReaction);
     }
 }
 

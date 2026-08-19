@@ -254,8 +254,8 @@ export struct DrivelineState
     // it is not turning. `startEngine` is what changes that, and it is deliberately not an input.
     EngineState engine = EngineState::Stalled;
 
-    // The coupling's own lock/slip machine, whichever kind is fitted.
-    CouplingState clutch{};
+    // The coupling slot's own state, whichever kind is fitted.
+    DriveCouplingState coupling{};
     // The pedal actually being held, which is the driver's when the driver is on it and the
     // automation's when nobody is. Kept rather than recomputed so the handover between the two is
     // continuous — see `advanceClutchPedal`.
@@ -263,9 +263,10 @@ export struct DrivelineState
 
     double idleIntegral = 0.0;
 
-    // What the clutch has turned into heat since the run began, in joules. A running total rather
-    // than a per-tick figure: the thermal model that will read it integrates, and a channel that had
-    // to be integrated by whoever plots it is a channel that gets integrated differently twice.
+    // What the coupling has turned into heat since the run began, in joules — a plate's friction or a
+    // converter's fluid. A running total rather than a per-tick figure: the thermal model that will
+    // read it integrates, and a channel that had to be integrated by whoever plots it is a channel
+    // that gets integrated differently twice.
     double slipEnergy = 0.0;
 
     // One per axle, and separate rather than shared, for the reason given at `split`.
@@ -279,7 +280,12 @@ export struct DrivelineTorques
 {
     // Per corner, in the same order as everything else.
     std::array<double, cornerCount> wheel{};
+    // What the coupling delivered to the gearbox input.
     double clutch = 0.0;
+    // And what it took off the engine, which is the same number for a friction clutch and smaller
+    // for a converter by exactly the torque ratio — the difference is the stator's reaction into the
+    // housing. Without both, an engine's own torque balance cannot be reconstructed from telemetry.
+    double clutchReaction = 0.0;
     double engine = 0.0;
     // How far out of step the two sides of the clutch are, in rad/s. It does not reach zero when the
     // coupling locks: only the engine's half of the constraint is integrated here, the driveline's
@@ -325,9 +331,10 @@ void settleEngineSpeed(const EngineModel& engine, DrivelineState& state)
 
 // One tick of the chain. `state` in, torques out, and the caller integrates the wheels.
 //
-// Fallible, and the one thing that can fail is the coupling slot: a torque converter is a kind
-// `DriveCoupling` can be set to and is not a model this engine has yet, so it says so rather than
-// answering. Nothing else in here knows which coupling is fitted.
+// Fallible, and the one thing that can fail is the coupling slot: it answers for the kinds it has a
+// model for and refuses for any other rather than falling through to a neighbour's answer. Nothing
+// else in here knows which coupling is fitted, which is why the driver's pedal and the gear both go
+// into the slot whole and each kind drops what it does not read.
 //
 // The driver's packet arrives whole rather than as three loose scalars, because throttle, clutch and
 // gear are all its fields and passing them separately is three chances to pass them in the wrong
@@ -403,7 +410,7 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
     // friction, and the coupling is holding no two things together to have a mode about.
     if (!connected)
     {
-        state.clutch = CouplingState{};
+        state.coupling = DriveCouplingState{};
         state.engineSpeed += (flywheel / engineInertia) * deltaTime;
         settleEngineSpeed(setup.engine, state);
 
@@ -426,24 +433,26 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
                                      .drivenTorque = axleRoadTorque / reduction,
                                      .capacity = 0.0};
 
-    const auto solved = stepDriveCoupling(setup.coupling, state.clutch, sides, state.clutchPedal, deltaTime);
+    const auto command = DriveCouplingCommand{.clutchPedal = state.clutchPedal, .gear = input.gear};
+
+    const auto solved = stepDriveCoupling(setup.coupling, state.coupling, sides, command, deltaTime);
     if (!solved)
     {
         return std::unexpected(solved.error());
     }
 
-    const auto clutchTorque = solved->torque;
-
-    // The engine takes what the clutch did not. A stalled one takes nothing: `settleEngineSpeed`
+    // The engine takes what the coupling did not. A stalled one takes nothing: `settleEngineSpeed`
     // holds it at rest, which is what its own compression does, and the torque still crosses to the
     // driveline — that is why a stalled car in gear drags itself to a stop rather than coasting.
-    state.engineSpeed += ((flywheel - clutchTorque) / engineInertia) * deltaTime;
+    state.engineSpeed += ((flywheel - solved->drivingTorque) / engineInertia) * deltaTime;
     settleEngineSpeed(setup.engine, state);
 
-    state.slipEnergy += std::abs(clutchTorque * solved->slipSpeed) * deltaTime;
+    state.slipEnergy += solved->slipPower * deltaTime;
 
-    // Through the gearing to the differential, and out to the wheels it decides between.
-    const auto axleTorque = clutchTorque * reduction;
+    // Through the gearing to the differential, and out to the wheels it decides between. This is the
+    // *delivered* torque and not the reaction: they part company the moment the slot holds anything
+    // with a member grounded to its own housing.
+    const auto axleTorque = solved->drivenTorque * reduction;
 
     if (driven == DrivenAxle::All)
     {
@@ -470,7 +479,8 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
         result.wheel = {0.0, 0.0, split.left, split.right};
     }
 
-    result.clutch = clutchTorque;
+    result.clutch = solved->drivenTorque;
+    result.clutchReaction = solved->drivingTorque;
     result.clutchSlip = solved->slipSpeed;
     result.clutchLocked = solved->locked;
     result.slipEnergy = state.slipEnergy;
@@ -515,6 +525,23 @@ export [[nodiscard]] DrivelineSetup placeholderDriveline()
 
     setup.driven = DrivenAxle::Front;
     setup.differential = openDifferential();
+
+    return setup;
+}
+
+// The same car with a torque converter in the slot instead of a plate. Its ratios are an automatic's
+// rather than the manual's — a wider first, a taller top and a shorter final drive — because a
+// converter already multiplies at the bottom and a gearbox behind one is geared for that. Nothing
+// here touches the stall speed, which falls out of the converter's own curves and out of the engine's
+// torque at the speed they cross.
+export [[nodiscard]] DrivelineSetup placeholderAutomatic()
+{
+    auto setup = placeholderDriveline();
+
+    setup.coupling.kind = DriveCouplingKind::TorqueConverter;
+
+    setup.gearbox.ratios = {4.15, 2.37, 1.56, 1.16, 0.86, 0.69};
+    setup.gearbox.finalDrive = 3.20;
 
     return setup;
 }
