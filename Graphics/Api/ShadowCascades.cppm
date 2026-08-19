@@ -10,7 +10,6 @@ module;
 
 export module raceengine.graphics:ShadowCascades;
 
-import :GraphicsApi;
 import :RenderContract;
 import raceengine.graphics.models;
 
@@ -171,23 +170,20 @@ export [[nodiscard]] inline CascadeFit fitCascade(const glm::vec3& viewPosition,
 // Clip space to a shadow-map lookup: xy become texture coordinates and z the depth reference the
 // comparison sampler tests, both in 0..1.
 //
-// The only thing that differs between the backends is the sign of y, and it differs for a reason
-// that is invisible from the shader: the scene pass records with a negative viewport height
-// (docs/vulkan-abi.md), so clip y = +1 lands on framebuffer row 0 — the row v = 0 reads under
-// Vulkan's top-left texture origin — while GL's bottom-left origin already agrees with the
-// clip-space y it was rasterised from. Vulkan's 0..1 depth correction folds into the same matrix:
-// after it, z' = 0.5z + 0.5w on both, which is exactly what each backend's depth buffer stores.
-// Putting the difference here is what lets one GLSL expression be correct in both dialects.
+// y is negated, for a reason that is invisible from the shader: the scene pass records with a
+// negative viewport height (docs/vulkan-abi.md), so clip y = +1 lands on framebuffer row 0 — the
+// row v = 0 reads under Vulkan's top-left texture origin. The 0..1 depth correction folds into the
+// same matrix: after it, z' = 0.5z + 0.5w, which is exactly what the depth buffer stores. Putting
+// both here is what lets the GLSL hold no convention of its own.
 //
-// The sign is measured, not argued: with the shadow term live, verify-parity.sh puts Vulkan within
-// tens of pixels of GL, and the positive y a mirrored lookup would need moves every shadow to the
-// far side of its cascade. ShadowCascadesTests states the mapping directly, so the next reader
-// does not have to run a frame to check it.
-export [[nodiscard]] inline glm::mat4 shadowLookupCorrection(const GraphicsApi api)
+// The sign is measured, not argued: the positive y a mirrored lookup would need moves every shadow
+// to the far side of its cascade. ShadowCascadesTests states the mapping directly, so the next
+// reader does not have to run a frame to check it.
+export [[nodiscard]] inline glm::mat4 shadowLookupCorrection()
 {
     auto correction = glm::mat4(1.0f);
     correction[0][0] = 0.5f;
-    correction[1][1] = api == GraphicsApi::Vulkan ? -0.5f : 0.5f;
+    correction[1][1] = -0.5f;
     correction[2][2] = 0.5f;
     correction[3][0] = 0.5f;
     correction[3][1] = 0.5f;

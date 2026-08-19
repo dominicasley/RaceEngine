@@ -12,7 +12,6 @@ using Catch::Approx;
 using raceengine::cascadeSliceSphere;
 using raceengine::cascadeSplitDistances;
 using raceengine::fitCascade;
-using raceengine::GraphicsApi;
 using raceengine::shadowCascadeCount;
 using raceengine::shadowLookupCorrection;
 
@@ -45,9 +44,9 @@ std::array<glm::vec3, 8> sliceCorners(const float verticalFieldOfViewDegrees, co
 }
 
 // A lookup as the shader performs it: clip space through the correction, perspective-divided.
-glm::vec3 lookup(const GraphicsApi api, const glm::vec4& clip)
+glm::vec3 lookup(const glm::vec4& clip)
 {
-    const auto corrected = shadowLookupCorrection(api) * clip;
+    const auto corrected = shadowLookupCorrection() * clip;
 
     return glm::vec3(corrected) / corrected.w;
 }
@@ -189,40 +188,28 @@ TEST_CASE("the caster extent lengthens the cascade's depth range without widenin
     CHECK(fitWith.depthPerWorldUnit == Approx(1.0f / fitWith.farPlane));
 }
 
-// Both dialects run one GLSL expression, so the whole of the difference between them lives in this
-// matrix. z is the reference the comparison sampler tests and must span 0..1 on both: GL's depth
-// buffer stores window z from an NDC z in -1..1, and Vulkan's stores the 0..1 the clip correction
-// already produced.
-TEST_CASE("the lookup correction maps clip depth to 0..1 on both backends", "[shadow][cascades][parity]")
+// z is the reference the comparison sampler tests and must span 0..1: the clip correction is what
+// produces it, and the depth buffer stores exactly that.
+TEST_CASE("the lookup correction maps clip depth to 0..1", "[shadow][cascades][parity]")
 {
-    for (const auto api : {GraphicsApi::OpenGL, GraphicsApi::Vulkan})
-    {
-        CHECK(lookup(api, glm::vec4(0.0f, 0.0f, -1.0f, 1.0f)).z == Approx(0.0f));
-        CHECK(lookup(api, glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)).z == Approx(1.0f));
-        // Under a perspective divide as well: the correction is a post-multiply on the clip-space
-        // side, so a w of anything but 1 must come out the same.
-        CHECK(lookup(api, glm::vec4(0.0f, 0.0f, 3.0f, 6.0f)).z == Approx(0.75f));
-    }
+    CHECK(lookup(glm::vec4(0.0f, 0.0f, -1.0f, 1.0f)).z == Approx(0.0f));
+    CHECK(lookup(glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)).z == Approx(1.0f));
+    // Under a perspective divide as well: the correction is a post-multiply on the clip-space
+    // side, so a w of anything but 1 must come out the same.
+    CHECK(lookup(glm::vec4(0.0f, 0.0f, 3.0f, 6.0f)).z == Approx(0.75f));
 }
 
-// The one thing that differs, and the reason it does. GL rasterises the cascade with a normal
-// viewport into a bottom-left-origin texture, so clip y = -1 is the row v = 0 reads. Vulkan
-// rasterises it with a *negative* viewport height (docs/vulkan-abi.md), which puts clip y = +1 at
-// framebuffer row 0 — the row v = 0 reads under Vulkan's top-left texture origin. Getting this
-// backwards mirrors every shadow about the middle of its cascade, which the parity gate measures.
-TEST_CASE("the lookup correction flips y for Vulkan and not for OpenGL", "[shadow][cascades][parity]")
+// The cascade is rasterised with a *negative* viewport height (docs/vulkan-abi.md), which puts
+// clip y = +1 at framebuffer row 0 — the row v = 0 reads under Vulkan's top-left texture origin.
+// Getting this backwards mirrors every shadow about the middle of its cascade, which is a picture
+// plausible enough that only the frame gate catches it.
+TEST_CASE("the lookup correction flips y", "[shadow][cascades][parity]")
 {
-    CHECK(lookup(GraphicsApi::OpenGL, glm::vec4(0.0f, -1.0f, 0.0f, 1.0f)).y == Approx(0.0f));
-    CHECK(lookup(GraphicsApi::OpenGL, glm::vec4(0.0f, 1.0f, 0.0f, 1.0f)).y == Approx(1.0f));
+    CHECK(lookup(glm::vec4(0.0f, 1.0f, 0.0f, 1.0f)).y == Approx(0.0f));
+    CHECK(lookup(glm::vec4(0.0f, -1.0f, 0.0f, 1.0f)).y == Approx(1.0f));
 
-    CHECK(lookup(GraphicsApi::Vulkan, glm::vec4(0.0f, 1.0f, 0.0f, 1.0f)).y == Approx(0.0f));
-    CHECK(lookup(GraphicsApi::Vulkan, glm::vec4(0.0f, -1.0f, 0.0f, 1.0f)).y == Approx(1.0f));
-
-    // x is a texture coordinate on both and is never flipped: a backend that mirrored it would
-    // still land inside the map, which is what makes it worth stating.
-    for (const auto api : {GraphicsApi::OpenGL, GraphicsApi::Vulkan})
-    {
-        CHECK(lookup(api, glm::vec4(-1.0f, 0.0f, 0.0f, 1.0f)).x == Approx(0.0f));
-        CHECK(lookup(api, glm::vec4(1.0f, 0.0f, 0.0f, 1.0f)).x == Approx(1.0f));
-    }
+    // x is a texture coordinate and is never flipped: a backend that mirrored it would still land
+    // inside the map, which is what makes it worth stating.
+    CHECK(lookup(glm::vec4(-1.0f, 0.0f, 0.0f, 1.0f)).x == Approx(0.0f));
+    CHECK(lookup(glm::vec4(1.0f, 0.0f, 0.0f, 1.0f)).x == Approx(1.0f));
 }

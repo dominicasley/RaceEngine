@@ -24,8 +24,6 @@ module;
 
 export module raceengine.graphics:Window;
 
-import :GraphicsApi;
-
 namespace raceengine
 {
 
@@ -65,7 +63,6 @@ export class IWindow
 {
 public:
     virtual ~IWindow() = default;
-    virtual void makeContextCurrent() = 0;
     virtual void swapBuffers() const = 0;
     virtual void setMousePosition(int x, int y) = 0;
     virtual void setCursorMode(CursorMode mode) = 0;
@@ -116,7 +113,6 @@ private:
 
     WindowState windowState;
     spdlog::logger& logger;
-    GraphicsApi graphicsApi;
     // Unattended runs (smoke gates, frame captures) belong to no one at the keyboard: the
     // window never appears and every input path reports nothing, so an automated run
     // cannot steal focus, pull the cursor, or take keystrokes from the desktop session.
@@ -136,9 +132,8 @@ private:
     [[nodiscard]] bool focused() const;
 
 public:
-    explicit GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi);
+    explicit GLFWWindow(spdlog::logger& logger);
     ~GLFWWindow();
-    void makeContextCurrent() override;
     void swapBuffers() const override;
     void setMousePosition(int x, int y) override;
     void setCursorMode(CursorMode mode) override;
@@ -152,14 +147,13 @@ public:
     [[nodiscard]] float delta() const override;
 };
 
-GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
+GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     _delta(0),
     _frameTime(0),
     _avgFrameRate(0),
     _frameCount(0),
     windowState({0, 0, 0, 0}),
     logger(logger),
-    graphicsApi(graphicsApi),
     unattended(std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr)
 {
     // Thrown rather than logged and thrown: the exception is the report, and main's boundary is
@@ -174,16 +168,8 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
         logger.info("Vulkan support detected");
     }
 
-    if (graphicsApi == GraphicsApi::Vulkan)
-    {
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    }
-    else
-    {
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    }
+    // The renderer owns the device outright; GLFW is asked for a window and nothing else.
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
     // Games block on asset loading before the first frame, and nothing pumps events until
     // then, so a window mapped here answers no window-manager pings and gets reported as
@@ -212,12 +198,6 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger, GraphicsApi graphicsApi) :
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, windowResized);
     glfwSetCursorPosCallback(window, cursorPositionChanged);
-
-    if (graphicsApi == GraphicsApi::OpenGL)
-    {
-        glfwMakeContextCurrent(window);
-        glfwSwapInterval(1);
-    }
 }
 
 GLFWWindow::~GLFWWindow()
@@ -278,13 +258,8 @@ void GLFWWindow::swapBuffers() const
         _frameCount = 0;
     }
 
-    if (graphicsApi == GraphicsApi::OpenGL)
-    {
-        glfwSwapBuffers(window);
-    }
-
-    // Both backends have presented a frame by the time the loop reaches here, so the
-    // window reveals rendered content rather than the blank fill it was created with.
+    // The renderer has presented by the time the loop reaches here, so the window reveals
+    // rendered content rather than the blank fill it was created with.
     if (!windowShown && !unattended)
     {
         glfwShowWindow(window);
@@ -292,11 +267,6 @@ void GLFWWindow::swapBuffers() const
     }
 
     glfwPollEvents();
-}
-
-void GLFWWindow::makeContextCurrent()
-{
-    glfwMakeContextCurrent(window);
 }
 
 void GLFWWindow::windowResized(GLFWwindow* window, int width, int height)

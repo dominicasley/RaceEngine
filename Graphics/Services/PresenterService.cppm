@@ -36,7 +36,7 @@ void PresenterService::record() const
 {
     if (presenter.has_value())
     {
-        frameRecorder.recordPresent(presenter.value().shader, presenter.value().output);
+        frameRecorder.recordPresent(presenter.value());
     }
 }
 

@@ -43,6 +43,7 @@ export enum class FrameDiagnostic : size_t {
     DrawDataRingExhausted,
     FrameDataRingExhausted,
     PostProcessSkipped,
+    PostProcessInputsExceeded,
     PresentPassSkipped,
     UnsupportedTopology,
     UnsupportedIndexType,
@@ -50,9 +51,15 @@ export enum class FrameDiagnostic : size_t {
     MipGenerationUnavailable,
     ShadowCascadeUnavailable,
     ViewShaderUnavailable,
+    ProbeLimitExceeded,
+    ProbeCaptureSkipped,
+    ExposureMeterSkipped,
+    AmbientOcclusionSkipped,
+    ColourGradeUnavailable,
 };
 
-export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::ViewShaderUnavailable) + 1;
+export inline constexpr size_t frameDiagnosticCount =
+    static_cast<size_t>(FrameDiagnostic::ColourGradeUnavailable) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -89,6 +96,8 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "view(s) past the end of the frame-data ring";
     case FrameDiagnostic::PostProcessSkipped:
         return "post-process pass(es) wanting an input, a colour output or a fullscreen shader";
+    case FrameDiagnostic::PostProcessInputsExceeded:
+        return "post-process pass(es) declaring more inputs than the fullscreen set carries";
     case FrameDiagnostic::PresentPassSkipped:
         return "present pass(es) skipped, leaving the clear colour on screen";
     case FrameDiagnostic::UnsupportedTopology:
@@ -103,6 +112,16 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "view(s) shading lit, the cascade depth map they asked for having no target";
     case FrameDiagnostic::ViewShaderUnavailable:
         return "view(s) recording nothing, the shader they draw every entity with being unloaded";
+    case FrameDiagnostic::ProbeLimitExceeded:
+        return "light probe(s) past the end of the probe array, lighting nothing";
+    case FrameDiagnostic::ProbeCaptureSkipped:
+        return "light probe capture(s) abandoned, the target or the prefilter pipeline being unavailable";
+    case FrameDiagnostic::ExposureMeterSkipped:
+        return "exposure meter reading(s) not taken, the reduction chain having no image to copy from";
+    case FrameDiagnostic::AmbientOcclusionSkipped:
+        return "view(s) shaded without their occlusion, its buffer having no image to sample";
+    case FrameDiagnostic::ColourGradeUnavailable:
+        return "frame(s) presented ungraded, the presenter's lookup table having no image to sample";
     }
 
     return "skipped item(s) of an unnamed kind";

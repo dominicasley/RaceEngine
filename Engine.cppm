@@ -39,6 +39,7 @@ export using raceengine::RenderableModel;
 export using raceengine::Scene;
 export using raceengine::SceneNode;
 export using raceengine::ShaderDescriptor;
+export using raceengine::ToneCurve;
 
 namespace raceengine
 {
@@ -60,9 +61,6 @@ private:
     // that skips: the skinning path does too, and there is one answer per Engine, not per
     // process — which is what the function-local `static` latches this replaced could not say.
     FrameDiagnostics frameDiagnostics;
-    // Resolved before the window: the window's client API and the renderer factory both
-    // depend on the selection (member init order is the mechanism).
-    GraphicsApi graphicsApi;
     GLFWWindow glfwWindow;
     MemoryStorageService memoryStorageService;
     GLTFService gltfService;
@@ -70,9 +68,9 @@ private:
     BackgroundWorkerService backgroundWorkerService;
     RenderableEntityService renderableEntityService;
     SceneManagerService sceneManagerService;
-    // unique_ptr for backend selection, but the declaration position is still load-bearing:
-    // the GL renderer's destructor issues GL deletes that need the GLFW context current, so
-    // this member must keep destroying before glfwWindow — same slot the value member had.
+    // unique_ptr because the concrete backend is an implementation partition this header cannot
+    // name, but the declaration position is still load-bearing: the device's teardown destroys a
+    // surface built from the window, so this member must keep destroying before glfwWindow.
     //
     // This is the only member declared as the whole device: every service below takes the one
     // seam it uses, so a service cannot reach the frame or the factory it has no business in.
@@ -80,6 +78,9 @@ private:
     FboService fboService;
     ShaderService shaderService;
     CubeMapService cubeMapService;
+    // Places probes and marks them stale. It owns no device — a probe is scene data — so it sits
+    // with the other authoring services and not with the backend that captures them.
+    LightProbeService lightProbeService;
     PostProcessService postProcessService;
     PresenterService presenterService;
     // The release side of the resource model. It needs both the storage (to remove elements) and
@@ -87,6 +88,20 @@ private:
     // ResourceService up above the renderer — loading needs neither.
     AssetService assetService;
     CameraService cameraService;
+    // Builds the reduction chain a camera meters itself from and runs the adaptation over it, so
+    // it needs the framebuffers, the post-process passes and the camera they hang on — which is
+    // what puts it below all three.
+    AutoExposureService autoExposureService;
+    // Builds the buffers a camera gathers its own occlusion through: the same three dependencies as
+    // the meter above, minus the camera service, because it only ever writes the camera it is
+    // handed rather than adding passes to that camera's own chain.
+    AmbientOcclusionService ambientOcclusionService;
+    // Builds the two chains a camera's highlights spill down and back up. Same dependencies as the
+    // meter, and for the same reason: buffers, passes, and the camera the passes hang on.
+    BloomService bloomService;
+    // Turns a .cube file into a table the presenter can name. It needs storage and nothing else — the
+    // upload is the backend's, on the frame the grade is first presented with.
+    ColourGradeService colourGradeService;
     // Builds and moves the cascade cameras, so it needs the service that builds cameras and
     // nothing else — the depth targets are cameras like any other.
     ShadowService shadowService;
@@ -197,6 +212,11 @@ public:
         return cubeMapService;
     }
 
+    [[nodiscard]] LightProbeService& lightProbe()
+    {
+        return lightProbeService;
+    }
+
     [[nodiscard]] FboService& fbo()
     {
         return fboService;
@@ -205,6 +225,26 @@ public:
     [[nodiscard]] PostProcessService& postProcess()
     {
         return postProcessService;
+    }
+
+    [[nodiscard]] AutoExposureService& autoExposure()
+    {
+        return autoExposureService;
+    }
+
+    [[nodiscard]] AmbientOcclusionService& ambientOcclusion()
+    {
+        return ambientOcclusionService;
+    }
+
+    [[nodiscard]] BloomService& bloom()
+    {
+        return bloomService;
+    }
+
+    [[nodiscard]] ColourGradeService& colourGrade()
+    {
+        return colourGradeService;
     }
 
     [[nodiscard]] PresenterService& presenter()
@@ -225,6 +265,7 @@ public:
 private:
     void update(float delta);
     [[nodiscard]] float frameDelta() const;
+    void recordProbeCaptures();
     void dumpFrameIfRequested();
 };
 
@@ -238,12 +279,11 @@ namespace raceengine
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
     frameDiagnostics(*logger),
-    graphicsApi(selectGraphicsApi(*logger)),
-    glfwWindow(*logger, graphicsApi),
+    glfwWindow(*logger),
     gltfService(*logger, memoryStorageService),
     resourceService(*logger, memoryStorageService, backgroundWorkerService, gltfService),
     renderableEntityService(memoryStorageService, frameDiagnostics),
-    renderer(createRenderer(graphicsApi, *logger, frameDiagnostics, glfwWindow, glfwWindow, renderableEntityService,
+    renderer(createRenderer(*logger, frameDiagnostics, glfwWindow, glfwWindow, renderableEntityService,
                             sceneManagerService, memoryStorageService)),
     fboService(memoryStorageService, *renderer),
     shaderService(memoryStorageService, *renderer),
@@ -252,6 +292,10 @@ Engine::Engine() :
     presenterService(*renderer),
     assetService(*logger, memoryStorageService, *renderer, sceneManagerService),
     cameraService(memoryStorageService, fboService, glfwWindow),
+    autoExposureService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
+    ambientOcclusionService(*logger, memoryStorageService, fboService, postProcessService),
+    bloomService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
+    colourGradeService(*logger, memoryStorageService),
     shadowService(cameraService),
     sceneService(renderableEntityService, cameraService, sceneManagerService)
 {
@@ -305,12 +349,36 @@ Engine::Engine() :
 
                     for (auto postProcess : camera.postProcesses)
                     {
+                        // A pass over a buffer a service sized is that service's to rebuild, and
+                        // the exposure meter's is not the window's size at all.
+                        const auto* pass = memoryStorageService.postProcesses.find(postProcess);
+                        if (pass == nullptr || !pass->tracksWindowSize)
+                        {
+                            continue;
+                        }
+
                         if (const auto recreated = postProcessService.recreateOutputBuffer(postProcess, width, height);
                             !recreated)
                         {
                             logger->error("Post-process output buffer was not rebuilt at {}x{}: {}", width, height,
                                           recreated.error());
                         }
+                    }
+
+                    // The occlusion buffers are not in the chain above and are the view's own size,
+                    // which is the whole of why they have to be rebuilt here: the shading pass reads
+                    // them at its own pixel, so one left at the old size puts a scaled ghost of the
+                    // scene on every surface.
+                    if (const auto rebuilt = ambientOcclusionService.resize(camera, width, height); !rebuilt)
+                    {
+                        logger->error("Ambient occlusion buffers were not rebuilt at {}x{}: {}", width, height,
+                                      rebuilt.error());
+                    }
+
+                    // Half-size buffers a service owns, so the same rule and the same reason.
+                    if (const auto rebuilt = bloomService.resize(camera, width, height); !rebuilt)
+                    {
+                        logger->error("Bloom chains were not rebuilt at {}x{}: {}", width, height, rebuilt.error());
                     }
                 }
             }
@@ -378,10 +446,16 @@ void Engine::step()
     // and the leftover is always a fraction of one step.
     accumulator = std::min(accumulator + delta, fixedTimeStep * static_cast<float>(maxCatchUpSteps));
 
+    // Counted, because it is the only clock anything temporal below may read. A capture run makes
+    // the tick count a function of the frame number rather than of how fast the machine ran, and
+    // an exposure adaptation driven by anything else would put a different image on disk.
+    auto ticks = 0u;
+
     while (accumulator >= fixedTimeStep)
     {
         update(fixedTimeStep);
         accumulator -= fixedTimeStep;
+        ticks++;
     }
 
     interpolationAlpha = accumulator / fixedTimeStep;
@@ -399,6 +473,10 @@ void Engine::step()
 
         for (auto& camera : scenePtr->cameras)
         {
+            // Before the frame, not after it: the exposure a view is recorded with is a push
+            // constant read while that view's post chain is being recorded, so a camera that
+            // adapted afterwards would always be showing the previous frame's number.
+            autoExposureService.update(camera, ticks, fixedTimeStep);
             cameraService.updateModelViewProjectionMatrix(camera);
         }
     }
@@ -413,27 +491,52 @@ void Engine::step()
     // records nothing this step and skips the close, which is the one path with no present.
     if (renderer->beginFrame())
     {
-        // Twice over the same cameras rather than once, in role order: a shadow cascade produces
-        // the depth map the scene cameras sample, and a producer recorded after its consumer is
-        // read before it is written (see CameraRole). Two passes rather than a sort because the
-        // order is two fixed groups, and a sort would allocate inside the frame to say so.
-        for (const auto role : {CameraRole::ShadowCascade, CameraRole::Scene})
+        // The cascades first: a shadow cascade produces the depth map everything downstream
+        // samples, and a producer recorded after its consumer is read before it is written (see
+        // CameraRole). Separate passes rather than a sort because the order is fixed groups, and a
+        // sort would allocate inside the frame to say so.
+        for (auto& scenePtr : sceneManagerService.getScenes())
         {
-            for (auto& scenePtr : sceneManagerService.getScenes())
+            if (!scenePtr)
             {
-                if (!scenePtr)
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                for (auto& camera : scenePtr->cameras)
+            for (auto& camera : scenePtr->cameras)
+            {
+                if (camera.role == CameraRole::ShadowCascade)
                 {
-                    if (camera.role != role)
-                    {
-                        continue;
-                    }
-
                     renderer->recordView(*scenePtr, camera, delta);
+                }
+            }
+        }
+
+        // Then one probe's worth of capture, between the two: a probe shades from the cascades
+        // recorded above, and the scene cameras below shade from the probe.
+        recordProbeCaptures();
+
+        for (auto& scenePtr : sceneManagerService.getScenes())
+        {
+            if (!scenePtr)
+            {
+                continue;
+            }
+
+            for (auto& camera : scenePtr->cameras)
+            {
+                if (camera.role == CameraRole::Scene)
+                {
+                    // Immediately before the view that samples it, and inside the same frame: the
+                    // occlusion is gathered from this camera's own geometry, so it is neither a
+                    // group of its own above nor something a game could order for itself.
+                    renderer->recordAmbientOcclusion(*scenePtr, camera, delta);
+                    renderer->recordView(*scenePtr, camera, delta);
+
+                    // Immediately after the view that filled it. The reduction this reads from is
+                    // the tail of that view's post-process chain, so the copy has to be a command
+                    // in the same frame and after those passes; what it copies reaches the CPU a
+                    // fixed number of submissions later, never this one.
+                    renderer->recordAutoExposure(camera);
                 }
             }
         }
@@ -447,11 +550,43 @@ void Engine::step()
     // finished counting by here, and a reason is stated once rather than at each site that met it.
     frameDiagnostics.report();
 
-    // After the present and before the swap: the capture reads what this frame put on screen,
-    // and on GL the back buffer's contents are undefined once it has been swapped.
+    // After the present and before the swap: the capture reads what this frame put on screen.
     dumpFrameIfRequested();
 
     glfwWindow.swapBuffers();
+}
+
+// One probe's worth of capture per frame, over every scene.
+//
+// Deliberately one, and deliberately in scene-then-probe order rather than by any measure of
+// urgency: a capture is six full scene passes plus a prefilter, so the budget is what bounds the
+// cost, and a fixed order is what makes the schedule a function of the frame number. That matters
+// beyond tidiness — the frame gate captures frame 120, and a probe that reached its sixth face on
+// a different frame because the machine was busier would put a different image on disk.
+//
+// A probe already Ready is skipped, so a settled scene does no capture work at all and a
+// time-of-day change costs six frames per probe until the scene has settled again.
+void Engine::recordProbeCaptures()
+{
+    for (auto& scenePtr : sceneManagerService.getScenes())
+    {
+        if (!scenePtr)
+        {
+            continue;
+        }
+
+        for (auto& probe : scenePtr->probes)
+        {
+            if (probe.state == LightProbeState::Ready)
+            {
+                continue;
+            }
+
+            renderer->recordProbeCapture(*scenePtr, probe);
+
+            return;
+        }
+    }
 }
 
 // The frame gate's exit code is the whole result: it says a PNG of frame 120 exists on disk.

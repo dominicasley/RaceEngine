@@ -7,10 +7,14 @@ add_executable(EngineTests
         AccessorUtilityTests.cpp
         CameraServiceTests.cpp
         FrameDiagnosticsTests.cpp
-        GraphicsApiTests.cpp
+        GltfColourSpaceTests.cpp
+        LookupTableTests.cpp
         MemoryStorageTests.cpp
+        PhysicalCameraTests.cpp
+        PostProcessingTests.cpp
         RendererSeamTests.cpp
         SceneManagerServiceTests.cpp
+        SphericalHarmonicsTests.cpp
         ShadowCascadesTests.cpp)
 
 # The recording fake is a module unit rather than a header because the seams it implements are
