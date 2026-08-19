@@ -510,10 +510,14 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> placeholderSedan()
     // Placeholder: a 1200 kg body's inertia about its own centre, about what a 4.5 x 1.8 x 1.4 m
     // shell of that mass comes to. Diagonal in body axes, which is what a symmetric car very nearly
     // is; the products of inertia a real one has are small enough to be somebody else's milestone.
+    // The body frame is +x lateral, +y up, +z forward, so the long axis is z and not x: the roll
+    // term belongs on [2][2]. Written the other way round the car is nearly four times too
+    // roll-resistant and as much too willing to pitch, which distorts only the transients — yaw is
+    // on the right axis either way and steady-state cornering never asks.
     auto shell = glm::dmat3(0.0);
-    shell[0][0] = 500.0;  // roll, about the long axis
+    shell[0][0] = 1900.0; // pitch, about the lateral axis
     shell[1][1] = 2900.0; // yaw
-    shell[2][2] = 1900.0; // pitch
+    shell[2][2] = 500.0;  // roll, about the longitudinal axis
 
     setup.sprung = {MassComponent{.mass = sprungMass, .centre = glm::dvec3(0.0, 0.52, sprungCentre), .inertia = shell}};
 
