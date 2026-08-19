@@ -25,7 +25,13 @@ namespace raceengine
 // SI, like everything else under Physics: metres. +x is lateral, +z is along the ground, +y is up,
 // matching the engine's handedness.
 
-export enum class SurfaceKind : std::uint32_t { Tarmac, Kerb, Grass };
+// A coarse label and deliberately not the friction. A real circuit states nine surfaces where this
+// has five kinds, and the difference between a road, a pit lane, a painted line and a run-off is
+// entirely in the numbers `SurfaceMaterial` carries — so quantising them onto this enum would throw
+// a 0.98 road and a 0.95 pit lane onto the same value for nothing. What is worth a *kind* is what
+// something other than the tire will one day branch on: dust off a gravel trap, a wall that is not
+// a surface a car drives on at all.
+export enum class SurfaceKind : std::uint32_t { Tarmac, Kerb, Grass, Gravel, Wall };
 
 // What a surface is worth to a tire, separately from where it is. Kept beside the mesh rather than
 // baked into it because the tire model scales its own mu by this at runtime — the seam the deferred
@@ -36,6 +42,11 @@ export struct SurfaceMaterial
     // Amplitude, in metres, of the fine surface roughness a tire feels but the mesh does not
     // resolve. Nothing consumes it this milestone; it is a channel the sampler already carries.
     double bumpiness = 0.0;
+    // Velocity-proportional drag a surface adds beyond what the tire model already produces —
+    // ploughing through gravel rather than rolling over it. Assetto Corsa's `surfaces.ini` states
+    // one per surface and a real circuit's export carries it, so it is read and kept here rather
+    // than discarded at the boundary. Nothing consumes it this milestone either.
+    double damping = 0.0;
     SurfaceKind kind = SurfaceKind::Tarmac;
 };
 
@@ -133,7 +144,10 @@ export struct SurfaceMesh
     }
 };
 
-// The materials the generator emits, in `SurfaceKind` order so a kind indexes its own material.
+// The materials the generator emits, one per kind it can emit and in `SurfaceKind` order, so those
+// kinds index their own material. It stops at Grass because that is where the generator stops:
+// gravel and walls are things a *circuit* carries, and the table an authored track brings with it is
+// its own — see `PhysicsWorld::materials`.
 export [[nodiscard]] std::vector<SurfaceMaterial> defaultSurfaceMaterials()
 {
     return {SurfaceMaterial{.gripMultiplier = 1.00, .bumpiness = 0.0015, .kind = SurfaceKind::Tarmac},

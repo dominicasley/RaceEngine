@@ -56,7 +56,8 @@ public:
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
     PhysicsWorld(PhysicsWorld&& other) noexcept :
-        world(std::exchange(other.world, 0))
+        world(std::exchange(other.world, 0)),
+        surfaceMaterials(std::move(other.surfaceMaterials))
     {
     }
 
@@ -66,6 +67,7 @@ public:
         {
             raceengineJoltDestroyWorld(world);
             world = std::exchange(other.world, 0);
+            surfaceMaterials = std::move(other.surfaceMaterials);
         }
 
         return *this;
@@ -80,6 +82,15 @@ public:
     // to have run: Jolt's shape types register into a factory that does not exist before it.
     [[nodiscard]] static std::expected<PhysicsWorld, std::string> create(const SurfaceMesh& mesh)
     {
+        // Reported here rather than left to the bridge, because the bridge's own answer to an empty
+        // table is "triangle 0 names surface 0, of which there are 0", which reads as a bad index
+        // rather than as a missing table. The table is also what `materials()` hands the tire, and a
+        // patch aggregated against an empty one has no first element to fall back on.
+        if (mesh.materials.empty())
+        {
+            return std::unexpected("a collision mesh needs at least one surface material");
+        }
+
         auto reason = std::string();
 
         // glm::dvec3 is three doubles with no padding, which the static_assert below is what makes
@@ -94,7 +105,20 @@ public:
             return std::unexpected("the physics world was not created: " + reason);
         }
 
-        return PhysicsWorld(created);
+        return PhysicsWorld(created, mesh.materials);
+    }
+
+    // What each surface index is worth to a tire, in the order the mesh declared them.
+    //
+    // It lives with the world and not with the caller because the `surface` a `SurfaceHit` reports
+    // is an index into *this* mesh's table and is meaningless against any other. The vehicle used to
+    // aggregate its contact patches against `defaultSurfaceMaterials()` regardless of what world it
+    // was querying, which is exact for a generated proving ground — the generator emits that table —
+    // and silently wrong for anything else: an authored circuit states nine surfaces, and every
+    // index past the third fell back on the first, so a wheel in the gravel gripped like tarmac.
+    [[nodiscard]] const std::vector<SurfaceMaterial>& materials() const
+    {
+        return surfaceMaterials;
     }
 
     // Batched, and that is the interface rather than a convenience over a single cast: a wheel's
@@ -147,12 +171,14 @@ public:
     }
 
 private:
-    explicit PhysicsWorld(const std::uint64_t created) :
-        world(created)
+    PhysicsWorld(const std::uint64_t created, std::vector<SurfaceMaterial> surfaces) :
+        world(created),
+        surfaceMaterials(std::move(surfaces))
     {
     }
 
     std::uint64_t world = 0;
+    std::vector<SurfaceMaterial> surfaceMaterials;
 };
 
 // The vertex and direction arrays cross the bridge as bare `const double*` over the whole vector,

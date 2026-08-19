@@ -699,7 +699,9 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
     auto allHits = std::vector<SurfaceHit>{};
     world.castRays(allOrigins, allDirections, setup.sampling.searchDistance * 2.0, allHits);
 
-    const auto materials = defaultSurfaceMaterials();
+    // The world's own table, not the generator's. A `SurfaceHit` reports an index into the mesh the
+    // world was built from, so reading it against any other table is reading the wrong row.
+    const auto& materials = world.materials();
     auto consumed = std::size_t{0};
     for (auto index = std::size_t{0}; index < cornerCount; index++)
     {

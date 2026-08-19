@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cmath>
+#include <expected>
 #include <set>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -272,4 +275,93 @@ TEST_CASE("a world that cannot be built is reported", "[physics][world]")
     const auto world = PhysicsWorld::create(empty);
     REQUIRE_FALSE(world.has_value());
     REQUIRE(world.error().find("vertices and triangles") != std::string::npos);
+}
+
+TEST_CASE("a world with no surface table is refused", "[physics][world]")
+{
+    const JoltGuard jolt;
+
+    auto mesh = generateProvingGround(patch(FeatureKind::Kerb, 10.0, 10.0, 1.0));
+    REQUIRE(mesh.has_value());
+
+    mesh->materials.clear();
+
+    const auto world = PhysicsWorld::create(mesh.value());
+    REQUIRE_FALSE(world.has_value());
+    REQUIRE(world.error().find("surface material") != std::string::npos);
+}
+
+// The table a world hands back has to be the one its mesh declared, whatever length that is. An
+// authored circuit states nine surfaces against the generator's three, and everything downstream
+// indexes it by the surface a hit reports.
+TEST_CASE("a world carries the surface table its mesh declared", "[physics][world]")
+{
+    const JoltGuard jolt;
+
+    auto mesh = generateProvingGround(patch(FeatureKind::Kerb, 10.0, 10.0, 1.0));
+    REQUIRE(mesh.has_value());
+
+    mesh->materials.push_back(raceengine::SurfaceMaterial{
+        .gripMultiplier = 0.37, .bumpiness = 0.011, .damping = 0.05, .kind = SurfaceKind::Gravel});
+
+    const auto world = PhysicsWorld::create(mesh.value());
+    REQUIRE(world.has_value());
+
+    REQUIRE(world->materials().size() == mesh->materials.size());
+    REQUIRE(world->materials().back().gripMultiplier == Catch::Approx(0.37));
+    REQUIRE(world->materials().back().bumpiness == Catch::Approx(0.011));
+    REQUIRE(world->materials().back().damping == Catch::Approx(0.05));
+    REQUIRE(world->materials().back().kind == SurfaceKind::Gravel);
+}
+
+// The failure this pins is silent and does not look like a table problem at all.
+//
+// `stepVehicle` aggregated every contact patch against `defaultSurfaceMaterials()`, which has three
+// entries, and `aggregateContactPatch` answers an out-of-range surface with `materials.front()`. So
+// a car on a circuit whose gravel trap is surface 6 gripped like tarmac, with nothing anywhere
+// reporting anything — the car simply did not slow down where it should have.
+TEST_CASE("a vehicle reads grip from the world it is standing on", "[physics][world][vehicle]")
+{
+    const JoltGuard jolt;
+
+    auto descriptor = raceengine::ProvingGroundDescriptor{};
+    descriptor.length = 200.0;
+    descriptor.width = 200.0;
+    descriptor.cellSize = 2.0;
+    descriptor.features = {};
+
+    auto mesh = generateProvingGround(descriptor);
+    REQUIRE(mesh.has_value());
+
+    // A ninth surface, past anything the generator's own table carries, and every triangle tagged
+    // with it — so a fallback to the first entry reads 1.00 where the answer is 0.37.
+    constexpr auto gravel = std::uint32_t{8};
+    mesh->materials.resize(gravel + 1, raceengine::SurfaceMaterial{});
+    mesh->materials[gravel] =
+        raceengine::SurfaceMaterial{.gripMultiplier = 0.37, .bumpiness = 0.011, .kind = SurfaceKind::Gravel};
+    std::fill(mesh->surfaces.begin(), mesh->surfaces.end(), gravel);
+
+    const auto world = PhysicsWorld::create(mesh.value());
+    REQUIRE(world.has_value());
+
+    const auto setup = raceengine::placeholderSedan();
+    REQUIRE(setup.has_value());
+
+    auto state = raceengine::VehicleState{};
+    state.chassis.position = glm::dvec3(0.0, 0.52, 20.0);
+
+    auto stepped = std::expected<raceengine::VehicleStep, std::string>{};
+    for (auto step = 0; step < 720; step++)
+    {
+        stepped = stepVehicle(setup.value(), state, raceengine::VehicleInput{}, raceengine::noDriveTorque,
+                              world.value(), 1.0 / 360.0);
+        REQUIRE(stepped.has_value());
+    }
+
+    for (const auto& corner : stepped->corners)
+    {
+        REQUIRE(corner.patch.inContact);
+        REQUIRE(corner.patch.gripMultiplier == Catch::Approx(0.37));
+        REQUIRE(corner.patch.bumpiness == Catch::Approx(0.011));
+    }
 }
