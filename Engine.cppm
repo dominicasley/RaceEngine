@@ -23,6 +23,21 @@ export import raceengine.async;
 export import raceengine.game;
 export import raceengine.graphics;
 export import raceengine.io;
+// The device layer. Same rule as the graphics one: the seam and the pure mapping are exported, the
+// two concrete backends are implementation partitions, so importing this costs nobody
+// <linux/input.h> or <dinput.h>.
+export import raceengine.input;
+// Re-exported for the reason every module above it is: a game that had to import a second module to
+// reach half the engine is a seam this file exists to close. The rule that keeps the Vulkan backend
+// out of here does not reach this one — that leak is 51 MB of vulkan.h, VMA, shaderc and GLFW in
+// every importer's BMI, and these partitions' global module fragments carry std and glm, both of
+// which the graphics closure already brings. Jolt stays where it is: it is reached through
+// `extern "C++"` free functions taking fundamental types, so its -mavx2 never touches a BMI.
+export import raceengine.physics;
+// The sound, and the same shape again: `raceengine.audio` exports what the car is doing and the seam
+// that consumes it, and keeps <fmod_studio.hpp> in an implementation partition nobody importing this
+// pays for.
+export import raceengine.audio;
 
 // Sandbox code names these unqualified in the global namespace; export import alone
 // only surfaces raceengine::X, so re-alias them globally.
@@ -107,6 +122,22 @@ private:
     ShadowService shadowService;
     SceneService sceneService;
     EntityService entityService;
+    // The device layer, and the last thing constructed because it is the first thing torn down: it
+    // owns a thread, and a thread member stops and joins before anything it could still be touching
+    // has been destroyed. It reaches only the logger and the window, both declared far above it, so
+    // the backend it was handed outlives it by exactly one member.
+    //
+    // A unique_ptr for the reason the renderer is one — the concrete backend is an implementation
+    // partition this file cannot name — and declared immediately above the service so that the
+    // service is destroyed first.
+    std::unique_ptr<IInputBackend> inputBackend;
+    InputService inputService;
+    // The write side, and it is declared after the read side because it goes through it: one object
+    // owns the device's lifetime, so a torque cannot be written into a file descriptor the reader
+    // has already decided is gone. It owns a thread of its own, which is why it is the last service
+    // here — it stops and joins before the service it holds a reference to is destroyed.
+    ForceFeedbackService forceFeedbackService;
+    AudioService audioService;
     // Simulation clock and the game's tick subscribers. Neither depends on a service, so
     // they sit last: the callbacks are owned by the engine but written by the game, and
     // being destroyed first means no service they reach into is gone while they still exist.
@@ -138,6 +169,12 @@ public:
     static constexpr int maxCatchUpSteps = 8;
 
     Engine();
+    // Declared only because the physics backend's process-wide registry has to come down with the
+    // engine that stood it up. It makes Engine non-movable, which it already was in practice: a
+    // game holds one by value and the services below hold references into each other.
+    ~Engine();
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
     // False once the window has been closed or the engine has asked its own loop to stop. A
     // game's loop is `while (engine.running()) engine.step();` and nothing below it ends the
     // process, so every destructor between the loop and `main` still runs.
@@ -160,6 +197,14 @@ public:
     [[nodiscard]] float interpolation() const
     {
         return interpolationAlpha;
+    }
+
+    // The engine's own logger, so a game can say something into the same stream the engine does
+    // rather than starting a second one that lands somewhere else in the file. Named `log` because
+    // the member it returns is called `logger` and the two may not share a name.
+    [[nodiscard]] spdlog::logger& log()
+    {
+        return *logger;
     }
 
     [[nodiscard]] IWindow& window()
@@ -262,6 +307,28 @@ public:
         return entityService;
     }
 
+    // Sampled once per fixed tick by whoever is driving. A wheel, a pad and the keyboard all come
+    // out of here as the same struct, and nothing below this line ever learns which it was.
+    [[nodiscard]] InputService& input()
+    {
+        return inputService;
+    }
+
+    // Where a game publishes stage one — steering rack torque in newton metres — once per physics
+    // tick. Everything below it is this device's problem and nothing above it may know what device
+    // that is.
+    // Where a game says what the car is doing, in the units a sound bank names. One call a tick, and
+    // nothing below it knows what a vehicle is — the same rule stage one of the force feedback keeps.
+    [[nodiscard]] AudioService& audio()
+    {
+        return audioService;
+    }
+
+    [[nodiscard]] ForceFeedbackService& forceFeedback()
+    {
+        return forceFeedbackService;
+    }
+
 private:
     void update(float delta);
     [[nodiscard]] float frameDelta() const;
@@ -275,6 +342,95 @@ module :private;
 
 namespace raceengine
 {
+
+namespace
+{
+
+// What this run is allowed to do with the machine's input devices, and the same test every other
+// input path here makes: an unattended run owns no hands at the controls, so it opens no device,
+// starts no thread and writes no calibration into somebody's home directory. That is what keeps a
+// capture byte-identical with and without any of this.
+[[nodiscard]] InputOptions engineInputOptions()
+{
+    auto options = InputOptions{};
+
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+    options.profileDirectory = options.unattended ? std::string() : defaultProfileDirectory();
+
+    // The three the two platforms genuinely differ on, stated here rather than discovered as a
+    // force that never arrives. Constant force is what the force feedback coming after this needs;
+    // the rotation range is what maps a rim to a rack; the base's own tuning menu has no host-side
+    // route on either platform without the vendor's SDK, and on this base the driver creates no
+    // node for it at all. Each is a warning and a fallback, never a refusal to start — the string
+    // views are literals and outlive everything that reads them.
+    options.wanted = {CapabilityRequest{.capability = DeviceCapability::ConstantForce,
+                                        .purpose = "force feedback",
+                                        .fallback = "the wheel stays free"},
+                      CapabilityRequest{.capability = DeviceCapability::ReadRotationRange,
+                                        .purpose = "reading the wheel's own rotation range",
+                                        .fallback = "the range this device's profile states is used"},
+                      CapabilityRequest{.capability = DeviceCapability::TuningMenu,
+                                        .purpose = "following the base's own tuning profile",
+                                        .fallback = "the game's own settings stand alone"}};
+
+    return options;
+}
+
+// What the write side is allowed to do, on the same test and for the same reason. The rate is the
+// one the driver consumes rather than the one the transport advertises — this base's `hid-fanatec`
+// runs its output on a two millisecond timer that is compile-time fixed, so the thousand hertz the
+// interrupt endpoint's `bInterval` states is a ceiling nothing reaches. Pacing to the transport
+// would be half the writes going nowhere.
+[[nodiscard]] AudioOptions engineAudioOptions()
+{
+    auto options = AudioOptions{};
+
+    // The same rule every device path here keeps, and the reason the golden frames do not move when
+    // a machine gains a sound card.
+    //
+    // `RACEENGINE_AUDIO=1` overrides it, and only that way round: a run can ask for sound it would
+    // not have had, and nothing can ask a gate for sound it must not have. That asymmetry is the
+    // whole of why it is safe — the gates set neither variable and are unreachable from here.
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+
+    if (const auto* asked = std::getenv("RACEENGINE_AUDIO"); asked != nullptr && std::string_view(asked) == "1")
+    {
+        options.unattended = false;
+    }
+
+    // `RACEENGINE_DUMP_AUDIO` is `RACEENGINE_DUMP_FRAME` for sound, and it overrides unattended for
+    // the same reason and by the same asymmetry: a run can ask to be recorded, and nothing can ask a
+    // gate to make a noise. It opens no device — the mix goes to the file — so it is safe on a
+    // machine somebody is working at, which is the whole point of it.
+    if (const auto* path = std::getenv("RACEENGINE_DUMP_AUDIO"); path != nullptr && *path != '\0')
+    {
+        options.capturePath = path;
+        options.unattended = false;
+    }
+
+    options.useFmod = true;
+
+    return options;
+}
+
+[[nodiscard]] ForceFeedbackOptions engineForceFeedbackOptions()
+{
+    auto options = ForceFeedbackOptions{};
+
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+    options.outputHz = 500.0;
+    // Five minutes of a 120 Hz publish. The stage-one trace is the deliverable rather than a
+    // diagnostic, so it is recorded whether or not a device is attached and whether or not anybody
+    // has asked for it.
+    options.traceCapacity = 36000;
+
+    return options;
+}
+
+} // namespace
 
 Engine::Engine() :
     logger(spdlog::stdout_color_mt<spdlog::async_factory>("engine")),
@@ -297,7 +453,15 @@ Engine::Engine() :
     bloomService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
     colourGradeService(*logger, memoryStorageService),
     shadowService(cameraService),
-    sceneService(renderableEntityService, cameraService, sceneManagerService)
+    sceneService(renderableEntityService, cameraService, sceneManagerService),
+    // Null: DirectInput's cooperative level is set against a window and this composition root has no
+    // portable way to name one. A Windows build that wants exclusive access — which is what force
+    // feedback needs there — passes its HWND here, and that is a one-line change to this call rather
+    // than to the interface, which is the whole reason the parameter exists before its caller does.
+    inputBackend(createInputBackend(nullptr)),
+    inputService(*logger, *inputBackend, glfwWindow, engineInputOptions()),
+    forceFeedbackService(*logger, inputService, engineForceFeedbackOptions()),
+    audioService(*logger, engineAudioOptions())
 {
     // An engine whose device would not come up has nothing left to do: every service below
     // was built against it, and there is no second backend to fall back to.
@@ -383,6 +547,28 @@ Engine::Engine() :
                 }
             }
         });
+
+    // Last in the body, so nothing above it can throw past a registry that is already up. Jolt's
+    // allocator, factory and type registry are process-wide and have to stand up before the first
+    // PhysicsWorld and come down after the last, which makes them the composition root's and
+    // nobody else's — two owners of a process-wide singleton is the bug it would be hiding. A game
+    // holds its worlds in members declared after its engine and is bracketed by that.
+    if (const auto physics = bringUpJolt(); !physics)
+    {
+        throw std::runtime_error(physics.error());
+    }
+}
+
+Engine::~Engine()
+{
+    // Only when something was written. A run with no wheel on it has nothing to report and a line
+    // saying so every time is a line nobody reads.
+    if (forceFeedbackService.writeRateHz() > 0.0)
+    {
+        logger->info("{}", forceFeedbackService.report());
+    }
+
+    tearDownJolt();
 }
 
 bool Engine::running() const
@@ -451,8 +637,17 @@ void Engine::step()
     // an exposure adaptation driven by anything else would put a different image on disk.
     auto ticks = 0u;
 
+    // How many the loop is about to run, computed before it runs rather than discovered by running
+    // it. Anything sampling a signal that lives in *wall* time — the driver's hands, above all —
+    // needs to know that this tick is one of several simulating one frame's worth of already
+    // elapsed time, and it needs to know it on the first of them. `CatchUpPhase` is what that is
+    // for; without it every tick of a burst reads the same wheel position and the demand a 120 Hz
+    // simulation sees is a staircase climbing once per rendered frame.
+    const auto steps = static_cast<unsigned>(accumulator / fixedTimeStep);
+
     while (accumulator >= fixedTimeStep)
     {
+        inputService.setCatchUpPhase(ticks, steps);
         update(fixedTimeStep);
         accumulator -= fixedTimeStep;
         ticks++;
@@ -606,8 +801,20 @@ void Engine::dumpFrameIfRequested()
         return;
     }
 
+    // Frame 120 unless told otherwise. The gates say nothing and get 120, which is what keeps a
+    // golden frame a golden frame; `RACEENGINE_DUMP_FRAME_AT` is for looking at a moment the gate's
+    // instant is too early to show — a car half a second into a launch has not turned yet, and
+    // "which way did it go" is not a question frame 120 can answer.
+    static const int dumpAt = []
+    {
+        const auto* at = std::getenv("RACEENGINE_DUMP_FRAME_AT");
+        const auto asked = at == nullptr ? 0 : std::atoi(at);
+
+        return asked > 0 ? asked : 120;
+    }();
+
     static int dumpFrameCount = 0;
-    if (++dumpFrameCount < 120)
+    if (++dumpFrameCount < dumpAt)
     {
         return;
     }

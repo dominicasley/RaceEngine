@@ -3,11 +3,28 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 import raceengine;
 
 using Catch::Approx;
 using raceengine::SceneManagerService;
+
+namespace
+{
+
+void requireMatricesAgree(const glm::mat4& actual, const glm::mat4& expected)
+{
+    for (auto column = 0; column < 4; column++)
+    {
+        for (auto row = 0; row < 4; row++)
+        {
+            REQUIRE(actual[column][row] == Approx(static_cast<double>(expected[column][row])).margin(1e-6));
+        }
+    }
+}
+
+} // namespace
 
 TEST_CASE("createScene reuses the slot a destroyed scene left behind", "[scene]")
 {
@@ -241,4 +258,163 @@ TEST_CASE("rotate takes degrees where setDirection takes radians", "[scene][tran
     // them converted and the other did not.
     REQUIRE(fromRotate[0].z == Approx(-1.0).margin(1e-6));
     REQUIRE(fromDirection[0].z == Approx(-1.0).margin(1e-6));
+}
+
+TEST_CASE("setOrientation with the identity quaternion leaves the node unrotated", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    sceneManager.setPosition(node, 3.0f, 4.0f, 5.0f);
+    sceneManager.setOrientation(node, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+
+    // The identity is the degenerate case of the decomposition: it has no axis to recover, so the
+    // angle is the thing that has to come back zero.
+    REQUIRE(node.rotation.w == Approx(0.0).margin(1e-6));
+
+    auto expected = glm::mat4(1.0f);
+    expected[3] = glm::vec4(3.0f, 4.0f, 5.0f, 1.0f);
+
+    requireMatricesAgree(sceneManager.modelMatrix(node), expected);
+}
+
+TEST_CASE("setOrientation replaces the orientation rather than accumulating", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    const auto quarterTurn = glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+    sceneManager.setOrientation(node, quarterTurn);
+    sceneManager.setOrientation(node, quarterTurn);
+
+    // Twice is once. A setter that composed the way rotate() does would be at a half turn here,
+    // which is the whole difference between this and the incremental family.
+    REQUIRE(sceneManager.modelMatrix(node)[0].z == Approx(-1.0).margin(1e-6));
+
+    sceneManager.setOrientation(node, glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+
+    requireMatricesAgree(sceneManager.modelMatrix(node), glm::mat4(1.0f));
+}
+
+TEST_CASE("setOrientation writes the world matrix the quaternion states", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    sceneManager.setOrientation(node, glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+
+    // Spelled out rather than built with glm::rotate, which is what the setter reaches for itself.
+    // A quarter turn about +Y sends +X to -Z and +Z to +X, and a column is where a basis vector
+    // lands, so those two columns are the whole rotation.
+    auto expected = glm::mat4(1.0f);
+    expected[0] = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
+    expected[2] = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+
+    requireMatricesAgree(sceneManager.modelMatrix(node), expected);
+}
+
+TEST_CASE("setOrientation and setDirection agree on the same rotation", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& viaQuaternion = sceneManager.createNode(scene);
+    auto& viaAxisAngle = sceneManager.createNode(scene);
+
+    const auto axis = glm::normalize(glm::vec3(1.0f, 2.0f, -3.0f));
+    const auto angle = glm::radians(37.0f);
+
+    sceneManager.setOrientation(viaQuaternion, glm::angleAxis(angle, axis));
+    sceneManager.setDirection(viaAxisAngle, angle, axis.x, axis.y, axis.z);
+
+    requireMatricesAgree(sceneManager.modelMatrix(viaQuaternion), sceneManager.modelMatrix(viaAxisAngle));
+
+    // And the vec4 carries setDirection's reading whichever of the two wrote it — axis in xyz,
+    // angle in w, radians. modelMatrix reads only the matrix, so nothing downstream can tell the
+    // setters apart and the field has to mean one thing.
+    REQUIRE(viaQuaternion.rotation.x == Approx(static_cast<double>(axis.x)).margin(1e-6));
+    REQUIRE(viaQuaternion.rotation.y == Approx(static_cast<double>(axis.y)).margin(1e-6));
+    REQUIRE(viaQuaternion.rotation.z == Approx(static_cast<double>(axis.z)).margin(1e-6));
+    REQUIRE(viaQuaternion.rotation.w == Approx(static_cast<double>(angle)).margin(1e-6));
+}
+
+TEST_CASE("setOrientation composes with a parent and invalidates the child", "[scene][transform][cache]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& parent = sceneManager.createNode(scene);
+    auto& child = sceneManager.createNode(scene);
+
+    sceneManager.setPosition(child, 0.0f, 0.0f, 5.0f);
+    sceneManager.setParent(child, parent);
+
+    REQUIRE(sceneManager.modelMatrix(child)[3].z == Approx(5.0));
+
+    // A quarter turn about +Y carries the child's +Z offset round onto +X, and the child has to
+    // find out through the same version counter every other setter bumps.
+    sceneManager.setOrientation(parent, glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+
+    REQUIRE(sceneManager.modelMatrix(child)[3].x == Approx(5.0).margin(1e-6));
+    REQUIRE(sceneManager.modelMatrix(child)[3].z == Approx(0.0).margin(1e-6));
+}
+
+TEST_CASE("setOrientation composes with translation and scale", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    // Deliberately not in composition order: each setter owns one matrix and modelMatrix is what
+    // orders them, so the three have to be writable in any order at all.
+    sceneManager.setScale(node, 2.0f, 2.0f, 2.0f);
+    sceneManager.setOrientation(node, glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)));
+    sceneManager.setPosition(node, 1.0f, 2.0f, 3.0f);
+
+    const auto& world = sceneManager.modelMatrix(node);
+
+    // Translation * rotation * scale: the scale is inside the rotation, so the rotated basis comes
+    // out two long and the translation is not multiplied by it.
+    REQUIRE(world[3].x == Approx(1.0));
+    REQUIRE(world[3].y == Approx(2.0));
+    REQUIRE(world[3].z == Approx(3.0));
+    REQUIRE(world[0].z == Approx(-2.0).margin(1e-6));
+    REQUIRE(world[1].y == Approx(2.0).margin(1e-6));
+    REQUIRE(world[2].x == Approx(2.0).margin(1e-6));
+}
+
+TEST_CASE("setOrientation normalises the quaternion it is given", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    // An integrator's attitude drifts off unit length, and the decomposition recovers the axis
+    // length from w rather than measuring it — so five percent of drift is six degrees of rotation
+    // here, not five percent of anything.
+    const auto drifted = glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)) * 1.05f;
+
+    sceneManager.setOrientation(node, drifted);
+
+    REQUIRE(node.rotation.w == Approx(static_cast<double>(glm::radians(90.0f))).margin(1e-6));
+    REQUIRE(sceneManager.modelMatrix(node)[0].z == Approx(-1.0).margin(1e-6));
+}
+
+TEST_CASE("setOrientation keeps the axis of a rotation glm::axis cannot resolve", "[scene][transform]")
+{
+    SceneManagerService sceneManager;
+    auto& scene = sceneManager.createScene();
+    auto& node = sceneManager.createNode(scene);
+
+    // A thousandth of a degree, which is inside the band where sqrt(1 - w*w) cancels to exactly
+    // zero in float: glm::axis answers +Z there, and a node driven from a physics body sitting all
+    // but level would be turned about an axis it never asked for. The angle is what says the
+    // rotation is negligible; the axis has to survive it.
+    sceneManager.setOrientation(node, glm::angleAxis(glm::radians(0.001f), glm::vec3(0.0f, 1.0f, 0.0f)));
+
+    REQUIRE(node.rotation.y == Approx(1.0).margin(1e-6));
+    REQUIRE(node.rotation.z == Approx(0.0).margin(1e-6));
+    REQUIRE(node.rotation.w == Approx(static_cast<double>(glm::radians(0.001f))).margin(1e-9));
 }

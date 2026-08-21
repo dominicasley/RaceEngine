@@ -41,6 +41,7 @@ export enum class FrameDiagnostic : size_t {
     ScenePipelineUnavailable,
     DescriptorSetUnavailable,
     DrawDataRingExhausted,
+    JointDataRingExhausted,
     FrameDataRingExhausted,
     PostProcessSkipped,
     PostProcessInputsExceeded,
@@ -58,8 +59,7 @@ export enum class FrameDiagnostic : size_t {
     ColourGradeUnavailable,
 };
 
-export inline constexpr size_t frameDiagnosticCount =
-    static_cast<size_t>(FrameDiagnostic::ColourGradeUnavailable) + 1;
+export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::ColourGradeUnavailable) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -92,6 +92,8 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "draw(s) or pass(es) the descriptor pool had no room for";
     case FrameDiagnostic::DrawDataRingExhausted:
         return "draw(s) past the end of the draw-data ring";
+    case FrameDiagnostic::JointDataRingExhausted:
+        return "skinned draw(s) drawn in their bind pose, the joint-palette ring having no slot left";
     case FrameDiagnostic::FrameDataRingExhausted:
         return "view(s) past the end of the frame-data ring";
     case FrameDiagnostic::PostProcessSkipped:

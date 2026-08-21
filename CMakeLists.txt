@@ -17,6 +17,12 @@ endif()
 find_package(spdlog CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
+# No features requested, and that is the safe answer rather than a lazy one: the port's debug
+# renderer, profiler and C++ RTTI options each change JPH_ prefixed preprocessor state that alters
+# the layout of Jolt's own types, so a consumer compiled against a different set than the library
+# was built with mismatches silently. The imported target propagates exactly what it was built
+# with, which is what keeps our translation units and the archive agreeing.
+find_package(Jolt CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(unofficial-shaderc CONFIG REQUIRED)
@@ -36,6 +42,18 @@ FetchContent_Declare(
         GIT_SHALLOW TRUE
         PATCH_COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchOzzCMakeMinimum.cmake)
 FetchContent_MakeAvailable(ozz_animation)
+
+# The physics backend is its own plain (non-module) target, and that is load-bearing rather than
+# tidy. Jolt::Jolt carries `-mavx2 -mfma -mbmi -mlzcnt -mf16c -mpopcnt` and eight JPH_USE_* defines
+# as usage requirements, and a clang BMI records the target features it was built with — so linking
+# Jolt into Engine makes every translation unit that *imports* an Engine module fail to load the
+# BMI unless it is built with Jolt's instruction set too. That is the tests and the sandbox, neither
+# of which has anything to do with physics. Confining Jolt here keeps its usage requirements off
+# Engine's translation units, off Engine's BMIs, and off everything downstream of them, and leaves
+# the engine's own codegen exactly as it was.
+add_library(EnginePhysicsBackend STATIC Physics/Backend/JoltBackend.cpp)
+target_link_libraries(EnginePhysicsBackend PRIVATE Jolt::Jolt)
+target_link_libraries(EnginePhysicsBackend PRIVATE raceengine_warnings)
 
 add_library (Engine STATIC
         Io/ThirdPartyImpl.cpp)
@@ -61,6 +79,7 @@ target_sources(Engine PUBLIC
         Graphics/Api/RenderContract.cppm
         Graphics/Api/SphericalHarmonics.cppm
         Graphics/Api/ShadowCascades.cppm
+        Graphics/Api/Frustum.cppm
         Graphics/Api/PostProcessing.cppm
         Graphics/Api/LookupTable.cppm
         Graphics/Api/PhysicalCamera.cppm
@@ -91,10 +110,51 @@ target_sources(Engine PUBLIC
         Graphics/Services/SceneService.cppm
         Graphics/Services/ShadowService.cppm
         Graphics/Services/AssetService.cppm
+        Physics/Physics.cppm
+        Physics/Api/RigidBody.cppm
+        Physics/Api/JoltRuntime.cppm
+        Physics/Api/ProvingGround.cppm
+        Physics/Api/PhysicsWorld.cppm
+        Physics/Api/Suspension.cppm
+        Physics/Api/ContactPatch.cppm
+        Physics/Api/Tyre.cppm
+        Physics/Api/Contact.cppm
+        Physics/Api/Telemetry.cppm
+        Physics/Api/Vehicle.cppm
+        Physics/Api/Coupling.cppm
+        Physics/Api/Clutch.cppm
+        Physics/Api/Driveline.cppm
+        Physics/Api/PublishedCars.cppm
+        Physics/Api/SetupFile.cppm
+        Audio/Audio.cppm
+        Audio/Api/CarAudio.cppm
+        Audio/Api/EngineLayers.cppm
+        Audio/Api/TyreLayers.cppm
+        Audio/Api/SoundBank.cppm
+        Audio/Api/AudioBackend.cppm
+        Audio/Backend/SilentAudioBackend.cppm
+        Audio/Backend/FmodAudioBackend.cppm
+        Audio/Services/AudioService.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm
         Io/Utility/AccessorUtility.cppm # module raceengine.io.accessor, not a partition of raceengine.io
+        Input/Input.cppm
+        Input/Api/DriverInput.cppm
+        Input/Api/InputBackend.cppm
+        Input/Api/DeviceProfile.cppm
+        Input/Api/InputMapping.cppm
+        Input/Api/RackTorque.cppm
+        Input/Api/ForceMapping.cppm
+        Input/Api/DirectInputContract.cppm
+        Input/Api/InputBackendFactory.cppm
+        # Implementation partitions, on the renderer's rule: both are built on both platforms so
+        # neither rots, and each one's system calls are the only part of it that is conditional.
+        Input/Api/InputBackendFactoryImpl.cppm
+        Input/Backend/EvdevInputBackend.cppm
+        Input/Backend/DirectInputBackend.cppm
+        Input/Services/InputService.cppm
+        Input/Services/ForceFeedbackService.cppm
         Shared/Shared.cppm
         Shared/Types/Resource.cppm)
 
@@ -113,6 +173,8 @@ target_link_libraries(Engine PRIVATE GPUOpen::VulkanMemoryAllocator)
 target_link_libraries(Engine PRIVATE unofficial::shaderc::shaderc)
 target_link_libraries(Engine PUBLIC ozz_animation ozz_base)
 
+target_link_libraries(Engine PRIVATE EnginePhysicsBackend)
+
 target_link_libraries(Engine PRIVATE raceengine_warnings)
 
 # Unit tests. They construct services directly against fakes and never open a device, a window or
@@ -123,3 +185,37 @@ option(RACEENGINE_BUILD_TESTS "Build the RaceEngine unit tests" ON)
 if(RACEENGINE_BUILD_TESTS)
     add_subdirectory(Tests)
 endif()
+
+# FMOD, when there is one. Off by default and named rather than discovered: an audio SDK that has to
+# be downloaded behind a login is not something a configure step should go looking for, and a build
+# that quietly found one on one machine and not another is a build whose sound is a property of the
+# machine. `FMOD_ROOT` is the extracted FMOD Engine folder — the one holding `api/`.
+option(RACEENGINE_WITH_FMOD "Build the FMOD audio backend" OFF)
+
+if(RACEENGINE_WITH_FMOD)
+    if(NOT DEFINED FMOD_ROOT)
+        message(FATAL_ERROR "RACEENGINE_WITH_FMOD is ON but FMOD_ROOT is not set")
+    endif()
+
+    find_library(FMOD_LIBRARY NAMES fmod PATHS "${FMOD_ROOT}/api/core/lib/x86_64" REQUIRED)
+    find_library(FMOD_STUDIO_LIBRARY NAMES fmodstudio PATHS "${FMOD_ROOT}/api/studio/lib/x86_64" REQUIRED)
+
+    # SYSTEM, so FMOD's own headers are not held to this project's warnings. The zero-suppressions
+    # rule is first-party only and this is how that is kept: no #pragma, no -Wno-, and -Werror still
+    # absolute over every line anybody here wrote. `fmod.hpp` alone trips -Wold-style-cast.
+    target_include_directories(Engine SYSTEM PRIVATE
+            "${FMOD_ROOT}/api/core/inc"
+            "${FMOD_ROOT}/api/studio/inc")
+    target_link_libraries(Engine PRIVATE "${FMOD_LIBRARY}" "${FMOD_STUDIO_LIBRARY}")
+    target_compile_definitions(Engine PRIVATE RACEENGINE_HAS_FMOD)
+
+    message(STATUS "FMOD: ${FMOD_LIBRARY}")
+endif()
+
+# The calibration tool. A console program, no window and no Vulkan: it talks to the input backend
+# directly because what it needs is the raw device code, and the service's whole job is to have
+# shaped it already. Built as part of `all` so it is always beside the game it writes a profile for.
+add_executable(RaceEngineCalibrate Tools/Calibrate.cpp)
+target_link_libraries(RaceEngineCalibrate PRIVATE Engine)
+target_link_libraries(RaceEngineCalibrate PRIVATE raceengine_warnings)
+set_target_properties(RaceEngineCalibrate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

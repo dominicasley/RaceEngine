@@ -357,6 +357,12 @@ export struct RenderableMesh
     // Joint palette, rebuilt in place every frame by RenderableEntityService::joints so the draw
     // path does not allocate one vector per mesh per frame.
     std::vector<glm::mat4> jointTransforms{};
+    // A per-instance transform in this mesh's own node frame, multiplied in after the glTF chain:
+    // the baked node matrix maps local to model, so what is appended here rotates about the node's
+    // own origin and axes. Identity for everything that never moves; a steering wheel that turns
+    // and a road wheel that spins are what it exists for. Per instance rather than on the shared
+    // Mesh, because two cars from one model must not steer each other.
+    glm::mat4 localTransform{1.0f};
 };
 
 export struct RenderableModel : public RenderableEntity

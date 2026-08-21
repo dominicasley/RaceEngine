@@ -34,6 +34,7 @@ module;
 module raceengine.graphics:VulkanRenderer;
 
 import :FrameDiagnostics;
+import :Frustum;
 import :IRenderBackend;
 import :LookupTable;
 import :PostProcessing;
@@ -54,9 +55,18 @@ namespace
 
 constexpr auto waitForever = std::numeric_limits<uint64_t>::max();
 constexpr const char* validationLayerName = "VK_LAYER_KHRONOS_validation";
-// DrawData is ~8.5 KiB per draw; a few hundred draws per frame covers the sandbox scene
-// with generous headroom while keeping the ring under 5 MiB per frame in flight.
-constexpr uint32_t drawDataRingSlots = 512;
+// A draw is every primitive of every renderable, once per *view*: four cascades, the occlusion
+// prepass and the shading pass are six of them before a probe face is recorded, so a scene of a
+// few hundred primitives spends a few thousand slots a frame. That is what decides this number,
+// and getting it wrong is not a soft failure — the ring is walked in record order, so the frame
+// that runs out loses everything after the first cascade rather than losing the least important
+// draws. DrawData is 272 bytes now the skinning palette has a ring of its own, so eight thousand
+// slots is the same 4 MiB per frame in flight that five hundred used to cost.
+constexpr uint32_t drawDataRingSlots = 16384;
+// The skinning palette, sized by the skinned draws alone. 128 mat4s is 8 KiB a slot, so this is
+// the ring that has to stay short — and it can, because a skinned draw is a character rather than
+// a body panel and the two counts are not related.
+constexpr uint32_t jointDataRingSlots = 128;
 // FrameData is per view, not per frame: Engine::step records every camera into one command
 // buffer, so a single slot would have the last camera's view matrix and position shading all
 // of them. 16 views in a frame is far past a split-screen game's needs at 352 bytes each.
@@ -155,15 +165,24 @@ struct DrawDataUbo
     glm::mat4 localToScreen;
     glm::mat4 normalMatrix;
     glm::ivec4 animated;
-    std::array<glm::mat4, maxJoints> jointTransforms;
 };
 
-static_assert(sizeof(DrawDataUbo) == 8464);
-// The per-draw fill writes the three regions directly into the mapped ring slot; the
+static_assert(sizeof(DrawDataUbo) == 272);
+// The per-draw fill writes the two regions directly into the mapped ring slot; the
 // offsets are asserted so the writes cannot drift away from the shader's block layout.
 static_assert(offsetof(DrawDataUbo, localToWorld) == 0);
 static_assert(offsetof(DrawDataUbo, animated) == 256);
-static_assert(offsetof(DrawDataUbo, jointTransforms) == 272);
+
+// Set 2 binding JOINT_DATA_BINDING, dynamic-offset, on a ring of its own (vulkan-abi.md). Every
+// draw binds it because the layout declares it; only a draw with `animated.x != 0` allocates a
+// slot, and the rest read the zeroed slot 0 they never look at.
+struct JointDataUbo
+{
+    std::array<glm::mat4, maxJoints> jointTransforms;
+};
+
+static_assert(sizeof(JointDataUbo) == 8192);
+static_assert(offsetof(JointDataUbo, jointTransforms) == 0);
 
 // Set 1 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
 // textureTransform carries a 3x3 UV transform in a mat4 slot: std140 pads a mat3's columns to
@@ -940,9 +959,13 @@ private:
         VkBuffer drawDataBuffer = VK_NULL_HANDLE;
         VmaAllocation drawDataAllocation = nullptr;
         void* drawDataMapped = nullptr;
+        VkBuffer jointDataBuffer = VK_NULL_HANDLE;
+        VmaAllocation jointDataAllocation = nullptr;
+        void* jointDataMapped = nullptr;
         VkDescriptorSet frameDataSet = VK_NULL_HANDLE;
         VkDescriptorSet drawDataSet = VK_NULL_HANDLE;
         uint32_t drawDataSlotsUsed = 0;
+        uint32_t jointDataSlotsUsed = 0;
         uint32_t frameDataSlotsUsed = 0;
         // Byte offset of the view currently being recorded; every draw in that view binds it.
         VkDeviceSize frameDataOffset = 0;
@@ -1028,6 +1051,10 @@ private:
         // Whether the fragment's alpha is a coverage to blend with. True for every pass that writes
         // a colour, which was every pass there was; false for one that writes data.
         bool blend = true;
+        // Whether the draw contributes to the depth buffer as well as reading it. False only for
+        // blended geometry in a shading view: a transparent surface does not hide what is behind
+        // it, so recording it as an occluder is a claim the picture does not make.
+        bool depthWrite = true;
         // VK_NULL_HANDLE is a build that failed and is not retried.
         VkPipeline pipeline = VK_NULL_HANDLE;
         std::vector<VkBuffer> boundBuffers;
@@ -1129,6 +1156,7 @@ private:
     VkCommandPool uploadCommandPool = VK_NULL_HANDLE;
     VkSampler attachmentSampler = VK_NULL_HANDLE;
     VkDeviceSize drawDataStride = 0;
+    VkDeviceSize jointDataStride = 0;
     VkDeviceSize frameDataStride = 0;
     VkSurfaceFormatKHR surfaceFormat{};
     VkExtent2D swapchainExtent{};
@@ -1169,8 +1197,8 @@ private:
     // beside them. A vector rather than a map because there are two live entries in practice — the
     // shading view's and the fallback — and `<map>` in a second global module fragment breaks the
     // sandbox link on clang-19 (see CLAUDE.md).
-    mutable std::vector<std::pair<std::pair<std::array<unsigned int, shadowCascadeCount>, unsigned int>,
-                                  VkDescriptorSet>>
+    mutable std::vector<
+        std::pair<std::pair<std::array<unsigned int, shadowCascadeCount>, unsigned int>, VkDescriptorSet>>
         shadowSets;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
     // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
@@ -1330,10 +1358,15 @@ private:
     // The view a pass renders into or samples for one level of an image. Level 0 of a single-level
     // image is its whole-image view, which is why nothing allocates a second one for it.
     [[nodiscard]] VkImageView levelView(const ImageResource& resource, uint32_t level) const;
+    // `clipCorrectedViewProjection` is `clipCorrection() * camera.modelViewProjectionMatrix`, which
+    // is constant for a whole view and is passed rather than rebuilt because this runs thousands of
+    // times a frame. It is a parameter and not a member for the same reason every other per-view
+    // value here is: a member would be state two passes could disagree about.
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
-                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat,
-                    VkDescriptorSet shadowDescriptors, bool doubleSided);
+                    const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
+                    VkFormat colorFormat, VkFormat depthFormat, VkDescriptorSet shadowDescriptors, bool doubleSided,
+                    bool depthWrite);
     // One fullscreen pass: bind the inputs, push the parameters, draw the oversized triangle. The
     // inputs are expected to be in SHADER_READ_ONLY_OPTIMAL already — the caller moves them,
     // because it is the caller that knows whether one of them is a level of the image being
@@ -1341,8 +1374,8 @@ private:
     // `lookupTableImageId` is the colour grade this pass binds — the neutral identity for every
     // pass but the last one, which is the only pass whose input is a display-referred image.
     bool recordFullScreenPass(std::span<const PostProcessBinding> inputs, unsigned int lookupTableImageId,
-                              VkImageView targetView,
-                              VkExtent2D targetExtent, VkPipeline pipeline, const FullscreenPushConstants& parameters);
+                              VkImageView targetView, VkExtent2D targetExtent, VkPipeline pipeline,
+                              const FullscreenPushConstants& parameters);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId, const glm::vec4& parameters,
                            unsigned int lookupTableImageId);
     // Moves the whole image to one layout, emitting one barrier per run of levels that share a
@@ -1384,11 +1417,11 @@ private:
     // The pipeline this primitive is drawn with in this view, together with the vertex buffers
     // that pipeline expects. Borrowed from the binding's own cache and valid until the next call
     // for the same primitive, which is one draw's worth — recordDraw uses it and lets it go.
-    // `blend` is false for a pass whose fragment alpha is data rather than coverage; see the blend
-    // state in the definition.
+    // `blend` is false for a pass whose fragment alpha is data rather than coverage; `depthWrite`
+    // is false for blended geometry in a shading view. See the state in the definition.
     [[nodiscard]] const ResolvedPipeline* scenePipeline(unsigned int shaderId, PrimitiveBinding& binding,
                                                         VkCullModeFlags cullMode, VkFormat colorFormat,
-                                                        VkFormat depthFormat, bool blend);
+                                                        VkFormat depthFormat, bool blend, bool depthWrite);
     [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
@@ -1429,6 +1462,7 @@ private:
     void drainRetiredResources() const;
     void releaseShaderObject(unsigned int shaderId);
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
+    [[nodiscard]] std::optional<VkDeviceSize> allocateJointDataSlot();
     [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
 
@@ -1580,6 +1614,10 @@ VulkanRenderer::~VulkanRenderer()
         if (frame.drawDataBuffer != VK_NULL_HANDLE)
         {
             vmaDestroyBuffer(allocator, frame.drawDataBuffer, frame.drawDataAllocation);
+        }
+        if (frame.jointDataBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, frame.jointDataBuffer, frame.jointDataAllocation);
         }
         if (frame.inFlight != VK_NULL_HANDLE)
         {
@@ -2190,8 +2228,15 @@ void VulkanRenderer::createDescriptorInfrastructure()
     }
     materialSetLayout = makeSetLayout(materialBindings);
 
-    // Scene set 2: dynamic-offset DrawData UBO, ring-buffered per frame in flight.
+    // Scene set 2: dynamic-offset DrawData UBO, ring-buffered per frame in flight, and beside it the
+    // skinning palette on a ring of its own. Two bindings rather than one block because the palette
+    // is thirty times the size of everything else a draw carries and only a skinned draw has one:
+    // folded together, a scene's draw ring is sized in units of the largest thing any draw *might*
+    // need rather than what its draws actually need.
     const std::array drawBindings = {VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+                                                                  VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+                                     VkDescriptorSetLayoutBinding{jointDataBinding,
+                                                                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                                   VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
     drawDataSetLayout = makeSetLayout(drawBindings);
 
@@ -2300,6 +2345,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
 
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
     drawDataStride = (sizeof(DrawDataUbo) + alignment - 1) / alignment * alignment;
+    jointDataStride = (sizeof(JointDataUbo) + alignment - 1) / alignment * alignment;
     frameDataStride = (sizeof(FrameDataUbo) + alignment - 1) / alignment * alignment;
 
     for (auto& frame : frames)
@@ -2308,6 +2354,11 @@ void VulkanRenderer::createDescriptorInfrastructure()
                                        frame.frameDataAllocation, frame.frameDataMapped);
         createHostVisibleUniformBuffer(drawDataStride * drawDataRingSlots, frame.drawDataBuffer,
                                        frame.drawDataAllocation, frame.drawDataMapped);
+        // Zeroed at creation, which is what makes slot 0 a legitimate thing for an unskinned draw
+        // to bind: its `animated.x` is zero, so the palette is never read, but the descriptor is
+        // still one the pipeline may statically use and must therefore address real memory.
+        createHostVisibleUniformBuffer(jointDataStride * jointDataRingSlots, frame.jointDataBuffer,
+                                       frame.jointDataAllocation, frame.jointDataMapped);
 
         const std::array setLayouts = {frameDataSetLayout, drawDataSetLayout};
         std::array<VkDescriptorSet, 2> sets{};
@@ -2324,8 +2375,11 @@ void VulkanRenderer::createDescriptorInfrastructure()
         const VkDescriptorBufferInfo frameDataInfo{frame.frameDataBuffer, 0, sizeof(FrameDataUbo)};
         // Dynamic UBO range is one DrawData; the bound offset walks the ring per draw.
         const VkDescriptorBufferInfo drawDataInfo{frame.drawDataBuffer, 0, sizeof(DrawDataUbo)};
+        // Likewise one palette, on its own ring: a skinned draw walks it and every other draw
+        // binds offset zero.
+        const VkDescriptorBufferInfo jointDataInfo{frame.jointDataBuffer, 0, sizeof(JointDataUbo)};
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        std::array<VkWriteDescriptorSet, 3> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = frame.frameDataSet;
         writes[0].dstBinding = 0;
@@ -2338,6 +2392,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[1].pBufferInfo = &drawDataInfo;
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = frame.drawDataSet;
+        writes[2].dstBinding = jointDataBinding;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        writes[2].pBufferInfo = &jointDataInfo;
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
@@ -2348,8 +2408,8 @@ void VulkanRenderer::createDescriptorInfrastructure()
     dummyVertexBuffer = createDeviceLocalBuffer(defaultVertexAttribute.data(), sizeof(defaultVertexAttribute));
 
     logger.info("Vulkan descriptor machinery ready: scene sets 0-2 + fullscreen set, pool for {} sets, "
-                "draw-data ring {} slots x {} bytes per frame in flight",
-                descriptorPoolMaxSets, drawDataRingSlots, drawDataStride);
+                "draw-data ring {} slots x {} bytes and joint-palette ring {} slots x {} bytes per frame in flight",
+                descriptorPoolMaxSets, drawDataRingSlots, drawDataStride, jointDataRingSlots, jointDataStride);
 }
 
 void VulkanRenderer::recreateSwapchainIfNeeded()
@@ -2389,6 +2449,7 @@ bool VulkanRenderer::beginFrame()
     // The fence guarantees the GPU is done with this slot's uniform rings; reset both for
     // the views and draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
+    frame.jointDataSlotsUsed = 0;
     frame.frameDataSlotsUsed = 0;
     frame.frameDataOffset = 0;
 
@@ -2504,6 +2565,7 @@ bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
     // must be flushed before the submit on any host-cached heap.
     ensure(vmaFlushAllocation(allocator, frame.frameDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
     ensure(vmaFlushAllocation(allocator, frame.drawDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+    ensure(vmaFlushAllocation(allocator, frame.jointDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
     VkSemaphoreSubmitInfo waitSemaphoreInfo{};
     waitSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -2981,7 +3043,20 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     depthAttachment.imageView = depthImage.view;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // Kept only where something reads it, which on this engine is exactly the shadow cascades. A
+    // depth attachment is given a sampler when, and only when, its FboAttachment asked for a
+    // comparison — so the handle being null *is* the statement that nothing samples this buffer,
+    // and no second flag is needed to say it.
+    //
+    // The two that do not: the shading camera's depth, which the tone map binds as its second input
+    // and never reads (HdrFragmentShader samples inputs[0] and inputs[2]), and the occlusion
+    // prepass's, whose own comment in AmbientOcclusionService says it is never sampled. Storing
+    // them writes two full-resolution D32 buffers a frame that nothing looks at, and — the larger
+    // cost — forces a depth decompression when the image is moved to a read layout afterwards. The
+    // move itself stays: the descriptor written for it promises that layout whether or not the
+    // shader reads it, and a mismatch there is undefined even for a binding nothing samples.
+    depthAttachment.storeOp =
+        depthImage.sampler != VK_NULL_HANDLE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
 
     // A camera with no colour attachment renders colour-less and one with no depth attachment
@@ -3219,6 +3294,41 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
     // has gone stale — a model unloaded while its renderable is still in the scene — is skipped
     // here, not chased into a recycled slot.
     auto recordedDraws = 0u;
+
+    // This view's own clip volume, extracted once. Every pass this function serves — the four
+    // cascades, the occlusion prepass, the shading pass and a probe face — arrives here with its
+    // matrix already built, so one extraction covers all of them and no pass needs a case of its
+    // own (:Frustum states why, including why the cascade case is the one that looks like it needs
+    // special handling and does not).
+    const auto viewPlanes = frustumPlanes(camera.modelViewProjectionMatrix);
+
+    // Likewise view-constant. `*` associates left to right, so folding the correction in here gives
+    // every draw below the same `(clipCorrection() * mvp) * model` it computed for itself before.
+    const auto clipCorrectedViewProjection = clipCorrection() * camera.modelViewProjectionMatrix;
+
+    // Blended geometry does not draw where it is found. Alpha blending is not commutative — the
+    // result depends on the order the fragments arrive in — so a transparent surface is only
+    // correct once everything visible *through* it is already in the buffer. Recording it in glTF
+    // node order means a windscreen drawn before the dashboard blends with the sky and then has
+    // the dashboard drawn over the top of it, and the pane vanishes from wherever the interior
+    // covers it. So the pass records every opaque draw first, then these, sorted back to front.
+    //
+    // The sort key is the view-space depth of the primitive's own bounding-box centre. Per
+    // primitive rather than per entity or per node, because this asset's 79 blended primitives all
+    // hang off nodes that resolve to the same origin: keyed on the node they would sort by 79
+    // copies of one number, and the sort would be a no-op that looked like a fix.
+    struct DeferredDraw
+    {
+        const MeshPrimitive* primitive;
+        Resource<Material> materialKey;
+        const std::vector<glm::mat4>* joints;
+        glm::mat4 entityModelMatrix;
+        unsigned int shaderId;
+        float viewDepth;
+    };
+
+    std::vector<DeferredDraw> blendedDraws;
+
     for (auto& entity : scene.models)
     {
         // The depth pass draws casters. A skybox in the map fills it at the near plane and puts
@@ -3283,7 +3393,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 continue;
             }
 
-            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix;
+            const auto entityModelMatrix =
+                sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix * renderableMesh.localTransform;
             // Bound by reference into the mesh's palette buffer; copying undoes the per-frame
             // allocation the service avoids.
             const auto& joints = renderableEntityService.joints(renderableMesh, delta);
@@ -3315,8 +3426,68 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                     continue;
                 }
 
+                // The occlusion prepass describes the geometry that shades, and a transparent
+                // surface is not it: there is no single depth to stand for a pane you can see
+                // through, and a car's glazing is always two near-coplanar shells. Written into
+                // the prepass they fight — that pass writes depth for everything — and the gather
+                // reads the fight as occlusion and prints it back onto the glass as hard-edged
+                // wedges. Not deferred, dropped: a prepass has no blending to order, and the
+                // surface does not belong in the buffer at all. `PbrFragmentShader` states the
+                // other half of the same rule, and a transparent fragment reads no occlusion.
+                if (camera.role == CameraRole::DepthNormalPrepass && !material->opaque)
+                {
+                    continue;
+                }
+
+                // Nothing this view can see, so nothing this view need record. The box is the one
+                // the POSITION accessor declared, carried into world space by the same matrix the
+                // vertex stage is about to be handed, and the planes are this view's own clip
+                // volume — so a primitive wholly outside one of them is clipped by the rasteriser
+                // before it can write a fragment, and skipping the draw records the same image.
+                //
+                // Two exemptions, both of which fail safe by drawing:
+                //
+                //   - a skinned draw, because the palette moves vertices outside the bind pose the
+                //     accessor measured, so those bounds are not a bound at all. `joints` is the
+                //     same vector recordDraw reads to decide whether this draw is animated.
+                //   - a primitive whose accessor declared no bounds, which keeps a zero half-extent
+                //     and would otherwise be culled for being unmeasured rather than for being
+                //     invisible.
+                //
+                // The test sits below every guard above it on purpose: the mesh upload, the joint
+                // palette and the entity's own draw callbacks are side effects a view owes whether
+                // or not this primitive is visible, and skipping them would make what is on screen
+                // depend on what was on screen last frame.
+                if (joints.empty() && glm::all(glm::greaterThan(primitive.boundsHalfExtent, glm::vec3(0.0f))) &&
+                    aabbOutsideFrustum(viewPlanes, entityModelMatrix, primitive.boundsCentre,
+                                       primitive.boundsHalfExtent))
+                {
+                    continue;
+                }
+
+                // Depth-only and prepass views have no blending to order — they write data, and
+                // their shaders carry no alpha at all — so only a shading view defers.
+                if (shading && !material->opaque)
+                {
+                    const auto centreInView =
+                        camera.modelViewMatrix * entityModelMatrix * glm::vec4(primitive.boundsCentre, 1.0f);
+
+                    blendedDraws.push_back(DeferredDraw{.primitive = &primitive,
+                                                        .materialKey = primitive.material.value(),
+                                                        .joints = &joints,
+                                                        .entityModelMatrix = entityModelMatrix,
+                                                        .shaderId = shaderId,
+                                                        // The view looks down -z, so the distance
+                                                        // in front of the eye is -z (the same
+                                                        // convention the shadow lookup reads).
+                                                        .viewDepth = -centreInView.z});
+
+                    continue;
+                }
+
                 recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
-                           joints, colorFormat, depthFormat, shadowDescriptors, staticOnly);
+                           clipCorrectedViewProjection, joints, colorFormat, depthFormat, shadowDescriptors, staticOnly,
+                           true);
                 recordedDraws++;
             }
         }
@@ -3327,6 +3498,34 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
         }
     }
 
+    // Furthest first. `stable_sort` so that two panels at the same depth — a car's outer and inner
+    // glass share a bounding-box centre often enough — keep their authored order rather than
+    // swapping between frames as the camera moves and the comparison flips.
+    std::stable_sort(blendedDraws.begin(), blendedDraws.end(), [](const DeferredDraw& left, const DeferredDraw& right)
+                     { return left.viewDepth > right.viewDepth; });
+
+    for (const auto& deferred : blendedDraws)
+    {
+        // Re-resolved rather than carried: the borrow rule says a `find()` pointer is good until
+        // its element is removed, and holding one across the whole entity walk is a longer window
+        // than this pass needs to ask for. It is one lookup per transparent draw, which is a
+        // rounding error against the sort.
+        const auto* material = memoryStorageService.materials.find(deferred.materialKey);
+        if (material == nullptr)
+        {
+            diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial,
+                               [&] { return "material slot " + std::to_string(deferred.materialKey.index); });
+
+            continue;
+        }
+
+        // No depth write: these are the blended draws, and the sort above is what orders them.
+        recordDraw(*deferred.primitive, deferred.materialKey, *material, deferred.shaderId, deferred.entityModelMatrix,
+                   camera, clipCorrectedViewProjection, *deferred.joints, colorFormat, depthFormat, shadowDescriptors,
+                   staticOnly, false);
+        recordedDraws++;
+    }
+
     return recordedDraws;
 }
 
@@ -3335,9 +3534,9 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
 void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey,
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
-                                const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
-                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors,
-                                const bool doubleSided)
+                                const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
+                                const VkFormat colorFormat, const VkFormat depthFormat,
+                                const VkDescriptorSet shadowDescriptors, const bool doubleSided, const bool depthWrite)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -3351,7 +3550,11 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
         return;
     }
 
-    const VkCullModeFlags cullMode = (material.opaque && !doubleSided) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    // The material's own doubleSided joins the probe capture's blanket one: a foliage card is
+    // authored to be seen from both sides, and an alpha-tested material that got back-face culled
+    // would lose half of every tree the moment MASK started counting as opaque.
+    const VkCullModeFlags cullMode =
+        (material.opaque && !doubleSided && !material.doubleSided) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
     // A prepass writes geometry into its attachment — a normal and a distance — and neither is a
     // colour with a coverage in front of it. Blending them would read the distance as an opacity.
@@ -3360,7 +3563,8 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     // Borrowed, and used before anything else can resolve a pipeline for this primitive: the
     // buffers to feed it are part of the same entry, and nothing between here and the draw
     // resolves one.
-    const auto* resolved = scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat, blend);
+    const auto* resolved =
+        scenePipeline(shaderId, bound->second, cullMode, colorFormat, depthFormat, blend, depthWrite);
     if (resolved->pipeline == VK_NULL_HANDLE)
     {
         diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
@@ -3413,11 +3617,15 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     auto& frame = frames[frameIndex];
     auto* target = static_cast<unsigned char*>(frame.drawDataMapped) + slot.value();
 
+    // Written out once and reused, rather than stated twice: `*` is left-associative, so this is
+    // the same product with the same operands in the same order that both the view matrix slot and
+    // the normal matrix below used to compute separately.
+    const auto localToView = camera.modelViewMatrix * entityModelMatrix;
+
     const std::array<glm::mat4, 4> matrices = {
-        entityModelMatrix, camera.modelViewMatrix * entityModelMatrix,
-        clipCorrection() * camera.modelViewProjectionMatrix * entityModelMatrix,
+        entityModelMatrix, localToView, clipCorrectedViewProjection * entityModelMatrix,
         // The shader reads mat3(normalMatrix); the mat4 slot carries the upper 3x3.
-        glm::mat4(glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))))};
+        glm::mat4(glm::transpose(glm::inverse(glm::mat3(localToView))))};
     std::memcpy(target, matrices.data(), sizeof(matrices));
 
     auto jointCount = joints.size();
@@ -3433,12 +3641,27 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
         jointCount = maxJoints;
     }
 
-    const auto animated = glm::ivec4(joints.empty() ? 0 : 1, 0, 0, 0);
-    std::memcpy(target + offsetof(DrawDataUbo, animated), &animated, sizeof(animated));
+    // Only a skinned draw takes a palette slot; everything else binds offset zero, which is the
+    // whole point of the split. A skinned draw the palette ring has no room left for is drawn in
+    // its bind pose rather than skipped: allocateJointDataSlot has counted the exhaustion, and a
+    // character standing in its rest pose says so far more legibly than a hole in the frame.
+    VkDeviceSize jointOffset = 0;
     if (jointCount > 0)
     {
-        std::memcpy(target + offsetof(DrawDataUbo, jointTransforms), joints.data(), jointCount * sizeof(glm::mat4));
+        if (const auto jointSlot = allocateJointDataSlot())
+        {
+            jointOffset = jointSlot.value();
+            std::memcpy(static_cast<unsigned char*>(frame.jointDataMapped) + jointOffset, joints.data(),
+                        jointCount * sizeof(glm::mat4));
+        }
+        else
+        {
+            jointCount = 0;
+        }
     }
+
+    const auto animated = glm::ivec4(jointCount > 0 ? 1 : 0, 0, 0, 0);
+    std::memcpy(target + offsetof(DrawDataUbo, animated), &animated, sizeof(animated));
 
     vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, resolved->pipeline);
 
@@ -3455,9 +3678,10 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
 
     const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet, shadowDescriptors};
     // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then
-    // set 2's draw slot.
+    // set 2's draw slot and its palette slot. The count is the *layout's* dynamic descriptors,
+    // not the shader's — a stage that declares no palette still binds one.
     const std::array dynamicOffsets = {static_cast<uint32_t>(frame.frameDataOffset),
-                                       static_cast<uint32_t>(slot.value())};
+                                       static_cast<uint32_t>(slot.value()), static_cast<uint32_t>(jointOffset)};
     vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout, 0,
                             static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
                             static_cast<uint32_t>(dynamicOffsets.size()), dynamicOffsets.data());
@@ -4408,9 +4632,9 @@ void VulkanRenderer::uploadProbes(const Scene& scene, FrameDataUbo& frameData) c
 }
 
 bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBinding> inputs,
-                                          const unsigned int lookupTableImageId,
-                                          const VkImageView targetView, const VkExtent2D targetExtent,
-                                          const VkPipeline pipeline, const FullscreenPushConstants& parameters)
+                                          const unsigned int lookupTableImageId, const VkImageView targetView,
+                                          const VkExtent2D targetExtent, const VkPipeline pipeline,
+                                          const FullscreenPushConstants& parameters)
 {
     const auto set = attachmentSet(inputs, lookupTableImageId);
     if (set == VK_NULL_HANDLE)
@@ -4426,11 +4650,18 @@ bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBindi
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView = targetView;
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // Nothing to load, because nothing survives: the oversized triangle covers every pixel of the
+    // render area, so whatever a clear wrote would be overwritten before it could be read. This was
+    // a CLEAR because GL's drawFullScreenQuad cleared first, and the comment that stood here
+    // conceded the point — "the quad covers the target anyway". Twenty-five of these run per frame.
+    //
+    // The one thing that could make the old contents observable is the blend, which is
+    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA on this layout: a pass writing alpha below one would read the
+    // destination. Every fullscreen shader writes 1.0, and the R8 targets have no alpha component
+    // at all — which Vulkan reads as 1.0 — so the destination factor is zero everywhere and the
+    // load is genuinely dead.
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // GL's drawFullScreenQuad clears before the quad; the quad covers the target anyway.
-    colorAttachment.clearValue.color =
-        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -5003,10 +5234,9 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
         return VK_NULL_HANDLE;
     }
 
-    const VkDescriptorImageInfo occlusionInfo{occlusionImage->second.sampler != VK_NULL_HANDLE
-                                                  ? occlusionImage->second.sampler
-                                                  : attachmentSampler,
-                                              occlusionImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo occlusionInfo{
+        occlusionImage->second.sampler != VK_NULL_HANDLE ? occlusionImage->second.sampler : attachmentSampler,
+        occlusionImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
     // One write covering the cascade binding's whole array: they are consecutive elements of a
     // single binding, so imageInfos is handed over in one go rather than a write per cascade. The
@@ -5145,11 +5375,15 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 
     MaterialDataUbo materialData{};
     materialData.baseColour = material.baseColour;
-    materialData.roughMetal = glm::vec4(material.roughness, material.metalness, 0.0f, 0.0f);
+    materialData.roughMetal = glm::vec4(material.roughness, material.metalness, material.alphaCutoff, 0.0f);
     materialData.textureTransform = glm::mat4(material.transform);
     materialData.useTextures = glm::ivec4(diffuse.has_value() ? 1 : 0, normal.has_value() ? 1 : 0,
                                           specular.has_value() ? 1 : 0, emissive.has_value() ? 1 : 0);
-    materialData.useTextures2 = glm::ivec4(occlusion.has_value() ? 1 : 0, 0, 0, 0);
+    // y carries the material's opacity, because the shader has to know it: a transparent fragment
+    // must not read the screen-space occlusion buffer, which holds one opaque surface per pixel and
+    // not this one. Stated here rather than inferred from the fragment's alpha, which is a
+    // threshold on a number that means something else.
+    materialData.useTextures2 = glm::ivec4(occlusion.has_value() ? 1 : 0, material.opaque ? 1 : 0, 0, 0);
     std::memcpy(mapped, &materialData, sizeof(materialData));
     ensure(vmaFlushAllocation(allocator, resource.allocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
@@ -5189,7 +5423,7 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 }
 
 VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessBinding> inputs,
-                                             const unsigned int lookupTableImageId)
+                                              const unsigned int lookupTableImageId)
 {
     // Resolved before any reference into imageResources is taken: creating the fallback inserts
     // into that map, and the padding below names it.
@@ -5273,19 +5507,21 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessB
 
 const VulkanRenderer::ResolvedPipeline*
 VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& binding, const VkCullModeFlags cullMode,
-                              const VkFormat colorFormat, const VkFormat depthFormat, const bool blend)
+                              const VkFormat colorFormat, const VkFormat depthFormat, const bool blend,
+                              const bool depthWrite)
 {
     // The whole of what a pipeline's identity adds to the primitive's own vertex input: the
     // shader, the cull mode its material asked for, the two formats of the target it is drawn
-    // into, and whether its alpha is a coverage. The shader has to be in the key because a view may
-    // override it — a shadow cascade draws the same primitives through a depth-only shader — and
-    // the buffer list cached with the entry is the shader's, not the primitive's. A failed build is
-    // not retried: the miss below caches a VK_NULL_HANDLE pipeline too.
+    // into, whether its alpha is a coverage, and whether it writes depth. The shader has to be in
+    // the key because a view may override it — a shadow cascade draws the same primitives through a
+    // depth-only shader — and the buffer list cached with the entry is the shader's, not the
+    // primitive's. A failed build is not retried: the miss below caches a VK_NULL_HANDLE pipeline
+    // too.
     const auto matches = [&](const ResolvedPipeline& candidate)
     {
         return candidate.shaderId == shaderId && candidate.cullMode == cullMode &&
                candidate.colorFormat == colorFormat && candidate.depthFormat == depthFormat &&
-               candidate.blend == blend;
+               candidate.blend == blend && candidate.depthWrite == depthWrite;
     };
 
     if (const auto resolved = std::ranges::find_if(binding.pipelines, matches); resolved != binding.pipelines.end())
@@ -5298,6 +5534,7 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
                            .colorFormat = colorFormat,
                            .depthFormat = depthFormat,
                            .blend = blend,
+                           .depthWrite = depthWrite,
                            .pipeline = VK_NULL_HANDLE,
                            .boundBuffers = {},
                            .boundOffsets = {}};
@@ -5365,7 +5602,7 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
                      std::to_string(static_cast<int>(binding.topology)) + "|" +
                      std::to_string(static_cast<int>(colorFormat)) + "+" +
                      std::to_string(static_cast<int>(depthFormat)) + "|" + (blend ? "blend" : "opaque") + "|" +
-                     binding.signature;
+                     (depthWrite ? "zwrite" : "zread") + "|" + binding.signature;
     if (const auto cachedPipeline = scenePipelines.find(key); cachedPipeline != scenePipelines.end())
     {
         entry.pipeline = cachedPipeline->second;
@@ -5416,12 +5653,21 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    // GL enables GL_DEPTH_TEST globally and never touches the func or the write mask, so
-    // this is GL's default LESS with writes on.
+    // GL enables GL_DEPTH_TEST globally and never touches the func or the write mask, so this is
+    // GL's default LESS — with the write mask now a property of the draw rather than of the API.
+    //
+    // **A transparent surface tests depth and does not write it.** Writing is a claim that nothing
+    // behind this fragment is visible, which is the one thing a pane of glass does not say. Two
+    // near-coplanar panes — and a car's glazing is always two, an outer shell and an inner one, the
+    // rear screen here overlapping through 0.12 cubic metres — then z-fight: whichever drew first
+    // owns the depth and the second wins or loses per *triangle*, which is why the artefact comes
+    // out as hard-edged wedges following the tessellation rather than as anything resembling glass.
+    // Sorting back to front is what makes dropping the write safe: the far pane is already in the
+    // buffer when the near one blends over it, so the depth test is not what was ordering them.
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_TRUE;
-    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
     depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
     depthStencil.maxDepthBounds = 1.0f;
 
@@ -5434,12 +5680,18 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     // minus infinity as fragments land on top of each other. What that produces is not obviously
     // broken: it is a buffer that reads as geometry on the triangles one fragment covered and as
     // empty sky on the triangles two did.
+    // **Premultiplied**: the scene pass hands over a colour that has already been scaled by its own
+    // coverage, so the source factor is ONE rather than SRC_ALPHA. That is what lets a surface
+    // decide *which* of its terms coverage applies to — glass transmits what is behind it and
+    // still reflects the sky at full strength, and a blend state that multiplies the whole fragment
+    // cannot express the difference (see PbrFragmentShader's `ads`). For an opaque fragment the two
+    // forms are the same arithmetic, so nothing that writes alpha 1 moves by a bit.
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
-    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
     blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
     blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
     blendAttachment.colorWriteMask =
@@ -5557,6 +5809,26 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
 
     const auto offset = static_cast<VkDeviceSize>(frame.drawDataSlotsUsed) * drawDataStride;
     frame.drawDataSlotsUsed++;
+    return offset;
+}
+
+std::optional<VkDeviceSize> VulkanRenderer::allocateJointDataSlot()
+{
+    auto& frame = frames[frameIndex];
+    if (frame.jointDataSlotsUsed >= jointDataRingSlots)
+    {
+        diagnostics.record(FrameDiagnostic::JointDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(jointDataRingSlots) + " slots of " +
+                                      std::to_string(jointDataStride) + " bytes";
+                           });
+
+        return std::nullopt;
+    }
+
+    const auto offset = static_cast<VkDeviceSize>(frame.jointDataSlotsUsed) * jointDataStride;
+    frame.jointDataSlotsUsed++;
     return offset;
 }
 
@@ -5680,7 +5952,10 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 
-    // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled.
+    // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled. Straight
+    // alpha, not the premultiplied form the scene pass uses: a fullscreen pass writes a whole
+    // image over a target it does not read through, so there is no coverage here to split a
+    // fragment's terms by.
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.blendEnable = VK_TRUE;
     blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -5910,8 +6185,8 @@ unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
 
     transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
-                    whole);
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT, whole);
 
     finishUploadCommands(commandBuffer);
     vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
@@ -6279,10 +6554,9 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
     std::erase_if(attachmentSets,
                   [&](const auto& cached)
                   {
-                      const auto names =
-                          std::ranges::any_of(cached.first.first, [&](const PostProcessBinding& binding)
-                                              { return binding.gpuResourceId == id; }) ||
-                          cached.first.second == id;
+                      const auto names = std::ranges::any_of(cached.first.first, [&](const PostProcessBinding& binding)
+                                                             { return binding.gpuResourceId == id; }) ||
+                                         cached.first.second == id;
                       if (!names)
                       {
                           return false;
@@ -6369,8 +6643,8 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
             // the usage a level of an image carries is the image's and a meter is not the last
             // pass that will want to read one back.
             case FboAttachmentType::Color:
-                usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                usage =
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
                 aspect = VK_IMAGE_ASPECT_COLOR_BIT;
                 break;
             case FboAttachmentType::Depth:

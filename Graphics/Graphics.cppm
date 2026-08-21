@@ -4,6 +4,7 @@ export import :Window;
 export import :RenderContract;
 export import :SphericalHarmonics;
 export import :ShadowCascades;
+export import :Frustum;
 export import :PostProcessing;
 export import :LookupTable;
 export import :PhysicalCamera;

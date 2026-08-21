@@ -7,6 +7,7 @@ module;
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 export module raceengine.graphics:SceneManagerService;
 
@@ -37,6 +38,10 @@ public:
     [[nodiscard]] const glm::mat4& modelMatrix(SceneNode& node) const;
     void setPosition(SceneNode& node, float x, float y, float z) const;
     void setDirection(SceneNode& node, float angle, float x, float y, float z) const;
+    // setDirection's rotation, for a caller that already holds one as a quaternion — a rigid body's
+    // attitude, a glTF node's TRS — rather than as an axis and an angle. Single precision because
+    // the whole scene graph is: a physics body's glm::dquat narrows at this call, explicitly.
+    void setOrientation(SceneNode& node, const glm::quat& orientation) const;
     void setScale(SceneNode& node, float x, float y, float z) const;
     void translate(SceneNode& node, float x, float y, float z) const;
     void rotate(SceneNode& node, float angle, float x, float y, float z) const;
@@ -107,6 +112,30 @@ void SceneManagerService::setDirection(SceneNode& node, float angle, float x, fl
     node.rotation = glm::vec4(x, y, z, angle);
     node.rotationMatrix = glm::rotate(glm::mat4(1.0), angle, glm::vec3(x, y, z));
     node.transformDirty = true;
+}
+
+// Decomposed and handed to setDirection rather than written as glm::mat4_cast, so that node.rotation
+// keeps exactly the reading setDirection gives it — axis in xyz, angle in w, radians. modelMatrix
+// reads only rotationMatrix, so no reader of the vec4 can tell which setter wrote a node, and the
+// pair cannot drift while one function writes both.
+//
+// Normalising is not defensive. The decomposition below reads the half-angle off a unit quaternion,
+// so an integrator's drifted attitude would come out at a plainly wrong angle rather than a
+// slightly wrong one.
+//
+// glm::axis is deliberately not what recovers the axis: it computes the imaginary part's length as
+// sqrt(1 - w*w), which cancels to exactly zero in float for every rotation under about a fiftieth
+// of a degree and substitutes +Z there, so a node driven from a body sitting all but level turns
+// about an axis nothing asked for. Measuring that length directly has no such band, and the
+// fallback below is then reached only by an exactly identity quaternion, which has no axis to lose.
+void SceneManagerService::setOrientation(SceneNode& node, const glm::quat& orientation) const
+{
+    const auto unit = glm::normalize(orientation);
+    const auto imaginary = glm::vec3(unit.x, unit.y, unit.z);
+    const auto halfAngleSine = glm::length(imaginary);
+    const auto rotationAxis = halfAngleSine > 0.0f ? imaginary / halfAngleSine : glm::vec3(0.0f, 0.0f, 1.0f);
+
+    setDirection(node, 2.0f * glm::atan(halfAngleSine, unit.w), rotationAxis.x, rotationAxis.y, rotationAxis.z);
 }
 
 void SceneManagerService::setScale(SceneNode& node, float x, float y, float z) const

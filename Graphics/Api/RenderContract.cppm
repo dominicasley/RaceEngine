@@ -124,6 +124,15 @@ static_assert(attributeLocation(PrimitiveAttributeType::SkinWeight) == 5);
 export inline constexpr uint32_t frameDescriptorSet = 0;
 export inline constexpr uint32_t materialDescriptorSet = 1;
 export inline constexpr uint32_t drawDescriptorSet = 2;
+
+// The skinning palette, at its own binding in the per-draw set rather than as a tail of the draw
+// block. Both are per draw and both ride a dynamic offset, so the split is not about *when* they
+// change — it is about how big they are. The palette is `maxJoints` mat4s, thirty times the rest of
+// the block put together, and a scene where one drawn thing in a thousand is skinned would size its
+// whole draw ring on the one that is: a car exported as 808 separate primitives exhausted a
+// 512-slot ring in the first cascade and drew nothing else all frame. Split, a draw slot is a
+// couple of hundred bytes and the palette ring is sized by the skinned draws alone.
+export inline constexpr uint32_t jointDataBinding = 1;
 // The cascades get a set of their own rather than a tail of set 1: they are per *frame*, and
 // writing them into every material set would mean rewriting every material set whenever a cascade
 // target is rebuilt.
@@ -225,7 +234,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 39;
+export inline constexpr size_t shaderContractMacroCount = 40;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -260,6 +269,7 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"SET_FRAME", frameDescriptorSet},
         {"SET_MATERIAL", materialDescriptorSet},
         {"SET_DRAW", drawDescriptorSet},
+        {"JOINT_DATA_BINDING", jointDataBinding},
         {"SET_SHADOW", shadowDescriptorSet},
         {"SHADOW_CASCADES", shadowCascadeCount},
         {"SHADOW_MAP_BINDING", shadowMapBinding},

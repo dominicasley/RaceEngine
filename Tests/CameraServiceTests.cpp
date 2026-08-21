@@ -51,12 +51,21 @@ public:
     {
     }
 
+    void setFullscreen(bool) override
+    {
+    }
+
     [[nodiscard]] std::tuple<double, double> mouseDelta() override
     {
         return {0.0, 0.0};
     }
 
     [[nodiscard]] bool shouldClose() const override
+    {
+        return false;
+    }
+
+    [[nodiscard]] bool fullscreen() const override
     {
         return false;
     }

@@ -13,6 +13,7 @@ module;
 #include <spdlog/logger.h>
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -46,6 +47,9 @@ export enum class Key : int {
     A = GLFW_KEY_A,
     S = GLFW_KEY_S,
     D = GLFW_KEY_D,
+    // The telemetry toggle. A driver flagging an interesting moment must not have to leave the seat
+    // to do it, which is the whole of why it is a key and not a command line switch.
+    T = GLFW_KEY_T,
     Escape = GLFW_KEY_ESCAPE,
     Space = GLFW_KEY_SPACE,
     LeftShift = GLFW_KEY_LEFT_SHIFT,
@@ -66,11 +70,19 @@ public:
     virtual void swapBuffers() const = 0;
     virtual void setMousePosition(int x, int y) = 0;
     virtual void setCursorMode(CursorMode mode) = 0;
+    // F11 is bound by the window itself rather than handed to the game as a key to poll, for
+    // the reason the occlusion prepass builds its own camera: there is nothing here for a
+    // level to keep in step. The platform reports a press once where keyPressed reports it
+    // every frame it is held, so a polled binding would need a debounce whose only purpose is
+    // to rediscover an edge the platform already had. A game wanting a different binding, or
+    // a settings menu, calls this and never sees F11.
+    virtual void setFullscreen(bool enable) = 0;
     // Motion since the previous call, in pixels. Zero when the window is not focused, when
     // the run is unattended, and on the first call after either changes — a controller that
     // steers from this can never be handed a jump it did not earn.
     [[nodiscard]] virtual std::tuple<double, double> mouseDelta() = 0;
     [[nodiscard]] virtual bool shouldClose() const = 0;
+    [[nodiscard]] virtual bool fullscreen() const = 0;
     [[nodiscard]] virtual bool keyPressed(Key key) const = 0;
     [[nodiscard]] virtual const WindowState& state() const = 0;
     [[nodiscard]] virtual std::tuple<double, double> mousePosition() = 0;
@@ -126,9 +138,22 @@ private:
     double lastCursorX = 0.0;
     double lastCursorY = 0.0;
     bool resyncCursor = true;
+    bool inFullscreen = false;
+    // Where to come back to. A fullscreen window reports the monitor's origin as its position
+    // and the monitor's size as its size, so the placement to restore has to be taken before
+    // the switch rather than asked for after it.
+    int windowedX = 0;
+    int windowedY = 0;
+    int windowedWidth = 0;
+    int windowedHeight = 0;
     GLFWwindow* window;
     static void windowResized(GLFWwindow* window, int width, int height);
     static void cursorPositionChanged(GLFWwindow* window, double x, double y);
+    static void keyChanged(GLFWwindow* window, int key, int scancode, int action, int mods);
+    // The monitor the window is most on, by area of overlap. GLFW has no such notion — a window
+    // belongs to no monitor until it is fullscreen — and the primary one is the wrong answer on
+    // any desk with two screens: it would throw the game onto the other one.
+    [[nodiscard]] GLFWmonitor* coveringMonitor() const;
     [[nodiscard]] bool focused() const;
 
 public:
@@ -137,10 +162,12 @@ public:
     void swapBuffers() const override;
     void setMousePosition(int x, int y) override;
     void setCursorMode(CursorMode mode) override;
+    void setFullscreen(bool enable) override;
     [[nodiscard]] std::tuple<double, double> mouseDelta() override;
     [[nodiscard]] VkSurfaceKHR generateVulkanSurface(const VkInstance& vkInstance) override;
     [[nodiscard]] VulkanWindowRequiredExtensions getRequiredVulkanWindowExtensions() override;
     [[nodiscard]] bool shouldClose() const override;
+    [[nodiscard]] bool fullscreen() const override;
     [[nodiscard]] bool keyPressed(Key key) const override;
     [[nodiscard]] const WindowState& state() const override;
     [[nodiscard]] std::tuple<double, double> mousePosition() override;
@@ -178,6 +205,11 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
 
+    // Fullscreen here adopts the monitor's current video mode rather than asking for one of
+    // its own, so nothing was taken from the desktop that alt-tabbing has to give back. The
+    // default — minimise on focus loss — would only cost a second screen its game.
+    glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
+
     windowState.windowWidth = 1920;
     windowState.windowHeight = 1080;
     window = glfwCreateWindow(windowState.windowWidth, windowState.windowHeight, "Quack!", nullptr, nullptr);
@@ -198,6 +230,7 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, windowResized);
     glfwSetCursorPosCallback(window, cursorPositionChanged);
+    glfwSetKeyCallback(window, keyChanged);
 }
 
 GLFWWindow::~GLFWWindow()
@@ -279,6 +312,107 @@ void GLFWWindow::windowResized(GLFWwindow* window, int width, int height)
     {
         callback(width, height);
     }
+}
+
+void GLFWWindow::keyChanged(GLFWwindow* window, const int key, int, const int action, int)
+{
+    auto caller = reinterpret_cast<GLFWWindow*>(glfwGetWindowUserPointer(window));
+
+    // GLFW_PRESS and not GLFW_REPEAT: a held F11 is one instruction, not a toggle per
+    // auto-repeat interval. An unattended run owns no screen to take over.
+    if (caller->unattended || action != GLFW_PRESS)
+    {
+        return;
+    }
+
+    if (key == GLFW_KEY_F11)
+    {
+        caller->setFullscreen(!caller->inFullscreen);
+    }
+}
+
+GLFWmonitor* GLFWWindow::coveringMonitor() const
+{
+    auto windowX = 0;
+    auto windowY = 0;
+    auto width = 0;
+    auto height = 0;
+    glfwGetWindowPos(window, &windowX, &windowY);
+    glfwGetWindowSize(window, &width, &height);
+
+    auto monitorCount = 0;
+    auto monitors = glfwGetMonitors(&monitorCount);
+
+    auto best = glfwGetPrimaryMonitor();
+    auto bestOverlap = 0;
+
+    for (auto index = 0; index < monitorCount; index++)
+    {
+        auto monitorX = 0;
+        auto monitorY = 0;
+        glfwGetMonitorPos(monitors[index], &monitorX, &monitorY);
+
+        const auto mode = glfwGetVideoMode(monitors[index]);
+        if (mode == nullptr)
+        {
+            continue;
+        }
+
+        const auto overlapWidth =
+            std::max(0, std::min(windowX + width, monitorX + mode->width) - std::max(windowX, monitorX));
+        const auto overlapHeight =
+            std::max(0, std::min(windowY + height, monitorY + mode->height) - std::max(windowY, monitorY));
+
+        if (const auto overlap = overlapWidth * overlapHeight; overlap > bestOverlap)
+        {
+            bestOverlap = overlap;
+            best = monitors[index];
+        }
+    }
+
+    return best;
+}
+
+void GLFWWindow::setFullscreen(const bool enable)
+{
+    // An unattended run maps no window at all, so there is no screen for one to take.
+    if (unattended || enable == inFullscreen)
+    {
+        return;
+    }
+
+    if (enable)
+    {
+        const auto monitor = coveringMonitor();
+        const auto mode = monitor == nullptr ? nullptr : glfwGetVideoMode(monitor);
+
+        // A headless session or a monitor that will not describe itself leaves the window
+        // exactly as it was: reported, and windowed, rather than resized to a guess.
+        if (mode == nullptr)
+        {
+            logger.warn("Fullscreen was not entered: no monitor could be measured");
+            return;
+        }
+
+        glfwGetWindowPos(window, &windowedX, &windowedY);
+        glfwGetWindowSize(window, &windowedWidth, &windowedHeight);
+        glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+    }
+    else
+    {
+        glfwSetWindowMonitor(window, nullptr, windowedX, windowedY, windowedWidth, windowedHeight, GLFW_DONT_CARE);
+    }
+
+    inFullscreen = enable;
+
+    // The pointer is somewhere else entirely after the window has changed size and monitor,
+    // and that jump is not motion the player asked the camera for.
+    resyncCursor = true;
+}
+
+bool GLFWWindow::fullscreen() const
+{
+    return inFullscreen;
 }
 
 bool GLFWWindow::keyPressed(Key key) const
