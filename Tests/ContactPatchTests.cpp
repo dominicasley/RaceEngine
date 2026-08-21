@@ -317,3 +317,141 @@ TEST_CASE("the sample count is data driven and the aggregate converges", "[physi
     REQUIRE(fine.gripMultiplier == Catch::Approx(coarse.gripMultiplier));
     REQUIRE(fine.centre.x == Catch::Approx(coarse.centre.x).margin(1e-12));
 }
+
+// A probe rather than a gate, hidden like the shimmy one: run it with
+// `./EngineTests "[.patch-chamfer]"`. It exists to answer whether the known kerb-chamfer
+// roughness is the patch aggregation's fault and, if so, which of two candidate repairs
+// removes it — a question that wants a swept table rather than a pass or a fail.
+TEST_CASE("probe: a patch crossing a kerb chamfer", "[.patch-chamfer]")
+{
+    const auto sampling = ContactPatchSampling{};
+    const auto materials = defaultSurfaceMaterials();
+
+    // The proving ground's own kerb, stated here so the probe cannot drift from it.
+    constexpr auto kerbHeight = 0.05;
+    constexpr auto kerbChamfer = 0.30;
+    constexpr auto kerbInnerEdge = 3.0;
+
+    const auto surfaceAt = [](const double x)
+    {
+        const auto across = x - kerbInnerEdge;
+        if (across <= 0.0)
+        {
+            return 0.0;
+        }
+
+        return kerbHeight * (across < kerbChamfer ? across / kerbChamfer : 1.0);
+    };
+
+    WARN("  wheelX   contacting  rejected   shipped(mm)  wholeGrid(mm)  loadWtd(mm)  touchingOnly(mm)");
+
+    for (auto step = 0; step <= 24; step++)
+    {
+        // Walk the wheel centre out across the chamfer, a centimetre at a time.
+        const auto wheelX = kerbInnerEdge - 0.12 + 0.02 * static_cast<double>(step);
+
+        // Yawed thirty degrees, because the recorded roughness is a wheel crossing *at an angle*
+        // and a perpendicular crossing spans less of the chamfer than an angled one does.
+        constexpr auto yaw = 0.5235987755982988;
+        const auto forward = glm::dvec3(std::sin(yaw), 0.0, std::cos(yaw));
+        const auto spin = glm::dvec3(std::cos(yaw), 0.0, -std::sin(yaw));
+
+        // Ridden over rather than driven through: the centre is placed so the deepest sample sits
+        // at a constant 15 mm of compression, which is what a loaded tyre does over a kerb. A wheel
+        // held at a fixed height instead reports penetrations no suspension would ever allow.
+        auto centreY = 0.31;
+        for (auto pass = 0; pass < 40; pass++)
+        {
+            const auto probe = WheelPose{.centre = glm::dvec3(wheelX, centreY, 0.0),
+                                         .spinAxis = spin,
+                                         .forward = forward,
+                                         .radius = 0.31};
+            const auto probed = contactPatchSamples(probe, sampling);
+
+            auto deepest = -1.0;
+            for (const auto& sample : probed.tireSurface)
+            {
+                deepest = std::max(deepest, surfaceAt(sample.x) - sample.y);
+            }
+
+            centreY += deepest - 0.015;
+        }
+
+        const auto wheel = WheelPose{.centre = glm::dvec3(wheelX, centreY, 0.0),
+                                     .spinAxis = spin,
+                                     .forward = forward,
+                                     .radius = 0.31};
+
+        const auto geometry = contactPatchSamples(wheel, sampling);
+
+        auto hits = std::vector<SurfaceHit>{};
+        for (const auto& sample : geometry.tireSurface)
+        {
+            const auto height = surfaceAt(sample.x);
+            hits.push_back(SurfaceHit{.point = glm::dvec3(sample.x, height, sample.z),
+                                      .normal = glm::dvec3(0.0, 1.0, 0.0),
+                                      .distance = 0.0,
+                                      .surface = 0,
+                                      .hit = height >= sample.y - 0.30});
+        }
+
+        const auto patch = aggregateContactPatch(geometry, hits, materials, sampling);
+
+        // The same arithmetic the shipping aggregation does, restated so the two candidate
+        // repairs can be evaluated against identical samples.
+        auto depths = std::vector<double>{};
+        for (auto index = std::size_t{0}; index < hits.size(); index++)
+        {
+            depths.push_back(hits[index].point.y - geometry.tireSurface[index].y);
+        }
+
+        auto touching = std::vector<double>{};
+        for (const auto depth : depths)
+        {
+            if (depth > 0.0)
+            {
+                touching.push_back(depth);
+            }
+        }
+
+        auto shipped = 0.0;
+        auto wholeGrid = 0.0;
+        auto weighted = 0.0;
+        auto weight = 0.0;
+        auto kept = 0;
+        auto rejected = 0;
+
+        if (!touching.empty())
+        {
+            std::sort(touching.begin(), touching.end());
+            const auto ceiling = touching[touching.size() / 2] + sampling.spikeRejection;
+
+            for (const auto depth : depths)
+            {
+                if (depth <= 0.0)
+                {
+                    continue;
+                }
+
+                wholeGrid += depth;
+
+                if (depth > ceiling)
+                {
+                    rejected++;
+                    continue;
+                }
+
+                kept++;
+                shipped += depth;
+                weighted += depth * depth;
+                weight += depth;
+            }
+        }
+
+        const auto count = static_cast<double>(hits.size());
+        WARN("  " << wheelX << "    " << kept << "          " << rejected << "        "
+                  << patch.penetration * 1000.0 << "        " << wholeGrid / count * 1000.0 << "       "
+                  << (weight > 0.0 ? weighted / weight : 0.0) * 1000.0 << "        "
+                  << (kept > 0 ? shipped / static_cast<double>(kept) : 0.0) * 1000.0);
+    }
+}
