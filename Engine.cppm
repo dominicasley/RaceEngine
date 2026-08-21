@@ -422,10 +422,15 @@ namespace
     options.unattended =
         std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
     options.outputHz = 500.0;
-    // Five minutes of a 120 Hz publish. The stage-one trace is the deliverable rather than a
-    // diagnostic, so it is recorded whether or not a device is attached and whether or not anybody
-    // has asked for it.
-    options.traceCapacity = 36000;
+    // Five minutes of a 360 Hz publish, and the rate in that sentence is why the number moved
+    // (2026-08-21). The stage-one trace is the deliverable rather than a diagnostic — it is recorded
+    // whether or not a device is attached and whether or not anybody has asked for it — and what
+    // makes it one is the *window*: a wheel complaint is settled by reading back the minutes before
+    // the driver reached for the key. When the simulation moved onto its own thread the publish rate
+    // tripled, so the 36000 frames that had been five minutes silently became a hundred seconds, and
+    // both this comment and `~PlayerCar`'s said five. 96 bytes a frame, so the window costs 10.4 MB
+    // against the 3.5 it did; that is the price of the instrument still being the one described.
+    options.traceCapacity = 108000;
 
     return options;
 }
@@ -625,6 +630,13 @@ void Engine::step()
 {
     frameDiagnostics.beginFrame();
 
+    // The keyboard, once, on the thread that owns the window. GLFW's key state only changes inside
+    // `glfwPollEvents` — which runs at the end of the previous step, inside `swapBuffers` — so this
+    // reads exactly what a tick polling `keyPressed` for itself would have read, and reads it on the
+    // one thread allowed to ask. Everything else about a device is taken by whoever is stepping the
+    // simulation; see `InputService::sample`.
+    inputService.pollWindow();
+
     const auto delta = frameDelta();
 
     // Clamping the accumulator, not the loop, is what bounds catch-up: time beyond the
@@ -637,17 +649,8 @@ void Engine::step()
     // an exposure adaptation driven by anything else would put a different image on disk.
     auto ticks = 0u;
 
-    // How many the loop is about to run, computed before it runs rather than discovered by running
-    // it. Anything sampling a signal that lives in *wall* time — the driver's hands, above all —
-    // needs to know that this tick is one of several simulating one frame's worth of already
-    // elapsed time, and it needs to know it on the first of them. `CatchUpPhase` is what that is
-    // for; without it every tick of a burst reads the same wheel position and the demand a 120 Hz
-    // simulation sees is a staircase climbing once per rendered frame.
-    const auto steps = static_cast<unsigned>(accumulator / fixedTimeStep);
-
     while (accumulator >= fixedTimeStep)
     {
-        inputService.setCatchUpPhase(ticks, steps);
         update(fixedTimeStep);
         accumulator -= fixedTimeStep;
         ticks++;

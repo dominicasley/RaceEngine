@@ -148,26 +148,28 @@ TEST_CASE("a wheel switched on mid-session takes over from the keyboard", "[inpu
     REQUIRE(settles(service, [&service] { return service.sample().brake > 0.99; }));
 }
 
-TEST_CASE("the steering demand is reconstructed across a catch-up burst", "[input][service]")
+TEST_CASE("the device source hands out the newest report and carries no state", "[input][service]")
 {
-    // **Simulated time advances in bursts and a steering wheel does not.** The engine runs a
-    // frame's worth of fixed steps back to back — measured on the rig, three or four inside a
-    // quarter of a millisecond — and every one of them reads the device thread's newest sample,
-    // which over that quarter millisecond is the same sample. So a 120 Hz simulation saw the demand
-    // as a staircase climbing once per rendered frame, and the ticks in between saw a wheel that
-    // was not moving at all.
+    // This replaces a test that pinned the opposite (2026-08-21), and the reason is worth keeping
+    // because the pair of them is the whole argument for putting the simulation on its own thread.
     //
-    // Nothing downstream can tell the difference except whatever differentiates the demand, and the
-    // steering rack does: its Coulomb friction saturates above 10 mm/s and its viscous damping is
+    // The demand used to be **reconstructed across the engine's catch-up burst**. Simulated time
+    // advanced in bursts and a steering wheel does not: the engine ran a frame's worth of fixed
+    // steps back to back — measured on the rig, three or four inside a quarter of a millisecond —
+    // and every one of them read the same device report, so the demand a fixed-step simulation saw
+    // was a staircase climbing once per rendered frame. That mattered because the steering rack
+    // differentiates it twice, through Coulomb friction saturating above 10 mm/s and viscous damping
     // linear in the same velocity. On the rig's 300-second trace rack travel was unchanged between
     // 94.2% of consecutive ticks inside a burst, so both terms switched fully on and fully off at
-    // the frame rate — 0.4254 N·m of torque step on a tick that moved against 0.0003 N·m on one
-    // that did not. That was the buzz in the driver's hands.
+    // the frame rate: 0.4254 N·m of torque step on a tick that moved against 0.0003 N·m on one that
+    // did not. That was the buzz in the driver's hands, and interpolating the staircase was a
+    // repair to a scheduling artefact rather than to a fault.
     //
-    // Driven against the source directly rather than through the service: no thread, no device and
-    // no `refresh` racing a publication for a `try_lock`, so what is measured is the reconstruction
-    // and not the scheduler. The view is written here exactly as the device thread would leave it.
-    auto phase = raceengine::CatchUpPhase{};
+    // **The simulation keeps its own fixed-rate clock now and there is no burst.** Ticks are 2.78 ms
+    // apart and the device reports faster than that, so consecutive ticks read consecutive samples
+    // of a wheel that is genuinely moving. What this pins is that the source is *stateless* — two
+    // sources looking at one view agree, and asking twice without the device saying anything gives
+    // the same answer twice — because the day any of it comes back, the burst has come back with it.
     auto view = raceengine::DeviceView{};
 
     view.connected = true;
@@ -177,7 +179,7 @@ TEST_CASE("the steering demand is reconstructed across a catch-up burst", "[inpu
         raceengine::AxisCalibration{.minimum = 0.0, .maximum = 65535.0, .centre = 32273.0};
     view.geometry = raceengine::SteeringGeometry{.deviceDegrees = 900.0, .vehicleDegrees = 756.0};
 
-    auto source = raceengine::DeviceInputSource(view, phase);
+    auto source = raceengine::DeviceInputSource(view);
 
     const auto turn = [&view](const std::int32_t raw)
     {
@@ -185,53 +187,56 @@ TEST_CASE("the steering demand is reconstructed across a catch-up burst", "[inpu
     };
 
     turn(20000);
-    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
-    const auto before = source.sample().steering;
+    const auto held = source.sample().steering;
 
-    // One frame of catch-up: the wheel moved once, and four ticks are about to simulate the time it
-    // moved in. Before this, all four read the same report — the first took the whole move and the
-    // three after it saw a wheel standing still.
+    // A tick that arrives with nothing new to read gets the same answer, rather than one carried
+    // part-way towards somewhere by a rule.
+    REQUIRE(source.sample().steering == Approx(held).epsilon(1e-12));
+
     turn(45000);
 
-    auto served = std::vector<double>{};
-    for (auto index = std::uint32_t{0}; index < 4; index++)
+    const auto moved = source.sample().steering;
+    REQUIRE(moved > held);
+
+    // The whole move, on the first tick that can see it. Nothing is spread across ticks to come.
+    for (auto index = 0; index < 4; index++)
     {
-        phase = raceengine::CatchUpPhase{.index = index, .steps = 4};
-        served.push_back(source.sample().steering);
+        REQUIRE(source.sample().steering == Approx(moved).epsilon(1e-12));
     }
 
-    CAPTURE(before, served[0], served[1], served[2], served[3]);
+    // Stateless: a source that has watched the wheel travel from lock to lock and one that has just
+    // been built answer identically off the same view.
+    auto fresh = raceengine::DeviceInputSource(view);
+    REQUIRE(source.sample().steering == Approx(fresh.sample().steering).epsilon(1e-12));
+}
 
-    // Evenly, because the hands moved evenly as far as anything here can know.
-    const auto stride = (served[3] - before) / 4.0;
+TEST_CASE("the keyboard is taken on the window's thread and the simulation reads a copy", "[input][service]")
+{
+    // The one source that cannot be sampled where the others are: it arrives through GLFW, and
+    // `glfwGetKey` may only be called from the thread that made the window. So the demand is taken
+    // by `pollWindow` on the main thread and read by `sample` on the simulation's.
+    //
+    // What this pins is that the split is not a leak — a key held does reach the car — and that it
+    // takes a poll to do so. A `sample` that answered a key nobody had polled would mean the
+    // keyboard was still being read from wherever the simulation happens to run.
+    auto log = CapturedLog();
+    auto backend = RecordingInputBackend();
+    auto window = SilentWindow();
+    auto service = InputService(log.sink(), backend, window, briskOptions());
 
-    REQUIRE(stride > 0.0);
+    window.hold(true);
 
-    for (auto index = std::size_t{0}; index < served.size(); index++)
-    {
-        REQUIRE(served[index] == Approx(before + stride * static_cast<double>(index + 1)).epsilon(1e-9));
-    }
+    REQUIRE(service.sample().throttle == Approx(0.0));
 
-    // The last tick lands exactly on the device's own newest sample, so **nothing is delayed by any
-    // of this**: the next burst, of one, returns the very same value.
-    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
-    REQUIRE(source.sample().steering == Approx(served[3]).epsilon(1e-9));
+    service.pollWindow();
 
-    // And a burst of one is the identity, which is what makes all of this inert at frame rates at
-    // or above the tick rate.
-    turn(30000);
-    const auto single = source.sample().steering;
+    REQUIRE(service.activeKind() == InputSourceKind::Keyboard);
+    REQUIRE(service.sample().throttle == Approx(1.0));
 
-    turn(52000);
-    REQUIRE(source.sample().steering != Approx(single));
+    window.hold(false);
+    service.pollWindow();
 
-    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
-    turn(60000);
-
-    auto direct = raceengine::DeviceInputSource(view, phase);
-    std::ignore = direct.sample();
-
-    REQUIRE(source.sample().steering == Approx(direct.sample().steering).epsilon(1e-9));
+    REQUIRE(service.sample().throttle == Approx(0.0));
 }
 
 TEST_CASE("a wheel switched off gives the car back to the keyboard", "[input][service]")
@@ -268,7 +273,10 @@ TEST_CASE("a device the game outranks still loses to nothing being held", "[inpu
 
     // A key held while a wheel is connected does nothing: the highest available source answers
     // outright, because merging two steering demands is a car that fights whoever is holding it.
+    // Polled, so that what is being shown is the wheel outranking a demand that genuinely arrived
+    // rather than one that was never taken.
     window.hold(true);
+    service.pollWindow();
 
     REQUIRE(service.activeKind() == InputSourceKind::Wheel);
     REQUIRE(service.sample().throttle == Approx(0.0));
