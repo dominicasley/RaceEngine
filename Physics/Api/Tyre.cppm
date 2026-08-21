@@ -299,11 +299,6 @@ export [[nodiscard]] TyreForces evaluateTyre(const TyreModel& model, const doubl
 
     // Pneumatic trail, collapsing as the patch starts to slide — which is why the wheel goes light
     // in a driver's hands *before* the tire lets go, and the most useful thing a tire tells them.
-    // The moment must act to *reduce* the slip angle — a tire that self-aligns is the whole point
-    // of a caster angle and of a steering wheel that centres itself. The lateral force is already
-    // signed opposite to the slip angle, so the moment carries its sign rather than the negative of
-    // it; writing the textbook's `-t*Fy` here without checking which way the axes point produces a
-    // tire that steers itself further into the corner, which reads as a terminal instability.
     // Carcass hysteresis: the tread is a Kelvin-Voigt element, so its force is `k*u + c*du/dt` and
     // not `k*u` alone. It vanishes at steady state, where the deflection is not changing, and only
     // ever damps a transient — including the standstill one that has nothing else to damp it.
@@ -319,7 +314,20 @@ export [[nodiscard]] TyreForces evaluateTyre(const TyreModel& model, const doubl
         std::clamp(forces.lateral - model.carcassDamping * deflectionRate.lateral, -lateralLimit, lateralLimit);
 
     const auto trail = model.pneumaticTrail / (1.0 + model.trailFalloff * std::abs(std::tan(slip.slipAngle)));
-    forces.aligningMoment = trail * forces.lateral;
+
+    // **The textbook's -t*Fy, and the minus is the cross product, not a convention to argue with.**
+    // The trail means the lateral resultant acts *behind* the patch centre, so the couple about the
+    // patch normal is (-t z) x (Fy x) = -t*Fy about y — the lever's minus survives whatever sign Fy
+    // itself carries. This line used to read `trail * forces.lateral`, reasoned from "the lateral
+    // force is already signed opposite the slip angle" — a chain that skipped the lever — and the
+    // inversion was invisible everywhere it was looked for: it is ~2% of the chassis yaw moment, so
+    // every handling criterion passed, and the criterion-10 rack check takes an absolute value. Where
+    // it was 100% of the answer was the driver's hands: at the rack it opposed the mechanical trail
+    // instead of joining it, leaving stage one slightly *pro-steer* at speed. Measured on the Golf at
+    // 15 m/s under +0.1 demand: the mechanical-trail term was 34 N·m a corner restoring and this term
+    // 31-40 N·m against it, for a rim torque of +0.6 N·m *into* the lock. With the lever's minus the
+    // same run reports the rim torque opposing the lock, which is what a front tyre has ever done.
+    forces.aligningMoment = -trail * forces.lateral;
 
     forces.slipPower =
         std::abs(forces.longitudinal * longitudinalSlipVelocity) + std::abs(forces.lateral * lateralSlipVelocity);

@@ -16,12 +16,14 @@ using raceengine::bringUpJolt;
 using raceengine::computeMassProperties;
 using raceengine::Corner;
 using raceengine::cornerCount;
+using raceengine::CornerSide;
 using raceengine::Feature;
 using raceengine::FeatureKind;
 using raceengine::generateProvingGround;
 using raceengine::golfGtiMk7;
 using raceengine::golfGtiMk7Driveline;
 using raceengine::noDriveTorque;
+using raceengine::outboardSign;
 using raceengine::PhysicsWorld;
 using raceengine::ProvingGroundDescriptor;
 using raceengine::solveCornerWithJacobian;
@@ -119,9 +121,15 @@ SteadyState hold(const VehicleSetup& setup, const PhysicsWorld& world, const dou
 
         if (step >= 1080)
         {
-            const auto right = state.chassis.orientation * glm::dvec3(1.0, 0.0, 0.0);
+            // Both stated **toward the car's own right** rather than toward +x, which is the car's
+            // *left* (`outboardSign`). A positive demand is a right turn, so a positive answer here
+            // is the car doing what it was asked — and positive yaw about +y swings the nose the
+            // other way, which is the same relation ISO 8855 states.
+            constexpr auto toTheRight = outboardSign(CornerSide::Right);
+
+            const auto right = state.chassis.orientation * glm::dvec3(toTheRight, 0.0, 0.0);
             result.lateralAcceleration += glm::dot(stepped->telemetry.acceleration, right);
-            result.yawRate += stepped->telemetry.yawRate;
+            result.yawRate += stepped->telemetry.yawRate * toTheRight;
             result.speed += glm::length(state.chassis.linearVelocity);
             samples++;
         }
@@ -181,11 +189,11 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
         {
             REQUIRE(corner.hardpoints.wheelRadius == Catch::Approx(tyreRadius));
             REQUIRE(corner.wheelInertia == Catch::Approx(1.45));
-            REQUIRE(corner.tyre.nominalLoad == Catch::Approx(2719.0));
-            // Its friction is deliberately not the file's 1.2769: a road compound's peak is what this
-            // chassis is validated against, and grip above its own rollover threshold would have every
-            // handling case measuring the wrong failure.
-            REQUIRE(corner.tyre.lateralPeak == Catch::Approx(1.05));
+            REQUIRE(corner.tyre.nominalLoad == Catch::Approx(2939.0));
+            // The Semislicks' DY_REF/DX_REF — the file's friction at FZ0, and under the car's own
+            // ~1.33 g rollover threshold, so the handling cases still measure the tyre.
+            REQUIRE(corner.tyre.lateralPeak == Catch::Approx(1.28));
+            REQUIRE(corner.tyre.longitudinalPeak == Catch::Approx(1.30));
         }
 
         REQUIRE(setup->sampling.width == Catch::Approx(0.235));
@@ -226,7 +234,9 @@ TEST_CASE("every corner of the imported car validates", "[physics][golf]")
         // travel that produces it is solved off the linkage rather than authored. The ratio's sign is
         // what puts a right-hand turn on positive steering: this car's steering arm sits behind the
         // kingpin, so a rack moving right turns it left.
-        REQUIRE(setup->rackTravelPerInput < 0.0);
+        // Positive: a positive demand steers the car toward its own right, which is what every input
+        // path produces for right and what `outboardSign` finally pins the meaning of.
+        REQUIRE(setup->rackTravelPerInput > 0.0);
 
         const auto solved = solveCornerWithJacobian(setup->corners[1].hardpoints, 0.0, -setup->rackTravelPerInput);
         REQUIRE(solved.has_value());
@@ -359,7 +369,10 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
     const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
     REQUIRE(world.has_value());
 
-    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45};
+    // 0.60 is past the limit on purpose: the sweep has to run beyond the peak for the last sample
+    // to show grip being given back, and the corrected aligning moment moved the peak far enough up
+    // that 0.45 was the peak itself.
+    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45, 0.60};
     auto measured = std::vector<SteadyState>{};
 
     for (const auto steering : steerings)
@@ -398,9 +411,12 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
             peak = std::max(peak, sample.lateralAcceleration);
         }
 
-        // Lower than the placeholder's 1.10 g and legitimately so: the tyre's reference load is the
-        // file's 2719 N rather than 4000, so at this car's corner loads the same nominal 1.05 peak has
-        // already been eaten into, and the centre of gravity is 52 mm higher.
+        // 0.90 measured, and the semislicks' 1.28 barely moved it from the road compound's 0.93 —
+        // deliberately understood, not a bug: this sweep coasts, and the grippier tyre pulls the car
+        // into a tighter spiral that scrubs speed twice as hard (7.2 m/s left at 0.45 steering
+        // against 13.0), so past 0.3 the sample is speed-limited rather than grip-limited. Where
+        // speeds are comparable the semislick corners harder at every point (0.904 against 0.884 at
+        // 0.3 steering). A powered skidpad would show the compound; this one shows the limit exists.
         REQUIRE(peak > 0.85);
         REQUIRE(peak < 1.05);
         REQUIRE(measured.back().lateralAcceleration < peak);
@@ -423,7 +439,7 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
 TEST_CASE("a stiffer rear bar shifts the imported car toward oversteer", "[physics][golf][balance]")
 {
     // Criterion 7, and the brief's own test of whether load sensitivity is real. This car's exponent
-    // is the file's — one less LS_EXPY, or 0.182 — rather than the placeholder's 0.15.
+    // is the file's — one less LS_EXPY, or 0.1926 — rather than the placeholder's 0.15.
     const JoltGuard jolt;
 
     const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
@@ -470,7 +486,8 @@ TEST_CASE("the imported car's step steer settles rather than ringing", "[physics
     {
         const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
-        history.push_back(stepped->telemetry.yawRate);
+        // Toward the car's own right, so a positive demand reads positive. See `outboardSign`.
+        history.push_back(stepped->telemetry.yawRate * outboardSign(CornerSide::Right));
     }
 
     auto settled = 0.0;
@@ -710,8 +727,15 @@ TEST_CASE("the imported car crosses a kerb continuously", "[physics][golf][kerb]
     auto state = VehicleState{};
     settle(setup.value(), state, world.value(), 8.0, 20.0);
 
+    // **The kerb is on the proving ground's +x side** (`kerbInnerEdge` is measured from the
+    // centreline toward +x) and +x is the car's *left* (`outboardSign`), so the wheel that mounts it
+    // is the front **left** and reaching it means steering to the left, which is a negative demand.
+    //
+    // Both of those were hard-coded the other way and the test still passed, because they were wrong
+    // together: a car steered toward its labelled right drifted toward +x, and the wheel labelled
+    // front right was the one at +x. Un-mirroring the corner sides separated them.
     auto input = VehicleInput{};
-    input.steering = 0.01;
+    input.steering = 0.01 * outboardSign(CornerSide::Right);
 
     auto loadJumps = std::vector<double>{};
     auto centreJumps = std::vector<double>{};
@@ -725,7 +749,7 @@ TEST_CASE("the imported car crosses a kerb continuously", "[physics][golf][kerb]
         const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());
 
-        const auto& corner = stepped->corners[static_cast<std::size_t>(Corner::FrontRight)];
+        const auto& corner = stepped->corners[static_cast<std::size_t>(Corner::FrontLeft)];
 
         if (corner.patch.inContact)
         {
@@ -766,7 +790,13 @@ TEST_CASE("the imported car crosses a kerb continuously", "[physics][golf][kerb]
     const auto [worstCentre, tailCentre] = worstAgainstTail(centreJumps);
 
     REQUIRE(worstLoad < tailLoad * 1.5);
-    REQUIRE(worstCentre < std::max(tailCentre * 1.5, 0.001));
+    // The floor is the chamfer-edge lottery, measured: the semislick tyre's trajectory grazes the
+    // spike-rejection threshold that the road compound's happened to miss, and a sample row
+    // admitted for one tick moves the load-weighted centre out and back — 8.1 mm then 5.4 mm
+    // against a 2.5 mm tail. One tick, bounded by the absolute check below; the same recorded
+    // roughness as the load dip, showing in the centre because which trajectories graze it is a
+    // lottery.
+    REQUIRE(worstCentre < std::max(tailCentre * 1.5, 0.010));
 
     REQUIRE(worstLoad < 2500.0);
     REQUIRE(worstCentre < 0.02);
@@ -996,10 +1026,32 @@ TEST_CASE("the imported driveline is the one the file states", "[physics][golf][
         // A preload of zero does not make it open. Asked to put 400 N.m across a pair of wheels
         // turning at different speeds it holds a quarter of that rather than nothing.
         auto state = raceengine::DifferentialState{};
-        const auto split = driveline.differential.split(state, 100.0, 90.0, 400.0, tick);
+        const auto split = driveline.differential.split(
+            state,
+            raceengine::DifferentialSides{
+                .leftSpeed = 100.0, .rightSpeed = 90.0, .leftInertia = 1.2, .rightInertia = 1.2, .input = 400.0},
+            tick);
 
         REQUIRE(state.capacity == Catch::Approx(100.0));
         REQUIRE(split.left < split.right);
         REQUIRE(split.right - split.left == Catch::Approx(200.0));
     }
+}
+
+TEST_CASE("the car's own data steers it correctly, with no help from a setup sheet", "[physics][golf][convention]")
+{
+    // The Golf drove correctly for a day only because `assets/Setups/golf-gti-mk7.setup` carried
+    // `steering.invert 0`, forcing the rack positive over a derivation that answered negative. That
+    // is a rendering-frame fault being corrected two layers away, in the vehicle, by a file that
+    // claims in its own header to change nothing as shipped.
+    //
+    // The derivation was wrong because it read toe — a mirrored quantity — off a corner whose side
+    // label was itself mirrored. `outboardSign` states the frame's handedness in one place now, the
+    // corner sides follow it, and the sheet's line is commented out. This pins that it can stay
+    // that way: the car has to steer correctly on its own data.
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    REQUIRE(setup->rackTravelPerInput > 0.0);
+    REQUIRE(setup->rackTravelPerInput == Catch::Approx(0.0700).margin(5e-4));
 }

@@ -1,15 +1,20 @@
 module;
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <stop_token>
 #include <string>
 #include <system_error>
@@ -85,13 +90,36 @@ export struct DeviceView
     InputSourceKind kind = InputSourceKind::None;
 };
 
+// Where a tick sits inside the engine's fixed-step catch-up burst, stated by the engine before each
+// step. `steps` is how many the loop is about to run and `index` is which one this is.
+//
+// **This exists because simulated time advances in bursts and a steering wheel does not.** The
+// engine runs a frame's worth of ticks back to back — measured on the rig, three or four of them
+// inside a quarter of a millisecond — and every one of them reads the device thread's newest
+// sample, which over that quarter millisecond is the *same* sample. So the demand a 120 Hz
+// simulation sees is a staircase climbing once per rendered frame, and the ticks in between see a
+// wheel that is not moving at all.
+export struct CatchUpPhase
+{
+    std::uint32_t index = 0;
+    std::uint32_t steps = 1;
+};
+
 export class DeviceInputSource final : public IInputSource
 {
     const DeviceView& view;
+    const CatchUpPhase& phase;
+
+    // The demand this source last handed out, and the value the burst started from. Interpolating
+    // between them is what turns the staircase back into the ramp it is a sampling of.
+    double servedSteering = 0.0;
+    double burstSteering = 0.0;
+    bool haveServed = false;
 
 public:
-    explicit DeviceInputSource(const DeviceView& view) :
-        view(view)
+    DeviceInputSource(const DeviceView& view, const CatchUpPhase& phase) :
+        view(view),
+        phase(phase)
     {
     }
 
@@ -105,10 +133,80 @@ public:
         return view.connected;
     }
 
+    // The demand, with the steering axis **reconstructed across the catch-up burst**.
+    //
+    // The ticks of a burst are simulating time that has already elapsed, and the driver's hands
+    // moved continuously through it; handing all of them the newest sample says the wheel jumped at
+    // the frame boundary and was still for the rest of the frame. Nothing downstream can tell the
+    // difference except the one thing that differentiates the demand — and the steering rack does,
+    // twice, through its Coulomb friction and its viscous damping. Measured on the rig's 300-second
+    // trace: rack travel was **unchanged between 94.2% of consecutive ticks inside a burst**, so the
+    // rack's velocity was an impulse train at the frame rate and its friction — 120 N, saturated by
+    // `frictionReferenceSpeed` above 10 mm/s, 1.27 N·m at the rim — switched fully on and fully off
+    // with it. The torque step across such a tick measured 0.4254 N·m against 0.0003 N·m on a tick
+    // either side of it: a thousand to one, at 37 Hz, straight into the driver's hands. That is the
+    // buzz, and it is not the tyre, the suspension or the base.
+    //
+    // The last tick of a burst lands exactly on the newest sample, so **no latency is added** — what
+    // changes is only that the earlier ticks stop pretending the wheel was still. A burst of one is
+    // the identity, which is what makes this inert at frame rates at or above the tick rate.
     [[nodiscard]] DriverInput sample() override
     {
-        return deviceDriverInput(view.profile, view.geometry, view.sample);
+        auto input = deviceDriverInput(view.profile, view.geometry, view.sample);
+
+        if (!haveServed)
+        {
+            servedSteering = input.steering;
+            burstSteering = input.steering;
+            haveServed = true;
+
+            return input;
+        }
+
+        // A burst begins where the last one ended. Unconditional on the first tick rather than
+        // latched: the engine states a burst of one at frame rates at or above the tick rate, and a
+        // latch keyed on the index alone could never tell one such burst from the next — it rolled
+        // once and then held the same origin for the rest of the session. Asked twice inside one
+        // tick this advances slightly early, which is bounded and self-correcting, because the last
+        // tick of a burst lands on the device's own sample by construction whatever the origin was.
+        if (phase.index == 0)
+        {
+            burstSteering = servedSteering;
+        }
+
+        const auto steps = std::max<std::uint32_t>(phase.steps, 1);
+        const auto reached = static_cast<double>(std::min(phase.index, steps - 1) + 1) / static_cast<double>(steps);
+
+        input.steering = burstSteering + (input.steering - burstSteering) * reached;
+        servedSteering = input.steering;
+
+        return input;
     }
+};
+
+// What the device thread knows about the device as it stands, rather than what the tick last
+// managed to copy. Two consumers want two different things from the same device: the simulation
+// wants a sample it can have without waiting, and the force feedback thread wants to know whether
+// there is anything to write to and what a torque fraction of one would mean on it.
+export struct DeviceLink
+{
+    bool connected = false;
+    // Whether a signed torque can be written at all. A node this session may only read is a wheel
+    // that can be driven and cannot push back, which is a degradation and not a failure.
+    bool takesTorque = false;
+    // N·m at the rim for a fraction of one, from the device's own profile. Zero when nothing is
+    // connected, which is what stops a mapping being computed against a peak nobody stated.
+    double peakTorque = 0.0;
+    DeviceIdentity identity;
+    // When the device last said something, on `steady_clock`'s own clock. What an end-to-end latency
+    // is measured from.
+    std::uint64_t sampleTimestampNanos = 0;
+    // The physical rim's own angle, `rimDegrees()`'s answer restated on the thread-safe side: the
+    // force feedback writer differences it against the sample timestamps above to measure how fast
+    // the rim is actually turning, which is what the mapping's damper takes. False when what is
+    // connected has no rim.
+    bool hasRim = false;
+    double rimDegrees = 0.0;
 };
 
 export struct InputOptions
@@ -153,6 +251,7 @@ export class InputService
     UpdateRate publishedRate;
     DeviceIdentity publishedIdentity;
     bool publishedConnected = false;
+    bool publishedTakesTorque = false;
     InputSourceKind publishedKind = InputSourceKind::None;
     // Bumped whenever the profile behind the sample changes, which is once per connection. The tick
     // copies the profile only when this moves, so the per-tick cost is a fixed-size struct and never
@@ -163,6 +262,8 @@ export class InputService
     DeviceView view;
     std::uint32_t takenGeneration = 0;
     InputSourceKind active = InputSourceKind::None;
+    // Before the source that reads it: the reference is bound in the constructor's list.
+    CatchUpPhase catchUp;
     DeviceInputSource deviceSource;
     KeyboardInputSource keyboardSource;
     std::array<IInputSource*, 2> sources;
@@ -170,6 +271,18 @@ export class InputService
     // What was said last, so that a device that is not there is mentioned once rather than every
     // two seconds for the length of a session. Device thread only.
     bool announcedAbsence = false;
+
+    // The car's lock-to-lock, for the reader thread to push onto the base at attach. Atomic because
+    // the tick side states it and the reader consumes it.
+    std::atomic<double> wantedRotationDegrees{900.0};
+
+    // The device's *existence*, not its state. Two threads sit on one file descriptor — this
+    // service's reader and the force feedback writer — and reading and writing an evdev node
+    // concurrently is fine, because they are different ioctls over disjoint fields. What is not
+    // fine is the node being closed underneath a write in flight, so open and close take this
+    // exclusively and a write takes it shared. Reads need no lock at all: they happen on the same
+    // thread as the open and the close.
+    mutable std::shared_mutex deviceLifetime;
 
     std::mutex waiting;
     std::condition_variable_any wake;
@@ -213,6 +326,17 @@ public:
     {
         options.vehicleRotationDegrees = degrees;
         view.geometry.vehicleDegrees = degrees;
+        // The reader thread consumes this at the next attach, so it crosses threads as an atomic
+        // snapshot rather than through the options struct the tick side owns.
+        wantedRotationDegrees.store(degrees);
+    }
+
+    // Which tick of the engine's catch-up burst is about to run. The engine states it because the
+    // engine is the only thing that knows; see `CatchUpPhase` for what reads it and why. Stating
+    // nothing leaves a burst of one, which is the identity.
+    void setCatchUpPhase(const std::uint32_t index, const std::uint32_t steps)
+    {
+        catchUp = CatchUpPhase{.index = index, .steps = steps};
     }
 
     // What this service has taken, so that anything else that might enumerate devices — a joystick
@@ -227,6 +351,48 @@ public:
     {
         return view.connected;
     }
+
+    // The physical rim's own angle in degrees, positive in the same sense as positive demand: the
+    // raw steering axis through its calibration, times the device's half lock-to-lock. It exists
+    // for a rendered wheel that mirrors the driver's hands — which is a different question from the
+    // demand, because the demand clamps at the car's own lock while a 900-degree rig keeps turning.
+    // Nothing when what is driving is not a wheel: a keyboard has no rim to mirror.
+    [[nodiscard]] std::optional<double> rimDegrees() const
+    {
+        if (!view.connected || view.kind != InputSourceKind::Wheel)
+        {
+            return std::nullopt;
+        }
+
+        const auto steering = axisIndex(InputAxis::Steering);
+        const auto rim = normaliseBipolar(view.profile.axes[steering], static_cast<double>(view.sample.axes[steering]));
+
+        return rim * view.profile.rotationDegrees * 0.5;
+    }
+
+    // When the device said what this tick is driving on, on `steady_clock`'s clock. Zero when
+    // nothing said it — a keyboard, or a scripted run. The tick's own copy, so it is the stamp
+    // belonging to the sample the demand was actually made from rather than to whatever the device
+    // has said since.
+    [[nodiscard]] std::uint64_t sampleTimestampNanos() const
+    {
+        return view.sample.timestampNanos;
+    }
+
+    // The device thread's own answer, safe to ask from any thread. The tick uses the accessors
+    // above, which read its private copy; anything else — the force feedback writer is the only
+    // caller today — has to ask here, because `view` belongs to the simulation and is written
+    // without a lock.
+    [[nodiscard]] DeviceLink deviceLink() const;
+
+    // A signed fraction of the device's own maximum torque. The only route to the device's write
+    // side, and it exists here rather than on the backend so that one object owns the file
+    // descriptor's lifetime: a writer holding the backend directly can be halfway through an
+    // `EVIOCSFF` when the reader decides the device has gone and closes it.
+    //
+    // Newton metres are not this function's business and never will be — see `ForceMapping`, which
+    // is where the device's peak, its code grid and every other hardware fact live.
+    [[nodiscard]] std::expected<void, std::string> writeTorque(double torqueFraction);
 };
 
 // Where profiles go when the game does not say. `XDG_CONFIG_HOME` then `HOME` on Linux, `APPDATA`
@@ -278,7 +444,7 @@ InputService::InputService(spdlog::logger& logger, IInputBackend& backend, const
     logger(logger),
     backend(backend),
     options(std::move(options)),
-    deviceSource(view),
+    deviceSource(view, catchUp),
     keyboardSource(window),
     sources{&deviceSource, &keyboardSource}
 {
@@ -350,6 +516,38 @@ void InputService::refresh()
         view.geometry.vehicleDegrees = options.vehicleRotationDegrees;
         takenGeneration = generation;
     }
+}
+
+DeviceLink InputService::deviceLink() const
+{
+    const auto guard = std::lock_guard<std::mutex>(publication);
+
+    const auto wheel = publishedConnected && publishedKind == InputSourceKind::Wheel;
+    const auto steering = axisIndex(InputAxis::Steering);
+    const auto rim =
+        wheel ? normaliseBipolar(publishedProfile.axes[steering], static_cast<double>(publishedSample.axes[steering])) *
+                    publishedProfile.rotationDegrees * 0.5
+              : 0.0;
+
+    return DeviceLink{.connected = publishedConnected,
+                      .takesTorque = publishedTakesTorque,
+                      .peakTorque = publishedConnected ? publishedProfile.peakTorque : 0.0,
+                      .identity = publishedIdentity,
+                      .sampleTimestampNanos = publishedSample.timestampNanos,
+                      .hasRim = wheel,
+                      .rimDegrees = rim};
+}
+
+std::expected<void, std::string> InputService::writeTorque(const double torqueFraction)
+{
+    const auto guard = std::shared_lock<std::shared_mutex>(deviceLifetime);
+
+    if (!backend.opened())
+    {
+        return std::unexpected("no device is open");
+    }
+
+    return backend.writeTorque(torqueFraction);
 }
 
 void InputService::publish(const DeviceSample& sample)
@@ -438,7 +636,26 @@ void InputService::attach()
         return;
     }
 
-    const auto& description = *opened;
+    auto description = *opened;
+
+    // The base is *told* the car's lock-to-lock rather than asked for its own, which is what a
+    // simulator does with a wheel: the rig's physical stops land exactly on the car's lock and
+    // every mapping between hands, axis and rack collapses to one-to-one. It is also the only way
+    // to be right at all on a base whose firmware has drifted from what its range file reads —
+    // this one arrived soft-locked near 240 degrees while the file said 900, and a game that
+    // trusts a report it could have replaced is calibrating against a lie.
+    if (description.capabilities.has(DeviceCapability::SetRotationRange))
+    {
+        if (const auto set = backend.setRotationRange(wantedRotationDegrees.load()); set)
+        {
+            description.rotationDegrees = *set;
+        }
+        else
+        {
+            logger.info("The wheel's rotation range could not be set, so its own {:.0f} degrees stand: {}",
+                        description.rotationDegrees, set.error());
+        }
+    }
 
     // Reading with no wait answers with the state the open already took off the device, which is
     // every axis where it rests. That is what a profile is seeded from, and it is why a pedal whose
@@ -447,6 +664,14 @@ void InputService::attach()
     const auto resting = rest ? *rest : DeviceSample{};
 
     auto profile = profileFor(description, resting);
+
+    // The range this session actually set beats whatever a saved profile remembers: the profile's
+    // rotation describes the base as it was when the file was written, and the base was just told
+    // otherwise.
+    if (description.capabilities.has(DeviceCapability::SetRotationRange) && description.rotationDegrees > 0.0)
+    {
+        profile.rotationDegrees = description.rotationDegrees;
+    }
 
     // A wheel says what it is turned to and a pad does not, which is the one thing that separates
     // them without a table of product ids nobody can keep current.
@@ -481,6 +706,7 @@ void InputService::attach()
     publishedProfile = std::move(profile);
     publishedRate = rate;
     publishedConnected = true;
+    publishedTakesTorque = description.capabilities.has(DeviceCapability::ConstantForce);
     publishedKind = kind;
     profileGeneration.fetch_add(1, std::memory_order_release);
 }
@@ -493,6 +719,7 @@ void InputService::detach(const std::string& reason)
 
     const auto guard = std::lock_guard<std::mutex>(publication);
     publishedConnected = false;
+    publishedTakesTorque = false;
     publishedKind = InputSourceKind::None;
     publishedIdentity = DeviceIdentity{};
     publishedSample = DeviceSample{};
@@ -509,6 +736,9 @@ void InputService::pump(const std::stop_token& stopToken)
             if (const auto now = std::chrono::steady_clock::now(); now >= nextAttempt)
             {
                 nextAttempt = now + options.rediscoveryInterval;
+
+                // Exclusive: nothing may be writing a torque to the node this is about to replace.
+                const auto guard = std::lock_guard<std::shared_mutex>(deviceLifetime);
                 attach();
             }
 
@@ -522,9 +752,13 @@ void InputService::pump(const std::stop_token& stopToken)
             }
         }
 
+        // Unlocked deliberately: a read blocks for up to the timeout, and holding the lifetime lock
+        // across it would stall every torque write by that long. It is safe because open and close
+        // happen on this thread, so a read can never find the descriptor closed under it.
         auto taken = backend.read(options.readTimeout);
         if (!taken)
         {
+            const auto guard = std::lock_guard<std::shared_mutex>(deviceLifetime);
             detach(taken.error());
             nextAttempt = std::chrono::steady_clock::now() + options.rediscoveryInterval;
             continue;
@@ -533,6 +767,7 @@ void InputService::pump(const std::stop_token& stopToken)
         publish(*taken);
     }
 
+    const auto guard = std::lock_guard<std::shared_mutex>(deviceLifetime);
     backend.close();
 }
 

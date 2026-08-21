@@ -31,6 +31,7 @@ export class RecordingInputBackend final : public IInputBackend
     std::atomic<double> lastTorque{0.0};
 
 public:
+    double rotationRangeAsked = 0.0;
     RecordingInputBackend()
     {
         offered.add(DeviceCapability::ConstantForce);
@@ -135,6 +136,13 @@ public:
         sample.axes[axisIndex(InputAxis::Brake)] = brake.load();
         sample.axes[axisIndex(InputAxis::Clutch)] = 65535;
         sample.reports = reports.fetch_add(1) + 1;
+        // A real backend stamps every report and the force feedback writer differences those stamps
+        // to measure how fast the rim is turning. Left at zero this double skipped that estimator
+        // entirely — so the damper read a rim speed of zero whatever the wheel did, and nothing in
+        // the suite noticed because every damper case passes a rim speed to `mapRackTorque` by hand.
+        sample.timestampNanos = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
 
         return sample;
     }
@@ -154,6 +162,14 @@ public:
     [[nodiscard]] DeviceCapabilities capabilities() const override
     {
         return offered;
+    }
+
+    // The fake confirms whatever it is asked, which is what lets a service test assert the ask.
+    [[nodiscard]] std::expected<double, std::string> setRotationRange(const double degrees) override
+    {
+        rotationRangeAsked = degrees;
+
+        return degrees;
     }
 
     [[nodiscard]] UpdateRate updateRate() const override

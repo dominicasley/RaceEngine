@@ -34,6 +34,7 @@ module;
 module raceengine.graphics:VulkanRenderer;
 
 import :FrameDiagnostics;
+import :Frustum;
 import :IRenderBackend;
 import :LookupTable;
 import :PostProcessing;
@@ -61,7 +62,7 @@ constexpr const char* validationLayerName = "VK_LAYER_KHRONOS_validation";
 // that runs out loses everything after the first cascade rather than losing the least important
 // draws. DrawData is 272 bytes now the skinning palette has a ring of its own, so eight thousand
 // slots is the same 4 MiB per frame in flight that five hundred used to cost.
-constexpr uint32_t drawDataRingSlots = 8192;
+constexpr uint32_t drawDataRingSlots = 16384;
 // The skinning palette, sized by the skinned draws alone. 128 mat4s is 8 KiB a slot, so this is
 // the ring that has to stay short — and it can, because a skinned draw is a character rather than
 // a body panel and the two counts are not related.
@@ -1357,10 +1358,15 @@ private:
     // The view a pass renders into or samples for one level of an image. Level 0 of a single-level
     // image is its whole-image view, which is why nothing allocates a second one for it.
     [[nodiscard]] VkImageView levelView(const ImageResource& resource, uint32_t level) const;
+    // `clipCorrectedViewProjection` is `clipCorrection() * camera.modelViewProjectionMatrix`, which
+    // is constant for a whole view and is passed rather than rebuilt because this runs thousands of
+    // times a frame. It is a parameter and not a member for the same reason every other per-view
+    // value here is: a member would be state two passes could disagree about.
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
-                    const std::vector<glm::mat4>& joints, VkFormat colorFormat, VkFormat depthFormat,
-                    VkDescriptorSet shadowDescriptors, bool doubleSided, bool depthWrite);
+                    const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
+                    VkFormat colorFormat, VkFormat depthFormat, VkDescriptorSet shadowDescriptors, bool doubleSided,
+                    bool depthWrite);
     // One fullscreen pass: bind the inputs, push the parameters, draw the oversized triangle. The
     // inputs are expected to be in SHADER_READ_ONLY_OPTIMAL already — the caller moves them,
     // because it is the caller that knows whether one of them is a level of the image being
@@ -3037,7 +3043,20 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     depthAttachment.imageView = depthImage.view;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // Kept only where something reads it, which on this engine is exactly the shadow cascades. A
+    // depth attachment is given a sampler when, and only when, its FboAttachment asked for a
+    // comparison — so the handle being null *is* the statement that nothing samples this buffer,
+    // and no second flag is needed to say it.
+    //
+    // The two that do not: the shading camera's depth, which the tone map binds as its second input
+    // and never reads (HdrFragmentShader samples inputs[0] and inputs[2]), and the occlusion
+    // prepass's, whose own comment in AmbientOcclusionService says it is never sampled. Storing
+    // them writes two full-resolution D32 buffers a frame that nothing looks at, and — the larger
+    // cost — forces a depth decompression when the image is moved to a read layout afterwards. The
+    // move itself stays: the descriptor written for it promises that layout whether or not the
+    // shader reads it, and a mismatch there is undefined even for a binding nothing samples.
+    depthAttachment.storeOp =
+        depthImage.sampler != VK_NULL_HANDLE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
 
     // A camera with no colour attachment renders colour-less and one with no depth attachment
@@ -3276,6 +3295,17 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
     // here, not chased into a recycled slot.
     auto recordedDraws = 0u;
 
+    // This view's own clip volume, extracted once. Every pass this function serves — the four
+    // cascades, the occlusion prepass, the shading pass and a probe face — arrives here with its
+    // matrix already built, so one extraction covers all of them and no pass needs a case of its
+    // own (:Frustum states why, including why the cascade case is the one that looks like it needs
+    // special handling and does not).
+    const auto viewPlanes = frustumPlanes(camera.modelViewProjectionMatrix);
+
+    // Likewise view-constant. `*` associates left to right, so folding the correction in here gives
+    // every draw below the same `(clipCorrection() * mvp) * model` it computed for itself before.
+    const auto clipCorrectedViewProjection = clipCorrection() * camera.modelViewProjectionMatrix;
+
     // Blended geometry does not draw where it is found. Alpha blending is not commutative — the
     // result depends on the order the fragments arrive in — so a transparent surface is only
     // correct once everything visible *through* it is already in the buffer. Recording it in glTF
@@ -3363,7 +3393,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 continue;
             }
 
-            const auto entityModelMatrix = sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix;
+            const auto entityModelMatrix =
+                sceneManagerService.modelMatrix(entity.node) * mesh->modelMatrix * renderableMesh.localTransform;
             // Bound by reference into the mesh's palette buffer; copying undoes the per-frame
             // allocation the service avoids.
             const auto& joints = renderableEntityService.joints(renderableMesh, delta);
@@ -3408,6 +3439,32 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                     continue;
                 }
 
+                // Nothing this view can see, so nothing this view need record. The box is the one
+                // the POSITION accessor declared, carried into world space by the same matrix the
+                // vertex stage is about to be handed, and the planes are this view's own clip
+                // volume — so a primitive wholly outside one of them is clipped by the rasteriser
+                // before it can write a fragment, and skipping the draw records the same image.
+                //
+                // Two exemptions, both of which fail safe by drawing:
+                //
+                //   - a skinned draw, because the palette moves vertices outside the bind pose the
+                //     accessor measured, so those bounds are not a bound at all. `joints` is the
+                //     same vector recordDraw reads to decide whether this draw is animated.
+                //   - a primitive whose accessor declared no bounds, which keeps a zero half-extent
+                //     and would otherwise be culled for being unmeasured rather than for being
+                //     invisible.
+                //
+                // The test sits below every guard above it on purpose: the mesh upload, the joint
+                // palette and the entity's own draw callbacks are side effects a view owes whether
+                // or not this primitive is visible, and skipping them would make what is on screen
+                // depend on what was on screen last frame.
+                if (joints.empty() && glm::all(glm::greaterThan(primitive.boundsHalfExtent, glm::vec3(0.0f))) &&
+                    aabbOutsideFrustum(viewPlanes, entityModelMatrix, primitive.boundsCentre,
+                                       primitive.boundsHalfExtent))
+                {
+                    continue;
+                }
+
                 // Depth-only and prepass views have no blending to order — they write data, and
                 // their shaders carry no alpha at all — so only a shading view defers.
                 if (shading && !material->opaque)
@@ -3429,7 +3486,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 }
 
                 recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
-                           joints, colorFormat, depthFormat, shadowDescriptors, staticOnly, true);
+                           clipCorrectedViewProjection, joints, colorFormat, depthFormat, shadowDescriptors, staticOnly,
+                           true);
                 recordedDraws++;
             }
         }
@@ -3463,7 +3521,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
 
         // No depth write: these are the blended draws, and the sort above is what orders them.
         recordDraw(*deferred.primitive, deferred.materialKey, *material, deferred.shaderId, deferred.entityModelMatrix,
-                   camera, *deferred.joints, colorFormat, depthFormat, shadowDescriptors, staticOnly, false);
+                   camera, clipCorrectedViewProjection, *deferred.joints, colorFormat, depthFormat, shadowDescriptors,
+                   staticOnly, false);
         recordedDraws++;
     }
 
@@ -3475,9 +3534,9 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
 void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey,
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
-                                const std::vector<glm::mat4>& joints, const VkFormat colorFormat,
-                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors,
-                                const bool doubleSided, const bool depthWrite)
+                                const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
+                                const VkFormat colorFormat, const VkFormat depthFormat,
+                                const VkDescriptorSet shadowDescriptors, const bool doubleSided, const bool depthWrite)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -3491,7 +3550,11 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
         return;
     }
 
-    const VkCullModeFlags cullMode = (material.opaque && !doubleSided) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    // The material's own doubleSided joins the probe capture's blanket one: a foliage card is
+    // authored to be seen from both sides, and an alpha-tested material that got back-face culled
+    // would lose half of every tree the moment MASK started counting as opaque.
+    const VkCullModeFlags cullMode =
+        (material.opaque && !doubleSided && !material.doubleSided) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
 
     // A prepass writes geometry into its attachment — a normal and a distance — and neither is a
     // colour with a coverage in front of it. Blending them would read the distance as an opacity.
@@ -3554,11 +3617,15 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
     auto& frame = frames[frameIndex];
     auto* target = static_cast<unsigned char*>(frame.drawDataMapped) + slot.value();
 
+    // Written out once and reused, rather than stated twice: `*` is left-associative, so this is
+    // the same product with the same operands in the same order that both the view matrix slot and
+    // the normal matrix below used to compute separately.
+    const auto localToView = camera.modelViewMatrix * entityModelMatrix;
+
     const std::array<glm::mat4, 4> matrices = {
-        entityModelMatrix, camera.modelViewMatrix * entityModelMatrix,
-        clipCorrection() * camera.modelViewProjectionMatrix * entityModelMatrix,
+        entityModelMatrix, localToView, clipCorrectedViewProjection * entityModelMatrix,
         // The shader reads mat3(normalMatrix); the mat4 slot carries the upper 3x3.
-        glm::mat4(glm::transpose(glm::inverse(glm::mat3(camera.modelViewMatrix * entityModelMatrix))))};
+        glm::mat4(glm::transpose(glm::inverse(glm::mat3(localToView))))};
     std::memcpy(target, matrices.data(), sizeof(matrices));
 
     auto jointCount = joints.size();
@@ -4583,11 +4650,18 @@ bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBindi
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView = targetView;
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // Nothing to load, because nothing survives: the oversized triangle covers every pixel of the
+    // render area, so whatever a clear wrote would be overwritten before it could be read. This was
+    // a CLEAR because GL's drawFullScreenQuad cleared first, and the comment that stood here
+    // conceded the point — "the quad covers the target anyway". Twenty-five of these run per frame.
+    //
+    // The one thing that could make the old contents observable is the blend, which is
+    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA on this layout: a pass writing alpha below one would read the
+    // destination. Every fullscreen shader writes 1.0, and the R8 targets have no alpha component
+    // at all — which Vulkan reads as 1.0 — so the destination factor is zero everywhere and the
+    // load is genuinely dead.
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // GL's drawFullScreenQuad clears before the quad; the quad covers the target anyway.
-    colorAttachment.clearValue.color =
-        VkClearColorValue{{clearColour[0], clearColour[1], clearColour[2], clearColour[3]}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -5301,7 +5375,7 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 
     MaterialDataUbo materialData{};
     materialData.baseColour = material.baseColour;
-    materialData.roughMetal = glm::vec4(material.roughness, material.metalness, 0.0f, 0.0f);
+    materialData.roughMetal = glm::vec4(material.roughness, material.metalness, material.alphaCutoff, 0.0f);
     materialData.textureTransform = glm::mat4(material.transform);
     materialData.useTextures = glm::ivec4(diffuse.has_value() ? 1 : 0, normal.has_value() ? 1 : 0,
                                           specular.has_value() ? 1 : 0, emissive.has_value() ? 1 : 0);

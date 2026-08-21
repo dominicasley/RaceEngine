@@ -328,13 +328,17 @@ TEST_CASE("the aligning moment goes light before the grip does", "[physics][tyre
     REQUIRE(peakMoment > 0.0);
     REQUIRE(peakMomentAngle < peakForceAngle);
 
-    // And it self-aligns: the moment acts to *reduce* the slip angle, whichever way the wheel is
-    // slipping. A sign error here gives a tire that steers itself further into the corner, which
-    // reads as a terminal instability rather than as a sign error.
+    // And it self-aligns: applied to the wheel about the patch normal, the moment turns the wheel
+    // plane *toward* the velocity vector, reducing the slip angle. In this model's conventions a
+    // positive slip angle produces a negative lateral force, and the trail's lever behind the patch
+    // centre puts a minus of its own on the couple — so the self-aligning moment carries the *same*
+    // sign as the slip angle. This invariant was pinned the other way round once, by reasoning that
+    // skipped the lever, and the inversion cost nothing any vehicle criterion could see while
+    // handing the force feedback a wheel that pulled into its own lock.
     for (const auto angle : {-0.12, -0.05, 0.05, 0.12})
     {
         const auto steered = evaluateTyre(model, load, TyreSlip{.slipAngle = angle}, 1.0);
-        REQUIRE(steered.aligningMoment * angle < 0.0);
+        REQUIRE(steered.aligningMoment * angle > 0.0);
     }
 }
 

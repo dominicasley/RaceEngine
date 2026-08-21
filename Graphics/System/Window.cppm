@@ -47,6 +47,9 @@ export enum class Key : int {
     A = GLFW_KEY_A,
     S = GLFW_KEY_S,
     D = GLFW_KEY_D,
+    // The telemetry toggle. A driver flagging an interesting moment must not have to leave the seat
+    // to do it, which is the whole of why it is a key and not a command line switch.
+    T = GLFW_KEY_T,
     Escape = GLFW_KEY_ESCAPE,
     Space = GLFW_KEY_SPACE,
     LeftShift = GLFW_KEY_LEFT_SHIFT,

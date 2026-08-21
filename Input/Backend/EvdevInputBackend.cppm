@@ -92,6 +92,8 @@ public:
         return deviceCapabilities;
     }
 
+    [[nodiscard]] std::expected<double, std::string> setRotationRange(double degrees) override;
+
     [[nodiscard]] UpdateRate updateRate() const override
     {
         const auto ceiling = transportHz > 0.0 ? transportHz : 0.0;
@@ -131,6 +133,18 @@ template <class T> [[nodiscard]] bool control(const int fileDescriptor, const un
 // profile carries calibration keyed on the *role*, so it travels to a platform that names the same
 // physical axis something else. Getting the order wrong is one line here rather than a file
 // everybody's wheel has to have rewritten.
+//
+// **Z is the throttle, RZ is the brake and Y is the clutch** on this rig, measured by pressing them.
+// It is not the order the names suggest and it was wrong here twice before it was measured: the
+// symptom is worth knowing, because it is not "the pedals are swapped". Every calibration prompt
+// watches one axis, so asking for the throttle while the throttle pedal drives a different code reads
+// as *no travel at all* — which was diagnosed first as a disconnected pedal and then as the USB
+// drop-outs, and was neither.
+//
+// **This order should not be hardcoded here at all**, and the fact that it has been wrong twice is
+// the argument: the calibration tool watches every axis while a pedal is pressed, so it already knows
+// which one moved and could simply say so. Until the profile can carry that, this is a per-rig
+// constant sitting in a place a rig cannot reach.
 [[nodiscard]] bool axisRole(const std::uint16_t code, InputAxis& role)
 {
     switch (code)
@@ -139,13 +153,13 @@ template <class T> [[nodiscard]] bool control(const int fileDescriptor, const un
         role = InputAxis::Steering;
         return true;
     case ABS_Y:
-        role = InputAxis::Throttle;
+        role = InputAxis::Clutch;
         return true;
     case ABS_Z:
-        role = InputAxis::Brake;
+        role = InputAxis::Throttle;
         return true;
     case ABS_RZ:
-        role = InputAxis::Clutch;
+        role = InputAxis::Brake;
         return true;
     default:
         break;
@@ -589,6 +603,8 @@ std::expected<DeviceSample, std::string> EvdevInputBackend::read(const std::chro
             }
 
             current.reports++;
+            current.timestampNanos = static_cast<std::uint64_t>(event.input_event_sec) * 1000000000ull +
+                                     static_cast<std::uint64_t>(event.input_event_usec) * 1000ull;
 
             const auto seconds =
                 static_cast<double>(event.input_event_sec) + static_cast<double>(event.input_event_usec) * 1e-6;
@@ -618,6 +634,44 @@ std::expected<DeviceSample, std::string> EvdevInputBackend::read(const std::chro
     return current;
 }
 
+std::expected<double, std::string> EvdevInputBackend::setRotationRange(const double degrees)
+{
+    if (device == noDevice)
+    {
+        return std::unexpected("no device is open");
+    }
+
+    if (!deviceCapabilities.has(DeviceCapability::SetRotationRange))
+    {
+        return std::unexpected("this device's rotation range is not writable from here");
+    }
+
+    // The driver clamps to what the base accepts (90-900 on this family); asking inside that range
+    // and reading back what stuck is what keeps the number honest rather than assumed. Writing it
+    // at all is also what re-synchronises a base whose firmware has drifted from the file: this rig
+    // arrived soft-locked at roughly 240 degrees while its range file read 900, and no calibration
+    // on top of a lie could put the picture and the hands in the same place.
+    const auto asked = static_cast<int>(std::lround(std::clamp(degrees, 90.0, 900.0)));
+
+    {
+        auto file = std::ofstream(std::filesystem::path(sysfs) / "range");
+        if (!file)
+        {
+            return std::unexpected("the range file would not open for writing");
+        }
+
+        file << asked;
+        if (!file.flush())
+        {
+            return std::unexpected("the range file did not take the write");
+        }
+    }
+
+    const auto confirmed = readNumericAttribute(std::filesystem::path(sysfs) / "range");
+
+    return confirmed > 0.0 ? confirmed : static_cast<double>(asked);
+}
+
 std::expected<void, std::string> EvdevInputBackend::writeTorque(const double torqueFraction)
 {
     if (device == noDevice)
@@ -639,7 +693,18 @@ std::expected<void, std::string> EvdevInputBackend::writeTorque(const double tor
     // means "away from the user" and is what a rumble pad wants; a wheel given it turns the sign of
     // every force into a property of the driver's interpretation rather than of the number.
     shape.direction = 0x4000;
-    shape.u.constant.level = static_cast<std::int16_t>(std::lround(clamped * 32767.0));
+    // **Negated, because evdev's positive at 0x4000 is the opposite of the seam's contract.** The
+    // contract is that a positive fraction turns the rim toward positive steering demand — a right
+    // turn on this rig — and the kernel's direction rose names 0x4000 "left": hid-fanatecff scales
+    // the level by sin(direction) and passes the sign through, so a positive level pushes the rim
+    // left. Written without the minus it inverted every torque this engine ever sent, and the two
+    // places it showed were chosen by a second inversion upstream cancelling it at speed: the
+    // aligning moment's sign fault in the tyre model made stage one slightly pro-steer while
+    // driving — flipped here into a weak, plausible centring — and left the standstill, where stage
+    // one was already correct, as the one regime a driver could feel the truth: ease the wheel off
+    // centre with the car parked and it pulled itself further, the restoring torque delivered
+    // backwards. Measured from the seat 2026-08-20.
+    shape.u.constant.level = static_cast<std::int16_t>(std::lround(-clamped * 32767.0));
     // Zero is until it is replaced or removed. A length would make a torque that expires between
     // two writes, which is a stutter that looks like a physics fault.
     shape.replay.length = 0;
@@ -697,6 +762,11 @@ std::expected<DeviceSample, std::string> EvdevInputBackend::read(std::chrono::mi
 }
 
 std::expected<void, std::string> EvdevInputBackend::writeTorque(double)
+{
+    return std::unexpected("no device is open");
+}
+
+std::expected<double, std::string> EvdevInputBackend::setRotationRange(double)
 {
     return std::unexpected("no device is open");
 }

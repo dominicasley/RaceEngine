@@ -13,8 +13,10 @@ import raceengine.physics;
 using raceengine::bringUpJolt;
 using raceengine::clutchPackLsd;
 using raceengine::cornerCount;
+using raceengine::degreesToRadians;
 using raceengine::Curve;
 using raceengine::Differential;
+using raceengine::DifferentialSides;
 using raceengine::DifferentialState;
 using raceengine::DrivelineSetup;
 using raceengine::DrivelineState;
@@ -25,9 +27,13 @@ using raceengine::fillDrivelineTelemetry;
 using raceengine::generateProvingGround;
 using raceengine::noDriveTorque;
 using raceengine::openDifferential;
+using raceengine::placeDriveline;
 using raceengine::PhysicsWorld;
 using raceengine::placeholderDriveline;
 using raceengine::placeholderSedan;
+using raceengine::rampLockFraction;
+using raceengine::rampLsd;
+using raceengine::RampGeometry;
 using raceengine::ProvingGroundDescriptor;
 using raceengine::roadTorques;
 using raceengine::spool;
@@ -35,6 +41,7 @@ using raceengine::startEngine;
 using raceengine::stepDriveline;
 using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
+using raceengine::torqueBiasRatio;
 using raceengine::TelemetryFrame;
 using raceengine::VehicleInput;
 using raceengine::VehicleState;
@@ -143,16 +150,27 @@ TEST_CASE("the differential is asked a question rather than performing a divisio
     // one twice.
     auto axle = DifferentialState{};
 
+    // A pair of wheels the pack has to hold together, with the road doing nothing to either: the
+    // cases below vary the speeds and the torque going in, which is what the pack answers to.
+    const auto wheels = [](const double leftSpeed, const double rightSpeed, const double input)
+    {
+        return DifferentialSides{.leftSpeed = leftSpeed,
+                                 .rightSpeed = rightSpeed,
+                                 .leftInertia = 1.2,
+                                 .rightInertia = 1.2,
+                                 .input = input};
+    };
+
     SECTION("an open diff splits evenly whatever the wheels are doing")
     {
         const auto open = openDifferential();
 
-        const auto even = open.split(axle, 50.0, 50.0, 400.0, tick);
+        const auto even = open.split(axle, wheels(50.0, 50.0, 400.0), tick);
         REQUIRE(even.left == Catch::Approx(200.0));
         REQUIRE(even.right == Catch::Approx(200.0));
 
         // One wheel spinning changes nothing, which is exactly the open diff's famous failing.
-        const auto spinning = open.split(axle, 200.0, 50.0, 400.0, tick);
+        const auto spinning = open.split(axle, wheels(200.0, 50.0, 400.0), tick);
         REQUIRE(spinning.left == Catch::Approx(200.0));
         REQUIRE(spinning.right == Catch::Approx(200.0));
     }
@@ -160,12 +178,18 @@ TEST_CASE("the differential is asked a question rather than performing a divisio
     SECTION("a spool refuses to let the wheels differ")
     {
         const auto locked = spool();
-        const auto split = locked.split(axle, 60.0, 50.0, 400.0, tick);
+        const auto split = locked.split(axle, wheels(60.0, 50.0, 400.0), tick);
 
-        // Enormous transfer away from the fast wheel and into the slow one.
+        // Enormous transfer away from the fast wheel and into the slow one — and it is the
+        // *constraint's* answer rather than the pack's capacity, which is the difference between a
+        // spool and a clutch pack with a very large number in it.
         REQUIRE(split.left < -1000.0);
         REQUIRE(split.right > 1000.0);
         REQUIRE(split.left + split.right == Catch::Approx(400.0));
+        REQUIRE(axle.pack.mode == raceengine::CouplingMode::Locked);
+
+        // What that torque is: the reduced inertia removing the whole speed difference in a tick.
+        REQUIRE(axle.transfer == Catch::Approx(0.5 * 1.2 * 10.0 / tick));
     }
 
     SECTION("a clutch pack transfers up to its capacity and no further")
@@ -173,36 +197,65 @@ TEST_CASE("the differential is asked a question rather than performing a divisio
         const auto lsd = clutchPackLsd(60.0, 0.35, 0.15);
 
         // Under power: preload plus the power ramp.
-        const auto driving = lsd.split(axle, 60.0, 50.0, 400.0, tick);
+        const auto driving = lsd.split(axle, wheels(60.0, 50.0, 400.0), tick);
         const auto capacity = 60.0 + 0.35 * 400.0;
 
         REQUIRE(driving.right - driving.left == Catch::Approx(2.0 * capacity));
         REQUIRE(driving.left + driving.right == Catch::Approx(400.0));
 
-        // And it says so: the pack was asked for more than it could hold and reports both numbers,
-        // which is what the lock/slip machine will read when it replaces the clamp.
+        // And it says so: the pack was asked for more than it could hold, so it is sliding at its
+        // capacity rather than holding the two wheels together.
         REQUIRE(axle.capacity == Catch::Approx(capacity));
         REQUIRE(axle.transfer == Catch::Approx(capacity));
+        REQUIRE(axle.pack.mode == raceengine::CouplingMode::Slipping);
 
         // Off power the coast ramp is shallower, which is most of an LSD's character.
-        const auto coasting = lsd.split(axle, 60.0, 50.0, -400.0, tick);
+        const auto coasting = lsd.split(axle, wheels(60.0, 50.0, -400.0), tick);
         const auto coastCapacity = 60.0 + 0.15 * 400.0;
         REQUIRE(coasting.right - coasting.left == Catch::Approx(2.0 * coastCapacity));
 
         // And the preload acts with no torque going through at all, which is what holds a car
         // straight with one wheel on ice.
-        const auto idle = lsd.split(axle, 60.0, 50.0, 0.0, tick);
+        const auto idle = lsd.split(axle, wheels(60.0, 50.0, 0.0), tick);
         REQUIRE(idle.right - idle.left == Catch::Approx(120.0));
     }
 
     SECTION("a small speed difference is inside the pack rather than at its limit")
     {
         const auto lsd = clutchPackLsd(60.0, 0.35, 0.15);
-        const auto barely = lsd.split(axle, 50.05, 50.0, 400.0, tick);
+        const auto barely = lsd.split(axle, wheels(50.05, 50.0, 400.0), tick);
 
-        // 0.05 rad/s against a stiffness of 400 is 20 Nm, well under the 200 Nm capacity.
-        REQUIRE(barely.right - barely.left == Catch::Approx(40.0));
-        REQUIRE(axle.transfer == Catch::Approx(20.0));
+        // Holding 0.05 rad/s together costs the reduced inertia times that over a tick — 10.8 Nm,
+        // well under the 200 Nm the pack can hold — so the pack holds instead of sliding, and what
+        // it carries is what holding cost rather than what it was capable of.
+        const auto holding = 0.5 * 1.2 * 0.05 / tick;
+
+        REQUIRE(axle.pack.mode == raceengine::CouplingMode::Locked);
+        REQUIRE(axle.transfer == Catch::Approx(holding));
+        REQUIRE(barely.right - barely.left == Catch::Approx(2.0 * holding));
+    }
+
+    SECTION("what the pack has to hold is the road's asymmetry, not the input torque")
+    {
+        // The reason the road torques are in `DifferentialSides` at all. The gears have already
+        // split the input evenly, so an even road leaves the pack nothing to do; put one wheel on
+        // ice and the pack is what carries the difference. Told the wheels had no external torque
+        // the constraint could only make it up out of a speed difference, which is the *clutch's*
+        // recorded failure — a lock that works by slipping — written one element further down.
+        const auto lsd = clutchPackLsd(0.0, 0.5, 0.5);
+
+        auto ice = DifferentialState{};
+        auto even = DifferentialState{};
+
+        auto slippery = wheels(50.0, 50.0, 400.0);
+        slippery.leftTorque = 0.0;
+        slippery.rightTorque = -300.0;
+
+        static_cast<void>(lsd.split(ice, slippery, tick));
+        static_cast<void>(lsd.split(even, wheels(50.0, 50.0, 400.0), tick));
+
+        REQUIRE(even.transfer == Catch::Approx(0.0));
+        REQUIRE(ice.transfer == Catch::Approx(150.0));
     }
 
     SECTION("two axles on one differential keep their own state")
@@ -214,11 +267,62 @@ TEST_CASE("the differential is asked a question rather than performing a divisio
         auto front = DifferentialState{};
         auto rear = DifferentialState{};
 
-        static_cast<void>(lsd.split(front, 60.0, 50.0, 400.0, tick));
-        static_cast<void>(lsd.split(rear, 50.0, 50.0, 400.0, tick));
+        static_cast<void>(lsd.split(front, wheels(60.0, 50.0, 400.0), tick));
+        static_cast<void>(lsd.split(rear, wheels(50.0, 50.0, 400.0), tick));
 
         REQUIRE(front.transfer == Catch::Approx(60.0 + 0.35 * 400.0));
         REQUIRE(rear.transfer == Catch::Approx(0.0));
+    }
+}
+
+TEST_CASE("a pack stated as hardware and a pack stated as a fraction meet at one function",
+          "[physics][driveline][differential]")
+{
+    // The unit question this milestone had to answer rather than inherit. The brief specifies ramp
+    // angles, friction faces and a coefficient; `Differential` stores two dimensionless torque
+    // fractions. They are not the same number twice — the fraction is what the differential does and
+    // the geometry is one way of arriving at it — so the conversion is a factory and `split` never
+    // learns a ramp angle exists.
+    const auto geometry = RampGeometry{};
+
+    SECTION("published ramp angles come back as published torque bias ratios")
+    {
+        // A Salisbury's two numbers are quoted from the plane perpendicular to the axis, and a
+        // 45/60 pack is the commonest thing on a spec sheet. What it should give is about four to
+        // one on power and about two to one on coast, and that is the check that this arithmetic is
+        // a differential rather than a plausible product of four numbers.
+        const auto power = rampLockFraction(geometry, 45.0 * degreesToRadians);
+        const auto coast = rampLockFraction(geometry, 60.0 * degreesToRadians);
+
+        REQUIRE(torqueBiasRatio(power) == Catch::Approx(4.3).epsilon(0.1));
+        REQUIRE(torqueBiasRatio(coast) == Catch::Approx(2.2).epsilon(0.1));
+
+        // A flat face is not a ramp: it produces no axial thrust, so the pack holds its preload and
+        // nothing else. That is the end of the range that says the convention is the right way up.
+        REQUIRE(rampLockFraction(geometry, 90.0 * degreesToRadians) == Catch::Approx(0.0).margin(1e-9));
+        REQUIRE(torqueBiasRatio(0.0) == Catch::Approx(1.0));
+    }
+
+    SECTION("a shallower ramp locks harder, and more plates lock harder still")
+    {
+        REQUIRE(rampLockFraction(geometry, 30.0 * degreesToRadians) >
+                rampLockFraction(geometry, 45.0 * degreesToRadians));
+
+        auto stacked = geometry;
+        stacked.faces = geometry.faces * 2;
+
+        REQUIRE(rampLockFraction(stacked, 45.0 * degreesToRadians) ==
+                Catch::Approx(2.0 * rampLockFraction(geometry, 45.0 * degreesToRadians)));
+    }
+
+    SECTION("and the factory puts the two ramps where the fractions go")
+    {
+        const auto pack = rampLsd(40.0, 45.0 * degreesToRadians, 60.0 * degreesToRadians, geometry);
+
+        REQUIRE(pack.preload == Catch::Approx(40.0));
+        REQUIRE(pack.powerRamp == Catch::Approx(rampLockFraction(geometry, 45.0 * degreesToRadians)));
+        REQUIRE(pack.coastRamp == Catch::Approx(rampLockFraction(geometry, 60.0 * degreesToRadians)));
+        REQUIRE(pack.powerRamp > pack.coastRamp);
     }
 }
 
@@ -290,6 +394,9 @@ TEST_CASE("only the driven wheels are driven", "[physics][driveline]")
     // the clutch torque is negative, and every driven wheel correctly reports being braked.
     const auto wheelSpeed = 40.0;
     auto state = runningAt(setup, wheelSpeed * setup.gearbox.reduction(2));
+    // And the shaft where the wheels put it, or the spring opens the case holding a twist nobody
+    // wound into it.
+    placeDriveline(setup, state, wheelSpeed);
 
     SECTION("front wheel drive")
     {

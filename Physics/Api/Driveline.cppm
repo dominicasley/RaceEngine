@@ -54,6 +54,59 @@ export struct IdleGovernor
     double maximumBypass = 1.0;
 };
 
+// The plate and the air path past it, which is the whole of why a part-load engine is not a
+// full-throttle one scaled down.
+//
+// **Representative rather than measured, and loudly so.** Assetto Corsa's `engine.ini` states a
+// wide-open power curve, a coast reference and a turbo; it says nothing whatever about what the
+// engine makes at a third of the pedal, and neither does any published figure for this car. AC's own
+// model multiplies the wide-open curve by the pedal, which is what this file did until now. What is
+// here instead is the standard orifice-and-pump balance — a throttle passing air against a pressure
+// ratio, an engine drawing it in proportion to its own speed — solved for the manifold pressure:
+// Guzzella and Onder, *Introduction to Modelling and Control of Internal Combustion Engine Systems*
+// 2nd ed. ch. 2; Heywood, *Internal Combustion Engine Fundamentals* ch. 7.
+export struct ThrottleBody
+{
+    // How far the butterfly opens. A plate's flow area goes as one minus the cosine of its angle
+    // from shut, which is what makes the first third of the pedal worth so much less than the last.
+    double fullOpenAngle = 1.396; // 80 degrees
+
+    // What is still open with the plate shut: the machined bypass an idle valve breathes through
+    // plus the plate's own leakage, as a fraction of the fully open area. **Sized rather than
+    // guessed** — it is the area at which the engine's own idle airflow exactly covers its friction,
+    // so a warm engine holds its idle without the governor doing anything. It is also the whole of
+    // what an overrun cut has to turn off: air at a shut throttle is what a coasting engine is still
+    // burning, and cutting the fuel is what stops it.
+    double leakArea = 0.006;
+
+    // Where the plate stops being the restriction. At this speed a fully open throttle holds
+    // 1/sqrt(2) of ambient in the manifold, so below it the pedal saturates early and above it the
+    // same pedal opening passes steadily less of what the engine wants.
+    double chokedSpeed = 900.0;
+};
+
+// The overrun cut, and it is two thresholds and no dwell for `advanceRevLimiter`'s reason: the band
+// is crossed at a rate the car's own deceleration sets, and a speed cannot dither across it inside a
+// tick the way a torque can.
+//
+// **What it does is the restore, not the cut**, and that is worth stating because the opposite reads
+// as obvious. A shut throttle passes only the leak area whatever the injectors are doing, so cutting
+// the fuel above the band changes the torque by exactly what that leak was making — real, and small.
+// Coming *back* through the band is where it shows: the injectors return, the engine sustains itself
+// again, and the braking lets go rather than tapering linearly to nothing at rest.
+export struct OverrunCut
+{
+    bool enabled = true;
+
+    // As multiples of idle speed, so they follow the engine rather than being restated against it.
+    double cutFraction = 1.8;
+    double restoreFraction = 1.4;
+
+    // Past this the driver is asking for torque and the injectors are on whatever the speed. A rev
+    // match counts as asking, which is why the *demanded* pedal is what this is read against.
+    double throttleThreshold = 0.02;
+};
+
 export struct EngineModel
 {
     // Torque against engine speed in rad/s, at full throttle. A curve rather than a peak and a
@@ -81,7 +134,44 @@ export struct EngineModel
     // nothing at rest. Deliberately separate from the torque curve, which is a full-throttle
     // measurement and has no business carrying the closed-throttle behaviour as a negative number.
     double coastTorque = 75.0;
+
+    ThrottleBody throttle;
+    OverrunCut overrun;
 };
+
+// The fraction of the air a fully open throttle would pass at this speed, which is what the cylinder
+// actually gets. Exactly 1 at full pedal and exactly the leak area's worth at a shut one, at every
+// speed — so the measured full-throttle curve is reproduced to the bit and only the middle of the
+// pedal is reshaped.
+//
+// Pure and exported, because a part-load surface is the one thing here that has to be swept and read
+// rather than believed.
+export [[nodiscard]] double throttleAirFlow(const EngineModel& engine, const double speed, const double throttle)
+{
+    const auto& body = engine.throttle;
+
+    const auto span = 1.0 - std::cos(std::max(body.fullOpenAngle, 1e-6));
+    const auto leak = std::clamp(body.leakArea, 0.0, 1.0);
+    const auto plate = span > 1e-12 ? (1.0 - std::cos(std::clamp(throttle, 0.0, 1.0) * body.fullOpenAngle)) / span
+                                    : std::clamp(throttle, 0.0, 1.0);
+
+    const auto area = leak + (1.0 - leak) * std::clamp(plate, 0.0, 1.0);
+
+    // The manifold pressure a plate of this area holds against an engine drawing air in proportion
+    // to its own speed. Both flows equated and solved: the throttle passes with the square root of
+    // what is left of the pressure drop, the engine swallows in proportion to what is there.
+    const auto restriction = std::abs(speed) / std::max(body.chokedSpeed, 1e-9);
+    const auto pressure = [restriction](const double open)
+    {
+        const auto denominator = std::sqrt(open * open + restriction * restriction);
+
+        return denominator > 1e-12 ? open / denominator : 0.0;
+    };
+
+    const auto wideOpen = pressure(1.0);
+
+    return wideOpen > 1e-12 ? std::clamp(pressure(area) / wideOpen, 0.0, 1.0) : 0.0;
+}
 
 // Torque at the flywheel. Positive drives, negative brakes.
 //
@@ -93,23 +183,39 @@ export struct EngineModel
 //
 // Whether the fuel is cut arrives as an argument because the *decision* has memory and this function
 // has none: see `advanceRevLimiter`.
+// Part load is **not** the full-throttle curve scaled by the pedal, and that was the whole of what
+// this function used to say. What the crankshaft delivers is the work the trapped air did less the
+// friction and pumping the engine owes whatever the load — so a third of the air is a good deal less
+// than a third of the torque, and high enough up the range it is none at all. Written this way the
+// coast reference stops being a term bolted beside the curve and becomes the loss the part-load
+// blend is taken from, which is what it physically is.
 export [[nodiscard]] double engineTorque(const EngineModel& engine, const double speed, const double throttle,
                                          const bool fuelCut)
 {
-    const auto demand = std::clamp(throttle, 0.0, 1.0);
+    const auto losses =
+        std::max(engine.coastTorque, 0.0) * std::clamp(speed / std::max(engine.limiterSpeed, 1e-9), 0.0, 1.0);
+    const auto full = engine.torque.at(speed);
 
-    const auto driving = fuelCut ? 0.0 : demand * engine.torque.at(speed);
-    const auto pumping = fuelCut ? 1.0 : 1.0 - demand;
-    const auto braking = pumping * engine.coastTorque * std::clamp(speed / engine.limiterSpeed, 0.0, 1.0);
+    // Cutting fuel does not merely stop the engine driving — it makes it *brake*, because a cylinder
+    // still pumping with nothing burning in it is a compressor. That is why the limiter is a cliff
+    // here and not a taper: the abruptness is what a driver feels.
+    if (fuelCut)
+    {
+        return -losses;
+    }
 
-    return driving - braking;
+    return throttleAirFlow(engine, speed, throttle) * (full + losses) - losses;
 }
 
-// The same engine with the limiter answered from this instant alone, which is the right question for
-// anything sweeping the curve and the wrong one for anything running it.
+// The same engine with both fuel decisions answered from this instant alone, which is the right
+// question for anything sweeping the curve and the wrong one for anything running it: see
+// `advanceRevLimiter` and `advanceOverrunCut` for why each of them has memory.
 export [[nodiscard]] double engineTorque(const EngineModel& engine, const double speed, const double throttle)
 {
-    return engineTorque(engine, speed, throttle, speed >= engine.limiterSpeed);
+    const auto overrun = engine.overrun.enabled && throttle <= engine.overrun.throttleThreshold &&
+                         speed >= engine.overrun.cutFraction * engine.idleSpeed;
+
+    return engineTorque(engine, speed, throttle, speed >= engine.limiterSpeed || overrun);
 }
 
 // Where the fuel cut goes next, given where it is. Two thresholds, and deliberately *not*
@@ -124,6 +230,21 @@ export [[nodiscard]] bool advanceRevLimiter(const EngineModel& engine, const boo
 {
     return fuelCut ? speed > engine.limiterSpeed - std::max(engine.limiterRestoreBand, 0.0)
                    : speed >= engine.limiterSpeed;
+}
+
+// Where the overrun cut goes next. The same two-thresholds-and-memory shape the limiter has, armed
+// only while nobody is asking for torque — and `throttle` is the *demanded* pedal rather than the
+// driver's, so a rev match's blip puts the injectors back exactly as a foot would.
+export [[nodiscard]] bool advanceOverrunCut(const EngineModel& engine, const bool cut, const double speed,
+                                            const double throttle)
+{
+    if (!engine.overrun.enabled || throttle > engine.overrun.throttleThreshold)
+    {
+        return false;
+    }
+
+    return cut ? speed > engine.overrun.restoreFraction * engine.idleSpeed
+               : speed >= engine.overrun.cutFraction * engine.idleSpeed;
 }
 
 // How much bypass the governor is asking for, and the integral it is asking through. Exported and
@@ -173,6 +294,20 @@ export struct Gearbox
     double finalDrive = 4.37;
     double reverseRatio = 3.6;
 
+    // What turns at the gearbox *input*: the clutch's driven plate or the converter's turbine, plus
+    // the input shaft and the gearset riding on it. A manual's is small; an automatic's turbine
+    // carries entrained fluid and is several times it, which is why `placeholderAutomatic` states
+    // its own.
+    //
+    // Rigidly coupled this was never needed — the wheels reach the gearbox input through the
+    // gearing and outweigh it by two orders of magnitude, so leaving it out cost nothing. A
+    // compliant shaft is what makes it load-bearing: the input is no longer tied to the wheels
+    // within a tick, so its own inertia is the only thing the coupling has to push against, and
+    // without it the coupling solves against the *shaft* alone and finds a body 141 times too light
+    // to be pushed on. That reads as a clutch that transmits nothing and a converter that never
+    // multiplies.
+    double inputInertia = 0.02;
+
     ShiftTiming shift;
 
     // The highest forward gear this box actually has.
@@ -190,9 +325,10 @@ export struct Gearbox
         return std::clamp(gear, -1, topGear());
     }
 
-    // Total reduction from the flywheel to the differential input. Zero in neutral, which is what
-    // disconnects the chain — not a special case anywhere else, just a ratio of nothing.
-    [[nodiscard]] double reduction(const std::int32_t gear) const
+    // The box's own ratio, with nothing after it. Named separately from `reduction` because the
+    // compliant shaft lives *between* the two: what twists is the gearbox output against the
+    // differential input, so the two halves of the chain are needed apart as well as together.
+    [[nodiscard]] double ratio(const std::int32_t gear) const
     {
         if (gear == 0 || ratios.empty())
         {
@@ -201,12 +337,17 @@ export struct Gearbox
 
         if (gear < 0)
         {
-            return -reverseRatio * finalDrive;
+            return -reverseRatio;
         }
 
-        const auto index = std::min(static_cast<std::size_t>(gear - 1), ratios.size() - 1);
+        return ratios[std::min(static_cast<std::size_t>(gear - 1), ratios.size() - 1)];
+    }
 
-        return ratios[index] * finalDrive;
+    // Total reduction from the flywheel to the differential input. Zero in neutral, which is what
+    // disconnects the chain — not a special case anywhere else, just a ratio of nothing.
+    [[nodiscard]] double reduction(const std::int32_t gear) const
+    {
+        return ratio(gear) * finalDrive;
     }
 };
 
@@ -216,14 +357,38 @@ export struct DifferentialTorques
     double right = 0.0;
 };
 
-// What the pack did last tick. The lock/slip machine in `:Coupling` is what will decide this
-// instead of the clamp in `split`, and these two are precisely the numbers it judges — how much the
-// pack was asked to carry against how much it could — so they are recorded where they are known
-// rather than recovered afterwards from torques that have already been split.
+// What the pack did last tick, and the lock/slip machine that decided it. `transfer` and `capacity`
+// are precisely the two numbers that machine judges — how much the pack was asked to carry against
+// how much it could — so they are recorded where they are known rather than recovered afterwards
+// from torques that have already been split.
 export struct DifferentialState
 {
     double transfer = 0.0;
     double capacity = 0.0;
+    CouplingState pack{};
+};
+
+// The two wheels as the differential needs to see them, and it is a struct for `CouplingSides`'
+// reason: seven loose scalars at a call site are seven chances to pass them in the wrong order.
+//
+// The inertias and the road torques are here because **a friction differential cannot be solved
+// without them**. `stepCoupling` holds a pair together by asking what torque that costs, and that
+// question is `(Ir*Tl - Il*Tr)/(Il+Ir)` plus the slip through the reduced inertia — so a pack told
+// the wheels have no external torque can only make up the difference with a speed difference, and
+// "locks" by slipping for ever. That is the failure the clutch already had and had measured out of
+// it; reproducing it one element further down the chain would be the same bug written twice.
+export struct DifferentialSides
+{
+    double leftSpeed = 0.0;
+    double rightSpeed = 0.0;
+    double leftInertia = 1.0;
+    double rightInertia = 1.0;
+    // What the road did to each wheel, lagged one tick exactly as the clutch's is and for the same
+    // reason: the tyre's answer for this tick does not exist until the vehicle tick has run.
+    double leftTorque = 0.0;
+    double rightTorque = 0.0;
+    // What the gearing delivered to the differential's case.
+    double input = 0.0;
 };
 
 // The differential, asked a question rather than performing a division.
@@ -240,35 +405,51 @@ export struct Differential
     double preload = 0.0;
     // Fraction of the input torque that becomes locking torque, on power and off it. Real ramp
     // angles give different numbers for the two, and that asymmetry is most of an LSD's character.
+    // The geometry that produces these lives in `rampLockFraction` and deliberately not in here —
+    // see the note there for why.
     double powerRamp = 0.0;
     double coastRamp = 0.0;
 
-    // How hard it resists a speed difference before it reaches its locking limit. Large: this is a
-    // friction element, and the limit is what shapes it, not the stiffness.
-    double lockingStiffness = 400.0;
+    // The pack's own lock/slip machine, and its two departures from the plate's defaults are both
+    // required rather than tuning.
+    //
+    // `lockSlipSpeed` is half a rad/s because that is what a differential is *for*: a corner of any
+    // real radius turns the two wheels past each other faster than that, and a pack that considered
+    // locking across it would be answering the question a spool answers. And `slipDwell` is zero
+    // for `advanceRevLimiter`'s reason — the dwell exists because a *torque* can dither across both
+    // thresholds inside one tick, and what this pack's constraint is dominated by is a speed
+    // difference, which cannot. Left at the plate's 20 ms it is 20 ms of sliding friction at full
+    // capacity every time a wheel is momentarily quicker than its partner, which is a car that
+    // darts on the first tick of every launch.
+    CouplingSetup pack{.lockSlipSpeed = 0.5, .slipDwell = 0.0};
 
     // The state is the axle's, not the differential's: a `Differential` is setup and is handed
     // around by const reference, and all-wheel drive asks the *same* one twice. Two axles sharing
     // one state object would have the front's lock stamping on the rear's, which is why the state
     // arrives here rather than living in the struct.
-    [[nodiscard]] DifferentialTorques split(DifferentialState& state, const double leftSpeed, const double rightSpeed,
-                                            const double input, const double deltaTime) const
+    [[nodiscard]] DifferentialTorques split(DifferentialState& state, const DifferentialSides& sides,
+                                            const double deltaTime) const
     {
-        // The tick the lock/slip machine will want when it replaces the clamp below. Taken now
-        // because adding it later moves every call site, and consumed by nothing yet.
-        static_cast<void>(deltaTime);
+        const auto ramp = sides.input >= 0.0 ? powerRamp : coastRamp;
+        const auto capacity = std::max(preload, 0.0) + std::max(ramp, 0.0) * std::abs(sides.input);
 
-        const auto ramp = input >= 0.0 ? powerRamp : coastRamp;
-        const auto capacity = preload + ramp * std::abs(input);
+        // The pack is `stepCoupling`'s third consumer and holds the two wheels together exactly as
+        // the plate holds the engine to the gearbox: the gears have already split the input evenly,
+        // so what is left for the pack to carry is whatever asymmetry the road is imposing on top.
+        const auto pair = CouplingSides{.drivingSpeed = sides.leftSpeed,
+                                        .drivenSpeed = sides.rightSpeed,
+                                        .drivingInertia = sides.leftInertia,
+                                        .drivenInertia = sides.rightInertia,
+                                        .drivingTorque = 0.5 * sides.input + sides.leftTorque,
+                                        .drivenTorque = 0.5 * sides.input + sides.rightTorque,
+                                        .capacity = capacity};
 
-        // Opposes the difference, up to what the pack can hold. Beyond that the diff is simply open
-        // and the faster wheel keeps the extra.
-        const auto transfer = std::clamp(lockingStiffness * (leftSpeed - rightSpeed), -capacity, capacity);
+        const auto held = stepCoupling(pack, state.pack, pair, deltaTime);
 
-        state.transfer = transfer;
+        state.transfer = held.torque;
         state.capacity = capacity;
 
-        return DifferentialTorques{.left = 0.5 * input - transfer, .right = 0.5 * input + transfer};
+        return DifferentialTorques{.left = 0.5 * sides.input - held.torque, .right = 0.5 * sides.input + held.torque};
     }
 };
 
@@ -279,14 +460,87 @@ export [[nodiscard]] Differential openDifferential()
 
 export [[nodiscard]] Differential spool()
 {
-    // Locked solid: an enormous capacity, so the transfer term is never the binding constraint and
-    // the two wheels are held to the same speed.
-    return Differential{.preload = 1e6, .powerRamp = 0.0, .coastRamp = 0.0, .lockingStiffness = 1e5};
+    // Locked solid, and both numbers are needed to say so. An enormous capacity is what stops the
+    // pack ever reaching its limit; a lock slip speed past anything a wheel can do is what makes it
+    // hold across a difference rather than sliding at that capacity, which for 1e6 N.m would put a
+    // megawatt of nonsense into the wheels on the first tick of a corner.
+    return Differential{.preload = 1e6, .pack = {.lockSlipSpeed = 1e9, .slipDwell = 0.0}};
 }
 
 export [[nodiscard]] Differential clutchPackLsd(const double preload, const double powerRamp, const double coastRamp)
 {
     return Differential{.preload = preload, .powerRamp = powerRamp, .coastRamp = coastRamp};
+}
+
+// The pack a ramped differential actually has, for the cars whose data states the hardware rather
+// than the behaviour.
+//
+// **The geometry lives here and not in `Differential`, and that is the decision this milestone had
+// to take rather than inherit.** The brief specifies ramp angles, friction faces and a coefficient;
+// the struct above stores two dimensionless torque fractions, and the two are not the same thing
+// said twice — the fraction is *what the differential does* and the geometry is one particular way
+// of arriving at it. Every source this project has states the fraction directly: AC's `POWER` and
+// `COAST` are exactly it, a race engineer asks for "a 25% diff", and a torque bias ratio is a
+// one-line function of it. Putting the geometry in the type would oblige the Golf — whose file
+// states 0.25 and no hardware at all — to carry an invented ramp angle, a made-up plate count and a
+// friction coefficient nobody measured, chosen so that their product came back to the number
+// already known. That is the fictitious damper again: a plausible-looking geometry describing a
+// pack that does not exist, and a second statement of a number with nothing making the two agree.
+// So the conversion is a factory, `split` and its call sites never learn a ramp angle exists, and
+// the two ways of stating a pack meet at one function that can be checked against published bias
+// ratios without a car anywhere near it.
+// Ramp angles are the one thing in this model quoted in degrees everywhere they are published, so
+// the conversion is stated once here rather than as a magic number at every data site. The angle
+// itself stays radians, as everything here is.
+export inline constexpr auto degreesToRadians = 0.017453292519943295;
+
+export struct RampGeometry
+{
+    // Where the cross pin rides its ramp, and where the plates rub. Both from the axis, in metres.
+    double rampRadius = 0.0225;
+    double plateRadius = 0.042;
+
+    // Friction interfaces in **one** side's stack. The two stacks are symmetric and each carries the
+    // same torque, but they carry it to opposite wheels — the sum is the input, and the *bias* is
+    // one stack's worth, the other being what reacts it.
+    std::uint32_t faces = 4;
+
+    // Wet plates in gear oil, which is why it is a tenth rather than the third a dry clutch runs.
+    double frictionCoefficient = 0.085;
+};
+
+// The fraction of the torque through the case that a ramp of this angle turns into locking torque.
+//
+// The angle is measured from the plane perpendicular to the differential's axis, which is the
+// convention the two numbers on a Salisbury's spec sheet are quoted in: a face at 90 degrees is flat
+// against the rotation, produces no axial thrust at all and locks with nothing, and every smaller
+// angle locks harder. Tangential force at the pin is the input torque over the ramp radius; the
+// wedge turns it into thrust through the cotangent; the pin is driven by ramps in *both* pressure
+// rings so each takes half of it; and the thrust on one ring clamps that ring's stack.
+export [[nodiscard]] double rampLockFraction(const RampGeometry& geometry, const double rampAngle)
+{
+    const auto radius = std::max(geometry.rampRadius, 1e-9);
+    const auto tangent = std::tan(std::clamp(rampAngle, 1e-6, 1.5707963267948966));
+
+    return 0.5 * (geometry.plateRadius / radius) * static_cast<double>(geometry.faces) *
+           std::max(geometry.frictionCoefficient, 0.0) / tangent;
+}
+
+// The torque bias ratio a lock fraction produces: what the loaded wheel carries over what the
+// unloaded one does. The number a differential is advertised by, and the one this model can be
+// checked against published hardware with.
+export [[nodiscard]] double torqueBiasRatio(const double lockFraction)
+{
+    const auto fraction = std::clamp(lockFraction, 0.0, 0.5 - 1e-9);
+
+    return (0.5 + fraction) / (0.5 - fraction);
+}
+
+// A pack stated as hardware. Angles in radians, as everything here is.
+export [[nodiscard]] Differential rampLsd(const double preload, const double powerAngle, const double coastAngle,
+                                          const RampGeometry& geometry)
+{
+    return clutchPackLsd(preload, rampLockFraction(geometry, powerAngle), rampLockFraction(geometry, coastAngle));
 }
 
 // Rev matching, and it is *one* controller in both directions rather than a blip and a cut bolted
@@ -318,6 +572,51 @@ export [[nodiscard]] double revMatchThrottle(const EngineModel& engine, const Sh
     return std::clamp(assist.gain * (target - engineSpeed), 0.0, 1.0);
 }
 
+// The shaft between the gearbox output and the differential input, and what it does when the
+// throttle is dropped on it.
+//
+// One lumped torsional element standing for the whole shaft train below the box, stated at the
+// **gearbox output** because that is where the element is. On a transverse transaxle the number is
+// dominated by the two halfshafts referred through the final drive rather than by the pinion's own
+// torsion, and referring a rate across gearing divides it by the ratio squared — the output turns
+// `finalDrive` times faster than the wheel, so it twists that much further for the same halfshaft
+// angle. Two halfshafts of a small hatchback are about 25 kN.m/rad at the wheel, which twists eleven
+// degrees under this car's 4879 N.m of peak axle torque; through 4.37 that is **1331 N.m/rad here**,
+// and the same shaft appears as a different number on a car with a different final drive, which is
+// why `placeholderAutomatic` restates it rather than inheriting it. The damping is a ratio of 0.08
+// on the driveline mode, which is why shunt rings a few times rather than either buzzing or
+// vanishing.
+//
+// **It was 500, and that is worth recording because of how it failed.** Too soft is not merely a
+// softer car: first gear then asks for more twist than `maximumTwist` allows — 6.1 rad on the
+// automatic against a 3.0 rad guard — so the guard stops being a guard and becomes a silent 1500 N.m
+// torque limiter in ordinary driving. What that looks like is a converter that never reaches stall
+// (3312 rpm against a road automatic's 1800-2500), a car that will not drive away, and a torque
+// interrupt that never appears, none of which reads as a stiffness.
+//
+// **The numbers are representative and the shape is not.** No published figure for this car states a
+// halfshaft rate, and AC does not model driveline compliance at all — so these are sized from the
+// frequency the element has to produce (a FWD hatchback shuffles at nine to eleven hertz) rather
+// than measured. What is *not* representative is that it is one degree of freedom solved implicitly:
+// that is the model, and the rate is the data.
+export struct DrivelineCompliance
+{
+    bool enabled = true;
+
+    // N.m per radian and N.m.s per radian, both at the gearbox output.
+    double stiffness = 1331.0;
+    double damping = 7.3;
+
+    // What turns between the box and the final drive: the output shaft, the pinion and the
+    // differential case. drivetrain.ini [GEARBOX] INERTIA for this car, whose own reference the file
+    // does not state.
+    double inertia = 0.017;
+
+    // A shaft wound past this is not a driveline, it is a solve that has come apart. The clamp is
+    // what keeps that diagnosable rather than a NaN spreading through the wheels.
+    double maximumTwist = 3.0;
+};
+
 export struct DrivelineSetup
 {
     EngineModel engine;
@@ -327,6 +626,7 @@ export struct DrivelineSetup
     DriveCoupling coupling;
     AutoClutch autoClutch;
     ShiftAssist shiftAssist;
+    DrivelineCompliance compliance;
     Differential differential = openDifferential();
     DrivenAxle driven = DrivenAxle::Front;
 };
@@ -365,6 +665,9 @@ export struct DrivelineState
 
     // The limiter's one bit of memory, which is the whole of what stops it chattering.
     bool fuelCut = false;
+    // And the overrun's, which is a separate decision made against a separate band: one is the
+    // engine being held down, the other the car driving it.
+    bool overrunCut = false;
 
     // A default-constructed driveline is a car with the key out: nothing has started this engine, so
     // it is not turning. `startEngine` is what changes that, and it is deliberately not an input.
@@ -376,6 +679,13 @@ export struct DrivelineState
     // automation's when nobody is. Kept rather than recomputed so the handover between the two is
     // continuous — see `advanceClutchPedal`.
     double clutchPedal = 0.0;
+
+    // The compliant shaft's two numbers, both at the gearbox output: what it is turning at and how
+    // far it is wound against the differential. Slaved to the wheels and held at zero when the
+    // compliance is off, which is what makes a rigid driveline the same arithmetic rather than a
+    // second path.
+    double shaftSpeed = 0.0;
+    double windUp = 0.0;
 
     double idleIntegral = 0.0;
 
@@ -403,6 +713,13 @@ export struct DrivelineTorques
     // housing. Without both, an engine's own torque balance cannot be reconstructed from telemetry.
     double clutchReaction = 0.0;
     double engine = 0.0;
+    // What the gearbox delivered to the shaft, at its own output, and what the shaft delivered to the
+    // differential. They are the same number only where the driveline is rigid or settled; the
+    // difference between them *is* the wind-up, which is why both are reported rather than one.
+    double gearbox = 0.0;
+    double shaftTorque = 0.0;
+    // How far the shaft is wound, in radians at the gearbox output. The channel shunt is read in.
+    double windUp = 0.0;
     // How far out of step the two sides of the clutch are, in rad/s. It does not reach zero when the
     // coupling locks: only the engine's half of the constraint is integrated here, the driveline's
     // half being the vehicle tick's, so a locked clutch converges over a handful of ticks rather
@@ -424,6 +741,7 @@ export struct DrivelineTorques
     double referredInertia = 0.0;
 
     bool fuelCut = false;
+    bool overrunCut = false;
 };
 
 // How a stalled engine comes back, and it is a function the game calls rather than a field on
@@ -437,6 +755,25 @@ export void startEngine(const DrivelineSetup& setup, DrivelineState& state)
     state.engine = EngineState::Running;
     state.engineSpeed = std::max(state.engineSpeed, setup.engine.idleSpeed);
     state.idleIntegral = 0.0;
+}
+
+// Placing a car at a road speed means placing all of it, and the compliant shaft is the part that is
+// easy to forget. A `DrivelineState` written with the wheels turning and the shaft still at rest is
+// not a slow car, it is an impossible one: the spring reads the difference as a twist nobody put
+// there and hands the wheels a torque on the first tick that nothing in the car produced. Measured on
+// the placeholder with the wheels at 40 rad/s, that fiction is **-2746 N.m** — a fault that presents
+// as a driveline refusing to drive and is entirely an initial condition.
+//
+// A rigid driveline has no such state, which is why nothing needed this before and why leaving it out
+// went unnoticed: `stepDriveline` slaves the shaft to the wheels every tick when the compliance is
+// off, so the same fixture was consistent by construction.
+//
+// Separate from `startEngine` deliberately. Which of the two a caller wants is a real question — a
+// car can be placed rolling with its engine dead, and is, every time one is pushed.
+export void placeDriveline(const DrivelineSetup& setup, DrivelineState& state, const double axleSpeed)
+{
+    state.shaftSpeed = axleSpeed * setup.gearbox.finalDrive;
+    state.windUp = 0.0;
 }
 
 namespace
@@ -631,7 +968,40 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
     // gearbox here to get the torque balance wrong in.
     const auto connected = geared && drivenCount > 0 && state.shiftPhase == ShiftPhase::Engaged;
 
-    const auto clutchSideSpeed = connected ? axleSpeed * reduction : 0.0;
+    const auto gearRatio = setup.gearbox.ratio(state.gear);
+    const auto finalDrive = setup.gearbox.finalDrive;
+
+    // The differential input's speed, at the gearbox output — the reference the compliant shaft and
+    // every number describing it is stated in, because that is where the shaft physically is.
+    const auto diffSpeed = axleSpeed * finalDrive;
+    const auto compliant = setup.compliance.enabled && drivenCount > 0 && std::abs(finalDrive) >= 1e-9;
+
+    // A rigid driveline has no state of its own: the shaft is whatever the wheels are doing and the
+    // twist is nothing. Slaving the two rather than branching around them is what makes
+    // `enabled = false` reproduce the arithmetic this function had before the compliance existed,
+    // tick for tick — a second code path kept in step by hand would not.
+    if (!compliant)
+    {
+        state.shaftSpeed = diffSpeed;
+        state.windUp = 0.0;
+    }
+
+    const auto clutchSideSpeed = connected ? state.shaftSpeed * gearRatio : 0.0;
+
+    // What the shaft is carrying as this tick opens. The clutch is solved against it rather than
+    // against the road, which is what removes the one-tick lag the rigid path has to live with: the
+    // driven side's external torque is now a spring this function owns both ends of.
+    const auto shaftReaction = compliant ? std::max(setup.compliance.stiffness, 0.0) * state.windUp +
+                                               std::max(setup.compliance.damping, 0.0) * (state.shaftSpeed - diffSpeed)
+                                         : 0.0;
+
+    // How hard the spring resists the shaft *changing* speed over this tick, as opposed to what it is
+    // already pulling with. The coupling needs it because it is solving for a driven side this
+    // function will then integrate against exactly this coefficient — the reaction above is the
+    // explicit half of the same spring and the two are not interchangeable.
+    const auto shaftResisting =
+        compliant ? std::max(setup.compliance.stiffness, 0.0) * deltaTime + std::max(setup.compliance.damping, 0.0)
+                  : 0.0;
 
     // The bypass and the driver's pedal are parallel air paths, so the engine gets the larger of the
     // two and never their sum: a governor that added to a wide-open throttle would be making torque
@@ -650,99 +1020,182 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
     const auto demand = std::max(pedal, bypass);
 
     state.fuelCut = running && advanceRevLimiter(setup.engine, state.fuelCut, state.engineSpeed);
+    // Against the *demanded* pedal rather than the driver's, so the idle path and a rev match both
+    // put the injectors back the way a foot would.
+    state.overrunCut = running && advanceOverrunCut(setup.engine, state.overrunCut, state.engineSpeed, demand);
 
-    const auto flywheel = running ? engineTorque(setup.engine, state.engineSpeed, demand, state.fuelCut) : 0.0;
+    const auto flywheel =
+        running ? engineTorque(setup.engine, state.engineSpeed, demand, state.fuelCut || state.overrunCut) : 0.0;
 
     result.engine = flywheel;
     result.fuelCut = state.fuelCut;
+    result.overrunCut = state.overrunCut;
 
     // The pedal, whoever is on it, and the automation is a layer over exactly this one number.
     const auto automatic = autoClutchPedal(setup.autoClutch, setup.engine.idleSpeed, clutchSideSpeed, state.engineSpeed,
                                            input.throttle, connected);
-    state.clutchPedal = advanceClutchPedal(setup.autoClutch, state.clutchPedal, input.clutch, automatic, deltaTime);
+    state.clutchPedal =
+        advanceClutchPedal(setup.autoClutch, state.clutchPedal, input.clutch, automatic,
+                           antiStallPedal(setup.autoClutch, setup.engine.idleSpeed, state.engineSpeed), deltaTime);
 
     result.slipEnergy = state.slipEnergy;
 
     // Neutral, a gear change, or a car with nothing driven: the engine is on its own, spinning
     // against its own friction, and the coupling is holding no two things together to have a mode
-    // about.
-    if (!connected)
+    // about. The shaft under it is still turning with the wheels either way, which is why this is no
+    // longer where the function ends.
+    auto coupling = DriveCouplingSolution{};
+
+    if (connected)
+    {
+        // Rigid, this is the wheels' own inertia and nothing else, which is the right one over a
+        // tick: the car's mass reaches the wheel through the tire, and the tire builds its force
+        // over a relaxation *length* rather than instantly. Folding the car in here instead — 122
+        // kg.m^2 against the wheels' 2.4 — was tried and is unstable, because the vehicle tick then
+        // integrates the wheel against 1.2 while the coupling sized its torque against a hundred
+        // times that: measured, it turned a launch's one lock transition into forty of them banging
+        // between plus and minus the whole capacity.
+        //
+        // Compliant, the driven side is no longer the wheels at all: it is the shaft, whose inertia
+        // is its own and whose external torque is the spring. That is the honest pair, and it is
+        // also what makes the road's one-tick lag stop mattering here.
+        const auto referredInertia = result.referredInertia;
+        const auto drivenInertia = compliant
+                                       ? setup.gearbox.inputInertia + setup.compliance.inertia / (gearRatio * gearRatio)
+                                       : referredInertia;
+        const auto drivenTorque = compliant ? -shaftReaction / gearRatio : axleRoadTorque / reduction;
+
+        const auto sides = CouplingSides{.drivingSpeed = state.engineSpeed,
+                                         .drivenSpeed = clutchSideSpeed,
+                                         .drivingInertia = engineInertia,
+                                         .drivenInertia = std::max(drivenInertia, 1e-9),
+                                         .drivingTorque = flywheel,
+                                         .drivenTorque = drivenTorque,
+                                         .capacity = 0.0,
+                                         .drivenResisting = compliant ? shaftResisting / (gearRatio * gearRatio) : 0.0};
+
+        // The gear in mesh rather than the one asked for: a lockup clutch that read the demand would
+        // let go a shift early and take hold one late.
+        const auto command = DriveCouplingCommand{.clutchPedal = state.clutchPedal, .gear = state.gear};
+
+        const auto solved = stepDriveCoupling(setup.coupling, state.coupling, sides, command, deltaTime);
+        if (!solved)
+        {
+            return std::unexpected(solved.error());
+        }
+
+        coupling = solved.value();
+
+        // The engine takes what the coupling did not. A stalled one takes nothing: `settleEngineSpeed`
+        // holds it at rest, which is what its own compression does, and the torque still crosses to
+        // the driveline — that is why a stalled car in gear drags itself to a stop rather than
+        // coasting.
+        state.engineSpeed += ((flywheel - coupling.drivingTorque) / engineInertia) * deltaTime;
+        settleEngineSpeed(setup.engine, state);
+
+        state.slipEnergy += coupling.slipPower * deltaTime;
+    }
+    else
     {
         idleDriveCoupling(setup.coupling, state.coupling, deltaTime);
         state.engineSpeed += (flywheel / engineInertia) * deltaTime;
         settleEngineSpeed(setup.engine, state);
 
-        return result;
+        if (!compliant && drivenCount == 0)
+        {
+            return result;
+        }
     }
 
-    // The wheels' own inertia and nothing else, which is the right one over a tick: the car's mass
-    // reaches the wheel through the tire, and the tire builds its force over a relaxation *length*
-    // rather than instantly. Folding the car in here instead — 122 kg.m^2 against the wheels' 2.4 —
-    // was tried and is unstable, because the vehicle tick then integrates the wheel against 1.2 while
-    // the coupling sized its torque against a hundred times that: measured, it turned a launch's one
-    // lock transition into forty of them banging between plus and minus the whole capacity.
-    const auto referredInertia = result.referredInertia;
+    // What the box put into the shaft, at the gearbox output, and an **exact zero** through every
+    // phase of a gear change and in neutral: an open gearbox is not a small torque. What the wheels
+    // see through that window is a separate question once the shaft is compliant — a wound shaft
+    // gives back what it stored, and that release is the shunt this element exists to produce.
+    const auto gearboxTorque = connected ? coupling.drivenTorque * gearRatio : 0.0;
 
-    const auto sides = CouplingSides{.drivingSpeed = state.engineSpeed,
-                                     .drivenSpeed = clutchSideSpeed,
-                                     .drivingInertia = engineInertia,
-                                     .drivenInertia = std::max(referredInertia, 1e-9),
-                                     .drivingTorque = flywheel,
-                                     .drivenTorque = axleRoadTorque / reduction,
-                                     .capacity = 0.0};
-
-    // The gear in mesh rather than the one asked for: a lockup clutch that read the demand would let
-    // go a shift early and take hold one late.
-    const auto command = DriveCouplingCommand{.clutchPedal = state.clutchPedal, .gear = state.gear};
-
-    const auto solved = stepDriveCoupling(setup.coupling, state.coupling, sides, command, deltaTime);
-    if (!solved)
+    // The shaft, *solved* rather than stepped. Its spring and its damper are both contributed as
+    // coefficients on the left of `(J/dt + C)w' = (J/dt)w + T` — which is `integrate`'s rule for a
+    // damper, extended to a spring by writing the twist implicitly as well — so it is stable at any
+    // stiffness rather than at stiffnesses under `2J/dt`. A driveline is the stiffest element in
+    // this model after the tyre's vertical rate, and stepping it explicitly is what substepping the
+    // driveline would have been for.
+    const auto shaftTorque = [&]
     {
-        return std::unexpected(solved.error());
-    }
+        if (!compliant)
+        {
+            return gearboxTorque;
+        }
 
-    // The engine takes what the coupling did not. A stalled one takes nothing: `settleEngineSpeed`
-    // holds it at rest, which is what its own compression does, and the torque still crosses to the
-    // driveline — that is why a stalled car in gear drags itself to a stop rather than coasting.
-    state.engineSpeed += ((flywheel - solved->drivingTorque) / engineInertia) * deltaTime;
-    settleEngineSpeed(setup.engine, state);
+        // The shaft and the gearbox input are one body while the box is closed, so this solve and the
+        // coupling's must be told the same thing about it or they are moving two different cars. The
+        // coupling sees it at the *input*, this sees it at the output, and the two differ by the
+        // ratio squared — which is not a detail here: through first gear the input's own inertia is
+        // twelve times the shaft's once referred, so leaving it out of this half makes the shaft the
+        // light body all over again. Open, the box has disconnected them and the shaft is alone.
+        const auto coupled = connected ? setup.gearbox.inputInertia * gearRatio * gearRatio : 0.0;
+        const auto inertia = std::max(setup.compliance.inertia + coupled, 1e-9);
+        const auto stiffness = std::max(setup.compliance.stiffness, 0.0);
+        const auto damping = std::max(setup.compliance.damping, 0.0);
+        const auto twist = std::max(setup.compliance.maximumTwist, 0.0);
 
-    state.slipEnergy += solved->slipPower * deltaTime;
+        const auto mass = inertia / std::max(deltaTime, 1e-9);
+        const auto resisting = stiffness * deltaTime + damping;
 
-    // Through the gearing to the differential, and out to the wheels it decides between. This is the
-    // *delivered* torque and not the reaction: they part company the moment the slot holds anything
-    // with a member grounded to its own housing.
-    const auto axleTorque = solved->drivenTorque * reduction;
+        state.shaftSpeed =
+            (mass * state.shaftSpeed + gearboxTorque - stiffness * state.windUp + resisting * diffSpeed) /
+            (mass + resisting);
+        state.windUp = std::clamp(state.windUp + (state.shaftSpeed - diffSpeed) * deltaTime, -twist, twist);
+
+        return stiffness * state.windUp + damping * (state.shaftSpeed - diffSpeed);
+    }();
+
+    result.gearbox = gearboxTorque;
+    result.shaftTorque = shaftTorque;
+    result.windUp = state.windUp;
+
+    // Through the final drive to the differential, and out to the wheels it decides between. This is
+    // the *delivered* torque and not the reaction: they part company the moment the slot holds
+    // anything with a member grounded to its own housing.
+    const auto axleTorque = shaftTorque * finalDrive;
+
+    // One statement of what a differential is handed, rather than the same seven fields written out
+    // three times with the indices changed.
+    const auto axleSides = [&](const std::size_t left, const double torque)
+    {
+        return DifferentialSides{.leftSpeed = wheelSpeeds[left],
+                                 .rightSpeed = wheelSpeeds[left + 1],
+                                 .leftInertia = wheelInertias[left],
+                                 .rightInertia = wheelInertias[left + 1],
+                                 .leftTorque = roadTorques[left],
+                                 .rightTorque = roadTorques[left + 1],
+                                 .input = torque};
+    };
 
     if (driven == DrivenAxle::All)
     {
         // Split evenly front to rear before each differential, which is a centre spool. A centre
         // differential is the same interface again and is somebody else's milestone. The two
         // differentials are the same setup asked twice and each keeps its own state.
-        const auto front = setup.differential.split(state.differentials[0], wheelSpeeds[0], wheelSpeeds[1],
-                                                    0.5 * axleTorque, deltaTime);
-        const auto rear = setup.differential.split(state.differentials[1], wheelSpeeds[2], wheelSpeeds[3],
-                                                   0.5 * axleTorque, deltaTime);
+        const auto front = setup.differential.split(state.differentials[0], axleSides(0, 0.5 * axleTorque), deltaTime);
+        const auto rear = setup.differential.split(state.differentials[1], axleSides(2, 0.5 * axleTorque), deltaTime);
 
         result.wheel = {front.left, front.right, rear.left, rear.right};
     }
     else if (driven == DrivenAxle::Front)
     {
-        const auto split =
-            setup.differential.split(state.differentials[0], wheelSpeeds[0], wheelSpeeds[1], axleTorque, deltaTime);
+        const auto split = setup.differential.split(state.differentials[0], axleSides(0, axleTorque), deltaTime);
         result.wheel = {split.left, split.right, 0.0, 0.0};
     }
     else
     {
-        const auto split =
-            setup.differential.split(state.differentials[1], wheelSpeeds[2], wheelSpeeds[3], axleTorque, deltaTime);
+        const auto split = setup.differential.split(state.differentials[1], axleSides(2, axleTorque), deltaTime);
         result.wheel = {0.0, 0.0, split.left, split.right};
     }
 
-    result.clutch = solved->drivenTorque;
-    result.clutchReaction = solved->drivingTorque;
-    result.clutchSlip = solved->slipSpeed;
-    result.clutchLocked = solved->locked;
+    result.clutch = coupling.drivenTorque;
+    result.clutchReaction = coupling.drivingTorque;
+    result.clutchSlip = coupling.slipSpeed;
+    result.clutchLocked = coupling.locked;
     result.slipEnergy = state.slipEnergy;
 
     return result;
@@ -929,6 +1382,18 @@ export [[nodiscard]] DrivelineSetup placeholderAutomatic()
 
     setup.gearbox.ratios = {4.15, 2.37, 1.56, 1.16, 0.86, 0.69};
     setup.gearbox.finalDrive = 3.20;
+
+    // The turbine and the fluid it drags round with it, which is a far heavier thing than a manual's
+    // driven plate. It is also the inertia the stall test is really measuring against: a turbine
+    // held at rest is only held if there is something there to hold.
+    setup.gearbox.inputInertia = 0.09;
+
+    // The same halfshafts, restated for this car's final drive: a rate at the gearbox output is
+    // `k_wheel / finalDrive^2`, so dropping 4.37 to 3.20 makes the identical shaft a stiffer number
+    // here. Inheriting the manual's would have been a physically softer car by half, arrived at by
+    // saying nothing.
+    setup.compliance.stiffness = 2482.0;
+    setup.compliance.damping = 13.6;
 
     return setup;
 }

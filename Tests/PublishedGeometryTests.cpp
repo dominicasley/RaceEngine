@@ -85,8 +85,10 @@ TEST_CASE("the conversion from published data reproduces the track it states", "
     // The check that says the coordinate convention is right. It is the only part of the import
     // that cannot be verified from the file's internal consistency alone, and getting it wrong is
     // not subtle — it misses by tens of centimetres.
-    REQUIRE(2.0 * golfFront().wheelCentre.x == Catch::Approx(1.539).margin(1e-4));
-    REQUIRE(2.0 * golfRear().wheelCentre.x == Catch::Approx(1.516).margin(1e-4));
+    // A track is a width, so it is the magnitude that has to match: which side of the car +x is
+    // on is `outboardSign`'s to say, and it says the car's left.
+    REQUIRE(2.0 * std::abs(golfFront().wheelCentre.x) == Catch::Approx(1.539).margin(1e-4));
+    REQUIRE(2.0 * std::abs(golfRear().wheelCentre.x) == Catch::Approx(1.516).margin(1e-4));
 }
 
 TEST_CASE("a production front strut solves and behaves like one", "[physics][published][strut]")

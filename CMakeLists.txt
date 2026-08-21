@@ -79,6 +79,7 @@ target_sources(Engine PUBLIC
         Graphics/Api/RenderContract.cppm
         Graphics/Api/SphericalHarmonics.cppm
         Graphics/Api/ShadowCascades.cppm
+        Graphics/Api/Frustum.cppm
         Graphics/Api/PostProcessing.cppm
         Graphics/Api/LookupTable.cppm
         Graphics/Api/PhysicalCamera.cppm
@@ -124,6 +125,16 @@ target_sources(Engine PUBLIC
         Physics/Api/Clutch.cppm
         Physics/Api/Driveline.cppm
         Physics/Api/PublishedCars.cppm
+        Physics/Api/SetupFile.cppm
+        Audio/Audio.cppm
+        Audio/Api/CarAudio.cppm
+        Audio/Api/EngineLayers.cppm
+        Audio/Api/TyreLayers.cppm
+        Audio/Api/SoundBank.cppm
+        Audio/Api/AudioBackend.cppm
+        Audio/Backend/SilentAudioBackend.cppm
+        Audio/Backend/FmodAudioBackend.cppm
+        Audio/Services/AudioService.cppm
         Io/Io.cppm
         Io/Services/GLTFService.cppm
         Io/Services/ResourceService.cppm
@@ -133,6 +144,8 @@ target_sources(Engine PUBLIC
         Input/Api/InputBackend.cppm
         Input/Api/DeviceProfile.cppm
         Input/Api/InputMapping.cppm
+        Input/Api/RackTorque.cppm
+        Input/Api/ForceMapping.cppm
         Input/Api/DirectInputContract.cppm
         Input/Api/InputBackendFactory.cppm
         # Implementation partitions, on the renderer's rule: both are built on both platforms so
@@ -141,6 +154,7 @@ target_sources(Engine PUBLIC
         Input/Backend/EvdevInputBackend.cppm
         Input/Backend/DirectInputBackend.cppm
         Input/Services/InputService.cppm
+        Input/Services/ForceFeedbackService.cppm
         Shared/Shared.cppm
         Shared/Types/Resource.cppm)
 
@@ -171,3 +185,37 @@ option(RACEENGINE_BUILD_TESTS "Build the RaceEngine unit tests" ON)
 if(RACEENGINE_BUILD_TESTS)
     add_subdirectory(Tests)
 endif()
+
+# FMOD, when there is one. Off by default and named rather than discovered: an audio SDK that has to
+# be downloaded behind a login is not something a configure step should go looking for, and a build
+# that quietly found one on one machine and not another is a build whose sound is a property of the
+# machine. `FMOD_ROOT` is the extracted FMOD Engine folder — the one holding `api/`.
+option(RACEENGINE_WITH_FMOD "Build the FMOD audio backend" OFF)
+
+if(RACEENGINE_WITH_FMOD)
+    if(NOT DEFINED FMOD_ROOT)
+        message(FATAL_ERROR "RACEENGINE_WITH_FMOD is ON but FMOD_ROOT is not set")
+    endif()
+
+    find_library(FMOD_LIBRARY NAMES fmod PATHS "${FMOD_ROOT}/api/core/lib/x86_64" REQUIRED)
+    find_library(FMOD_STUDIO_LIBRARY NAMES fmodstudio PATHS "${FMOD_ROOT}/api/studio/lib/x86_64" REQUIRED)
+
+    # SYSTEM, so FMOD's own headers are not held to this project's warnings. The zero-suppressions
+    # rule is first-party only and this is how that is kept: no #pragma, no -Wno-, and -Werror still
+    # absolute over every line anybody here wrote. `fmod.hpp` alone trips -Wold-style-cast.
+    target_include_directories(Engine SYSTEM PRIVATE
+            "${FMOD_ROOT}/api/core/inc"
+            "${FMOD_ROOT}/api/studio/inc")
+    target_link_libraries(Engine PRIVATE "${FMOD_LIBRARY}" "${FMOD_STUDIO_LIBRARY}")
+    target_compile_definitions(Engine PRIVATE RACEENGINE_HAS_FMOD)
+
+    message(STATUS "FMOD: ${FMOD_LIBRARY}")
+endif()
+
+# The calibration tool. A console program, no window and no Vulkan: it talks to the input backend
+# directly because what it needs is the raw device code, and the service's whole job is to have
+# shaped it already. Built as part of `all` so it is always beside the game it writes a profile for.
+add_executable(RaceEngineCalibrate Tools/Calibrate.cpp)
+target_link_libraries(RaceEngineCalibrate PRIVATE Engine)
+target_link_libraries(RaceEngineCalibrate PRIVATE raceengine_warnings)
+set_target_properties(RaceEngineCalibrate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

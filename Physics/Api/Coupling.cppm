@@ -64,6 +64,20 @@ export struct CouplingSides
     double drivingTorque = 0.0;
     double drivenTorque = 0.0;
     double capacity = 0.0;
+
+    // What resists the driven side in proportion to how fast it turns, in N.m.s/rad — contributed as
+    // a **coefficient** rather than as a force, which is `integrate`'s rule for a damper and is here
+    // for the same reason: a coupling that solves its pair from inertia alone is predicting a motion
+    // that whatever integrates the driven side will not produce.
+    //
+    // A rigid driveline has none of this and leaves it zero, which reproduces the two-inertia
+    // arithmetic below exactly. A compliant one has a great deal: the spring between the gearbox
+    // output and the differential resists at `stiffness * dt + damping`, which through fourth gear is
+    // two thirds of the driven side's own inertial term. Left out, `required` under-predicts what it
+    // takes to bring the two together every tick, the slip never closes, and a clutch that should be
+    // locked sits slipping for ever — delivering half the torque the engine is making and reading as
+    // a driveline that has gone soft.
+    double drivenResisting = 0.0;
 };
 
 export struct CouplingSolution
@@ -92,12 +106,19 @@ export [[nodiscard]] CouplingSolution stepCoupling(const CouplingSetup& setup, C
     // Locked, the pair is one body: solve it as one and ask what torque the constraint had to carry
     // to make that true. Two terms and both are required. The first accelerates the two sides
     // together under the external torques; the second removes whatever slip is left, over one tick,
-    // through the reduced inertia. A lock written with only the first holds whatever speed
+    // through the reduced admittance. A lock written with only the first holds whatever speed
     // difference it engaged at for ever and is not a lock.
-    const auto total = drivingInertia + drivenInertia;
-    const auto reduced = drivingInertia * drivenInertia / total;
-    const auto required = (drivenInertia * sides.drivingTorque - drivingInertia * sides.drivenTorque) / total +
-                          reduced * slipSpeed / step;
+    //
+    // Each side is stated as what it takes to change its speed by one over a tick — `J/dt`, plus any
+    // coefficient resisting that change. Written that way the driven side's spring joins as a term
+    // rather than as a special case, and a side with no such coefficient gives back the plain
+    // two-inertia formula this had before, exactly.
+    const auto driving = drivingInertia / step;
+    const auto driven = drivenInertia / step + std::max(sides.drivenResisting, 0.0);
+
+    const auto total = driving + driven;
+    const auto reduced = driving * driven / total;
+    const auto required = (driven * sides.drivingTorque - driving * sides.drivenTorque) / total + reduced * slipSpeed;
 
     state.dwell += deltaTime;
 
@@ -130,8 +151,18 @@ export [[nodiscard]] CouplingSolution stepCoupling(const CouplingSetup& setup, C
     else
     {
         // Sliding: it carries its capacity, signed by which way the surfaces are moving past each
-        // other and by nothing else.
-        torque = std::copysign(capacity, slipSpeed);
+        // other — but never more than `required`, which is the torque that brings the two sides
+        // together exactly. A surface cannot reverse the slip it is damping, and over one tick a
+        // capacity larger than the constraint does precisely that: it drives the driven side past
+        // the driving one, the sliding direction flips, and the next tick flips it back.
+        //
+        // The cap only binds when the two agree in sign, because a capacity pushing slip *away*
+        // from zero can never overshoot it. And it only binds at all when the driven side is light
+        // enough for one tick's capacity to matter — a wheels-and-car driven side has a `required`
+        // in the tens of thousands, so every rigid case reaches `sliding` unchanged.
+        const auto sliding = std::copysign(capacity, slipSpeed);
+
+        torque = sliding * required > 0.0 ? std::clamp(required, -capacity, capacity) : sliding;
     }
 
     state.torque = torque;

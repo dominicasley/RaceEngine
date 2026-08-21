@@ -31,6 +31,7 @@ using raceengine::placeholderAutomatic;
 using raceengine::placeholderSedan;
 using raceengine::ProvingGroundDescriptor;
 using raceengine::roadTorques;
+using raceengine::placeDriveline;
 using raceengine::startEngine;
 using raceengine::stepDriveCoupling;
 using raceengine::stepDriveline;
@@ -376,6 +377,7 @@ TEST_CASE("the clutch pedal is ignored by a converter, visibly", "[physics][conv
         {
             auto state = DrivelineState{};
             startEngine(manual, state);
+            placeDriveline(manual, state, 12.0);
 
             auto input = VehicleInput{};
             input.throttle = 0.6;

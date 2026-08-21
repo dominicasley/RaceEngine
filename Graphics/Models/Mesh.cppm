@@ -60,6 +60,15 @@ export struct MeshPrimitive
     // 79 copies of the same number. Zero when the accessor declares no bounds, which glTF permits
     // for everything except POSITION and which then sorts that primitive by its own origin.
     glm::vec3 boundsCentre{0.0f};
+    // Half the side lengths of that same box, from the same accessor. It is what makes the box a
+    // box rather than a point, and what lets a view reject a primitive it cannot see: a draw whose
+    // world-space box lies wholly outside the clip volume writes no fragments (:Frustum states the
+    // exactness argument). Zero means the accessor declared no bounds — which glTF permits for
+    // everything except POSITION, and which must read as "no bounds to test" rather than as a box
+    // of no size, or a primitive would be culled for being unmeasured. The flag lives here rather
+    // than on the centre because a symmetric primitive modelled about its own origin — a wheel, a
+    // windscreen — legitimately has a centre of zero.
+    glm::vec3 boundsHalfExtent{0.0f};
     std::vector<MeshPrimitiveAttribute> attributes{};
 };
 

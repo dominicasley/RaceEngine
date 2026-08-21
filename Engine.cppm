@@ -34,6 +34,10 @@ export import raceengine.input;
 // which the graphics closure already brings. Jolt stays where it is: it is reached through
 // `extern "C++"` free functions taking fundamental types, so its -mavx2 never touches a BMI.
 export import raceengine.physics;
+// The sound, and the same shape again: `raceengine.audio` exports what the car is doing and the seam
+// that consumes it, and keeps <fmod_studio.hpp> in an implementation partition nobody importing this
+// pays for.
+export import raceengine.audio;
 
 // Sandbox code names these unqualified in the global namespace; export import alone
 // only surfaces raceengine::X, so re-alias them globally.
@@ -128,6 +132,12 @@ private:
     // service is destroyed first.
     std::unique_ptr<IInputBackend> inputBackend;
     InputService inputService;
+    // The write side, and it is declared after the read side because it goes through it: one object
+    // owns the device's lifetime, so a torque cannot be written into a file descriptor the reader
+    // has already decided is gone. It owns a thread of its own, which is why it is the last service
+    // here — it stops and joins before the service it holds a reference to is destroyed.
+    ForceFeedbackService forceFeedbackService;
+    AudioService audioService;
     // Simulation clock and the game's tick subscribers. Neither depends on a service, so
     // they sit last: the callbacks are owned by the engine but written by the game, and
     // being destroyed first means no service they reach into is gone while they still exist.
@@ -187,6 +197,14 @@ public:
     [[nodiscard]] float interpolation() const
     {
         return interpolationAlpha;
+    }
+
+    // The engine's own logger, so a game can say something into the same stream the engine does
+    // rather than starting a second one that lands somewhere else in the file. Named `log` because
+    // the member it returns is called `logger` and the two may not share a name.
+    [[nodiscard]] spdlog::logger& log()
+    {
+        return *logger;
     }
 
     [[nodiscard]] IWindow& window()
@@ -296,6 +314,21 @@ public:
         return inputService;
     }
 
+    // Where a game publishes stage one — steering rack torque in newton metres — once per physics
+    // tick. Everything below it is this device's problem and nothing above it may know what device
+    // that is.
+    // Where a game says what the car is doing, in the units a sound bank names. One call a tick, and
+    // nothing below it knows what a vehicle is — the same rule stage one of the force feedback keeps.
+    [[nodiscard]] AudioService& audio()
+    {
+        return audioService;
+    }
+
+    [[nodiscard]] ForceFeedbackService& forceFeedback()
+    {
+        return forceFeedbackService;
+    }
+
 private:
     void update(float delta);
     [[nodiscard]] float frameDelta() const;
@@ -344,6 +377,59 @@ namespace
     return options;
 }
 
+// What the write side is allowed to do, on the same test and for the same reason. The rate is the
+// one the driver consumes rather than the one the transport advertises — this base's `hid-fanatec`
+// runs its output on a two millisecond timer that is compile-time fixed, so the thousand hertz the
+// interrupt endpoint's `bInterval` states is a ceiling nothing reaches. Pacing to the transport
+// would be half the writes going nowhere.
+[[nodiscard]] AudioOptions engineAudioOptions()
+{
+    auto options = AudioOptions{};
+
+    // The same rule every device path here keeps, and the reason the golden frames do not move when
+    // a machine gains a sound card.
+    //
+    // `RACEENGINE_AUDIO=1` overrides it, and only that way round: a run can ask for sound it would
+    // not have had, and nothing can ask a gate for sound it must not have. That asymmetry is the
+    // whole of why it is safe — the gates set neither variable and are unreachable from here.
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+
+    if (const auto* asked = std::getenv("RACEENGINE_AUDIO"); asked != nullptr && std::string_view(asked) == "1")
+    {
+        options.unattended = false;
+    }
+
+    // `RACEENGINE_DUMP_AUDIO` is `RACEENGINE_DUMP_FRAME` for sound, and it overrides unattended for
+    // the same reason and by the same asymmetry: a run can ask to be recorded, and nothing can ask a
+    // gate to make a noise. It opens no device — the mix goes to the file — so it is safe on a
+    // machine somebody is working at, which is the whole point of it.
+    if (const auto* path = std::getenv("RACEENGINE_DUMP_AUDIO"); path != nullptr && *path != '\0')
+    {
+        options.capturePath = path;
+        options.unattended = false;
+    }
+
+    options.useFmod = true;
+
+    return options;
+}
+
+[[nodiscard]] ForceFeedbackOptions engineForceFeedbackOptions()
+{
+    auto options = ForceFeedbackOptions{};
+
+    options.unattended =
+        std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
+    options.outputHz = 500.0;
+    // Five minutes of a 120 Hz publish. The stage-one trace is the deliverable rather than a
+    // diagnostic, so it is recorded whether or not a device is attached and whether or not anybody
+    // has asked for it.
+    options.traceCapacity = 36000;
+
+    return options;
+}
+
 } // namespace
 
 Engine::Engine() :
@@ -373,7 +459,9 @@ Engine::Engine() :
     // feedback needs there — passes its HWND here, and that is a one-line change to this call rather
     // than to the interface, which is the whole reason the parameter exists before its caller does.
     inputBackend(createInputBackend(nullptr)),
-    inputService(*logger, *inputBackend, glfwWindow, engineInputOptions())
+    inputService(*logger, *inputBackend, glfwWindow, engineInputOptions()),
+    forceFeedbackService(*logger, inputService, engineForceFeedbackOptions()),
+    audioService(*logger, engineAudioOptions())
 {
     // An engine whose device would not come up has nothing left to do: every service below
     // was built against it, and there is no second backend to fall back to.
@@ -473,6 +561,13 @@ Engine::Engine() :
 
 Engine::~Engine()
 {
+    // Only when something was written. A run with no wheel on it has nothing to report and a line
+    // saying so every time is a line nobody reads.
+    if (forceFeedbackService.writeRateHz() > 0.0)
+    {
+        logger->info("{}", forceFeedbackService.report());
+    }
+
     tearDownJolt();
 }
 
@@ -542,8 +637,17 @@ void Engine::step()
     // an exposure adaptation driven by anything else would put a different image on disk.
     auto ticks = 0u;
 
+    // How many the loop is about to run, computed before it runs rather than discovered by running
+    // it. Anything sampling a signal that lives in *wall* time — the driver's hands, above all —
+    // needs to know that this tick is one of several simulating one frame's worth of already
+    // elapsed time, and it needs to know it on the first of them. `CatchUpPhase` is what that is
+    // for; without it every tick of a burst reads the same wheel position and the demand a 120 Hz
+    // simulation sees is a staircase climbing once per rendered frame.
+    const auto steps = static_cast<unsigned>(accumulator / fixedTimeStep);
+
     while (accumulator >= fixedTimeStep)
     {
+        inputService.setCatchUpPhase(ticks, steps);
         update(fixedTimeStep);
         accumulator -= fixedTimeStep;
         ticks++;
@@ -697,8 +801,20 @@ void Engine::dumpFrameIfRequested()
         return;
     }
 
+    // Frame 120 unless told otherwise. The gates say nothing and get 120, which is what keeps a
+    // golden frame a golden frame; `RACEENGINE_DUMP_FRAME_AT` is for looking at a moment the gate's
+    // instant is too early to show — a car half a second into a launch has not turned yet, and
+    // "which way did it go" is not a question frame 120 can answer.
+    static const int dumpAt = []
+    {
+        const auto* at = std::getenv("RACEENGINE_DUMP_FRAME_AT");
+        const auto asked = at == nullptr ? 0 : std::atoi(at);
+
+        return asked > 0 ? asked : 120;
+    }();
+
     static int dumpFrameCount = 0;
-    if (++dumpFrameCount < 120)
+    if (++dumpFrameCount < dumpAt)
     {
         return;
     }

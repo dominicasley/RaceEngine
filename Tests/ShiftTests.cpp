@@ -44,6 +44,11 @@ constexpr std::array<double, cornerCount> noRoadTorque{};
 struct Sample
 {
     double axleTorque = 0.0;
+    // What left the *box*, which is where a torque interrupt is a fact rather than a consequence:
+    // once the shaft below it is compliant, the wheels go on feeling the wind-up unwind through the
+    // whole neutral window and never see a zero at all.
+    double gearboxTorque = 0.0;
+    double clutchTorque = 0.0;
     double engineSpeed = 0.0;
     double referredInertia = 0.0;
     double slipEnergy = 0.0;
@@ -78,6 +83,8 @@ struct Bench
         REQUIRE(torques.has_value());
 
         return Sample{.axleTorque = torques->wheel[0] + torques->wheel[1],
+                      .gearboxTorque = torques->gearbox,
+                      .clutchTorque = torques->clutch,
                       .engineSpeed = state.engineSpeed,
                       .referredInertia = torques->referredInertia,
                       .slipEnergy = torques->slipEnergy,
@@ -110,17 +117,23 @@ VehicleInput driving(const double throttle, const std::int32_t gear)
     return input;
 }
 
-// How long the wheels saw nothing at all, in ticks, counting the first run of exact zeros.
+// How long the gearbox passed nothing at all, in ticks, counting the first run of exact zeros.
+//
+// Measured at the box and not at the wheels, and that is the whole of what a compliant driveline
+// changed about this question. An open gearbox is an exact zero and always was; what the *wheels*
+// see through that window is the shaft giving back what it stored, which decays over some tens of
+// milliseconds and is never once equal to zero. Counting zeros at the wheels therefore returns 0 on
+// a car whose interrupt is working perfectly — which is exactly how it read.
 [[nodiscard]] int interruptTicks(const std::vector<Sample>& samples)
 {
     auto first = std::size_t{0};
-    while (first < samples.size() && samples[first].axleTorque != 0.0)
+    while (first < samples.size() && samples[first].gearboxTorque != 0.0)
     {
         first++;
     }
 
     auto last = first;
-    while (last < samples.size() && samples[last].axleTorque == 0.0)
+    while (last < samples.size() && samples[last].gearboxTorque == 0.0)
     {
         last++;
     }
@@ -178,7 +191,7 @@ TEST_CASE("an upshift is a real torque interrupt, and it lasts as long as the ca
 
     const auto shifted = bench.run(driving(1.0, 4), 720);
 
-    SECTION("nothing at all reaches the wheels while the ratio is being changed")
+    SECTION("nothing at all leaves the box while the ratio is being changed")
     {
         const auto ticks = interruptTicks(shifted);
 
@@ -190,8 +203,22 @@ TEST_CASE("an upshift is a real torque interrupt, and it lasts as long as the ca
         // Zero, and exactly zero — an open gearbox is not a small torque.
         for (auto index = 0; index < ticks; index++)
         {
-            REQUIRE(shifted[static_cast<std::size_t>(index)].axleTorque == 0.0);
+            REQUIRE(shifted[static_cast<std::size_t>(index)].gearboxTorque == 0.0);
             REQUIRE(shifted[static_cast<std::size_t>(index)].phase != ShiftPhase::Engaged);
+        }
+
+        // And the wheels do *not* see that zero, which is the compliant shaft doing its job rather
+        // than the interrupt failing: the wind-up the box left in it comes back out over the window.
+        // It rings while it does — freed of the box the shaft is alone on its spring at about 44 Hz,
+        // so a quarter cycle is under three ticks and the torque crosses zero inside the interrupt.
+        // That crossing is the element working rather than a sign error, and it is why this asks for
+        // magnitude rather than for a monotonic fall.
+        for (auto index = 0; index < ticks; index++)
+        {
+            const auto& sample = shifted[static_cast<std::size_t>(index)];
+
+            REQUIRE(sample.axleTorque != 0.0);
+            REQUIRE(std::abs(sample.axleTorque) < before);
         }
     }
 
@@ -202,6 +229,8 @@ TEST_CASE("an upshift is a real torque interrupt, and it lasts as long as the ca
 
         // Settled in fourth: the same engine torque through a taller gear.
         const auto after = shifted.back().axleTorque;
+        CAPTURE(before, after, settled.back().engineSpeed, shifted.back().engineSpeed, bench.setup.gearbox.reduction(3),
+                bench.setup.gearbox.reduction(4));
         REQUIRE(after > 1500.0);
         REQUIRE(after < before);
         REQUIRE(
@@ -342,7 +371,12 @@ TEST_CASE("a rev match blips the engine with the throttle and nothing else", "[p
     {
         REQUIRE(matched.reengagementHeat < bare.reengagementHeat);
         REQUIRE(matched.reengagementHeat < 0.25 * bare.reengagementHeat);
-        REQUIRE(bare.reengagementHeat > 400.0);
+        // 363 J measured. It was over 400 with rigid shafts and the drop is the compliance rather
+        // than a softer shift: the plate is re-syncing the gearbox input and the shaft above the
+        // spring, not the car through it, so there is less inertia to bring back into step. What the
+        // floor is for is unchanged — an unmatched downshift must cost real heat, and 60 rad/s of
+        // mismatch through this plate does.
+        REQUIRE(bare.reengagementHeat > 300.0);
     }
 }
 
@@ -741,10 +775,30 @@ TEST_CASE("the clutch pedal stays the driver's, shift or no shift", "[physics][s
         // sliding — the engine climbs away from it rather than being held down to the gearing, which
         // is what a launch is and what says the pedal reached the friction model rather than a number
         // that happened to multiply out.
+        //
+        // Asserted at the plate. The *wheels* cannot see it yet on tick one and it would be wrong if
+        // they could: what stands between them is a spring, and a spring delivers by winding up. This
+        // read as a clutch carrying a quarter of its capacity and was a shaft that had not finished
+        // taking hold.
         for (const auto& sample : launching)
         {
-            REQUIRE(sample.axleTorque == Catch::Approx(capacity * bench.setup.gearbox.reduction(1)).epsilon(0.02));
+            REQUIRE(sample.clutchTorque == Catch::Approx(capacity).epsilon(0.02));
         }
+
+        // And the wheels settle on exactly that, once the shaft has stopped ringing about it. Getting
+        // there is not a gentle build: a plate dumped onto a light gearbox input winds the spring
+        // past where it is going and comes back, so the first tenth of a second *overshoots* the
+        // steady figure rather than approaching it. That is the shunt a clutch dump produces, and the
+        // bound is what says it is a shunt rather than a divergence.
+        const auto held = bench.run(input, 350);
+        REQUIRE(held.back().axleTorque == Catch::Approx(capacity * bench.setup.gearbox.reduction(1)).epsilon(0.02));
+
+        const auto peak = std::max_element(launching.begin(), launching.end(),
+                                           [](const Sample& a, const Sample& b) { return a.axleTorque < b.axleTorque; })
+                              ->axleTorque;
+
+        REQUIRE(peak > held.back().axleTorque);
+        REQUIRE(peak < 3.0 * held.back().axleTorque);
 
         REQUIRE(bench.state.engineSpeed > 350.0);
     }

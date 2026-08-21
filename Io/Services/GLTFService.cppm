@@ -332,14 +332,27 @@ std::expected<void, std::string> GLTFService::processNode(Model& model, const ti
 
             // glTF requires POSITION to declare min and max, which is a bounding box for free — no
             // vertex data is read to get it. It is what orders blended geometry, and the order is
-            // only as good as this is: a primitive that declares none sorts by its own origin.
+            // only as good as this is: a primitive that declares none sorts by its own origin. The
+            // half-extent beside it is what a view culls against, and a primitive that declares
+            // none keeps a zero one and is never culled.
             if (attributeType.value() == PrimitiveAttributeType::Position && accessor.minValues.size() == 3 &&
                 accessor.maxValues.size() == 3)
             {
+                // Summed as declared and narrowed once, which is the expression this has always
+                // been: narrowing the two ends separately and adding them in float rounds
+                // differently, and this value orders the blended draws.
                 meshPrimitive.boundsCentre =
                     glm::vec3(static_cast<float>(accessor.minValues[0] + accessor.maxValues[0]),
                               static_cast<float>(accessor.minValues[1] + accessor.maxValues[1]),
                               static_cast<float>(accessor.minValues[2] + accessor.maxValues[2])) *
+                    0.5f;
+
+                // Absolute, because an asset that declares min above max would otherwise state a
+                // negative half-extent, and a negative half-extent is a box that culls everything.
+                meshPrimitive.boundsHalfExtent =
+                    glm::abs(glm::vec3(static_cast<float>(accessor.maxValues[0] - accessor.minValues[0]),
+                                       static_cast<float>(accessor.maxValues[1] - accessor.minValues[1]),
+                                       static_cast<float>(accessor.maxValues[2] - accessor.minValues[2]))) *
                     0.5f;
             }
         }
@@ -448,11 +461,14 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
                                     tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[3]),
             .metalness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.metallicFactor),
             .roughness = static_cast<float>(tinyGltfMaterial.pbrMetallicRoughness.roughnessFactor),
-            // glTF's alphaMode, which was hardcoded true — so the one thing reading this field, the
-            // back-face cull decision, always took the opaque branch and the field was a constant
-            // wearing a material's name. MASK counts as not-opaque here: this engine has no alpha
-            // test, so a cut-out is carried by the same blend as a pane of glass.
-            .opaque = tinyGltfMaterial.alphaMode.empty() || tinyGltfMaterial.alphaMode == "OPAQUE",
+            // glTF's alphaMode. MASK counts as *opaque*: a cut-out is opaque geometry with holes,
+            // and the holes are the fragment stages' discard under `alphaCutoff` — so it draws in
+            // the opaque pass, writes depth, joins the occlusion prepass and casts leaf-shaped
+            // shadows, none of which the blended path it used to ride could do. Only BLEND defers.
+            .opaque = tinyGltfMaterial.alphaMode != "BLEND",
+            .alphaCutoff =
+                tinyGltfMaterial.alphaMode == "MASK" ? static_cast<float>(tinyGltfMaterial.alphaCutoff) : 0.0f,
+            .doubleSided = tinyGltfMaterial.doubleSided,
             // One material-wide transform, read from the base colour reference. The extension is
             // per texture reference, so a material transforming its maps differently is flattened
             // to whatever base colour asks for.

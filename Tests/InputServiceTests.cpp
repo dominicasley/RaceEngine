@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -6,6 +7,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -144,6 +146,92 @@ TEST_CASE("a wheel switched on mid-session takes over from the keyboard", "[inpu
     // Half the load cell's travel against a 450 N maximum is full pressure.
     backend.press(32767);
     REQUIRE(settles(service, [&service] { return service.sample().brake > 0.99; }));
+}
+
+TEST_CASE("the steering demand is reconstructed across a catch-up burst", "[input][service]")
+{
+    // **Simulated time advances in bursts and a steering wheel does not.** The engine runs a
+    // frame's worth of fixed steps back to back — measured on the rig, three or four inside a
+    // quarter of a millisecond — and every one of them reads the device thread's newest sample,
+    // which over that quarter millisecond is the same sample. So a 120 Hz simulation saw the demand
+    // as a staircase climbing once per rendered frame, and the ticks in between saw a wheel that
+    // was not moving at all.
+    //
+    // Nothing downstream can tell the difference except whatever differentiates the demand, and the
+    // steering rack does: its Coulomb friction saturates above 10 mm/s and its viscous damping is
+    // linear in the same velocity. On the rig's 300-second trace rack travel was unchanged between
+    // 94.2% of consecutive ticks inside a burst, so both terms switched fully on and fully off at
+    // the frame rate — 0.4254 N·m of torque step on a tick that moved against 0.0003 N·m on one
+    // that did not. That was the buzz in the driver's hands.
+    //
+    // Driven against the source directly rather than through the service: no thread, no device and
+    // no `refresh` racing a publication for a `try_lock`, so what is measured is the reconstruction
+    // and not the scheduler. The view is written here exactly as the device thread would leave it.
+    auto phase = raceengine::CatchUpPhase{};
+    auto view = raceengine::DeviceView{};
+
+    view.connected = true;
+    view.kind = InputSourceKind::Wheel;
+    view.profile.rotationDegrees = 900.0;
+    view.profile.axes[raceengine::axisIndex(raceengine::InputAxis::Steering)] =
+        raceengine::AxisCalibration{.minimum = 0.0, .maximum = 65535.0, .centre = 32273.0};
+    view.geometry = raceengine::SteeringGeometry{.deviceDegrees = 900.0, .vehicleDegrees = 756.0};
+
+    auto source = raceengine::DeviceInputSource(view, phase);
+
+    const auto turn = [&view](const std::int32_t raw)
+    {
+        view.sample.axes[raceengine::axisIndex(raceengine::InputAxis::Steering)] = raw;
+    };
+
+    turn(20000);
+    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
+    const auto before = source.sample().steering;
+
+    // One frame of catch-up: the wheel moved once, and four ticks are about to simulate the time it
+    // moved in. Before this, all four read the same report — the first took the whole move and the
+    // three after it saw a wheel standing still.
+    turn(45000);
+
+    auto served = std::vector<double>{};
+    for (auto index = std::uint32_t{0}; index < 4; index++)
+    {
+        phase = raceengine::CatchUpPhase{.index = index, .steps = 4};
+        served.push_back(source.sample().steering);
+    }
+
+    CAPTURE(before, served[0], served[1], served[2], served[3]);
+
+    // Evenly, because the hands moved evenly as far as anything here can know.
+    const auto stride = (served[3] - before) / 4.0;
+
+    REQUIRE(stride > 0.0);
+
+    for (auto index = std::size_t{0}; index < served.size(); index++)
+    {
+        REQUIRE(served[index] == Approx(before + stride * static_cast<double>(index + 1)).epsilon(1e-9));
+    }
+
+    // The last tick lands exactly on the device's own newest sample, so **nothing is delayed by any
+    // of this**: the next burst, of one, returns the very same value.
+    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
+    REQUIRE(source.sample().steering == Approx(served[3]).epsilon(1e-9));
+
+    // And a burst of one is the identity, which is what makes all of this inert at frame rates at
+    // or above the tick rate.
+    turn(30000);
+    const auto single = source.sample().steering;
+
+    turn(52000);
+    REQUIRE(source.sample().steering != Approx(single));
+
+    phase = raceengine::CatchUpPhase{.index = 0, .steps = 1};
+    turn(60000);
+
+    auto direct = raceengine::DeviceInputSource(view, phase);
+    std::ignore = direct.sample();
+
+    REQUIRE(source.sample().steering == Approx(direct.sample().steering).epsilon(1e-9));
 }
 
 TEST_CASE("a wheel switched off gives the car back to the keyboard", "[input][service]")

@@ -11,6 +11,7 @@ using raceengine::computeRollCentre;
 using raceengine::CornerHardpoints;
 using raceengine::CornerSide;
 using raceengine::intersectSphereWithCircle;
+using raceengine::outboardSign;
 using raceengine::solveCorner;
 using raceengine::solveCornerWithJacobian;
 using raceengine::SuspensionKind;
@@ -28,7 +29,7 @@ namespace
 // than to describe a car. Real hardpoints replace them wholesale.
 CornerHardpoints frontCorner(const CornerSide side)
 {
-    const auto mirror = side == CornerSide::Right ? 1.0 : -1.0;
+    const auto mirror = outboardSign(side);
     const auto at = [mirror](const double x, const double y, const double z)
     {
         return glm::dvec3(mirror * x, y, z);
@@ -62,7 +63,7 @@ CornerHardpoints frontCorner(const CornerSide side)
 // to describe a car.
 CornerHardpoints strutCorner(const CornerSide side)
 {
-    const auto mirror = side == CornerSide::Right ? 1.0 : -1.0;
+    const auto mirror = outboardSign(side);
     const auto at = [mirror](const double x, const double y, const double z)
     {
         return glm::dvec3(mirror * x, y, z);
@@ -353,7 +354,9 @@ TEST_CASE("geometry that cannot do its stated travel is refused at the point it 
     SECTION("a wishbone whose ball joint sits on its own pivot axis has no swing")
     {
         auto corner = frontCorner(CornerSide::Right);
-        corner.lower.ballJoint = glm::dvec3(0.30, 0.13, 0.0);
+        // Mirrored with the corner it is being placed on, or it is no longer on the axis and the
+        // case stops being degenerate at all.
+        corner.lower.ballJoint = glm::dvec3(outboardSign(CornerSide::Right) * 0.30, 0.13, 0.0);
 
         REQUIRE_FALSE(solveCorner(corner, 0.0, 0.0).has_value());
     }
@@ -379,9 +382,13 @@ TEST_CASE("the roll centre is an output and it migrates", "[physics][suspension]
     SECTION("parallel equal wishbones put it on the ground, which is the textbook case")
     {
         auto parallel = frontCorner(CornerSide::Right);
-        parallel.upper.frontPivot = glm::dvec3(0.30, 0.36, 0.15);
-        parallel.upper.rearPivot = glm::dvec3(0.30, 0.36, -0.15);
-        parallel.upper.ballJoint = glm::dvec3(0.62, 0.35, 0.0);
+        // Mirrored with the corner they are being placed on, like every other absolute coordinate
+        // in this file: unmirrored they describe a linkage on the other side of the car and the
+        // wishbones stop being parallel at all.
+        const auto side = outboardSign(CornerSide::Right);
+        parallel.upper.frontPivot = glm::dvec3(side * 0.30, 0.36, 0.15);
+        parallel.upper.rearPivot = glm::dvec3(side * 0.30, 0.36, -0.15);
+        parallel.upper.ballJoint = glm::dvec3(side * 0.62, 0.35, 0.0);
 
         auto solved = solveCorner(parallel, 0.0, 0.0);
         REQUIRE(solved.has_value());

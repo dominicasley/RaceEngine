@@ -196,7 +196,11 @@ export struct VehicleSetup
     // Sea level, 15 degrees. Placeholder, and the one number here a weather model would move.
     double airDensity = 1.225;
 
-    // Steering rack travel per unit of steering input, metres. Placeholder.
+    // Steering rack travel per unit of steering input, metres, **signed**: positive demand is a
+    // right turn, and whether that needs the rack going positive or negative is a property of the
+    // linkage — a steering arm ahead of the kingpin steers the opposite way to one behind it. Every
+    // car has to state or derive it; this default is a magnitude with a sign that means nothing, and
+    // a setup that leaves it alone has not answered the question.
     double rackTravelPerInput = 0.055;
 
     [[nodiscard]] double unsprungMass() const
@@ -369,7 +373,7 @@ inline constexpr auto earthGravity = 9.80665;
 // arm, so camber gain comes out of the linkage rather than being asked for.
 export [[nodiscard]] CornerHardpoints placeholderCorner(const CornerSide side, const double axleZ)
 {
-    const auto mirror = side == CornerSide::Right ? 1.0 : -1.0;
+    const auto mirror = outboardSign(side);
     const auto at = [mirror, axleZ](const double x, const double y, const double z)
     {
         return glm::dvec3(mirror * x, y, z + axleZ);
@@ -530,6 +534,15 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> placeholderSedan()
     setup.corners[static_cast<std::size_t>(Corner::RearRight)].hardpoints =
         placeholderCorner(CornerSide::Right, rearAxle);
 
+    // **Negative, and the sign belongs to this linkage rather than to the field's default.** Rack
+    // travel is applied toward +x on both corners, so it is outboard on one and inboard on the
+    // other, and which way that steers the car depends on where the steering arm sits relative to
+    // the kingpin. For this geometry a positive demand — which every input path produces for a
+    // right turn — needs the rack going negative. The real car derives the same fact from its own
+    // hardpoints in `rackTravelForSteer`; a fixture states it, and states it here rather than
+    // leaning on a struct default that cannot know which linkage it is about to describe.
+    setup.rackTravelPerInput = -0.055;
+
     // Sprung load on each axle, by statics about the other one. The springs are then sized from
     // those loads rather than from a guess at them.
     const auto wheelbase = frontAxle - rearAxle;
@@ -682,7 +695,7 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         // The wheel, in the world. The suspension solved it in chassis coordinates; the chassis
         // says where those are.
         const auto& suspension = result.corners[index].suspension;
-        const auto outboard = corner.hardpoints.side == CornerSide::Right ? 1.0 : -1.0;
+        const auto outboard = outboardSign(corner.hardpoints.side);
 
         const auto pose = WheelPose{
             .centre = bodyToWorld(state.chassis, suspension.wheelCentre),

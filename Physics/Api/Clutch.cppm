@@ -379,6 +379,14 @@ export struct AutoClutch
     // The free play a real pedal already has at the top of its travel, and the line this uses to
     // decide that the driver is on the pedal.
     double freePlay = 0.05;
+
+    // The anti-stall band, as fractions of idle speed. Above `antiStallBegin` the engine is healthy
+    // and this contributes nothing; by `antiStallOpen` the clutch is fully out. It begins *below*
+    // idle so the governor's own excursions never brush it, and it is fully open well above the
+    // engine's stall floor — 0.55 of an 850 rpm idle is 468 rpm against a stall floor of 382 —
+    // because the whole term exists to keep the fight away from that floor, not to referee at it.
+    double antiStallBegin = 0.90;
+    double antiStallOpen = 0.55;
 };
 
 // The pedal an automatic foot would be holding, given what the car is doing. `idleSpeed` arrives as a
@@ -409,6 +417,24 @@ export [[nodiscard]] double autoClutchPedal(const AutoClutch& assist, const doub
     return 1.0 - std::max(caught, headroom * std::clamp(throttle, 0.0, 1.0));
 }
 
+// How far the clutch must be out *right now* because the engine is being dragged toward its stall
+// floor. Zero for a healthy engine, one by `antiStallOpen`, and computed from the engine's own speed
+// rather than the driveline side's — which is the hole the engagement logic above has: `caught`
+// watches the road, and a full brake application arrests the wheels faster than any pedal follows,
+// so the road-side answer arrives after the engine is already below its floor.
+export [[nodiscard]] double antiStallPedal(const AutoClutch& assist, const double idleSpeed, const double engineSpeed)
+{
+    if (!assist.enabled)
+    {
+        return 0.0;
+    }
+
+    const auto begin = assist.antiStallBegin * idleSpeed;
+    const auto open = assist.antiStallOpen * idleSpeed;
+
+    return std::clamp((begin - engineSpeed) / std::max(begin - open, 1e-9), 0.0, 1.0);
+}
+
 // Where the pedal goes next, given where it is, what the driver is doing with it and what the
 // automation would like.
 //
@@ -420,12 +446,14 @@ export [[nodiscard]] double autoClutchPedal(const AutoClutch& assist, const doub
 // the line between the two is the free play a real pedal already has rather than an invented
 // threshold.
 export [[nodiscard]] double advanceClutchPedal(const AutoClutch& assist, const double pedal, const double driverPedal,
-                                               const double automatic, const double deltaTime)
+                                               const double automatic, const double antiStall, const double deltaTime)
 {
     const auto driver = std::clamp(driverPedal, 0.0, 1.0);
 
     // No rate limit on the driver: a real pedal answers an ankle directly, and dumping it is a thing
-    // a driver is allowed to do and this model is supposed to have an opinion about.
+    // a driver is allowed to do and this model is supposed to have an opinion about. The driver's
+    // foot beats the anti-stall too — a human deliberately biting the clutch is re-specifying what
+    // the engine is for, exactly as the cruise-control rule above says.
     if (!assist.enabled || driver > assist.freePlay)
     {
         return driver;
@@ -434,8 +462,16 @@ export [[nodiscard]] double advanceClutchPedal(const AutoClutch& assist, const d
     // Because the state above has been tracking the driver's pedal all the while it was the
     // driver's, the automation picks up where the foot left it instead of stepping.
     const auto limit = std::max(assist.pedalRate * deltaTime, 0.0);
+    const auto followed =
+        std::clamp(pedal + std::clamp(std::clamp(automatic, 0.0, 1.0) - pedal, -limit, limit), 0.0, 1.0);
 
-    return std::clamp(pedal + std::clamp(std::clamp(automatic, 0.0, 1.0) - pedal, -limit, limit), 0.0, 1.0);
+    // The anti-stall is a floor past the rate limit, deliberately: the limit models a foot, and on
+    // the hardware this automation stands in for — a dual clutch's hydraulics — the emergency
+    // disengage is not a foot. Rate-limited, it loses the race it exists for: a full brake
+    // application locks the wheels in a few tens of milliseconds and the pedal needs a quarter of a
+    // second, so the engine is below its floor before the follow arrives. The floored value becomes
+    // the state, so recovery decays smoothly from wherever the emergency put it.
+    return std::max(followed, std::clamp(antiStall, 0.0, 1.0));
 }
 
 } // namespace raceengine

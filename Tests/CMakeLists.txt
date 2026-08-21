@@ -11,12 +11,20 @@ find_package(Catch2 3 CONFIG REQUIRED)
 
 add_executable(EngineTests
         AccessorUtilityTests.cpp
+        AntiStallTests.cpp
+        BackendParityTests.cpp
         CameraServiceTests.cpp
+        CarAudioTests.cpp
         ClutchTests.cpp
+        ComplianceTests.cpp
         ContactPatchTests.cpp
         CouplingTests.cpp
+        DifferentialTests.cpp
         DrivelineTests.cpp
+        EngineLayerTests.cpp
+        ForceFeedbackTests.cpp
         FrameDiagnosticsTests.cpp
+        FrustumTests.cpp
         GltfColourSpaceTests.cpp
         GltfNodeTransformTests.cpp
         GolfGtiTests.cpp
@@ -32,13 +40,18 @@ add_executable(EngineTests
         PostProcessingTests.cpp
         ProvingGroundTests.cpp
         PublishedGeometryTests.cpp
+        RackTorqueTests.cpp
+        RackSignTests.cpp
         RendererSeamTests.cpp
         RigidBodyTests.cpp
         SceneManagerServiceTests.cpp
+        SetupFileTests.cpp
         ShiftTests.cpp
+        SteeringShimmyProbe.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp
         TorqueConverterTests.cpp
+        TyreLayerTests.cpp
         TyreTests.cpp
         VehicleTests.cpp
         SphericalHarmonicsTests.cpp

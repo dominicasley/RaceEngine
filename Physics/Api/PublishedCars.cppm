@@ -8,6 +8,7 @@ module;
 #include <vector>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 export module raceengine.physics:PublishedCars;
 
@@ -44,7 +45,8 @@ namespace raceengine
 // TRACK the same file states, on both axles, to four decimal places. Any other convention misses by
 // tens of centimetres, which is why that check is a test rather than a comment.
 //
-// The model frame is the engine's: +x right, +y up, +z forward, origin midway between the axles at
+// The model frame is the engine's: **+x is the car's left** (`outboardSign`), +y up, +z forward,
+// origin midway between the axles at
 // road level. AC's own frame has its origin at the centre of gravity, so everything AC states in it
 // — aero surfaces, the collider — is carried across by the centre of gravity's position below.
 
@@ -68,7 +70,7 @@ inline constexpr auto golfRearHubMass = 85.0;
 // and the two agreeing is the file's own statement that the strut picks up on the ball joint.
 export [[nodiscard]] CornerHardpoints golfMk7FrontCorner(const CornerSide side)
 {
-    const auto mirror = side == CornerSide::Right ? 1.0 : -1.0;
+    const auto mirror = outboardSign(side);
     const auto at = [mirror](const double x, const double y, const double z)
     {
         return glm::dvec3(mirror * (0.5 * golfFrontTrack - x), y + golfTyreRadius, z + golfFrontAxle);
@@ -100,7 +102,7 @@ export [[nodiscard]] CornerHardpoints golfMk7FrontCorner(const CornerSide side)
 // wishbone's clothes. The curves it produces are a road car's, but it is a model of a model.
 export [[nodiscard]] CornerHardpoints golfMk7RearCorner(const CornerSide side)
 {
-    const auto mirror = side == CornerSide::Right ? 1.0 : -1.0;
+    const auto mirror = outboardSign(side);
     const auto at = [mirror](const double x, const double y, const double z)
     {
         return glm::dvec3(mirror * (0.5 * golfRearTrack - x), y + golfTyreRadius, z + golfRearAxle);
@@ -172,19 +174,72 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
                             glm::dvec2(0.0, 0.0), glm::dvec2(bumpKneeSpeed, bumpKneeForce), glm::dvec2(span, bumpEnd)}};
 }
 
-// The rack travel that steers the front wheels to the lock the car states. AC gives the steering
-// wheel's own lock and the ratio between the two, so the road wheel's angle is data; the travel that
-// produces it is a property of this linkage and is solved for rather than guessed. Monotonic in the
-// travel over the range a rack has, so a bisection is enough and cannot pick a second root.
+// The rack travel that steers the front wheels to the lock the car states, **signed**. AC gives the
+// steering wheel's own lock and the ratio between the two, so the road wheel's angle is data; the
+// travel that produces it is a property of this linkage and is solved for rather than guessed.
+// Monotonic in the magnitude over the range a rack has, so a bisection is enough and cannot pick a
+// second root.
+//
+// The sign is the half that used to be missing, and it was missing invisibly. The bisection below
+// searches positive travel against `std::abs(toe)`, so it can only ever answer *how far*; which way
+// was then taken from `copysign(..., steerRatio)` — the sign of a steering *ratio*, which is a
+// different quantity that happens to carry one. On this car that produced a rack that steered left
+// when the driver asked for right, on both the wheel and the keyboard, and nothing downstream could
+// tell: every stage from the kinematic solve to the force feedback was faithfully consistent with a
+// rack going the wrong way.
+//
+// Taken from the linkage instead, and **read off the wheel's own nose rather than off its toe**.
+// Toe is documented as positive when the front of the wheel points toward the car on both sides,
+// which makes it a mirrored quantity and therefore the worst possible thing to read a left-or-right
+// answer from: two separate attempts reasoned from it and both came out inverted. The second was
+// worse than the first, because it was "calibrated" against a chassis yaw rate whose own sign was
+// read in a frame nobody had pinned down — the answer looked measured and was not.
+//
+// What it reads now is where the nose of the wheel moves, against `outboardSign`, which is the one
+// place the frame's handedness is stated and the only thing here that has been checked against a
+// picture. No mirrored quantity is involved and no car-specific assumption either: a rack behind the
+// axle steers the opposite way to one ahead of it, and this measures whichever this car has.
+//
+// The magnitude is searched **along the direction that steers right** rather than along +x. Rack
+// travel is applied toward +x on both corners, so it is outboard on one and inboard on the other,
+// and a linkage that reaches full lock one way need not reach it the other within a rack's travel —
+// searching the wrong way is an honest-looking "cannot reach the lock the car states".
 [[nodiscard]] std::expected<double, std::string> rackTravelForSteer(const CornerHardpoints& hardpoints,
                                                                     const double roadWheelAngle)
 {
-    auto low = 0.0;
-    auto high = 0.15;
-
-    const auto steerAt = [&hardpoints](const double travel) -> std::expected<double, std::string>
+    // Where this wheel is pointing, as a direction rather than as an angle with a convention on it.
+    const auto noseAt = [&hardpoints](const double travel) -> std::expected<glm::dvec3, std::string>
     {
         const auto solved = solveCorner(hardpoints, 0.0, travel);
+        if (!solved)
+        {
+            return std::unexpected(solved.error());
+        }
+
+        return solved->uprightOrientation * glm::dvec3(0.0, 0.0, 1.0);
+    };
+
+    // Small enough to be unambiguously in the linear part of the linkage, large enough to be clear
+    // of the solve's own noise.
+    constexpr auto probeTravel = 0.01;
+
+    const auto centred = noseAt(0.0);
+    const auto probed = noseAt(probeTravel);
+    if (!centred || !probed)
+    {
+        return std::unexpected("the steering linkage will not solve at a small rack travel: " +
+                               (centred ? probed.error() : centred.error()));
+    }
+
+    // The car's right, from the one function allowed to know which way that is.
+    const auto towardRight = outboardSign(CornerSide::Right);
+    const auto direction = (probed->x - centred->x) * towardRight > 0.0 ? 1.0 : -1.0;
+
+    auto low = 0.0;
+
+    const auto steerAt = [&hardpoints, direction](const double travel) -> std::expected<double, std::string>
+    {
+        const auto solved = solveCorner(hardpoints, 0.0, direction * travel);
         if (!solved)
         {
             return std::unexpected(solved.error());
@@ -193,10 +248,23 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         return std::abs(solved->toe);
     };
 
+    const auto steersRightForPositiveTravel = direction > 0.0;
+
+    // The bracket is **found rather than assumed**, and 0.15 m is past the end of this linkage. A
+    // steering arm offset from the kingpin reaches further one way than the other — the Golf's front
+    // corner solves to about 110 mm of rack in one direction and 90 in the other — so a fixed upper
+    // bracket is a geometry question dressed as a constant, and it answers "the rack cannot reach
+    // the lock the car states" for a car whose lock is at 70 mm and perfectly reachable.
+    auto high = 0.15;
+    while (high > 0.01 && !steerAt(high))
+    {
+        high *= 0.5;
+    }
+
     const auto reach = steerAt(high);
     if (!reach)
     {
-        return std::unexpected("the rack cannot reach the lock the car states: " + reach.error());
+        return std::unexpected("the steering linkage will not solve at any usable rack travel: " + reach.error());
     }
 
     if (reach.value() < roadWheelAngle)
@@ -223,7 +291,9 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         }
     }
 
-    return 0.5 * (low + high);
+    const auto magnitude = 0.5 * (low + high);
+
+    return steersRightForPositiveTravel ? magnitude : -magnitude;
 }
 
 // The parallel-axis contribution of a point mass offset from the axis it is being measured about.
@@ -397,24 +467,29 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
         corner.brakeTorque = brakeTorque[index];
         corner.unsprungMass = hubMass(index);
 
-        // tyres.ini, the Street compound: its carcass rate and damping, its angular inertia, and its
-        // rolling resistance. AC's ROLLING_RESISTANCE_0 of 10 is not a load fraction and the file
-        // does not carry the formula it goes into; read as one part in a thousand it comes to 0.010,
-        // which is a road radial's, and the speed-squared term beside it adds under a tenth of that
-        // at motorway speed and is not modelled here.
-        corner.tireVerticalRate = 303948.0;
+        // tyres.ini, the Semislicks compound — AC's own default for this car, taken whole so the
+        // grip and the carcass describe the same tyre: carcass rate and damping, angular inertia,
+        // and rolling resistance. AC's ROLLING_RESISTANCE_0 of 12 is not a load fraction and the
+        // file does not carry the formula it goes into; read as one part in a thousand it comes to
+        // 0.012, and the speed-squared term beside it adds under a tenth of that at motorway speed
+        // and is not modelled here.
+        corner.tireVerticalRate = 298926.0;
         corner.tireVerticalDamping = 500.0;
         corner.wheelInertia = 1.45;
-        corner.rollingResistance = 0.010;
+        corner.rollingResistance = 0.012;
 
-        // The tyre. Its reference load and load sensitivity are the file's — AC states the force as
-        // going with load to the LS_EXP power, so the friction goes with load to that power less one,
-        // which is this model's exponent with the sign turned over. **The friction itself is
-        // deliberately not the file's** 1.2769 lateral: a road compound's 1.05 is what this chassis
-        // is validated against, and grip above the car's own rollover threshold would have every
-        // handling case measuring the wrong failure.
-        corner.tyre.nominalLoad = 2719.0;
-        corner.tyre.loadSensitivity = 1.0 - 0.8182;
+        // The tyre. Reference load, load sensitivity and both friction peaks are the file's:
+        // DY_REF/DX_REF state the friction at FZ0, which is exactly this model's
+        // peak-at-nominal-load convention, and AC states the force as going with load to the LS_EXP
+        // power, so the exponent is that power less one with the sign turned over. The lateral
+        // exponent serves both axes because this model carries one (the file's longitudinal 0.8756
+        // is close). 1.28 lateral sits under the car's own rollover threshold — about 1.33 g for a
+        // 0.572 m centre of gravity on this track width — so the handling cases still measure the
+        // tyre and not the wrong failure.
+        corner.tyre.nominalLoad = 2939.0;
+        corner.tyre.loadSensitivity = 1.0 - 0.8074;
+        corner.tyre.lateralPeak = 1.28;
+        corner.tyre.longitudinalPeak = 1.30;
 
         // Stated on the shaft, and sized inside the travel the linkage has. The bump stops AC states
         // do not carry across: its front BUMPSTOP_UP of 0.80 m is not a travel any suspension has and
@@ -437,13 +512,26 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
         }
     }
 
-    const auto rackTravel = rackTravelForSteer(setup.corners[1].hardpoints, roadWheelLock);
+    // **The front left, and the side is load-bearing because of Ackermann.** A positive demand is a
+    // right turn, so the left front is the *outer* wheel and Ackermann steers it less — this linkage
+    // wants 70.0 mm of rack to put the outer wheel on the stated lock and 64.5 mm to put the inner
+    // one there, an 8% difference in the car's whole steering ratio depending on which is asked.
+    //
+    // It reads the outer one because that is the wheel this car has always been derived from and
+    // driven with: before the corner sides were un-mirrored (`outboardSign`) this line said
+    // `corners[1]` and that index *was* the left front. Which of the two AC's single STEER_RATIO is
+    // quoted against is a real question and it is not this change's to answer — un-mirroring the
+    // labels must not quietly re-gear the car by eight percent.
+    const auto rackTravel =
+        rackTravelForSteer(setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].hardpoints, roadWheelLock);
     if (!rackTravel)
     {
         return std::unexpected(rackTravel.error());
     }
 
-    setup.rackTravelPerInput = std::copysign(rackTravel.value(), steerRatio);
+    // Signed by the linkage, not by the ratio. `steerRatio` says how many degrees of rim make a
+    // degree of road wheel and its sign is a convention about which the rack knows nothing.
+    setup.rackTravelPerInput = rackTravel.value();
 
     return setup;
 }

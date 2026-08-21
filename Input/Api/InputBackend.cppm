@@ -102,6 +102,15 @@ export struct DeviceSample
     // Reports the device has produced since it was opened. Two ticks that read the same number saw
     // no report between them, which is what separates a still wheel from a stalled one.
     std::uint64_t reports = 0;
+    // When the device said it, on the same clock `std::chrono::steady_clock` reads — CLOCK_MONOTONIC
+    // on Linux, which is what `EVIOCSCLOCKID` asks the kernel for at open. Zero when the platform
+    // will not say.
+    //
+    // It is the device's own stamp and not the moment this thread woke up, which is the entire
+    // reason it is worth carrying: end-to-end force feedback latency is measured from the instant
+    // the wheel reported its position to the instant a torque derived from it was written back, and
+    // timing the wake-up instead measures the reader's poll interval.
+    std::uint64_t timestampNanos = 0;
 };
 
 static_assert(std::is_trivially_copyable_v<DeviceSample>);
@@ -296,10 +305,23 @@ public:
     // Present before there is anything to feed it on purpose. Force feedback is a later piece of
     // work, and an interface grown to fit it after a season of tuning against one backend is
     // exactly the retrofit two implementations exist to prevent.
+    //
+    // **The sign is a contract, not a suggestion: positive turns the rim in the direction of
+    // positive steering demand.** It is the same sense stage one reports its newton metres in, so
+    // the whole pipeline carries one convention and each backend owns the translation to whatever
+    // its platform means by positive — which is a platform fact, and the kind that is only settled
+    // from the seat. Get it wrong and every restoring torque becomes the pull it was resisting.
     [[nodiscard]] virtual std::expected<void, std::string> writeTorque(double torqueFraction) = 0;
 
     [[nodiscard]] virtual DeviceCapabilities capabilities() const = 0;
     [[nodiscard]] virtual UpdateRate updateRate() const = 0;
+
+    // Sets the device's own lock-to-lock, degrees, and answers with what the device confirmed.
+    // The game asks for the *car's* travel, which is what a simulator does with a wheel: the rig's
+    // physical stops land exactly on the car's lock, the axis calibration and the driver's hands
+    // agree by construction, and every mapping between them collapses to one-to-one. Only a backend
+    // whose capability list carries SetRotationRange can honour it; the rest refuse with a reason.
+    [[nodiscard]] virtual std::expected<double, std::string> setRotationRange(double degrees) = 0;
 };
 
 } // namespace raceengine

@@ -102,6 +102,12 @@ public:
     // does, so the only honest ceiling before a device has spoken is none at all, and the rate is
     // whatever it is measured at. It is generally above the Linux driver's, which is the difference
     // this query exists to make visible.
+    // DirectInput reports no rotation range API without the vendor SDK; stated, not assumed.
+    [[nodiscard]] std::expected<double, std::string> setRotationRange(double) override
+    {
+        return std::unexpected("this platform cannot set a rotation range without the vendor's own SDK");
+    }
+
     [[nodiscard]] UpdateRate updateRate() const override
     {
         return UpdateRate{.inputHz = measuredHz, .outputHz = measuredHz, .measured = measuredHz > 0.0};

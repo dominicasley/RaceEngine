@@ -11,6 +11,7 @@
 import raceengine.physics;
 
 using raceengine::advanceClutchPedal;
+using raceengine::antiStallPedal;
 using raceengine::AutoClutch;
 using raceengine::autoClutchPedal;
 using raceengine::bringUpJolt;
@@ -29,6 +30,7 @@ using raceengine::generateProvingGround;
 using raceengine::idleBypass;
 using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
+using raceengine::placeDriveline;
 using raceengine::placeholderAutomatic;
 using raceengine::placeholderDriveline;
 using raceengine::placeholderSedan;
@@ -300,6 +302,7 @@ TEST_CASE("the coupling slot has two kinds and neither answers for the other", "
         // Above the turbine, which at 10 rad/s of wheel speed in this car's first gear is 133. Left
         // at idle the wheels would be driving the engine and the answer would correctly be negative.
         state.engineSpeed = 300.0;
+        placeDriveline(setup, state, 10.0);
 
         auto input = VehicleInput{};
         input.throttle = 1.0;
@@ -357,16 +360,16 @@ TEST_CASE("the driver's pedal is not overridden by the automation", "[physics][c
     SECTION("a foot past the free play wins outright, in both directions")
     {
         // The automation wanting the clutch further out than the driver does.
-        REQUIRE(advanceClutchPedal(assist, 0.55, 0.55, 1.0, tick) == Catch::Approx(0.55));
+        REQUIRE(advanceClutchPedal(assist, 0.55, 0.55, 1.0, 0.0, tick) == Catch::Approx(0.55));
         // And wanting it further in.
-        REQUIRE(advanceClutchPedal(assist, 0.55, 0.55, 0.0, tick) == Catch::Approx(0.55));
+        REQUIRE(advanceClutchPedal(assist, 0.55, 0.55, 0.0, 0.0, tick) == Catch::Approx(0.55));
         // Neither blend does this: the more-released of the two lets the automation let out a clutch
         // the driver is biting, and the more-clamped lets it clamp one the driver is slipping.
     }
 
     SECTION("and a foot off it hands the pedal back where the foot left it, at a foot's speed")
     {
-        const auto step = advanceClutchPedal(assist, 0.55, 0.0, 1.0, tick);
+        const auto step = advanceClutchPedal(assist, 0.55, 0.0, 1.0, 0.0, tick);
 
         REQUIRE(step > 0.55);
         REQUIRE(step == Catch::Approx(0.55 + assist.pedalRate * tick));
@@ -377,7 +380,7 @@ TEST_CASE("the driver's pedal is not overridden by the automation", "[physics][c
         auto disabled = AutoClutch{};
         disabled.enabled = false;
 
-        REQUIRE(advanceClutchPedal(disabled, 1.0, 0.0, 1.0, tick) == 0.0);
+        REQUIRE(advanceClutchPedal(disabled, 1.0, 0.0, 1.0, 0.0, tick) == 0.0);
     }
 
     SECTION("the automation asks for the clutch out when the car cannot carry the gear")
@@ -393,6 +396,27 @@ TEST_CASE("the driver's pedal is not overridden by the automation", "[physics][c
         // And revs the driver asked for are revs it will spend, which is what a launch is.
         REQUIRE(autoClutchPedal(assist, idle, 0.0, 250.0, 1.0, true) == Catch::Approx(0.0));
         REQUIRE(autoClutchPedal(assist, idle, 0.0, 250.0, 0.5, true) == Catch::Approx(0.5));
+    }
+
+    SECTION("the anti-stall opens past the rate limit, and the driver's foot still beats it")
+    {
+        const auto idle = 89.0;
+
+        // A healthy engine asks for nothing, including at idle itself: the band begins below it so
+        // the governor's own excursions never brush this.
+        REQUIRE(antiStallPedal(assist, idle, idle) == 0.0);
+        REQUIRE(antiStallPedal(assist, idle, assist.antiStallBegin * idle) == 0.0);
+        // Dragged into the band it is fully out by the band's floor, and the floor arrives whole
+        // this tick — not at the foot's four-per-second — because the race it exists to win is over
+        // in tens of milliseconds.
+        REQUIRE(antiStallPedal(assist, idle, 0.5 * idle) == 1.0);
+        REQUIRE(advanceClutchPedal(assist, 0.0, 0.0, 0.0, 1.0, tick) == 1.0);
+        // A foot past the free play is still the driver's, emergency or none.
+        REQUIRE(advanceClutchPedal(assist, 0.0, 0.3, 0.0, 1.0, tick) == Catch::Approx(0.3));
+
+        auto disabled = AutoClutch{};
+        disabled.enabled = false;
+        REQUIRE(antiStallPedal(disabled, idle, 0.0) == 0.0);
     }
 }
 

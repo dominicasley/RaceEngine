@@ -24,9 +24,42 @@ namespace raceengine
 // dynamics, no forces, no time. That separation is what lets this be validated on its own, so that
 // when the tire misbehaves three milestones from now the suspension is not also a suspect.
 //
-// Chassis frame, SI: +x right, +y up, +z forward, metres, radians.
+// Chassis frame, SI: **+x is the car's left** (see `outboardSign`), +y up, +z forward, metres, radians.
 
 export enum class CornerSide : std::uint32_t { Left, Right };
+
+// **+x is the car's LEFT, and this function is the only place that is allowed to know it.**
+//
+// The frame is "+x, +y up, +z forward" and it is **left-handed**: right times up is *backward*, not
+// forward. Everything that draws it — `glm::lookAt`, and so the whole renderer — is right-handed, so
+// screen-right works out as `cross(forward, up)` = `cross(+z, +y)` = **−x**. The picture is not
+// wrong; Bathurst reads correctly on screen, which is the check that settled it. What is on the
+// left of the screen is on the car's left, and that is +x.
+//
+// This was stated in five places and got the wrong answer in all of them, and the cost was a day.
+// Written as `Right ? +1 : -1`, `CornerSide::Right` was built at +x — the car's *left* — so every
+// corner was labelled as its own mirror image. Mostly that is invisible, because a car is
+// symmetric and a mirrored car obeys the same physics; it surfaces exactly where a left or a right
+// has to be *named*:
+//
+//   - `rackTravelForSteer` probes what it believes is the right front and reads its toe. Toe is a
+//     mirrored quantity, so reading it off the wrong side inverted the answer, and the Golf's rack
+//     came out at −0.0700 when the car needs +0.0700. The setup sheet had been quietly correcting
+//     that with `steering.invert 0` since 2026-08-20 — a rendering-frame fault being compensated in
+//     the vehicle, two layers away from where it lived.
+//   - Telemetry's `Susp Pos FL` and `Damper Vel FL` carried the *right* corner's data, in a file
+//     whose entire purpose is dropping into i2 beside a real car's.
+//   - The cockpit camera's seat offset, which had to be measured off a picture twice.
+//
+// Two things about it are worth keeping. The frame being left-handed does **not** make the
+// simulation wrong — it simulates a mirror-image car, and a mirror-image car is a car. And it
+// cannot be settled by reasoning, because every convention it would be reasoned from is one of the
+// five statements: the picture is the only oracle, which is why the question that ended it was
+// "does the circuit look like Bathurst".
+export [[nodiscard]] constexpr double outboardSign(const CornerSide side)
+{
+    return side == CornerSide::Right ? -1.0 : 1.0;
+}
 
 // Which linkage this corner is. The two solve differently in exactly one step and are otherwise the
 // same problem, which is why they sit behind one function and one output struct rather than behind
@@ -412,7 +445,7 @@ export [[nodiscard]] std::expected<SuspensionState, std::string> solveCorner(con
 
     // The wheel's spin axis, pointing away from the car. Everything about how the wheel is standing
     // is read from this rather than tracked beside it.
-    const auto outboard = hardpoints.side == CornerSide::Right ? 1.0 : -1.0;
+    const auto outboard = outboardSign(hardpoints.side);
     const auto spinAxis = upright * glm::dvec3(outboard, 0.0, 0.0);
 
     state.camber = -std::asin(glm::clamp(spinAxis.y, -1.0, 1.0));
