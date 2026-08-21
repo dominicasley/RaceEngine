@@ -1,11 +1,8 @@
 module;
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
@@ -90,36 +87,13 @@ export struct DeviceView
     InputSourceKind kind = InputSourceKind::None;
 };
 
-// Where a tick sits inside the engine's fixed-step catch-up burst, stated by the engine before each
-// step. `steps` is how many the loop is about to run and `index` is which one this is.
-//
-// **This exists because simulated time advances in bursts and a steering wheel does not.** The
-// engine runs a frame's worth of ticks back to back — measured on the rig, three or four of them
-// inside a quarter of a millisecond — and every one of them reads the device thread's newest
-// sample, which over that quarter millisecond is the *same* sample. So the demand a 120 Hz
-// simulation sees is a staircase climbing once per rendered frame, and the ticks in between see a
-// wheel that is not moving at all.
-export struct CatchUpPhase
-{
-    std::uint32_t index = 0;
-    std::uint32_t steps = 1;
-};
-
 export class DeviceInputSource final : public IInputSource
 {
     const DeviceView& view;
-    const CatchUpPhase& phase;
-
-    // The demand this source last handed out, and the value the burst started from. Interpolating
-    // between them is what turns the staircase back into the ramp it is a sampling of.
-    double servedSteering = 0.0;
-    double burstSteering = 0.0;
-    bool haveServed = false;
 
 public:
-    DeviceInputSource(const DeviceView& view, const CatchUpPhase& phase) :
-        view(view),
-        phase(phase)
+    explicit DeviceInputSource(const DeviceView& view) :
+        view(view)
     {
     }
 
@@ -133,54 +107,27 @@ public:
         return view.connected;
     }
 
-    // The demand, with the steering axis **reconstructed across the catch-up burst**.
+    // The device's newest report, mapped through its profile. Nothing else, and that is the change
+    // (2026-08-21).
     //
-    // The ticks of a burst are simulating time that has already elapsed, and the driver's hands
-    // moved continuously through it; handing all of them the newest sample says the wheel jumped at
-    // the frame boundary and was still for the rest of the frame. Nothing downstream can tell the
-    // difference except the one thing that differentiates the demand — and the steering rack does,
-    // twice, through its Coulomb friction and its viscous damping. Measured on the rig's 300-second
-    // trace: rack travel was **unchanged between 94.2% of consecutive ticks inside a burst**, so the
-    // rack's velocity was an impulse train at the frame rate and its friction — 120 N, saturated by
-    // `frictionReferenceSpeed` above 10 mm/s, 1.27 N·m at the rim — switched fully on and fully off
-    // with it. The torque step across such a tick measured 0.4254 N·m against 0.0003 N·m on a tick
-    // either side of it: a thousand to one, at 37 Hz, straight into the driver's hands. That is the
-    // buzz, and it is not the tyre, the suspension or the base.
+    // This used to reconstruct the steering axis across the engine's catch-up burst, because
+    // simulated time advanced in bursts and a steering wheel does not: the engine ran a frame's
+    // worth of ticks back to back — three or four inside a quarter of a millisecond — and every one
+    // of them read the *same* device sample, so the demand a fixed-step simulation saw was a
+    // staircase climbing once per rendered frame. That mattered because the steering rack
+    // differentiates the demand twice over, through its Coulomb friction and its viscous damping,
+    // and the resulting impulse train at the frame rate was the buzz in the driver's hands.
     //
-    // The last tick of a burst lands exactly on the newest sample, so **no latency is added** — what
-    // changes is only that the earlier ticks stop pretending the wheel was still. A burst of one is
-    // the identity, which is what makes this inert at frame rates at or above the tick rate.
+    // **The simulation has its own fixed-rate clock now and there is no burst to paper over.** Each
+    // tick is a separate wake-up 2.78 ms after the last, and the device reports faster than that, so
+    // consecutive ticks read consecutive samples of a wheel that is genuinely moving. Interpolating
+    // across a burst of one was already the identity; with no bursts left the whole apparatus —
+    // `CatchUpPhase`, the served/burst origin pair and the engine's `setCatchUpPhase` — was papering
+    // over a scheduling artefact that has been removed instead. That it could go is the sign the
+    // threading change is the right one.
     [[nodiscard]] DriverInput sample() override
     {
-        auto input = deviceDriverInput(view.profile, view.geometry, view.sample);
-
-        if (!haveServed)
-        {
-            servedSteering = input.steering;
-            burstSteering = input.steering;
-            haveServed = true;
-
-            return input;
-        }
-
-        // A burst begins where the last one ended. Unconditional on the first tick rather than
-        // latched: the engine states a burst of one at frame rates at or above the tick rate, and a
-        // latch keyed on the index alone could never tell one such burst from the next — it rolled
-        // once and then held the same origin for the rest of the session. Asked twice inside one
-        // tick this advances slightly early, which is bounded and self-correcting, because the last
-        // tick of a burst lands on the device's own sample by construction whatever the origin was.
-        if (phase.index == 0)
-        {
-            burstSteering = servedSteering;
-        }
-
-        const auto steps = std::max<std::uint32_t>(phase.steps, 1);
-        const auto reached = static_cast<double>(std::min(phase.index, steps - 1) + 1) / static_cast<double>(steps);
-
-        input.steering = burstSteering + (input.steering - burstSteering) * reached;
-        servedSteering = input.steering;
-
-        return input;
+        return deviceDriverInput(view.profile, view.geometry, view.sample);
     }
 };
 
@@ -258,15 +205,24 @@ export class InputService
     // an allocation.
     std::atomic<std::uint32_t> profileGeneration{0};
 
-    // The tick's side. Touched by no other thread.
+    // The keyboard's demand, taken on the **main** thread and read by the simulation's.
+    //
+    // The keyboard is the one source that cannot be sampled where the others are: it arrives through
+    // GLFW, and `glfwGetKey` may only be called from the thread that made the window. So the split
+    // is not a preference — the main thread polls it once per rendered frame and publishes the
+    // struct, and the simulation thread reads its own copy. Nothing is lost by it: GLFW's key state
+    // only changes inside `glfwPollEvents`, which runs once a frame, so polling it faster than the
+    // frame rate would re-read the same answer.
+    mutable std::mutex keyboardPublication;
+    DriverInput keyboardDemand{};
+
+    // The simulation thread's side. Touched by no other thread.
     DeviceView view;
+    DriverInput takenKeyboard{};
     std::uint32_t takenGeneration = 0;
     InputSourceKind active = InputSourceKind::None;
-    // Before the source that reads it: the reference is bound in the constructor's list.
-    CatchUpPhase catchUp;
     DeviceInputSource deviceSource;
     KeyboardInputSource keyboardSource;
-    std::array<IInputSource*, 2> sources;
 
     // What was said last, so that a device that is not there is mentioned once rather than every
     // two seconds for the length of a session. Device thread only.
@@ -305,7 +261,17 @@ public:
     InputService& operator=(InputService&&) = delete;
     ~InputService();
 
-    // Once per physics tick. Everything above this is a device and everything below it is a car.
+    // Once per rendered frame, on the thread that owns the window. It reads the keyboard and
+    // nothing else — see `keyboardDemand` for why that one source cannot be taken where the rest
+    // are. A run with no window and no keys still calls it; every key reads up.
+    void pollWindow();
+
+    // Once per physics tick, on the thread that steps the simulation. Everything above this is a
+    // device and everything below it is a car.
+    //
+    // **This and every accessor reading `view` belong to that one thread**, which is what lets the
+    // copy be lock-free on the read side. Anything else asking about the device — the force feedback
+    // writer, or a game wanting the rim angle for a rendered wheel — goes through `deviceLink()`.
     [[nodiscard]] DriverInput sample();
 
     [[nodiscard]] InputSourceKind activeKind() const
@@ -329,14 +295,6 @@ public:
         // The reader thread consumes this at the next attach, so it crosses threads as an atomic
         // snapshot rather than through the options struct the tick side owns.
         wantedRotationDegrees.store(degrees);
-    }
-
-    // Which tick of the engine's catch-up burst is about to run. The engine states it because the
-    // engine is the only thing that knows; see `CatchUpPhase` for what reads it and why. Stating
-    // nothing leaves a burst of one, which is the identity.
-    void setCatchUpPhase(const std::uint32_t index, const std::uint32_t steps)
-    {
-        catchUp = CatchUpPhase{.index = index, .steps = steps};
     }
 
     // What this service has taken, so that anything else that might enumerate devices — a joystick
@@ -444,9 +402,8 @@ InputService::InputService(spdlog::logger& logger, IInputBackend& backend, const
     logger(logger),
     backend(backend),
     options(std::move(options)),
-    deviceSource(view, catchUp),
-    keyboardSource(window),
-    sources{&deviceSource, &keyboardSource}
+    deviceSource(view),
+    keyboardSource(window)
 {
     view.geometry.vehicleDegrees = this->options.vehicleRotationDegrees;
 
@@ -470,25 +427,34 @@ InputService::~InputService()
     wake.notify_all();
 }
 
+void InputService::pollWindow()
+{
+    // Sampled outside the lock: `keyPressed` reaches GLFW, and holding a lock the simulation thread
+    // may be waiting on across a call into a third-party library is how a fixed-rate loop discovers
+    // somebody else's mutex.
+    const auto demand = keyboardSource.sample();
+
+    const auto guard = std::lock_guard<std::mutex>(keyboardPublication);
+    keyboardDemand = demand;
+}
+
 DriverInput InputService::sample()
 {
     refresh();
 
-    for (auto* source : sources)
+    // A device first and the keyboard as the floor, which is the order the two sources were tried
+    // in when they lived in one array. They are no longer symmetric — one is read here and the
+    // other arrives from the main thread — so the priority is stated rather than iterated.
+    if (deviceSource.available())
     {
-        if (!source->available())
-        {
-            continue;
-        }
+        active = deviceSource.kind();
 
-        active = source->kind();
-
-        return source->sample();
+        return deviceSource.sample();
     }
 
-    active = InputSourceKind::None;
+    active = keyboardSource.kind();
 
-    return DriverInput{};
+    return takenKeyboard;
 }
 
 void InputService::refresh()
@@ -515,6 +481,15 @@ void InputService::refresh()
         view.geometry.deviceDegrees = publishedProfile.rotationDegrees;
         view.geometry.vehicleDegrees = options.vehicleRotationDegrees;
         takenGeneration = generation;
+    }
+
+    // The keyboard's, on the same terms: taken if it can be had without waiting, and otherwise the
+    // copy this thread already holds. A key held down does not change between one 360 Hz tick and
+    // the next, and the main thread only writes this once a frame, so the copy is never stale by
+    // anything a driver could feel.
+    if (auto keys = std::unique_lock<std::mutex>(keyboardPublication, std::try_to_lock); keys.owns_lock())
+    {
+        takenKeyboard = keyboardDemand;
     }
 }
 
