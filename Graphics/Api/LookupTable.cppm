@@ -13,35 +13,19 @@ export module raceengine.graphics:LookupTable;
 namespace raceengine
 {
 
-// A colour grade as a lookup table, in Adobe's `.cube` text format — which is what every grading
-// tool exports and therefore the only thing that makes a grade *tunable by whoever is grading it*.
-// The alternative is what this replaced: contrast, saturation and a split tone as constants in a
-// shader, tuned by editing the shader and rebuilding.
-//
-// Parsed here rather than in the service that uploads it, and returning data rather than a texture,
-// because a text format with a documented grammar is exactly the thing that can be pinned by tests
-// without a device — and every failure mode below is a file somebody wrote by hand.
-
-// The largest edge this will accept. 64 is two hundred and sixty thousand texels and beyond what any
-// grade needs; the cap is here because the size comes out of the file and a wrong number would
-// otherwise be an allocation the size of whatever it said.
-export inline constexpr uint32_t maximumLookupTableSize = 64;
-
-export struct LookupTable
-{
-    // Edge length of the cube: the table holds size³ entries.
-    uint32_t size = 0;
-    // The input range the table is defined over, which is almost always 0..1 and is stated in the
-    // file because a log-encoded grade is not.
-    float domainMinimum = 0.0f;
-    float domainMaximum = 1.0f;
-    // RGB triples, red fastest — the order the format writes them and the order a 3D texture wants
-    // its rows in, so the upload is a memcpy and not a transpose.
-    std::vector<float> entries;
-};
-
 namespace
 {
+
+// Kept here as well as in the implementation unit, and that is legal rather than sloppy: an
+// unnamed namespace is internal to each translation unit, so these are two distinct copies
+// and not one entity defined twice. This side is needed because an inline or constexpr
+// function below calls them, and those cannot move — a caller has to see their bodies.
+[[nodiscard]] inline bool parseNumber(const std::string_view token, float& value)
+{
+    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
+
+    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+}
 
 // `.cube` is line-oriented, `#` starts a comment, and everything else is whitespace-separated
 // tokens. Written out rather than reached for because <sstream> in a global module fragment is a
@@ -75,14 +59,34 @@ namespace
     return tokens;
 }
 
-[[nodiscard]] inline bool parseNumber(const std::string_view token, float& value)
-{
-    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
-
-    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
-}
-
 } // namespace
+
+// A colour grade as a lookup table, in Adobe's `.cube` text format — which is what every grading
+// tool exports and therefore the only thing that makes a grade *tunable by whoever is grading it*.
+// The alternative is what this replaced: contrast, saturation and a split tone as constants in a
+// shader, tuned by editing the shader and rebuilding.
+//
+// Parsed here rather than in the service that uploads it, and returning data rather than a texture,
+// because a text format with a documented grammar is exactly the thing that can be pinned by tests
+// without a device — and every failure mode below is a file somebody wrote by hand.
+
+// The largest edge this will accept. 64 is two hundred and sixty thousand texels and beyond what any
+// grade needs; the cap is here because the size comes out of the file and a wrong number would
+// otherwise be an allocation the size of whatever it said.
+export inline constexpr uint32_t maximumLookupTableSize = 64;
+
+export struct LookupTable
+{
+    // Edge length of the cube: the table holds size³ entries.
+    uint32_t size = 0;
+    // The input range the table is defined over, which is almost always 0..1 and is stated in the
+    // file because a log-encoded grade is not.
+    float domainMinimum = 0.0f;
+    float domainMaximum = 1.0f;
+    // RGB triples, red fastest — the order the format writes them and the order a 3D texture wants
+    // its rows in, so the upload is a memcpy and not a transpose.
+    std::vector<float> entries;
+};
 
 export [[nodiscard]] inline std::expected<LookupTable, std::string> parseCubeLookupTable(const std::string_view source)
 {
@@ -103,7 +107,10 @@ export [[nodiscard]] inline std::expected<LookupTable, std::string> parseCubeLoo
             continue;
         }
 
-        const auto at = [&] { return " on line " + std::to_string(lineNumber); };
+        const auto at = [&]
+        {
+            return " on line " + std::to_string(lineNumber);
+        };
 
         if (tokens[0] == "TITLE" || tokens[0] == "LUT_1D_SIZE")
         {
@@ -121,8 +128,8 @@ export [[nodiscard]] inline std::expected<LookupTable, std::string> parseCubeLoo
             if (tokens.size() < 2 || !parseNumber(tokens[1], size) || size < 2.0f ||
                 size > static_cast<float>(maximumLookupTableSize))
             {
-                return std::unexpected("LUT_3D_SIZE must be between 2 and " +
-                                       std::to_string(maximumLookupTableSize) + at());
+                return std::unexpected("LUT_3D_SIZE must be between 2 and " + std::to_string(maximumLookupTableSize) +
+                                       at());
             }
 
             table.size = static_cast<uint32_t>(size);

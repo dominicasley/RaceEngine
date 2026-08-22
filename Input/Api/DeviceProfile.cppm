@@ -19,6 +19,92 @@ import :InputBackend;
 namespace raceengine
 {
 
+namespace
+{
+
+// Kept here as well as in the implementation unit, and that is legal rather than sloppy: an
+// unnamed namespace is internal to each translation unit, so these are two distinct copies
+// and not one entity defined twice. This side is needed because an inline or constexpr
+// function below calls them, and those cannot move — a caller has to see their bodies.
+[[nodiscard]] inline std::string hex16(const std::uint16_t value)
+{
+    auto buffer = std::array<char, 8>{};
+    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
+    auto text = std::string(buffer.data(), result.ptr);
+
+    return std::string(4 - std::min<std::size_t>(4, text.size()), '0') + text;
+}
+
+// std::to_string on a double is six decimals of fixed notation, which loses a raw axis end above a
+// million and writes eight characters of nothing below one. to_chars' shortest round-trip form is
+// what makes a written profile read back as the same numbers.
+[[nodiscard]] inline std::string number(const double value)
+{
+    auto buffer = std::array<char, 32>{};
+    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+
+    return std::string(buffer.data(), result.ptr);
+}
+
+[[nodiscard]] inline bool parseDouble(const std::string_view token, double& value)
+{
+    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
+
+    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+}
+
+[[nodiscard]] inline bool parseHex16(const std::string_view token, std::uint16_t& value)
+{
+    auto wide = 0u;
+    const auto result = std::from_chars(token.data(), token.data() + token.size(), wide, 16);
+    if (result.ec != std::errc{} || result.ptr != token.data() + token.size() || wide > 0xFFFFu)
+    {
+        return false;
+    }
+
+    value = static_cast<std::uint16_t>(wide);
+
+    return true;
+}
+
+[[nodiscard]] inline bool parseIndex(const std::string_view token, std::int32_t& value)
+{
+    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
+
+    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+}
+
+[[nodiscard]] inline std::vector<std::string_view> profileTokens(const std::string_view line)
+{
+    auto tokens = std::vector<std::string_view>();
+    auto index = std::size_t{0};
+
+    while (index < line.size())
+    {
+        while (index < line.size() && (line[index] == ' ' || line[index] == '\t' || line[index] == '\r'))
+        {
+            index++;
+        }
+
+        if (index >= line.size() || line[index] == '#')
+        {
+            break;
+        }
+
+        const auto start = index;
+        while (index < line.size() && line[index] != ' ' && line[index] != '\t' && line[index] != '\r')
+        {
+            index++;
+        }
+
+        tokens.push_back(line.substr(start, index - start));
+    }
+
+    return tokens;
+}
+
+} // namespace
+
 // One axis, as this device reads and this driver wants it.
 //
 // `minimum` and `maximum` are the raw values at the two ends of the *useful* travel, and `minimum`
@@ -218,88 +304,6 @@ export struct DeviceProfile
     // Bit index into `DeviceSample::buttons`, or -1 for an action this device does not carry.
     std::array<std::int32_t, driverActionCount> buttons{{-1, -1, -1}};
 };
-
-namespace
-{
-
-[[nodiscard]] inline std::vector<std::string_view> profileTokens(const std::string_view line)
-{
-    auto tokens = std::vector<std::string_view>();
-    auto index = std::size_t{0};
-
-    while (index < line.size())
-    {
-        while (index < line.size() && (line[index] == ' ' || line[index] == '\t' || line[index] == '\r'))
-        {
-            index++;
-        }
-
-        if (index >= line.size() || line[index] == '#')
-        {
-            break;
-        }
-
-        const auto start = index;
-        while (index < line.size() && line[index] != ' ' && line[index] != '\t' && line[index] != '\r')
-        {
-            index++;
-        }
-
-        tokens.push_back(line.substr(start, index - start));
-    }
-
-    return tokens;
-}
-
-[[nodiscard]] inline bool parseDouble(const std::string_view token, double& value)
-{
-    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
-
-    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
-}
-
-[[nodiscard]] inline bool parseHex16(const std::string_view token, std::uint16_t& value)
-{
-    auto wide = 0u;
-    const auto result = std::from_chars(token.data(), token.data() + token.size(), wide, 16);
-    if (result.ec != std::errc{} || result.ptr != token.data() + token.size() || wide > 0xFFFFu)
-    {
-        return false;
-    }
-
-    value = static_cast<std::uint16_t>(wide);
-
-    return true;
-}
-
-[[nodiscard]] inline bool parseIndex(const std::string_view token, std::int32_t& value)
-{
-    const auto result = std::from_chars(token.data(), token.data() + token.size(), value);
-
-    return result.ec == std::errc{} && result.ptr == token.data() + token.size();
-}
-
-// std::to_string on a double is six decimals of fixed notation, which loses a raw axis end above a
-// million and writes eight characters of nothing below one. to_chars' shortest round-trip form is
-// what makes a written profile read back as the same numbers.
-[[nodiscard]] inline std::string number(const double value)
-{
-    auto buffer = std::array<char, 32>{};
-    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-
-    return std::string(buffer.data(), result.ptr);
-}
-
-[[nodiscard]] inline std::string hex16(const std::uint16_t value)
-{
-    auto buffer = std::array<char, 8>{};
-    const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
-    auto text = std::string(buffer.data(), result.ptr);
-
-    return std::string(4 - std::min<std::size_t>(4, text.size()), '0') + text;
-}
-
-} // namespace
 
 // The profile's own version. A file stating anything else is refused rather than read as though the
 // fields still meant what they used to.

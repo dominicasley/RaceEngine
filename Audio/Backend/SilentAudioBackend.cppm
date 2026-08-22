@@ -58,9 +58,6 @@ public:
     }
 };
 
-std::unique_ptr<IAudioBackend> createSilentAudioBackend()
-{
-    return std::make_unique<SilentAudioBackend>();
-}
+std::unique_ptr<IAudioBackend> createSilentAudioBackend();
 
 } // namespace raceengine

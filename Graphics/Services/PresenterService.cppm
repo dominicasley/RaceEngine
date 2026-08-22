@@ -25,24 +25,7 @@ public:
     void record() const;
 };
 
-PresenterService::PresenterService(IFrameRecorder& frameRecorder) :
-    frameRecorder(frameRecorder)
-{
-}
-
 // A game that has not chosen a presenter records nothing, and the backend's frame is left to
 // put the clear colour on screen. That is a level still being built, not a failure.
-void PresenterService::record() const
-{
-    if (presenter.has_value())
-    {
-        frameRecorder.recordPresent(presenter.value());
-    }
-}
-
-void PresenterService::setPresenter(const Presenter& _presenter)
-{
-    this->presenter = _presenter;
-}
 
 } // namespace raceengine

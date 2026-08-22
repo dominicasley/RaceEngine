@@ -73,24 +73,6 @@ postProcessBindings(const std::span<const PostProcessBinding> inputs, const Post
     return bindings;
 }
 
-namespace
-{
-
-// Narkowicz's fit of the ACES reference tone curve. It is display-referred on the way out — the
-// sRGB transfer is folded into the fit — which is why nothing encodes after it.
-[[nodiscard]] float acesFilm(const float x)
-{
-    constexpr auto a = 2.51f;
-    constexpr auto b = 0.03f;
-    constexpr auto c = 2.43f;
-    constexpr auto d = 0.59f;
-    constexpr auto e = 0.14f;
-
-    return std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0f, 1.0f);
-}
-
-} // namespace
-
 // Scene radiance to a display value, which is the function HdrFragmentShader.glsl also is. Four
 // stages, each monotonic and each leaving the ends of the range alone:
 //
@@ -101,28 +83,10 @@ namespace
 //  - a toe and a shoulder, one-sided gammas whose exponent runs from 1 + toe at black to 1 at
 //    white and from 1 at black to 1 + shoulder at white. Both only ever darken, so raising either
 //    deepens a region rather than shifting the whole picture.
-export [[nodiscard]] float evaluateToneCurve(const float value, const ToneCurve& curve, const float exposure)
-{
-    const auto exposed = value * exposure;
-    if (exposed <= 0.0f)
-    {
-        return 0.0f;
-    }
-
-    const auto shaped = toneGreyPivot * std::pow(exposed / toneGreyPivot, curve.contrast);
-    auto mapped = acesFilm(shaped);
-    mapped = std::pow(mapped, 1.0f + curve.toe * (1.0f - mapped));
-    mapped = std::pow(mapped, 1.0f + curve.shoulder * mapped);
-
-    return std::clamp(mapped, 0.0f, 1.0f);
-}
+export [[nodiscard]] float evaluateToneCurve(const float value, const ToneCurve& curve, const float exposure);
 
 // Per channel, exactly as the fragment stage applies it: the curve is a transfer function and not
 // a colour transform, so nothing here reads one channel to decide another.
-export [[nodiscard]] glm::vec3 evaluateToneCurve(const glm::vec3& value, const ToneCurve& curve, const float exposure)
-{
-    return glm::vec3(evaluateToneCurve(value.r, curve, exposure), evaluateToneCurve(value.g, curve, exposure),
-                     evaluateToneCurve(value.b, curve, exposure));
-}
+export [[nodiscard]] glm::vec3 evaluateToneCurve(const glm::vec3& value, const ToneCurve& curve, const float exposure);
 
 } // namespace raceengine

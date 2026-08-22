@@ -16,6 +16,40 @@ export module raceengine.input:RackTorque;
 namespace raceengine
 {
 
+namespace
+{
+
+// Kept here as well as in the implementation unit, and that is legal rather than sloppy: an
+// unnamed namespace is internal to each translation unit, so these are two distinct copies
+// and not one entity defined twice. This side is needed because an inline or constexpr
+// function below calls them, and those cannot move — a caller has to see their bodies.
+inline void appendRackInteger(std::string& text, const long long value)
+{
+    auto buffer = std::array<char, 32>{};
+    const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+
+    text.append(buffer.data(), written.ptr);
+}
+
+inline void appendRackNumber(std::string& text, const double value, const int precision)
+{
+    auto buffer = std::array<char, 64>{};
+    const auto written =
+        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::fixed, precision);
+
+    text.append(buffer.data(), written.ptr);
+}
+
+constexpr auto rackGravity = 9.80665;
+
+constexpr auto rackMetresPerSecondToKilometresPerHour = 3.6;
+
+constexpr auto rackRadiansPerSecondToRevolutionsPerMinute = 9.549296585513721;
+
+constexpr auto rackRadiansToDegrees = 57.29577951308232;
+
+} // namespace
+
 // Stage one of three: what the road is doing to the steering, in newton metres, with no notion
 // anywhere in it of what is going to display that.
 //
@@ -403,16 +437,6 @@ export struct RackTorque
     bool finite = true;
 };
 
-namespace
-{
-
-[[nodiscard]] inline bool allFinite(const glm::dvec3& vector)
-{
-    return std::isfinite(vector.x) && std::isfinite(vector.y) && std::isfinite(vector.z);
-}
-
-} // namespace
-
 // The whole derivation, and it is two cross products and a ratio per corner.
 //
 // The tyre's resultant acts at the contact patch. Its moment about the kingpin axis is what the
@@ -438,96 +462,7 @@ namespace
 // the whole derivation is exactly what it was before the assist existed.
 export [[nodiscard]] RackTorque steeringRackTorque(const SteeringRack& rack,
                                                    const std::span<const SteeredCorner> corners,
-                                                   const double rackVelocity, const double roadSpeed = 0.0)
-{
-    auto result = RackTorque{};
-
-    if (!std::isfinite(rackVelocity) || !std::isfinite(roadSpeed))
-    {
-        result.finite = false;
-
-        return result;
-    }
-
-    for (auto index = std::size_t{0}; index < corners.size() && index < steeredCornerLimit; index++)
-    {
-        const auto& corner = corners[index];
-
-        if (!allFinite(corner.lowerBallJoint) || !allFinite(corner.upperBallJoint) || !allFinite(corner.steeringArm) ||
-            !allFinite(corner.rackOuter) || !allFinite(corner.contactPatch) || !allFinite(corner.patchNormal) ||
-            !allFinite(corner.tyreForce) || !std::isfinite(corner.aligningMoment))
-        {
-            result.finite = false;
-
-            return result;
-        }
-
-        const auto kingpinSpan = corner.upperBallJoint - corner.lowerBallJoint;
-        if (glm::length(kingpinSpan) < 1e-9)
-        {
-            continue;
-        }
-
-        const auto kingpin = glm::normalize(kingpinSpan);
-        const auto arm = corner.steeringArm - corner.lowerBallJoint;
-
-        const auto moment =
-            glm::dot(kingpin, glm::cross(corner.contactPatch - corner.lowerBallJoint, corner.tyreForce)) +
-            corner.aligningMoment * glm::dot(kingpin, corner.patchNormal);
-
-        result.kingpinTorque[index] = moment;
-
-        const auto tieRod = corner.steeringArm - corner.rackOuter;
-        if (glm::length(tieRod) < 1e-9)
-        {
-            continue;
-        }
-
-        const auto along = glm::normalize(tieRod);
-        const auto aboutKingpin = glm::dot(kingpin, glm::cross(arm, along));
-
-        // A steering arm sitting on the kingpin axis cannot be turned by the rack at all, which is
-        // a legitimate corner — a rear axle with no steering authored is exactly this — and is a
-        // zero to skip rather than a zero to divide by.
-        if (std::abs(aboutKingpin) < 1e-9)
-        {
-            continue;
-        }
-
-        result.tyreForce += moment * along.x / aboutKingpin;
-    }
-
-    // Both resistances oppose the rack, so both take the sign of its motion and neither can do work
-    // on it. Regularised rather than switched — see `frictionReferenceSpeed`.
-    result.frictionForce = -rack.friction * std::tanh(rackVelocity / std::max(rack.frictionReferenceSpeed, 1e-9));
-    result.dampingForce = -rack.damping * rackVelocity;
-    result.rackForce = result.tyreForce + result.frictionForce + result.dampingForce;
-
-    const auto radius = pinionRadius(rack);
-    result.steeringTorque = result.rackForce * radius;
-
-    // The motor's share, and it is solved rather than applied.
-    //
-    // A boost curve is drawn as assist against the *driver's* effort, and the driver's effort is
-    // what is left after the assist — so writing it directly would be circular. What breaks the
-    // circle is that the two add up: `rackForce = driver + assist`, and with the boost `b` defined
-    // against the load the rack is under, `assist = b·driver` gives `driver = rackForce/(1 + b)`
-    // in one line and no iteration.
-    //
-    // Then the cap, and it is the physical fact rather than a safety clamp: a motor has a peak
-    // torque, and past it every further newton is the driver's. That is what leaves the incremental
-    // gain at one where the cue matters most.
-    const auto boost = assistBoost(rack.assist, result.rackForce, roadSpeed);
-    const auto uncapped = result.rackForce * boost / (1.0 + boost);
-
-    result.assistForce = std::copysign(std::min(std::abs(uncapped), std::max(rack.assist.maximumForce, 0.0)), uncapped);
-    result.driverRackForce = result.rackForce - result.assistForce;
-    result.assistedTorque = result.driverRackForce * radius;
-
-    result.finite = std::isfinite(result.steeringTorque) && std::isfinite(result.assistedTorque);
-
-    return result;
-}
+                                                   const double rackVelocity, const double roadSpeed = 0.0);
 
 // What the car was doing on the tick that produced the torque beside it.
 //
@@ -704,36 +639,6 @@ private:
     std::size_t next = 0;
     std::size_t filled = 0;
 };
-
-namespace
-{
-
-inline void appendRackNumber(std::string& text, const double value, const int precision)
-{
-    auto buffer = std::array<char, 64>{};
-    const auto written =
-        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::fixed, precision);
-
-    text.append(buffer.data(), written.ptr);
-}
-
-inline void appendRackInteger(std::string& text, const long long value)
-{
-    auto buffer = std::array<char, 32>{};
-    const auto written = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-
-    text.append(buffer.data(), written.ptr);
-}
-
-// The units the person reading the plot thinks in, converted once here rather than in everybody's
-// head — the same rule and the same numbers as `telemetryToCsv`, which is the other file this
-// session's analysis reads.
-constexpr auto rackRadiansToDegrees = 57.29577951308232;
-constexpr auto rackMetresPerSecondToKilometresPerHour = 3.6;
-constexpr auto rackRadiansPerSecondToRevolutionsPerMinute = 9.549296585513721;
-constexpr auto rackGravity = 9.80665;
-
-} // namespace
 
 // Pure, like `telemetryToCsv` and for the same two reasons: what is in the text is worth testing and
 // opening a file is not, and `std::to_chars` rather than a stream because a CSV written on a machine

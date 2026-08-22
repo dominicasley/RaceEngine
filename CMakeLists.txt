@@ -62,6 +62,38 @@ target_link_libraries(EnginePhysicsBackend PRIVATE raceengine_warnings)
 # `module raceengine.physics;` has to be ordered after that module's interface.
 add_library (Engine STATIC
         Io/ThirdPartyImpl.cpp
+        Audio/Impl/AudioServiceImpl.cpp
+        Audio/Impl/CarAudioImpl.cpp
+        Audio/Impl/EngineLayersImpl.cpp
+        Audio/Impl/SilentAudioBackendImpl.cpp
+        Audio/Impl/SoundBankImpl.cpp
+        Audio/Impl/TyreLayersImpl.cpp
+        Graphics/Impl/AmbientOcclusionServiceImpl.cpp
+        Graphics/Impl/AssetServiceImpl.cpp
+        Graphics/Impl/AutoExposureServiceImpl.cpp
+        Graphics/Impl/BloomServiceImpl.cpp
+        Graphics/Impl/CameraServiceImpl.cpp
+        Graphics/Impl/ColourGradeServiceImpl.cpp
+        Graphics/Impl/CubeMapServiceImpl.cpp
+        Graphics/Impl/FboServiceImpl.cpp
+        Graphics/Impl/FrameDiagnosticsImpl.cpp
+        Graphics/Impl/LightProbeServiceImpl.cpp
+        Graphics/Impl/LookupTableImpl.cpp
+        Graphics/Impl/PostProcessServiceImpl.cpp
+        Graphics/Impl/PostProcessingImpl.cpp
+        Graphics/Impl/PresenterServiceImpl.cpp
+        Graphics/Impl/RenderBackendFactoryBodies.cpp
+        Graphics/Impl/RenderableEntityServiceImpl.cpp
+        Graphics/Impl/SceneServiceImpl.cpp
+        Graphics/Impl/ShaderServiceImpl.cpp
+        Graphics/Impl/ShadowServiceImpl.cpp
+        Graphics/Impl/WindowImpl.cpp
+        Impl/EngineImpl.cpp
+        Input/Impl/DeviceProfileImpl.cpp
+        Input/Impl/ForceFeedbackServiceImpl.cpp
+        Input/Impl/PedalFeedbackImpl.cpp
+        Input/Impl/PedalMotorsImpl.cpp
+        Input/Impl/RackTorqueImpl.cpp
         Physics/Impl/ClutchImpl.cpp
         Physics/Impl/ContactImpl.cpp
         Physics/Impl/ContactPatchImpl.cpp

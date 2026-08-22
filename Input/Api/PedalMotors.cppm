@@ -79,46 +79,12 @@ export struct PedalMotorMapping
     double throttleGain = 1.0;
 };
 
-namespace
-{
-
-[[nodiscard]] inline std::uint8_t codeFor(const PedalMotorProfile& profile, const double severity, const double gain)
-{
-    const auto asked = std::clamp(severity, 0.0, 1.0) * std::max(gain, 0.0);
-
-    // Nought is nought, and it has to be exactly nought rather than the minimum duty: the whole
-    // point of a floor is that it applies to a motor that is meant to be turning.
-    if (asked <= 0.0)
-    {
-        return 0;
-    }
-
-    const auto floor = std::clamp(profile.minimumDuty, 0.0, 1.0);
-    const auto duty = floor + (1.0 - floor) * std::min(asked, 1.0);
-
-    const auto top = static_cast<double>(std::max(profile.levels, 2u) - 1);
-
-    return static_cast<std::uint8_t>(std::lround(std::clamp(duty, 0.0, 1.0) * top));
-}
-
-} // namespace
-
 // Stage one's answer, as the codes this pedal set takes.
 //
 // A pedal set with no motors answers silent for everything, which is what makes it safe to run this
 // on any hardware: the cue simply is not there, rather than the game asking a device to do something
 // it will not do and then wondering.
-export [[nodiscard]] PedalMotorCommand mapPedalFeedback(const PedalMotorProfile& profile,
-                                                        const PedalMotorMapping& mapping,
-                                                        const PedalFeedback& feedback)
-{
-    if (!profile.hasMotors || !feedback.finite)
-    {
-        return PedalMotorCommand{};
-    }
-
-    return PedalMotorCommand{.throttle = codeFor(profile, feedback.throttle, mapping.throttleGain),
-                             .brake = codeFor(profile, feedback.brake, mapping.brakeGain)};
-}
+export [[nodiscard]] PedalMotorCommand
+mapPedalFeedback(const PedalMotorProfile& profile, const PedalMotorMapping& mapping, const PedalFeedback& feedback);
 
 } // namespace raceengine

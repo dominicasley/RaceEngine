@@ -31,35 +31,4 @@ public:
     [[nodiscard]] std::optional<Resource<Shader>> getShaderByName(const std::string& name);
 };
 
-ShaderService::ShaderService(MemoryStorageService& memoryStorageService, IGpuResourceFactory& gpuResourceFactory) :
-    memoryStorageService(memoryStorageService),
-    gpuResourceFactory(gpuResourceFactory)
-{
-}
-
-std::expected<Resource<Shader>, std::string> ShaderService::createShader(const std::string& name,
-                                                                         const ShaderDescriptor& shaderDescriptor)
-{
-    const auto shaderProgramId = gpuResourceFactory.createShaderObject(shaderDescriptor);
-
-    if (!shaderProgramId)
-    {
-        return std::unexpected("shader '" + name + "' was not created: " + shaderProgramId.error());
-    }
-
-    const auto shader = memoryStorageService.shaders.add(Shader{.gpuResourceId = shaderProgramId.value()});
-
-    shaders[name] = shader;
-
-    return shader;
-}
-
-std::optional<Resource<Shader>> ShaderService::getShaderByName(const std::string& name)
-{
-    if (shaders.contains(name))
-        return shaders.at(name);
-
-    return {};
-}
-
 } // namespace raceengine

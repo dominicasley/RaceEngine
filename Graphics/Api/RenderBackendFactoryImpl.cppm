@@ -25,10 +25,6 @@ std::unique_ptr<IRenderBackend> createRenderer(spdlog::logger& logger, FrameDiag
                                                IWindow& window, IVulkanSurfaceSource& surfaceSource,
                                                RenderableEntityService& renderableEntityService,
                                                SceneManagerService& sceneManagerService,
-                                               MemoryStorageService& memoryStorageService)
-{
-    return std::make_unique<VulkanRenderer>(logger, frameDiagnostics, window, surfaceSource, renderableEntityService,
-                                            sceneManagerService, memoryStorageService);
-}
+                                               MemoryStorageService& memoryStorageService);
 
 } // namespace raceengine
