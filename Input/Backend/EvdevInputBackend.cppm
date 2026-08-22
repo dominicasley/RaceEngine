@@ -64,6 +64,11 @@ class EvdevInputBackend final : public IInputBackend
     DeviceSample current{};
     std::int16_t effect = -1;
     double lastReportSeconds = 0.0;
+    // The pedals' own `rumble` attribute, if a set with motors is plugged in. **A different device
+    // from the wheel base**, with its own USB identity, so it is searched for rather than derived
+    // from the wheel's node the way `range` and the tuning menu are.
+    std::filesystem::path pedalRumble;
+    int pedalMotors = noDevice;
 #endif
 
 public:
@@ -86,6 +91,7 @@ public:
 
     [[nodiscard]] std::expected<DeviceSample, std::string> read(std::chrono::milliseconds timeout) override;
     [[nodiscard]] std::expected<void, std::string> writeTorque(double torqueFraction) override;
+    [[nodiscard]] std::expected<void, std::string> writePedalMotors(std::uint8_t throttle, std::uint8_t brake) override;
 
     [[nodiscard]] DeviceCapabilities capabilities() const override
     {
@@ -198,6 +204,55 @@ template <class T> [[nodiscard]] bool control(const int fileDescriptor, const un
     {
         return 0.0;
     }
+}
+
+// Where a pedal set with vibration motors hangs its control, if one is attached.
+//
+// **Searched for across every HID device rather than derived from the wheel's**, because the pedals
+// are not necessarily the wheel: a ClubSport V3 set on USB has its own identity (0EB7:183b) and
+// `hid-fanatec` creates the attribute on *that* device. Plugged into a ClubSport V2.5 base's RJ12
+// instead — which is the usual way, and how a rig arrives out of the box — the pedals are axes on
+// the base, and the patched driver hangs a `rumble` on the *base* (0EB7:0004) that forwards to them
+// with the pedal sub-report forced. An unpatched driver creates no attribute there, which is not a
+// failure to report so much as a rig that has not been wired for this.
+[[nodiscard]] std::filesystem::path findPedalRumble()
+{
+    // **The identity is checked and not merely the attribute's presence.** `hid-fanatec` creates a
+    // `rumble` file for the CSL Elite *wheel base* as well, where it drives something that is not a
+    // pedal — the driver sends a different sub-report for the two — so a search that took the first
+    // node it found would, on that base, quietly write pedal cues into the wheel. The V2.5 base is
+    // the one base whose rumble *is* the pedals (it has no motor of its own, and the patched driver
+    // forces the pedal sub-report for it), and the pedals' own identity still wins over it so a set
+    // rewired to USB keeps its direct path.
+    constexpr auto clubsportPedalsV3 = std::string_view("0EB7:183B");
+    constexpr auto clubsportV25Base = std::string_view("0EB7:0004");
+
+    auto code = std::error_code();
+    const auto devices = std::filesystem::path("/sys/bus/hid/devices");
+
+    auto viaBase = std::filesystem::path();
+    for (const auto& entry : std::filesystem::directory_iterator(devices, code))
+    {
+        const auto name = entry.path().filename().string();
+        const auto ownIdentity = name.find(clubsportPedalsV3) != std::string::npos;
+        if (!ownIdentity && name.find(clubsportV25Base) == std::string::npos)
+        {
+            continue;
+        }
+
+        auto candidate = entry.path() / "rumble";
+        if (!std::filesystem::exists(candidate, code))
+        {
+            continue;
+        }
+        if (ownIdentity)
+        {
+            return candidate;
+        }
+        viaBase = candidate;
+    }
+
+    return viaBase;
 }
 
 // /sys/class/input/eventN/device/device is the HID device the node belongs to, which is where the
@@ -485,6 +540,22 @@ std::expected<DeviceDescription, std::string> EvdevInputBackend::open(const Devi
         sysfs = sysfsForNode(node).string();
         transportHz = transportCeiling(sysfs);
 
+        // The pedals, if a set with motors in it is attached. **Opened here and not lazily**,
+        // because whether the capability is there has to be settled before anything asks: a caller
+        // that discovers it mid-session would start a cue in the middle of a corner.
+        pedalRumble = findPedalRumble();
+        pedalMotors = noDevice;
+
+        if (!pedalRumble.empty())
+        {
+            pedalMotors = ::open(pedalRumble.c_str(), O_WRONLY | O_CLOEXEC);
+
+            if (pedalMotors != noDevice)
+            {
+                deviceCapabilities.add(DeviceCapability::PedalMotors);
+            }
+        }
+
         // Whatever the axes are resting at is what the first sample says, so a profile seeded from
         // it is seeded from the device at rest rather than from zeroes.
         for (auto index = std::size_t{0}; index < inputAxisCount; index++)
@@ -525,6 +596,20 @@ void EvdevInputBackend::close()
         static_cast<void>(control(device, EVIOCRMFF, &identifier));
         effect = -1;
     }
+
+    // **Silence before letting go, and this is not tidiness.** A torque settles when the writes stop
+    // because the effect is removed with the device; an eccentric mass does not — it keeps turning
+    // until something tells it nought. A pedal left buzzing after the game exits is a rig the driver
+    // has to unplug.
+    if (pedalMotors != noDevice)
+    {
+        static_cast<void>(::lseek(pedalMotors, 0, SEEK_SET));
+        static_cast<void>(::write(pedalMotors, "0", 1));
+        ::close(pedalMotors);
+        pedalMotors = noDevice;
+    }
+
+    pedalRumble.clear();
 
     ::close(device);
     device = noDevice;
@@ -670,6 +755,41 @@ std::expected<double, std::string> EvdevInputBackend::setRotationRange(const dou
     const auto confirmed = readNumericAttribute(std::filesystem::path(sysfs) / "range");
 
     return confirmed > 0.0 ? confirmed : static_cast<double>(asked);
+}
+
+std::expected<void, std::string> EvdevInputBackend::writePedalMotors(const std::uint8_t throttle,
+                                                                     const std::uint8_t brake)
+{
+    if (!deviceCapabilities.has(DeviceCapability::PedalMotors) || pedalMotors == noDevice)
+    {
+        return std::unexpected("no pedal motors are attached");
+    }
+
+    // Throttle in the high byte, brake in the middle, as the driver's own documentation states it.
+    // Written in decimal because `ftec_rumble_store` parses with base 0, which accepts either, and
+    // decimal cannot be misread.
+    const auto word = (static_cast<std::uint32_t>(throttle) << 16) | (static_cast<std::uint32_t>(brake) << 8);
+    const auto text = std::to_string(word);
+
+    // A sysfs attribute is rewritten from the start every time rather than appended to.
+    if (::lseek(pedalMotors, 0, SEEK_SET) < 0)
+    {
+        return std::unexpected("the pedals' control could not be rewound");
+    }
+
+    if (::write(pedalMotors, text.c_str(), text.size()) < 0)
+    {
+        // The pedals are a separate device and can be unplugged while the wheel keeps working, so
+        // this is a normal thing to happen rather than an error to carry on through. Dropping the
+        // capability is what stops the caller asking again every frame for the rest of the session.
+        ::close(pedalMotors);
+        pedalMotors = noDevice;
+        deviceCapabilities.remove(DeviceCapability::PedalMotors);
+
+        return std::unexpected("the pedals stopped taking vibration and have been let go");
+    }
+
+    return {};
 }
 
 std::expected<void, std::string> EvdevInputBackend::writeTorque(const double torqueFraction)

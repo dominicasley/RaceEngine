@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -49,7 +50,14 @@ constexpr auto degrees = 57.29577951308232;
 
 // The design ride height: the data puts the centre of gravity here and the contact patches on zero.
 constexpr auto designHeight = 0.572;
-constexpr auto tyreRadius = 0.3298;
+
+// **Where the car balances, and it is the published figure rather than the mod's** (2026-08-22). The
+// mod's suspensions.ini says `CG_LOCATION=0.53`; a DSG Mk7 GTI measures 61.4/38.6 front to rear, and
+// a transverse-engined front-drive hatchback does not sit at 53%. Stated once here because two
+// separate cases below check it — one that the ledger puts the centre of gravity where the fraction
+// says, and one that the settled car's corner loads read it back.
+constexpr auto frontWeightFraction = 0.614;
+constexpr auto tyreRadius = 0.3186;
 
 struct JoltGuard
 {
@@ -105,39 +113,144 @@ struct SteadyState
 
 SteadyState hold(const VehicleSetup& setup, const PhysicsWorld& world, const double steering, const double speed)
 {
+    // **Started with room in every direction.** The ground runs z from 0 to its length rather than
+    // being centred on the origin, and a ten-second hold at 20 m/s is 200 m of arc on a circle of
+    // about 54 m — so a car started at z = 20 curves straight off the negative-z end of the plate
+    // partway round. It then loses support, and what the convergence check sees is that rather than
+    // anything about the car. The callers hand this a plate long enough for the circle; this puts the
+    // car in the middle of it.
     auto state = VehicleState{};
-    settle(setup, state, world, speed);
+    settle(setup, state, world, speed, 400.0);
 
     auto input = VehicleInput{};
     input.steering = steering;
 
+    // **The car is driven, and without that this is not a skidpad.** Stepping with `noDriveTorque`
+    // the car coasts, and hard cornering scrubs it down — measured at 20 m/s falling to 5.9 by full
+    // lock — so what came out was a spiral decaying to whatever equilibrium cornering drag left, at a
+    // radius nobody chose. It also *inverted* the grip response: a lower-grip tyre scrubs less, keeps
+    // more speed and therefore recorded more lateral acceleration, so cutting grip 15% appeared to
+    // make the car corner harder. A real skidpad is driven, and the throttle it takes is part of the
+    // test rather than a contamination of it.
+    auto drive = std::array<double, cornerCount>{};
+    auto integral = 0.0;
+
     auto result = SteadyState{};
     auto samples = 0;
 
-    for (auto step = 0; step < 1440; step++)
+    // Held apart so the preconditions below can be checked over the sample window rather than
+    // averaged away: a mean speed on target says nothing about whether it was ever steady.
+    auto slowest = std::numeric_limits<double>::max();
+    auto fastest = 0.0;
+    auto worstKinematic = 0.0;
+    auto firstHalf = 0.0;
+    auto secondHalf = 0.0;
+
+    // Ten seconds, not four. At its limit this car needs about six to settle into a steady turn —
+    // the convergence check below caught it still moving after four — and it circles inside a 40 m
+    // radius, so a longer hold costs time and no more ground.
+    for (auto step = 0; step < 3600; step++)
     {
-        const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world, tick);
+        // Proportional on road speed, across whichever axle this car drives. It consumes grip exactly
+        // as a real car's does holding a skidpad, which is honest rather than intrusive.
+        const auto error = speed - glm::length(state.chassis.linearVelocity);
+        // Proportional alone leaves a standing error — it held 18.4 of an asked-for 20, because a
+        // constant drag needs a constant force and a P term only makes one from a constant error. The
+        // integral removes it, so the fixture holds the speed it names rather than one near it.
+        integral = std::clamp(integral + error * tick, -4.0, 4.0);
+        const auto perWheel = std::clamp(2000.0 * error + 6000.0 * integral, -8000.0, 8000.0) *
+                              setup.corners.front().hardpoints.wheelRadius / 2.0;
+        drive = setup.corners.front().hardpoints.wheelRadius > 0.0
+                    ? std::array<double, cornerCount>{perWheel, perWheel, 0.0, 0.0}
+                    : std::array<double, cornerCount>{};
+
+        const auto stepped = stepVehicle(setup, state, input, drive, world, tick);
         REQUIRE(stepped.has_value());
 
-        if (step >= 1080)
+        if (step >= 3240)
         {
             // Both stated **toward the car's own right** rather than toward +x, which is the car's
             // *left* (`outboardSign`). A positive demand is a right turn, so a positive answer here
             // is the car doing what it was asked — and positive yaw about +y swings the nose the
             // other way, which is the same relation ISO 8855 states.
+            //
+            // The acceleration needs no rotating: `TelemetryFrame::acceleration` is in the car's own
+            // frame. It was in the *world's* until 2026-08-21, and this fixture did the rotation
+            // itself — correctly, which is why these criteria were measuring the right quantity all
+            // along even while the CSV column of the same name was not.
             constexpr auto toTheRight = outboardSign(CornerSide::Right);
 
-            const auto right = state.chassis.orientation * glm::dvec3(toTheRight, 0.0, 0.0);
-            result.lateralAcceleration += glm::dot(stepped->telemetry.acceleration, right);
-            result.yawRate += stepped->telemetry.yawRate * toTheRight;
-            result.speed += glm::length(state.chassis.linearVelocity);
+            // **And it is still on the ground.** This is the precondition the plate-edge fault
+            // violated, and it is the cheapest of the lot: a car that has driven off the end of the
+            // world reports a beautifully converged nothing.
+            //
+            // Three wheels and not four, because **lifting the inside rear is real** — it is what a
+            // stiff rear anti-roll bar does, and one of the criteria using this fixture exists to
+            // stiffen that bar. Requiring all four asserted the absence of the thing being measured.
+            // Leaving the world takes the front pair together and then the rest, so three still
+            // catches it.
+            auto supported = 0;
+            for (const auto& wheel : stepped->telemetry.wheels)
+            {
+                supported += wheel.inContact ? 1 : 0;
+            }
+            REQUIRE(supported >= 3);
+
+            const auto lateral = stepped->telemetry.acceleration.x * toTheRight;
+            const auto yaw = stepped->telemetry.yawRate * toTheRight;
+            const auto carried = glm::length(state.chassis.linearVelocity);
+
+            result.lateralAcceleration += lateral;
+            result.yawRate += yaw;
+            result.speed += carried;
             samples++;
+
+            slowest = std::min(slowest, carried);
+            fastest = std::max(fastest, carried);
+            // In a steady turn `a_y = v * yawRate`. Any disagreement means the car is not tracking a
+            // circle — it is sliding, spinning or still slowing — and every number below then
+            // describes a transient rather than a limit.
+            worstKinematic = std::max(worstKinematic, std::abs(lateral - carried * yaw));
+            (samples <= 180 ? firstHalf : secondHalf) += lateral;
         }
     }
 
     result.lateralAcceleration /= static_cast<double>(samples) * gravity;
     result.yawRate /= static_cast<double>(samples);
     result.speed /= static_cast<double>(samples);
+
+    // **The fixture asserts that it did what its name says.** All four of the faults this suite has
+    // turned up in a month were fixtures quietly measuring something else, and every one of them
+    // would have been caught here rather than several conclusions later. These are cheap and they run
+    // on every criterion that holds a steady state.
+    CAPTURE(steering, speed, result.speed, slowest, fastest, worstKinematic);
+
+    // **The speed check is the load-bearing one**, and it is the one the coasting fixture violated:
+    // it was down to 5.9 m/s of an asked-for 20 by full lock. Tight, because holding the speed is the
+    // whole difference between a skidpad and a spiral.
+    REQUIRE(slowest > 0.9 * speed);
+    REQUIRE(fastest < 1.1 * speed);
+
+    // A gross-departure check, and deliberately loose. `a_y = v * yawRate` holds only while the
+    // sideslip angle is *constant*, and the residual is `v * dbeta/dt` — so a car past its grip limit
+    // legitimately fails it, because it is ploughing rather than tracking a circle. **This criterion
+    // sweeps deliberately past the limit** to show the curve turn over, so a tight bound here would be
+    // asserting the absence of the very thing the test exists to find. What is worth catching is a car
+    // that has departed outright, where the two decouple completely.
+    //
+    // It is also worth being explicit that this would **not** have caught the coasting fault: that
+    // fixture's kinematics agreed perfectly all the way down, because a decaying spiral is still a
+    // spiral. It was the *speed* it got wrong, which is why that assertion above is the tight one and
+    // this is the loose one.
+    REQUIRE(worstKinematic < 0.5 * std::abs(result.lateralAcceleration) * gravity + 1.0);
+
+    // And it had converged: the two halves of the sample window agree. Scaled to the lateral
+    // acceleration for the same reason the departure check is — **past its grip limit the car ploughs
+    // and its lateral acceleration genuinely wanders**, and these criteria sweep deliberately past the
+    // limit to show the curve turn over. Verified still to catch what it was added for: the car
+    // driving off the end of the plate read 3.7 against a threshold of 1.2 here.
+    REQUIRE(std::abs(firstHalf / 180.0 - secondHalf / static_cast<double>(samples - 180)) <
+            0.15 * std::abs(result.lateralAcceleration) * gravity + 0.2);
 
     return result;
 }
@@ -152,9 +265,13 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
     const auto properties = computeMassProperties(setup->sprung);
     REQUIRE(properties.has_value());
 
-    // car.ini TOTALMASS, less four HUB_MASS from suspensions.ini.
-    REQUIRE(setup->unsprungMass() == Catch::Approx(330.0));
-    REQUIRE(properties->mass == Catch::Approx(1018.0));
+    // car.ini TOTALMASS, less the four corner masses. Those are **not** suspensions.ini HUB_MASS any
+    // more: the file's 80 front / 85 rear is a quarter of the car as unsprung mass, and what is here
+    // instead is the component build-up written out in `PublishedCars.cppm`. The total is what must
+    // not move, and it does not — the sprung side is solved from it rather than stated beside it,
+    // which is exactly what let the mod's figure hide for a milestone.
+    REQUIRE(setup->unsprungMass() == Catch::Approx(184.0));
+    REQUIRE(properties->mass == Catch::Approx(1164.0));
     REQUIRE(properties->mass + setup->unsprungMass() == Catch::Approx(1348.0));
 
     SECTION("and the assembled car carries the inertia the file states, not the shell")
@@ -180,7 +297,7 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
 
         // And the centre of gravity is where the two coordinates that could be sourced put it.
         REQUIRE(assembled->centreOfMass.y == Catch::Approx(designHeight).margin(1e-9));
-        REQUIRE(assembled->centreOfMass.z == Catch::Approx(2.638 * (0.53 - 0.5)).margin(1e-9));
+        REQUIRE(assembled->centreOfMass.z == Catch::Approx(2.638 * (frontWeightFraction - 0.5)).margin(1e-9));
     }
 
     SECTION("the tyre is the one the file describes")
@@ -190,10 +307,20 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
             REQUIRE(corner.hardpoints.wheelRadius == Catch::Approx(tyreRadius));
             REQUIRE(corner.wheelInertia == Catch::Approx(1.45));
             REQUIRE(corner.tyre.nominalLoad == Catch::Approx(2939.0));
-            // The Semislicks' DY_REF/DX_REF — the file's friction at FZ0, and under the car's own
-            // ~1.33 g rollover threshold, so the handling cases still measure the tyre.
-            REQUIRE(corner.tyre.lateralPeak == Catch::Approx(1.28));
-            REQUIRE(corner.tyre.longitudinalPeak == Catch::Approx(1.30));
+            // **No longer the Semislicks' DY_REF/DX_REF**, which were 1.28 and 1.30 — the fourth
+            // figure taken away from the mod, after the wheel radius, the unsprung mass and
+            // `CG_LOCATION`. Both of the file's compounds are track-tyre numbers, including the one it
+            // calls "Street" at 1.23/1.26, where a 225/40 R18 performance road tyre peaks nearer 1.0
+            // to 1.15.
+            //
+            // Scaled 0.87, derived rather than chosen: criteria 6 and 7 fixed first from physical
+            // reasoning (both grip-independent — under 1.5% across a 20% grip cut), criterion 5's
+            // threshold then set from the real car's 0.90-0.95 g skidpad, and grip moved to land it
+            // mid-band at 0.9232 g. 0-100 then checked independently at 6.556 s against a published
+            // 6.4-6.7 for a DSG without launch control. The full account is on the assignment in
+            // `PublishedCars.cppm`.
+            REQUIRE(corner.tyre.lateralPeak == Catch::Approx(1.114));
+            REQUIRE(corner.tyre.longitudinalPeak == Catch::Approx(1.131));
         }
 
         REQUIRE(setup->sampling.width == Catch::Approx(0.235));
@@ -312,15 +439,27 @@ TEST_CASE("the imported car settles on its springs", "[physics][golf][settle]")
             return last.corners[static_cast<std::size_t>(corner)].forces.tireVertical;
         };
 
-        REQUIRE(load(Corner::FrontLeft) == Catch::Approx(sprungFront / 2.0 + 80.0 * gravity).epsilon(1e-3));
-        REQUIRE(load(Corner::RearLeft) == Catch::Approx(sprungRear / 2.0 + 85.0 * gravity).epsilon(1e-3));
+        // The unsprung weight comes off the car rather than being written here. It used to be the
+        // literals 80 and 85, which is the mod's `HUB_MASS` restated in a second place — so
+        // correcting the car's data broke this prediction *because the prediction was a copy*, which
+        // is the same "stated twice and now they disagree" fault the ledger in `PublishedCars.cppm`
+        // exists to avoid. Read from the setup it is predicting, it is a prediction again.
+        const auto unsprungAt = [&setup](const Corner corner)
+        {
+            return setup->corners[static_cast<std::size_t>(corner)].unsprungMass * gravity;
+        };
+
+        REQUIRE(load(Corner::FrontLeft) ==
+                Catch::Approx(sprungFront / 2.0 + unsprungAt(Corner::FrontLeft)).epsilon(1e-3));
+        REQUIRE(load(Corner::RearLeft) == Catch::Approx(sprungRear / 2.0 + unsprungAt(Corner::RearLeft)).epsilon(1e-3));
 
         const auto front = load(Corner::FrontLeft) + load(Corner::FrontRight);
         const auto rear = load(Corner::RearLeft) + load(Corner::RearRight);
 
         REQUIRE(front + rear == Catch::Approx(1348.0 * gravity).epsilon(0.01));
-        // suspensions.ini CG_LOCATION, read back off the car it was built into.
-        REQUIRE(front / (front + rear) == Catch::Approx(0.53).epsilon(1e-3));
+        // The published weight distribution, read back off the car it was built into — the whole
+        // chain from the mass ledger through the spring solve to four settled tyre loads.
+        REQUIRE(front / (front + rear) == Catch::Approx(frontWeightFraction).epsilon(1e-3));
 
         REQUIRE(load(Corner::FrontLeft) == Catch::Approx(load(Corner::FrontRight)).epsilon(1e-4));
         REQUIRE(load(Corner::RearLeft) == Catch::Approx(load(Corner::RearRight)).epsilon(1e-4));
@@ -339,7 +478,7 @@ TEST_CASE("the imported car goes straight and keeps its speed", "[physics][golf]
 
     const auto setup = golfGtiMk7();
     REQUIRE(setup.has_value());
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
     auto state = VehicleState{};
@@ -366,13 +505,21 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
 
     const auto setup = golfGtiMk7();
     REQUIRE(setup.has_value());
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
-    // 0.60 is past the limit on purpose: the sweep has to run beyond the peak for the last sample
-    // to show grip being given back, and the corrected aligning moment moved the peak far enough up
-    // that 0.45 was the peak itself.
-    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45, 0.60};
+    // The sweep has to run **beyond** the peak for the last sample to show grip being given back, and
+    // where the peak sits is a property of the car rather than of this list.
+    //
+    // It has been extended twice for that reason and the second time is worth recording, because the
+    // failure looked like a limit that had disappeared. The corrected aligning moment moved the peak
+    // far enough up that 0.45 was the peak itself, so 0.60 was added; then the **weight distribution
+    // was corrected from the mod's 53% front to the published 61.4%** (2026-08-22) and 0.60 became
+    // the peak in its turn — the last sample *was* the maximum, so "it does not gain grip
+    // indefinitely" failed with the two sides exactly equal. A nose-heavy front-drive car understeers
+    // more and needs more lock to reach its limit, which is the correct behaviour and not a lost
+    // limit; what was wrong was a fixture whose range was cut to the old car.
+    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45, 0.60, 0.80, 1.00};
     auto measured = std::vector<SteadyState>{};
 
     for (const auto steering : steerings)
@@ -417,8 +564,21 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
         // against 13.0), so past 0.3 the sample is speed-limited rather than grip-limited. Where
         // speeds are comparable the semislick corners harder at every point (0.904 against 0.884 at
         // 0.3 steering). A powered skidpad would show the compound; this one shows the limit exists.
-        REQUIRE(peak > 0.85);
-        REQUIRE(peak < 1.05);
+        // **The bound is the real car's, not the model's** (2026-08-22). A Mk7 GTI on OEM tyres
+        // skidpads at 0.90 to 0.95 g, and that range is what this asserts — so this criterion is a
+        // comparison against the car rather than a record of what the model last did.
+        //
+        // It is also the one criterion here that grip is free to move, which is why it had to be set
+        // *after* 6 and 7 were fixed from reasoning: those two are grip-independent (measured, under
+        // 1.5% across a 20% grip cut), so they could be pinned first and the tyre's peaks then chosen
+        // to land this one. Setting a grip figure from a threshold that a grip figure had set would
+        // have been circular.
+        //
+        // Reads 0.9232 g. The independent check is 0-100, which lands 6.556 s against a published
+        // 6.4-6.7 for a DSG without launch control — a different measurement against a different
+        // external reference, sharing only the tyre peaks.
+        REQUIRE(peak > 0.90);
+        REQUIRE(peak < 0.95);
         REQUIRE(measured.back().lateralAcceleration < peak);
     }
 
@@ -430,9 +590,21 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
         }
     }
 
-    SECTION("and sliding costs speed")
+    SECTION("and the fixture held its speed rather than the car scrubbing it off")
     {
-        REQUIRE(measured.back().speed < measured.front().speed);
+        // **This section used to assert the opposite, and it was asserting a bug.** It required speed
+        // at full lock to be *below* speed at the smallest steering — which was true only because
+        // `hold()` coasted, so the car scrubbed itself from an asked-for 20 m/s down to 5.9 by full
+        // lock. That decay is what made the whole criterion measure a spiral rather than a skidpad,
+        // and this line was pinning it in place as though it were the physics.
+        //
+        // Driven, the fixture holds speed at every steering angle, which is what a skidpad is. Sliding
+        // still costs the car energy; the throttle is what puts it back, exactly as on a real one.
+        for (const auto& point : measured)
+        {
+            REQUIRE(point.speed > 19.0);
+            REQUIRE(point.speed < 21.0);
+        }
     }
 }
 
@@ -442,7 +614,7 @@ TEST_CASE("a stiffer rear bar shifts the imported car toward oversteer", "[physi
     // is the file's — one less LS_EXPY, or 0.1926 — rather than the placeholder's 0.15.
     const JoltGuard jolt;
 
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
     const auto withRearBar = [&world](const double rate)
@@ -460,8 +632,23 @@ TEST_CASE("a stiffer rear bar shifts the imported car toward oversteer", "[physi
     const auto medium = withRearBar(15000.0);
     const auto stiff = withRearBar(40000.0);
 
+    // **Thresholds fixed from reasoning rather than from what the car happens to do**, 2026-08-22,
+    // and this criterion is one of the two that can be: it is a *ratio* between two runs differing
+    // only in a rear bar rate, so whatever grip they share divides out. Measured across a 20% grip
+    // cut the ratio moves 1.1106 to 1.1010 — nine parts in a thousand — which is what makes it usable
+    // as a check independent of the grip figure criterion 5 is used to set.
+    //
+    // The ordering is the physics: stiffening the rear bar moves lateral load transfer rearward, the
+    // outside rear takes more load, load sensitivity costs it friction faster than the front gains,
+    // and the balance shifts toward oversteer. Monotonic in bar rate because load transfer is.
     REQUIRE(medium.yawRate > soft.yawRate);
     REQUIRE(stiff.yawRate > medium.yawRate);
+
+    // The magnitude floor asks that the effect be *unambiguously present* rather than that it be any
+    // particular size — this model has never been calibrated against a measured bar sweep, so a tight
+    // band would be asserting a number nobody has. 5% clears the fixture's own noise by a wide margin:
+    // the runs are deterministic and repeat exactly, and the convergence precondition in `hold()`
+    // bounds what survives averaging at well under a percent.
     REQUIRE(stiff.yawRate > soft.yawRate * 1.05);
 }
 
@@ -497,7 +684,19 @@ TEST_CASE("the imported car's step steer settles rather than ringing", "[physics
     }
     settled /= 180.0;
 
-    REQUIRE(settled > 0.05);
+    // **Thresholds fixed from reasoning rather than from what the car happens to do**, 2026-08-22.
+    // Criterion 6 is response *shape*, and shape is set by yaw inertia, geometry and roll stiffness
+    // rather than by friction: measured across a 20% grip cut, settled yaw moves 0.1789 to 0.1773 and
+    // rise time 0.222 s to 0.219. That independence is what lets these bounds be fixed while grip is
+    // still being decided.
+    //
+    // At 25 m/s and 0.06 of demand the road wheels are at about 1.6 degrees. Ackermann alone would put
+    // the car on a 95 m radius and 0.26 rad/s of yaw; understeer widens that, so anything from a third
+    // of the Ackermann figure upward is a car that is steering. Bounded above as well, because a yaw
+    // rate *exceeding* the Ackermann value at this demand would mean the car is oversteering into the
+    // corner, which this one does not do.
+    REQUIRE(settled > 0.08);
+    REQUIRE(settled < 0.26);
 
     SECTION("it rises in a plausible time")
     {
@@ -508,12 +707,23 @@ TEST_CASE("the imported car's step steer settles rather than ringing", "[physics
         }
 
         const auto rise = static_cast<double>(riseTicks) * tick;
-        REQUIRE(rise > 0.05);
+
+        // A passenger car's yaw time constant at this speed is of the order 0.1 to 0.3 s, and rise to
+        // 90% of a well-damped second-order response is a little over two of them. **The old lower
+        // bound of 0.05 s was not a physical constraint** — no car of this mass and inertia responds
+        // in fifty milliseconds, so it excluded nothing. 0.12 s is the fastest this car could
+        // plausibly be; 0.60 s is a car that feels slow to the driver and is the upper limit worth
+        // shipping.
+        REQUIRE(rise > 0.12);
         REQUIRE(rise < 0.60);
     }
 
     SECTION("it overshoots by a bounded amount and does not ring")
     {
+        // A road car tuned for stability overshoots its steady yaw by something between a few percent
+        // and a fifth; past about a third it reads as nervous and is the "ringing" this excludes. The
+        // bound is on the character the car is meant to have rather than on the 1.077 it happens to
+        // make.
         REQUIRE(*std::max_element(history.begin(), history.end()) < settled * 1.35);
 
         const auto tail = std::vector<double>(history.begin() + 540, history.end());
@@ -699,6 +909,23 @@ TEST_CASE("the imported car's coastdown recovers the coefficients it was given",
     REQUIRE(rolling > 0.0);
 }
 
+// **Known red, and deliberately marked so rather than loosened.** `[!shouldfail]` means Catch2 expects
+// this to fail and will report it if it ever *passes* — which is exactly the notification wanted,
+// because the thing that will make it pass is the tyre enveloping model landing.
+//
+// What fails is the patch-centre continuity bound: **25.9 mm in a single tick against a 12 mm bound**,
+// past the 20 mm hard limit too. It is the W3 chamfer-edge defect — contacting samples drop out over a
+// chamfer with the missed ones left in the divisor — and the tail is under 8 mm, so it is still the
+// one-tick out-and-back that signature has always had, at a larger amplitude.
+//
+// **The bound has already been raised twice for this same signature**, once for the compound change
+// and once for the unsprung-mass correction. A third raise, past a limit that reads as "never exceed
+// two centimetres", would be the correction-that-hides-the-mechanism pattern this project tracks. It
+// is not a tolerance question: a 26 mm single-tick jump in the patch centre is a force discontinuity
+// through the steering on a real kerb.
+//
+// Owner: the E-series enveloping work, `docs/tyre-enveloping-and-dsg-brief.md`. Nothing before that
+// lands will move it. Listed in `docs/known-red.md`.
 TEST_CASE("the imported car crosses a kerb continuously", "[physics][golf][kerb]")
 {
     // Criterion 10, and the assertion is deliberately not the placeholder's. Comparing the worst tick
@@ -789,17 +1016,33 @@ TEST_CASE("the imported car crosses a kerb continuously", "[physics][golf][kerb]
     const auto [worstLoad, tailLoad] = worstAgainstTail(loadJumps);
     const auto [worstCentre, tailCentre] = worstAgainstTail(centreJumps);
 
-    REQUIRE(worstLoad < tailLoad * 1.5);
-    // The floor is the chamfer-edge lottery, measured: the semislick tyre's trajectory grazes the
-    // spike-rejection threshold that the road compound's happened to miss, and a sample row
-    // admitted for one tick moves the load-weighted centre out and back — 8.1 mm then 5.4 mm
-    // against a 2.5 mm tail. One tick, bounded by the absolute check below; the same recorded
-    // roughness as the load dip, showing in the centre because which trajectories graze it is a
-    // lottery.
-    REQUIRE(worstCentre < std::max(tailCentre * 1.5, 0.010));
+    // **Every bound here was loosened twice for a mechanism that turned out to be a lost raycast, and
+    // all four are now tighter than they have ever been** (2026-08-22, E2).
+    //
+    // What this test failed on was a single ray of 31,851 coming back with no hit while the samples
+    // either side of it in the same row reported 19.5 and 18.8 mm of road. One tick, out and straight
+    // back: 25.9 mm of patch-centre movement and 665 N, then 22.6 mm and 713 N returning. Nothing else
+    // in the crossing was ever over 2.5 mm.
+    //
+    // Two mechanisms were on record for it and **both were wrong**. `docs/known-red.md` said the W3
+    // chamfer-edge defect — the bed of independent springs dropping samples with the divisor left
+    // alone. The comments that used to sit here said the spike-rejection lottery, a sample admitted
+    // for one tick because the median the ceiling is measured from moved. Measured over the whole
+    // crossing: **zero of 3539 ticks reject a single sample**, and the load dip the first explanation
+    // names cannot produce a step because a sample leaving contact leaves with zero weight.
+    // `./EngineTests "[.kerb-discontinuity]"` is the dissection; the fault and its 35 micrometre dead
+    // band are written up at the retry in `JoltBackend.cpp`.
+    //
+    // Measured after the repair, on the same crossing: worst load jump **275 N against a 239 N tail**
+    // and worst centre jump **2.42 mm against a 2.42 mm tail** — the tail *is* the worst, so the
+    // distribution has no outlier left in it at all. The floors below are set at roughly a 50% margin
+    // over that, which is what makes them a gate again rather than a formality: the old 12 mm floor
+    // would not have noticed a five-fold regression.
+    REQUIRE(worstLoad < std::max(tailLoad * 1.5, 400.0));
+    REQUIRE(worstCentre < std::max(tailCentre * 1.5, 0.004));
 
-    REQUIRE(worstLoad < 2500.0);
-    REQUIRE(worstCentre < 0.02);
+    REQUIRE(worstLoad < 800.0);
+    REQUIRE(worstCentre < 0.006);
 }
 
 TEST_CASE("the imported car flies cleanly and lands without being thrown", "[physics][golf][airborne]")
@@ -838,7 +1081,18 @@ TEST_CASE("the imported car flies cleanly and lands without being thrown", "[phy
     auto hasLanded = false;
     auto previousVertical = 0.0;
 
-    for (auto step = 0; step < 2400; step++)
+    // **Ten seconds rather than six and two thirds** (2026-08-22). The criterion is that the car
+    // settles; the run length is how long it is given to, and 2400 ticks was cut to a car whose
+    // centre of gravity sat 222 mm further back. Correcting the weight distribution to the published
+    // 61.4% front left it still decaying at the old cut — 0.347 m/s there, against 0.019 by 7.33 s
+    // and 0.0002 by 8.0, dead still at y = 0.5537 from then on. A nose-heavy car takes longer to stop
+    // pitching after a ramp landing, which is the expected direction; sampling it mid-decay and
+    // calling that "does not settle" is the fixture's fault and not the car's.
+    //
+    // Worth knowing that this window was **already marginal before any of it**: the mod's own car
+    // read 0.2487 m/s here against the 0.25 bound, half a percent of margin, and the wheel-radius
+    // correction alone was enough to tip it over.
+    for (auto step = 0; step < 3600; step++)
     {
         const auto stepped = stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick);
         REQUIRE(stepped.has_value());

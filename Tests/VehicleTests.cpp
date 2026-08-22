@@ -14,6 +14,7 @@ using raceengine::Corner;
 using raceengine::cornerCount;
 using raceengine::Curve;
 using raceengine::generateProvingGround;
+using raceengine::golfGtiMk7;
 using raceengine::linearDamper;
 using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
@@ -287,5 +288,187 @@ TEST_CASE("the vehicle tick is pure and deterministic", "[physics][vehicle][dete
         drive(restored, 200);
 
         REQUIRE(std::memcmp(&first, &restored, sizeof(VehicleState)) == 0);
+    }
+}
+
+TEST_CASE("ride height is the floor's clearance, per corner, with rake recoverable", "[physics][vehicle][rideheight]")
+{
+    // **The seam an aero map will be looked up against, made correct before anything is built on
+    // it.** What was here before computed `chassis.position.y - patch.centre.y`, averaged it over
+    // four corners and threw it away — the centre of mass rather than the floor, a world-vertical
+    // drop rather than a clearance, and one scalar where rake needs two.
+    //
+    // Nothing consumes it yet. That is what makes now the time to fix it: a wrong seam is worse
+    // than an absent one, and it is free to move while it has no consumers.
+    const JoltGuard jolt;
+
+    auto descriptor = ProvingGroundDescriptor{};
+    descriptor.length = 400.0;
+    descriptor.width = 400.0;
+    descriptor.cellSize = 2.0;
+    descriptor.features = {};
+
+    const auto ground = generateProvingGround(descriptor);
+    REQUIRE(ground.has_value());
+    const auto world = PhysicsWorld::create(ground.value());
+    REQUIRE(world.has_value());
+
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+    const auto vehicle = built.value();
+
+    // Settled, on the level, doing nothing.
+    auto state = VehicleState{};
+    state.chassis.position = glm::dvec3(0.0, 0.52, 20.0);
+
+    auto settled = raceengine::VehicleStep{};
+    for (auto step = 0; step < 2160; step++)
+    {
+        const auto stepped = stepVehicle(vehicle, state, VehicleInput{}, noDriveTorque, world.value(), 1.0 / 360.0);
+        REQUIRE(stepped.has_value());
+        settled = stepped.value();
+    }
+
+    const auto& height = settled.rideHeight;
+    CAPTURE(height.corners[0], height.corners[1], height.corners[2], height.corners[3], height.front, height.rear,
+            height.rake, state.chassis.position.y);
+
+    SECTION("all four wheels are down and every corner is measured")
+    {
+        REQUIRE(height.grounded == cornerCount);
+    }
+
+    SECTION("it is a floor height and not a centre-of-mass height")
+    {
+        // The datum is the body box's underside, 0.15 m above the design contact plane, so a settled
+        // car reads a little under that. **The number this replaces read about 0.5** — the centre of
+        // mass — which is the failure that makes this case worth having: both are plausible-looking
+        // positive numbers and only one of them is a ride height.
+        for (const auto corner : height.corners)
+        {
+            REQUIRE(corner > 0.05);
+            REQUIRE(corner < 0.20);
+        }
+
+        // And it is nowhere near the centre of mass, which is what it used to be.
+        REQUIRE(height.front < 0.5 * state.chassis.position.y);
+    }
+
+    SECTION("the car is symmetric side to side and rake is recoverable")
+    {
+        REQUIRE(height.corners[0] == Catch::Approx(height.corners[1]).margin(1e-3));
+        REQUIRE(height.corners[2] == Catch::Approx(height.corners[3]).margin(1e-3));
+
+        REQUIRE(height.front == Catch::Approx(0.5 * (height.corners[0] + height.corners[1])));
+        REQUIRE(height.rear == Catch::Approx(0.5 * (height.corners[2] + height.corners[3])));
+        REQUIRE(height.rake == Catch::Approx(height.rear - height.front));
+    }
+
+    SECTION("and lowering one axle's springs moves that axle's height and the rake with it")
+    {
+        // The property that a single averaged scalar cannot have, and the whole reason this is four
+        // numbers: a change at one end has to show up at that end.
+        auto lowered = vehicle;
+        for (auto index = std::size_t{2}; index < cornerCount; index++)
+        {
+            lowered.corners[index].springRate *= 0.5;
+        }
+
+        auto soft = VehicleState{};
+        soft.chassis.position = glm::dvec3(0.0, 0.52, 20.0);
+
+        auto steppedSoft = raceengine::VehicleStep{};
+        for (auto step = 0; step < 2160; step++)
+        {
+            const auto stepped = stepVehicle(lowered, soft, VehicleInput{}, noDriveTorque, world.value(), 1.0 / 360.0);
+            REQUIRE(stepped.has_value());
+            steppedSoft = stepped.value();
+        }
+
+        CAPTURE(steppedSoft.rideHeight.front, steppedSoft.rideHeight.rear, steppedSoft.rideHeight.rake);
+
+        // Softer rear springs sit the back down under the same weight.
+        REQUIRE(steppedSoft.rideHeight.rear < height.rear - 1e-3);
+        // The front is left where it was...
+        REQUIRE(steppedSoft.rideHeight.front == Catch::Approx(height.front).margin(5e-3));
+        // ...so the rake has gone the other way, which is the number a map would read.
+        REQUIRE(steppedSoft.rideHeight.rake < height.rake - 1e-3);
+    }
+}
+
+TEST_CASE("the front axle's limit load is a fixed point, not a chosen manoeuvre", "[physics][vehicle][steering]")
+{
+    // `steeringLimitLoad` is what the power assist's whole placement is derived from, so what it
+    // claims has to hold: the outside front's load at the limit is the load at which the transfer it
+    // causes and the friction it costs agree with each other.
+    const auto built = raceengine::placeholderSedan();
+    REQUIRE(built.has_value());
+    const auto setup = built.value();
+
+    const auto loads = raceengine::steeringLimitLoad(setup);
+
+    REQUIRE(loads.staticPerWheel > 0.0);
+    REQUIRE(loads.outside > loads.staticPerWheel);
+
+    // Transfer moves load across the axle; it does not add any. This is the invariant that would
+    // catch the whole thing being computed as an axle load rather than a wheel one.
+    REQUIRE(loads.outside + loads.inside == Catch::Approx(2.0 * loads.staticPerWheel).epsilon(1e-9));
+
+    SECTION("and it really is the fixed point of the map it says it is")
+    {
+        // One more pass of the same recurrence must not move it. Written out here rather than
+        // trusting the loop count inside, because "converged" is exactly the sort of thing an
+        // iteration count is assumed to deliver and quietly does not.
+        auto mass = 0.0;
+        auto heightMoment = 0.0;
+        auto stationMoment = 0.0;
+
+        for (const auto& component : setup.sprung)
+        {
+            mass += component.mass;
+            heightMoment += component.mass * component.centre.y;
+            stationMoment += component.mass * component.centre.z;
+        }
+        for (const auto& corner : setup.corners)
+        {
+            mass += corner.unsprungMass;
+            heightMoment += corner.unsprungMass * corner.hardpoints.wheelCentre.y;
+            stationMoment += corner.unsprungMass * corner.hardpoints.wheelCentre.z;
+        }
+
+        const auto height = heightMoment / mass;
+        const auto station = stationMoment / mass;
+        const auto front = setup.corners[0].hardpoints.wheelCentre.z;
+        const auto rear = setup.corners[2].hardpoints.wheelCentre.z;
+        const auto track = 2.0 * std::abs(setup.corners[0].hardpoints.wheelCentre.x);
+        const auto frontMass = mass * (station - rear) / (front - rear);
+
+        const auto& tyre = setup.corners[0].tyre;
+        const auto friction = raceengine::tyreFriction(tyre, tyre.lateralPeak, loads.outside, 1.0);
+        const auto again = loads.staticPerWheel + friction * frontMass * 9.80665 * height / track;
+
+        REQUIRE(again == Catch::Approx(loads.outside).epsilon(1e-6));
+    }
+
+    SECTION("a car with a lower centre of gravity transfers less")
+    {
+        auto lowered = setup;
+        for (auto& component : lowered.sprung)
+        {
+            component.centre.y *= 0.5;
+        }
+
+        const auto low = raceengine::steeringLimitLoad(lowered);
+
+        REQUIRE(low.outside < loads.outside);
+        REQUIRE(low.inside > loads.inside);
+    }
+
+    SECTION("and a car with no mass at all reports nothing rather than dividing by it")
+    {
+        const auto empty = raceengine::steeringLimitLoad(raceengine::VehicleSetup{});
+
+        REQUIRE(empty.outside == 0.0);
+        REQUIRE(empty.staticPerWheel == 0.0);
     }
 }

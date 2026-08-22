@@ -29,6 +29,9 @@ export class RecordingInputBackend final : public IInputBackend
     std::atomic<std::int32_t> brake{65535};
     std::atomic<std::uint64_t> reports{0};
     std::atomic<double> lastTorque{0.0};
+    std::atomic<bool> motorsAttached{false};
+    std::atomic<std::uint32_t> lastMotors{0};
+    std::atomic<std::uint64_t> motorWrites{0};
 
 public:
     double rotationRangeAsked = 0.0;
@@ -157,6 +160,48 @@ public:
         lastTorque.store(torqueFraction);
 
         return {};
+    }
+
+    // Recorded rather than refused, so a test can assert on what the pedals were told. The two
+    // codes are packed into one atomic because they are written together and a reader that caught
+    // them half-updated would see a pair the game never sent.
+    [[nodiscard]] std::expected<void, std::string> writePedalMotors(const std::uint8_t throttleMotor,
+                                                                    const std::uint8_t brakeMotor) override
+    {
+        if (!isOpen.load())
+        {
+            return std::unexpected("no device is open");
+        }
+
+        if (!motorsAttached.load())
+        {
+            return std::unexpected("no pedal motors are attached");
+        }
+
+        lastMotors.store((static_cast<std::uint32_t>(throttleMotor) << 16) |
+                         (static_cast<std::uint32_t>(brakeMotor) << 8));
+        motorWrites.fetch_add(1);
+
+        return {};
+    }
+
+    // A rig whose pedals have motors, which is not the default: CSL Elite and CSL LC pedals are the
+    // same brand behind the same driver and have none.
+    void attachPedalMotors()
+    {
+        motorsAttached.store(true);
+        offered.add(DeviceCapability::PedalMotors);
+        description.capabilities = offered;
+    }
+
+    [[nodiscard]] std::uint32_t pedalMotorWord() const
+    {
+        return lastMotors.load();
+    }
+
+    [[nodiscard]] std::uint64_t pedalMotorWrites() const
+    {
+        return motorWrites.load();
     }
 
     [[nodiscard]] DeviceCapabilities capabilities() const override

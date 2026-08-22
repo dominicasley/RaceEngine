@@ -71,6 +71,27 @@ export struct WheelTelemetry
     double gripMultiplier = 1.0;
 
     bool inContact = false;
+
+    // How many of the contact patch's grid samples are actually touching, out of the grid the tyre
+    // is sampled on. `inContact` is this being non-zero; the count is the channel, because the two
+    // answer different questions and only the count answers the one that is open.
+    //
+    // **It is here to size a milestone rather than to plot a force.** The kerb-edge load dip is the
+    // spring bed collapsing where samples fall off a chamfer with the missed ones left in the
+    // divisor, and every measurement of it so far was taken on a synthetic probe against an analytic
+    // edge. Whether real driving enters that regime at all is a question about laps, not about
+    // probes, and this is the one integer that answers it.
+    std::uint32_t contactingSamples = 0;
+
+    // Deepest minus shallowest of those contacting samples, in metres. The count says *how much* of
+    // the patch is carrying; this says whether what it is carrying is **tilted**, and the pair is
+    // what separates a wheel loaded across a kerb chamfer from a wheel resting lightly on flat road.
+    //
+    // Both of those report a low `verticalLoad` today and only one of them should, so the count on
+    // its own selects the wrong ticks. `verticalLoad` cannot arbitrate because it is derived from
+    // the aggregate that the kerb case corrupts — the full argument is on
+    // `ContactPatch::depthSpread`, which is where this is taken from.
+    double patchDepthSpread = 0.0;
 };
 
 export struct TelemetryFrame
@@ -78,8 +99,16 @@ export struct TelemetryFrame
     double time = 0.0;
     std::uint64_t tick = 0;
 
+    // World frame, both of them: where the car is and how fast it is going over the ground.
     glm::dvec3 position{0.0};
     glm::dvec3 velocity{0.0};
+
+    // **The car's own frame**, and it was the world's until 2026-08-21. The CSV writes `.z` into
+    // `G Force Long` and `.x` into `G Force Lat`, which are body-frame roles — correct on a straight
+    // aimed along world +z, which is every fixture that has ever looked at them, and wrong almost
+    // everywhere on a circuit. Driven a quarter turn apart the same manoeuvre reported its
+    // longitudinal deceleration in the lateral column and back again: −6.44/−4.01 became
+    // +4.01/−6.44. Rotated here, at the one place that knows the attitude.
     glm::dvec3 acceleration{0.0};
 
     // Yaw, pitch and roll, and their rates. Held as Euler angles rather than as the chassis
@@ -92,9 +121,25 @@ export struct TelemetryFrame
     double pitchRate = 0.0;
     double rollRate = 0.0;
 
+    // The axle means off `VehicleStep::rideHeight`, in metres. **Computed since M1 and reaching no
+    // channel until now** — this file's own map claimed it was "computed and passed" and the second
+    // half of that was not true, which is exactly the kind of claim a column makes checkable. Zero
+    // with no corner touching, because there is then no road to measure from.
+    double rideHeightFront = 0.0;
+    double rideHeightRear = 0.0;
+
+    // The driver's demand, −1 to 1, dimensionless — and it stays that because that is what it is.
     double steering = 0.0;
+    // What the steering *wheel* is at, radians: the demand through this car's own lock-to-lock.
+    // Separate from the demand rather than replacing it, because the two answer different questions
+    // and conflating them is how the column below came to carry a demand in a field named degrees.
+    double steeringWheelAngle = 0.0;
     double throttle = 0.0;
     double brake = 0.0;
+    // Where the clutch pedal actually ended up, 0 engaged to 1 fully depressed — which is the
+    // auto-clutch's answer and not the driver's demand whenever nobody is on the pedal. Filled
+    // beside the driveline's other channels, from the state that owns it.
+    double clutch = 0.0;
     std::int32_t gear = 0;
     // Where the gearbox is between two gears, as `ShiftPhase`'s own order: 0 engaged, 1 disengaging,
     // 2 neutral, 3 engaging. A number rather than the enum because this partition names nothing it
@@ -234,7 +279,10 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
             "G Force Long [g],G Force Lat [g],G Force Vert [g],"
             "Yaw [deg],Pitch [deg],Roll [deg],"
             "Yaw Rate [deg/s],Pitch Rate [deg/s],Roll Rate [deg/s],"
-            "Steering Angle [deg],Throttle Pos [%],Brake Pos [%],Gear,Shift Phase [],Engine RPM [rpm],"
+            "Ride Height F [mm],Ride Height R [mm],"
+            "Steering Angle [deg],Steering Demand [],Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear,"
+            "Shift Phase [],"
+            "Engine RPM [rpm],"
             "Engine Torque [Nm],Clutch Torque [Nm],Clutch Slip [rad/s],Clutch Slip Energy [J]";
 
     for (auto corner = std::size_t{0}; corner < cornerCount; corner++)
@@ -253,6 +301,8 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
         text += ",Camber " + tag + " [deg]";
         text += ",Grip " + tag + " []";
         text += ",In Contact " + tag + " []";
+        text += ",Contact Samples " + tag + " []";
+        text += ",Patch Depth Spread " + tag + " [mm]";
     }
 
     text += "\n";
@@ -289,12 +339,26 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
             appendNumber(text, value * radiansToDegrees, 4);
         }
 
+        for (const auto value : {frame.rideHeightFront, frame.rideHeightRear})
+        {
+            text += ",";
+            appendNumber(text, value * 1000.0, 3);
+        }
+
+        // The rim's angle, and the demand beside it. Not the same number and no longer the same
+        // column: this one used to be `frame.steering * radiansToDegrees`, which is a dimensionless
+        // demand times a radians conversion, and printed 28.6 for a half-lock input on a car whose
+        // rim is at 189 degrees there.
         text += ",";
-        appendNumber(text, frame.steering * radiansToDegrees, 4);
+        appendNumber(text, frame.steeringWheelAngle * radiansToDegrees, 4);
+        text += ",";
+        appendNumber(text, frame.steering, 5);
         text += ",";
         appendNumber(text, frame.throttle * 100.0, 3);
         text += ",";
         appendNumber(text, frame.brake * 100.0, 3);
+        text += ",";
+        appendNumber(text, frame.clutch * 100.0, 3);
         text += ",";
         appendInteger(text, frame.gear);
         text += ",";
@@ -336,6 +400,10 @@ export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame
             appendNumber(text, wheel.gripMultiplier, 4);
             text += ",";
             appendInteger(text, wheel.inContact ? 1 : 0);
+            text += ",";
+            appendInteger(text, static_cast<long long>(wheel.contactingSamples));
+            text += ",";
+            appendNumber(text, wheel.patchDepthSpread * 1000.0, 3);
         }
 
         text += "\n";

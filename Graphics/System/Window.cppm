@@ -210,8 +210,34 @@ GLFWWindow::GLFWWindow(spdlog::logger& logger) :
     // default — minimise on focus loss — would only cost a second screen its game.
     glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
 
-    windowState.windowWidth = 1920;
-    windowState.windowHeight = 1080;
+    // The window's size, and it is overridable **because the parity goldens are a fixed size and the
+    // game's window is not**.
+    //
+    // Both were 1920x1080 until 2026-08-21 23:49, when the window went to 2560x1440. That is a
+    // perfectly good thing to want and it silently broke both frame gates: a capture is the
+    // framebuffer, so every comparison started failing on a size mismatch against goldens that were
+    // 1920x1080, and there was no way to run either gate without editing this line by hand. A gate
+    // nobody can run is a gate that gets ignored.
+    //
+    // So the *game's* size stays whatever Dominic wants it to be, and `scripts/verify-parity.sh` asks
+    // for the goldens' size through these. Deliberately not tied to `RACEENGINE_UNATTENDED`: an
+    // unattended run is not necessarily a gate run, and a capture at a size nobody chose is how this
+    // problem started.
+    const auto sizeFrom = [](const char* name, const int fallback)
+    {
+        const auto* stated = std::getenv(name);
+        if (stated == nullptr)
+        {
+            return fallback;
+        }
+
+        const auto value = std::atoi(stated);
+
+        return value > 0 ? value : fallback;
+    };
+
+    windowState.windowWidth = sizeFrom("RACEENGINE_FRAME_WIDTH", 2560);
+    windowState.windowHeight = sizeFrom("RACEENGINE_FRAME_HEIGHT", 1440);
     window = glfwCreateWindow(windowState.windowWidth, windowState.windowHeight, "Quack!", nullptr, nullptr);
 
     if (!window)

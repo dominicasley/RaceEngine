@@ -138,6 +138,11 @@ export enum class DeviceCapability : std::uint8_t {
     SetRotationRange,
     // The base's own tuning profile can be driven from the host.
     TuningMenu,
+    // Vibration motors under the pedals, which on a ClubSport V3 set is one under the throttle and
+    // one under the brake. **Not implied by anything else in this list**: it is a different device
+    // from the wheel base — the pedals have their own USB identity and their own driver path — and a
+    // rig can perfectly well have a base with full force feedback and pedals with no motors at all.
+    PedalMotors,
     Count
 };
 
@@ -157,6 +162,8 @@ export [[nodiscard]] constexpr const char* deviceCapabilityName(const DeviceCapa
         return "rotation range control";
     case DeviceCapability::TuningMenu:
         return "tuning menu control";
+    case DeviceCapability::PedalMotors:
+        return "pedal vibration motors";
     case DeviceCapability::Count:
         break;
     }
@@ -172,6 +179,15 @@ public:
     constexpr void add(const DeviceCapability capability)
     {
         bits |= 1u << static_cast<std::uint32_t>(capability);
+    }
+
+    // Dropping one is a normal thing to do rather than a correction. The pedals are a different
+    // device from the base and can be unplugged while the wheel keeps working, and a capability that
+    // could only ever be added would have a caller asking a gone device every frame for the rest of
+    // the session.
+    constexpr void remove(const DeviceCapability capability)
+    {
+        bits &= ~(1u << static_cast<std::uint32_t>(capability));
     }
 
     [[nodiscard]] constexpr bool has(const DeviceCapability capability) const
@@ -312,6 +328,19 @@ public:
     // its platform means by positive — which is a platform fact, and the kind that is only settled
     // from the seat. Get it wrong and every restoring torque becomes the pull it was resisting.
     [[nodiscard]] virtual std::expected<void, std::string> writeTorque(double torqueFraction) = 0;
+
+    // The two pedal motors, as the codes the device takes: nought is stopped and full is full. A
+    // backend whose capability list has no `PedalMotors` refuses with a reason, which is the point —
+    // the alternative is a game writing cues into a device that has no motors and no way to say so.
+    //
+    // **Refusing must be cheap and it must be safe to keep asking**, because the pedals are a
+    // separate device from the base and may be unplugged mid-session while the wheel keeps working.
+    //
+    // Unlike a torque, a vibration does not settle when the writes stop: an eccentric mass keeps
+    // turning until it is told nought. So a backend that is closing, releasing or otherwise giving
+    // up **must** write silence on the way out rather than simply stopping.
+    [[nodiscard]] virtual std::expected<void, std::string> writePedalMotors(std::uint8_t throttle,
+                                                                           std::uint8_t brake) = 0;
 
     [[nodiscard]] virtual DeviceCapabilities capabilities() const = 0;
     [[nodiscard]] virtual UpdateRate updateRate() const = 0;

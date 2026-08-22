@@ -11,6 +11,8 @@ export import :InputMapping;
 // torque.
 export import :RackTorque;
 export import :ForceMapping;
+export import :PedalFeedback;
+export import :PedalMotors;
 // The DirectInput ABI's numbers, but not DirectInput: this partition names no Windows type and
 // carries no Windows header, which is what lets the Windows backend's conversions be compiled and
 // tested on a machine that will never run them.

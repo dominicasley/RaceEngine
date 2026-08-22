@@ -55,15 +55,70 @@ inline constexpr auto golfWheelbase = 2.638;
 inline constexpr auto golfFrontAxle = 0.5 * golfWheelbase;
 inline constexpr auto golfRearAxle = -0.5 * golfWheelbase;
 
-// suspensions.ini [FRONT]/[REAR] TRACK, and tyres.ini RADIUS.
+// suspensions.ini [FRONT]/[REAR] TRACK.
 inline constexpr auto golfFrontTrack = 1.539;
 inline constexpr auto golfRearTrack = 1.516;
-inline constexpr auto golfTyreRadius = 0.3298;
 
-// car.ini [BASIC] TOTALMASS, and suspensions.ini HUB_MASS per corner.
+// **Not tyres.ini RADIUS, and this is the first number in this file taken away from the mod.**
+//
+// The file states 0.3298 m, which is 3.5% larger than any factory fitment for this car: a 225/40 R18
+// is 0.3186 m unloaded (18 × 25.4 / 2 + 225 × 0.40, in millimetres) and the Performance's 225/35 R19
+// is 0.3200. The import is faithful — nothing in `scripts/import-ac-car.py` is wrong — the source
+// disagrees with the car, so the published fitment wins and the disagreement is written down here
+// rather than absorbed.
+//
+// **It is a uniform scale factor, which is exactly what shape-based validation cannot see.** Road
+// speed, the effective final drive, every slip ratio and the rolling-resistance lever all move by
+// the same 3.5%, so every monotonicity, every ordering and every ratio the suite asserts is
+// preserved by construction. The two things that do move are absolute: what the speedometer says,
+// and what the coastdown fit reports — and a two-parameter fit will happily absorb a 3.5% lever
+// error into `Crr` and `CdA` and still look agreeable, which is why the pre-correction figures
+// coming out near their targets was never evidence the radius was right.
+//
+// One consequence worth stating because it is not obvious: this is also every corner's pickup-point
+// datum. The conversion at the top of this file puts the design contact patch on y = 0 by adding the
+// radius to AC's wheel-centre-relative y, so correcting the radius lowers every hardpoint by 11.2 mm
+// relative to the road and leaves the *suspension* geometry — the relative positions the linkage is
+// made of — untouched. That is the right behaviour: the linkage is what AC states, and where the
+// road is relative to it is what the tyre states.
+inline constexpr auto golfTyreRadius = 0.3186;
+
+// car.ini [BASIC] TOTALMASS.
 inline constexpr auto golfTotalMass = 1348.0;
-inline constexpr auto golfFrontHubMass = 80.0;
-inline constexpr auto golfRearHubMass = 85.0;
+
+// **Not suspensions.ini HUB_MASS, and this is the second number taken away from the mod.**
+//
+// The file states 80 kg per front corner and 85 per rear — 330 kg, a quarter of the whole car, on a
+// hatchback. It is not a plausible figure for any road car and it was invisible in every total
+// because the sprung side is *solved* from it (below), so `TOTALMASS` came out right whatever this
+// said. What it moves is the load path: wheel hop goes as sqrt(k_tyre / m_unsprung), and unsprung
+// mass transfers load directly rather than through the springs.
+//
+// **There is no published per-corner figure for this car**, so what replaces it is a component
+// build-up rather than a citation, and the lines are written out so the number can be argued with
+// rather than only accepted. Published breakdowns for a passenger-car corner put wheel at 9-13 kg,
+// tyre at 10-14, the brake assembly at 8-12 and the outboard suspension share at 8-11, for 35-45 kg
+// all in; this car sits at the top of that because it is the 245 PS car on 18s.
+//
+//     front, MacPherson strut, driven          rear, multi-link, undriven
+//     ---------------------------------        --------------------------------
+//     225/40 R18 tyre            10.0          225/40 R18 tyre            10.0
+//     18 x 7.5J cast alloy       11.0          18 x 7.5J cast alloy       11.0
+//     340 x 30 vented disc        9.5          310 x 22 vented disc        6.5
+//     caliper and carrier         4.5          caliper, carrier, EPB       5.0
+//     hub and bearing             2.5          hub and bearing             2.5
+//     steering knuckle            3.5          wheel carrier               3.5
+//     outboard share of arms      3.0          outboard share of links     3.5
+//     outboard half of driveshaft 3.0          --
+//     strut's unsprung share      2.5          damper and spring share     1.5
+//     ---------------------------------        --------------------------------
+//     total                      49.5          total                      43.5
+//
+// Rounded to the precision the build-up deserves, which is not three figures. The front carries the
+// larger brake and a driveshaft the rear does not have, which is why the two differ — and it is the
+// opposite ordering to the mod's, whose rear was the heavier of the two.
+inline constexpr auto golfFrontHubMass = 49.0;
+inline constexpr auto golfRearHubMass = 43.0;
 
 // Front: MacPherson strut, from suspensions.ini [FRONT]. The strut's top bearing is STRUT_CAR and
 // its lower end is the lower ball joint, which is WBTYRE_BOTTOM — the same point STRUT_TYRE names,
@@ -323,21 +378,59 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
 
     // --- the mass ledger ---
     //
-    // TOTALMASS is the whole car and HUB_MASS is per corner, so the sprung mass is what is left. The
-    // hub masses are high for a hatchback — 330 kg of unsprung against 1348 kg all in — and that is
-    // the file's figure rather than a reading of it.
+    // TOTALMASS is the whole car and the corner masses are per corner, so the sprung mass is what is
+    // left.
+    //
+    // **Everything below this line re-derives itself when the split changes, and that is the point.**
+    // Correcting the unsprung mass was specified as a four-step job — set the corner figure,
+    // recompute sprung mass to preserve the total, recompute the sprung centre of gravity to preserve
+    // the *assembled* centre, recompute the inertia tensor from the corrected distribution — and only
+    // the first step is an edit here. The other three were already solved rather than authored, for
+    // the reason given at each: stating the same fact twice is how two statements of it come to
+    // disagree. So `sprungMass` is a subtraction, `sprungCentre` is solved from the assembled centre
+    // the data states, and `shell` is the assembled tensor less every parallel-axis term the assembly
+    // puts back. Change a corner mass and all three follow, and `GolfGtiTests` asserts that the
+    // assembled car still has the centre and the tensor the file states.
     const auto unsprung = 2.0 * golfFrontHubMass + 2.0 * golfRearHubMass;
     const auto sprungMass = golfTotalMass - unsprung;
 
-    // Where the centre of gravity is. **Neither coordinate is stated cleanly by AC and both are
-    // marked**: the height comes from car.ini's GRAPHICS_OFFSET, which places the graphics origin
-    // relative to the physics body and so says how far the centre of gravity sits above the road;
-    // the longitudinal position comes from suspensions.ini's CG_LOCATION read as the front weight
-    // fraction. See the note in the tests for what the alternatives were and why these two won.
+    // Where the centre of gravity is. The height comes from car.ini's GRAPHICS_OFFSET, which places
+    // the graphics origin relative to the physics body and so says how far the centre of gravity
+    // sits above the road. That one is the mod's and is plausible: 0.572 m against a typical
+    // C-segment hatch's 0.55.
     const auto centreHeight = 0.572;
-    const auto frontFraction = 0.53;
+
+    // **The longitudinal position is the third number taken away from the mod** (2026-08-22).
+    //
+    // suspensions.ini states `CG_LOCATION=0.53 ; Front Weight distribution in percentance` — the
+    // file names its own convention, so `scripts/import-ac-car.py` reads it correctly and the source
+    // is what disagrees. A transverse-engined front-drive hatchback does not sit at 53% front, and a
+    // DSG Mk7 GTI measures **61.4/38.6**. At 1348 kg that is 114 kg per axle, 8.5% of the car.
+    //
+    // **It is a bigger change than the radius or the unsprung mass and it is a different kind.**
+    // Those two corrected levers — a scale factor on speed and gearing, a split that preserved every
+    // total. This moves the centre of gravity 222 mm forward, which moves the car's *balance*: front
+    // tyre load, understeer, the aligning moment, and therefore where the steering limit falls in
+    // rack torque. Nothing downstream is unaffected. It is here because the mod disagreed with the
+    // published car three times out of three and Dominic's call was to source the chassis from the
+    // specification rather than keep patching it.
+    const auto frontFraction = 0.614;
     const auto centreStation = golfWheelbase * (frontFraction - 0.5);
     const auto centre = glm::dvec3(0.0, centreHeight, centreStation);
+
+    // **And AC's own frame origin, which is not the same point any more.**
+    //
+    // Everything AC states positionally — the aero surfaces, the collider — it states relative to
+    // *its* centre of gravity, and its centre of gravity is the one at 53%. A wing is bolted to the
+    // bodywork: correcting where the car balances does not slide the radiator inlet 222 mm up the
+    // chassis. So AC-relative positions are carried across from where AC put its origin, and only
+    // the mass ledger uses the corrected centre.
+    //
+    // Getting this wrong is invisible in every total — the aero would still integrate to the same
+    // drag — and would show up only as a pitching moment nobody authored, which is exactly the class
+    // of fault this file keeps being bitten by.
+    const auto acCentreStation = golfWheelbase * (0.53 - 0.5);
+    const auto acOrigin = glm::dvec3(0.0, centreHeight, acCentreStation);
 
     // The unsprung masses ride at their own wheel centres, so the sprung centre is whatever puts the
     // *assembled* car's centre of gravity where the data says. Solved rather than authored, because
@@ -391,11 +484,15 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
     // zero angle of attack, times the GAIN beside it — so the body carries all the drag and none of
     // the lift and the two ends carry lift and no drag, which is what a road car is. AC's sign
     // convention is that a positive CL is *downforce*, so the rear's -0.124 is lift and comes across
-    // with its sign turned over. Positions are AC's, which are relative to the centre of gravity.
+    // with its sign turned over.
+    //
+    // **Positions are AC's, relative to AC's origin** — see `acOrigin` above. They were relative to
+    // `centre` until the weight distribution was corrected, and the two were the same point until
+    // then, which is why this reads as a change to nothing.
     const auto wingArea = 1.03 * 2.07;
-    const auto fromCentre = [&centre](const double x, const double y, const double z)
+    const auto fromCentre = [&acOrigin](const double x, const double y, const double z)
     {
-        return centre + glm::dvec3(x, y, z);
+        return acOrigin + glm::dvec3(x, y, z);
     };
 
     setup.aero = {AeroSurface{.centre = fromCentre(0.0, 0.23, -0.40), .dragArea = 0.340 * wingArea, .liftArea = 0.0},
@@ -415,6 +512,12 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
     setup.body =
         CollisionBox{.centre = glm::dvec3(0.0, 0.5 * (floor + roof), 0.0),
                      .halfExtents = glm::dvec3(0.5 * (golfFrontTrack + 0.235), 0.5 * (roof - floor), 0.5 * 4.27)};
+
+    // Where a ride height for this car is quoted from. **Not in AC's data**: its only collider is a
+    // coarse body shell whose underside is 0.32 m up, which is a real surface of the car and not the
+    // one anybody means. A Mk7 GTI is quoted at about 135 mm unladen, so that is the design figure
+    // taken here — a placeholder in the same sense as every other number without a source.
+    setup.rideHeightReference = 0.135;
 
     // car.ini CONTROLS: the steering wheel's lock in degrees each way, and the ratio between it and
     // the road wheel. The travel that produces that angle is solved off the linkage below.
@@ -488,8 +591,77 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
         // tyre and not the wrong failure.
         corner.tyre.nominalLoad = 2939.0;
         corner.tyre.loadSensitivity = 1.0 - 0.8074;
-        corner.tyre.lateralPeak = 1.28;
-        corner.tyre.longitudinalPeak = 1.30;
+
+        // **The fourth number taken away from the mod** (2026-08-22), after the wheel radius, the
+        // unsprung mass and `CG_LOCATION`. The file states DY_REF 1.28 and DX_REF 1.30 for its
+        // Semislicks — and **1.23/1.26 for a compound it calls "Street"**, which is not a street tyre:
+        // a 225/40 R18 performance road tyre peaks nearer 1.0 to 1.15. Both of its compounds are
+        // track-tyre numbers.
+        //
+        // Scaled by 0.87, which is **derived rather than chosen**, and the derivation is the point:
+        //
+        //   1. Criteria 6 and 7 were fixed from physical reasoning first, and they can be because
+        //      neither is a grip figure — 6 is response shape and 7 is a ratio between two runs that
+        //      share their grip. Measured across a 20% grip cut, 6's four channels move under 1.5%
+        //      and 7's ratio moves 0.9%. They then hold at whatever grip is chosen.
+        //   2. Criterion 5's threshold comes from the real car: a Mk7 GTI on OEM tyres skidpads at
+        //      **0.90 to 0.95 g**. Grip is the free parameter that lands it, so nothing about the
+        //      model may set it.
+        //   3. 0.87 puts criterion 5 at **0.9230 g**, mid-band.
+        //   4. **0-100 is then checked independently** on the launch fixture against the published
+        //      6.4-6.7 s for a DSG without launch control — a different measurement against a
+        //      different external reference, with no shared parameter but this one.
+        //
+        // Steps 3 and 4 agreeing is the validation. Neither number was used to set the other.
+        //
+        // Applied to the peaks and **not to `gripScale`**: that is the runtime seam a thermal,
+        // pressure or wear model multiplies through, and spending it on a static data correction
+        // would leave those models nowhere to act.
+        //
+        // **Driven and accepted, 2026-08-22** — Dominic's verdict was that it feels okay. That is a
+        // pass on the car's character with 13% less grip than the mod stated, which is what the
+        // derivation could not tell us.
+        corner.tyre.lateralPeak = 1.114;
+        corner.tyre.longitudinalPeak = 1.131;
+
+        // **The longitudinal curve's shape, and these three are fitted to target behaviour rather
+        // than sourced.** Labelled that way deliberately: `tyres.ini` carries `DX_REF` and nothing
+        // whatever about fall-off, so claiming provenance for a shape factor would be inventing it.
+        //
+        // What was here were the model's defaults — C = 1.65, K = 20, E = -1.0 — and they were never
+        // calibrated against anything. A Magic Formula's sliding force tends to `D * sin(C * pi/2)`
+        // as slip grows, so C alone caps it: 1.65 gives sin(148.5 deg) = **52.2% of peak**, measured
+        // at 54.8% by slip ratio 3. A standing start on this car reaches slip ratios of 2.5 to 3.8,
+        // so it was spending the whole launch on half the grip it had. **The lateral curve's
+        // C = 1.35 gives 85% and is healthy, which is why nothing caught it** — every validation this
+        // project runs is lateral, and the longitudinal curve had never been checked against
+        // anything at all.
+        //
+        // **Judged at a slip ratio of 1, not at 3**, and that correction matters more than the
+        // numbers it produced. A tyre rig runs to about 0.2-0.3, and to 1.0 for locked-wheel work;
+        // nobody measures one at 500% slip. Past that the formula is pure extrapolation and its
+        // asymptote is a property of the functional form rather than of any tyre — which is how a
+        // published C_x of 1.65 coexists with real tyres that plainly do not lose half their grip
+        // when they spin. The 70-80%-of-peak figure this is aimed at is locked-wheel data, so slip 1
+        // is where it is read: **77.7% here against 60.2% as shipped.**
+        //
+        // **K moves with C and E and is not free.** B is `K / (C * mu)`, so both shift where the peak
+        // sits and K is what holds it at 0.120, where a semislick's belongs. 28 does that and stays
+        // inside the 10-30 a road tyre runs. It is also what rules the alternatives out: E = +0.90 at
+        // C = 1.50 wants K = 81, and C = 1.45 with E = 0.95 wants 120, against the low forties of a
+        // race construction. A curve needing those is not this tyre.
+        //
+        // E = 0 rather than the +0.50 first tried. Holding the peak makes the two nearly equivalent
+        // where the data lives — 0.777 against 0.765 at slip 1 — so the choice is near-peak breadth:
+        // +0.50 makes 91.5% of peak at half the peak slip against this curve's 87.7%, and a semislick
+        // should be the peakier of the two. Chosen on that rather than as a by-product of the K
+        // constraint, and E = 0 needs no defending either way.
+        //
+        // Swept in `[.tyre-shape]`; **driven and accepted 2026-08-22**, in the same session as the
+        // grip correction below — the two went to the seat together and cannot be separated by it.
+        corner.tyre.longitudinalShape = 1.50;
+        corner.tyre.longitudinalCurvature = 0.0;
+        corner.tyre.longitudinalStiffness = 28.0;
 
         // Stated on the shaft, and sized inside the travel the linkage has. The bump stops AC states
         // do not carry across: its front BUMPSTOP_UP of 0.80 m is not a travel any suspension has and

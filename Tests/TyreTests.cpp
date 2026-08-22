@@ -390,3 +390,78 @@ TEST_CASE("the seams the deferred models need are already there", "[physics][tyr
         REQUIRE(gentle.gripUsed > 0.0);
     }
 }
+
+TEST_CASE("the aligning moment turns over before the grip does", "[physics][tyre][aligning]")
+{
+    // **The steering limit, as a property of the tyre**, and the reason a driver knows the front is
+    // going before it has gone. Aligning moment is lateral force times pneumatic trail: the force is
+    // still climbing while the trail is already collapsing, so their product peaks first. That
+    // ordering is the whole cue, and `tyreAligningPeak` is what the power assist's placement is
+    // derived from — so if it ever inverted, the assist would be positioned against the wrong point
+    // on the curve and nothing else in the suite would notice.
+    const auto model = raceengine::TyreModel{};
+
+    constexpr auto degrees = 57.29577951308232;
+    constexpr auto load = 4000.0;
+
+    const auto aligning = raceengine::tyreAligningPeak(model, load);
+
+    REQUIRE(aligning.slipAngle > 0.0);
+    REQUIRE(std::abs(aligning.aligningMoment) > 0.0);
+
+    // Where lateral force itself peaks, swept the same way.
+    auto gripSlip = 0.0;
+    auto gripPeak = 0.0;
+    for (auto angle = 0.001; angle < 25.0 / degrees; angle += 0.001)
+    {
+        const auto forces =
+            raceengine::evaluateTyre(model, load, raceengine::TyreSlip{.slipRatio = 0.0, .slipAngle = angle}, 1.0);
+
+        if (std::abs(forces.lateral) > gripPeak)
+        {
+            gripPeak = std::abs(forces.lateral);
+            gripSlip = angle;
+        }
+    }
+
+    CAPTURE(aligning.slipAngle * degrees, gripSlip * degrees);
+    REQUIRE(aligning.slipAngle < gripSlip);
+
+    SECTION("and what it reports is really the peak of the curve it swept")
+    {
+        for (const auto offset : {-0.6, -0.2, 0.2, 0.6})
+        {
+            const auto angle = aligning.slipAngle + offset / degrees;
+            if (angle <= 0.0)
+            {
+                continue;
+            }
+
+            const auto forces =
+                raceengine::evaluateTyre(model, load, raceengine::TyreSlip{.slipRatio = 0.0, .slipAngle = angle}, 1.0);
+
+            CAPTURE(offset);
+            REQUIRE(std::abs(forces.aligningMoment) <= std::abs(aligning.aligningMoment));
+        }
+    }
+
+    SECTION("a more heavily loaded tyre reaches it later and harder")
+    {
+        // Load sensitivity: friction falls with load, so the peak slip angle rises with it. This is
+        // what makes the steering limit a function of how hard the outside front is working, and
+        // therefore why the load it is evaluated at has to be the one at the limit.
+        const auto light = raceengine::tyreAligningPeak(model, 2000.0);
+        const auto heavy = raceengine::tyreAligningPeak(model, 6000.0);
+
+        REQUIRE(heavy.slipAngle > light.slipAngle);
+        REQUIRE(std::abs(heavy.aligningMoment) > std::abs(light.aligningMoment));
+    }
+
+    SECTION("and a tyre carrying nothing has no limit to report")
+    {
+        const auto none = raceengine::tyreAligningPeak(model, 0.0);
+
+        REQUIRE(none.aligningMoment == 0.0);
+        REQUIRE(none.lateralForce == 0.0);
+    }
+}

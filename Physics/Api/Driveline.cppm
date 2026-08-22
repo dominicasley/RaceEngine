@@ -1208,6 +1208,11 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
 export void fillDrivelineTelemetry(TelemetryFrame& frame, const DrivelineState& state, const DrivelineTorques& torques)
 {
     frame.engineSpeed = state.engineSpeed;
+    // Where the pedal ended up, which on a car nobody is declutching is the auto-clutch's doing.
+    // Off the state rather than off the input packet: the input carries what the driver asked for
+    // and the state carries what the clutch is at, and away from a standing start or a shift they
+    // are the same number — which is precisely when the channel is uninteresting.
+    frame.clutch = state.clutchPedal;
     frame.engineTorque = torques.engine;
     frame.clutchTorque = torques.clutch;
     frame.clutchSlip = torques.clutchSlip;

@@ -191,3 +191,24 @@ TEST_CASE("the differential's own numbers arrive through the same file", "[physi
     REQUIRE(driveline.differential.powerRamp == 0.4);
     REQUIRE(driveline.differential.coastRamp == coast);
 }
+
+TEST_CASE("the pedal cue's thresholds are the driver's dials", "[physics][setup]")
+{
+    // The game applies these to the input layer's `PedalFeedbackSetup` itself — this module cannot
+    // name that type — so what is pinned here is the sheet half: the keys parse, an unstated one
+    // stays absent rather than becoming a default, and a sheet stating only a pedal number still
+    // counts as saying something.
+    const auto tune = parseVehicleTune("pedal.brake_full 2.0\npedal.throttle_full 6\n");
+    REQUIRE(tune.has_value());
+
+    REQUIRE(tune->pedal.brakeFullPeaks == 2.0);
+    REQUIRE(tune->pedal.throttleFullPeaks == 6.0);
+    REQUIRE_FALSE(tune->pedal.onsetPeaks.has_value());
+
+    REQUIRE(raceengine::statesAnything(tune.value()));
+    REQUIRE_FALSE(raceengine::statesAnything(parseVehicleTune("").value()));
+
+    const auto onset = parseVehicleTune("pedal.onset 1.05\n");
+    REQUIRE(onset.has_value());
+    REQUIRE(onset->pedal.onsetPeaks == 1.05);
+}

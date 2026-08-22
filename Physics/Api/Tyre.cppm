@@ -131,6 +131,17 @@ export struct TyreForces
     // How much of the friction ellipse is in use, 0 to about 1. The channel that says whether the
     // car is near the limit, which no single force does.
     double gripUsed = 0.0;
+
+    // Where this tyre's own curves peak, under the load and the compound it was just evaluated at:
+    // the slip ratio and the slip angle's tangent at which each direction makes its most force.
+    //
+    // Exposed for the same reason `slipPower` is — it is computed here anyway, and the alternative
+    // is every consumer inventing a constant for it. **A cue that fires at a fixed slip is a cue
+    // that means something different on every compound**, and the two that want this are the tyre
+    // audio's skid and the pedal rumble, which are the same physical event and must agree. They
+    // move with the tyre if they are stated as multiples of these.
+    double longitudinalPeakSlip = 0.0;
+    double lateralPeakSlip = 0.0;
 };
 
 namespace
@@ -279,6 +290,9 @@ export [[nodiscard]] TyreForces evaluateTyre(const TyreModel& model, const doubl
     // peak, combined as a vector, and the resulting force is shared out along that vector. Full
     // braking and full cornering are then not simultaneously available, because the vector reaches
     // the limit sooner than either component does.
+    forces.longitudinalPeakSlip = longitudinalPeakSlip;
+    forces.lateralPeakSlip = lateralPeakSlip;
+
     const auto normalisedRatio = slip.slipRatio / std::max(longitudinalPeakSlip, 1e-9);
     const auto normalisedAngle = std::tan(slip.slipAngle) / std::max(lateralPeakSlip, 1e-9);
     const auto combined = std::hypot(normalisedRatio, normalisedAngle);
@@ -335,6 +349,60 @@ export [[nodiscard]] TyreForces evaluateTyre(const TyreModel& model, const doubl
     forces.gripUsed = combined;
 
     return forces;
+}
+
+// Where this tyre's aligning moment peaks, in pure lateral slip, at a given load.
+//
+// **This is the steering limit, stated as a property of the tyre rather than as a number somebody
+// drove to.** Aligning moment is the product of lateral force, which is still climbing, and
+// pneumatic trail, which is already collapsing — so it turns over *before* grip does, and the slip
+// angle where it turns over is the moment the wheel starts going light in a driver's hands. Every
+// downstream question about the steering — where a power assist's taper belongs, what the limit cue
+// is worth in newton metres — is asked about this point, and until now the answer came from reading
+// it off a session trace, which is a seat session per car.
+//
+// Pure lateral on purpose. On a real lap the front tyre is doing a lot of longitudinal work at the
+// same time — measured on Bathurst, the outside front runs |Fx|/Fz between 0.60 and 0.73 through
+// the whole slip range — so the *measured* lateral μ there is a component of a nearly saturated
+// friction circle rather than the tyre's lateral capability. That is a fact about how the car is
+// being driven, not about the tyre, and a per-car constant must not be fitted to it.
+export struct TyreAligningPeak
+{
+    double slipAngle = 0.0;
+    double lateralForce = 0.0;
+    double aligningMoment = 0.0;
+};
+
+// Swept rather than solved: `aligningMoment` is a product of a magic formula and a trail falloff and
+// has no closed-form turning point worth deriving. A tenth of a degree is far finer than anything
+// downstream of it can act on, and the whole sweep is a few hundred evaluations once per car at load
+// time.
+export [[nodiscard]] TyreAligningPeak tyreAligningPeak(const TyreModel& model, const double verticalLoad,
+                                                       const double surfaceGrip = 1.0)
+{
+    auto found = TyreAligningPeak{};
+
+    if (verticalLoad <= 0.0)
+    {
+        return found;
+    }
+
+    constexpr auto step = 0.1 * 0.017453292519943295;
+    constexpr auto limit = 25.0 * 0.017453292519943295;
+
+    for (auto angle = step; angle <= limit; angle += step)
+    {
+        const auto forces =
+            evaluateTyre(model, verticalLoad, TyreSlip{.slipRatio = 0.0, .slipAngle = angle}, surfaceGrip);
+
+        if (std::abs(forces.aligningMoment) > std::abs(found.aligningMoment))
+        {
+            found = TyreAligningPeak{
+                .slipAngle = angle, .lateralForce = forces.lateral, .aligningMoment = forces.aligningMoment};
+        }
+    }
+
+    return found;
 }
 
 } // namespace raceengine

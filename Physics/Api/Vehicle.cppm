@@ -203,6 +203,31 @@ export struct VehicleSetup
     // a setup that leaves it alone has not answered the question.
     double rackTravelPerInput = 0.055;
 
+    // Where this car's ride height is quoted from: the height above the *design contact plane* of
+    // the point on the chassis a ride height figure refers to, metres. The body frame puts the
+    // design contact plane at y = 0, so this is a ride height at design attitude by construction.
+    //
+    // **Stated rather than inferred, and the first attempt at inferring it is why.** Taking the
+    // underside of the collision box looks principled and is wrong on the one car with real data:
+    // AC's `COLLIDER_0` is a coarse body shell 0.32 m up, not a floor, so the Golf reported a 0.30 m
+    // ride height — a correct measurement of the wrong surface. A car's ride height is a figure the
+    // car states, and a model that derives it from a collision shape derives it from whatever that
+    // shape happened to be authored as.
+    //
+    // Placeholder, like every vehicle figure here, and a candidate for exactly the parameter sweep
+    // this file's units are getting.
+    double rideHeightReference = 0.12;
+
+    // What the steering *wheel* turns lock to lock, radians. 13.195 rad is 756 degrees, which is
+    // 2.1 turns and is this class of car's rack.
+    //
+    // The vehicle model needs it for exactly one thing and it is not a force: **the telemetry's
+    // `Steering Angle` column**, which until 2026-08-21 carried `input.steering` — a dimensionless
+    // demand from −1 to 1 — multiplied by 57.2958 and labelled degrees. That is the `Engine RPM`
+    // failure exactly: a units conversion applied to a quantity with no units. A demand is not an
+    // angle, and turning one into the other needs a number only the steering box has.
+    double steeringLockToLock = 13.194689145077131;
+
     [[nodiscard]] double unsprungMass() const
     {
         auto total = 0.0;
@@ -312,9 +337,42 @@ export struct CornerSolution
     double damperVelocity = 0.0;
 };
 
+// How high the car's floor is above the road, per corner and as the two figures a rake-sensitive
+// map is looked up against.
+//
+// **The datum is `VehicleSetup::rideHeightReference`**, which the car states — see there for why it
+// is stated and not read off the collision box. Each corner's is measured perpendicular to that
+// corner's *own* contact patch, so a car on a banked road reports the clearance it actually has
+// rather than a world-vertical drop.
+//
+// The version this replaces was `state.chassis.position.y - patch.centre.y` averaged over the four
+// corners and then discarded — three separate faults in one expression. The centre of mass is not
+// the floor, so it measured about 0.5 m where a ride height is about 0.12; a world-vertical
+// difference is not a clearance on any road that is not level; and averaging four corners into one
+// scalar destroys rake, which is the entire difference a rake-sensitive map exists to express.
+//
+// Nothing consumes this yet, and that is deliberate: the aero it is for is out of scope. What was
+// not acceptable was leaving a *wrong* seam in place for that work to be built on.
+export struct RideHeight
+{
+    std::array<double, cornerCount> corners{};
+
+    // The axle means, and the difference between them. Positive rake is the rear sitting higher than
+    // the front, which is the sense every aero map is drawn in.
+    double front = 0.0;
+    double rear = 0.0;
+    double rake = 0.0;
+
+    // How many corners were touching. A corner in the air is measured against the plane the others
+    // define, which is the best that can be said about it; with none touching there is no road to
+    // measure from and every figure above is zero.
+    std::uint32_t grounded = 0;
+};
+
 export struct VehicleStep
 {
     std::array<CornerSolution, cornerCount> corners{};
+    RideHeight rideHeight;
     // What the bodywork was touching this tick, with the impulses the solver settled on. Kept so a
     // test can assert on the contact rather than only on where the car ended up.
     ContactManifold contacts;
@@ -368,6 +426,99 @@ export [[nodiscard]] std::expected<double, std::string> springFreeLengthForLoad(
 
 // Standard gravity, and the only constant in this file that is not a placeholder.
 inline constexpr auto earthGravity = 9.80665;
+
+// What the outside front tyre carries when this car is cornering at its own limit, newtons.
+//
+// **A fixed point rather than a chosen manoeuvre**, which is what makes it a property of the car
+// instead of a number somebody drove to. Lateral load transfer is `m_axle · a_y · h / t`, and the
+// lateral acceleration the car can hold is set by the friction the outside tyre has — which falls
+// with the very load the transfer is putting on it. So the two define each other, and the honest
+// statement is the load that satisfies both:
+//
+//     Fz = W_front/2 + mu(Fz) · m_front · g · h / t_front
+//
+// It converges in three or four passes from the static load because tyre load sensitivity is weak
+// (this car's exponent is 0.1926) and the map is a strong contraction.
+//
+// **Validated against a real lap.** For the Golf this returns 6375 N on the outside front, against a
+// median 5851 N measured on Dominic's 201-second Bathurst session through the slip band where the
+// aligning moment peaks — **9% high**, and high is the expected direction: the approximation here is
+// that the front axle carries its own transfer with the whole car's centre of gravity height, rather
+// than a share set by the front/rear roll-stiffness split, and it takes no account of a driver who
+// is not at the limit on every corner. What is being placed against it is a knee and a taper, so
+// nine percent is comfortably inside what the answer needs to be worth.
+//
+// The rack force that comes out the far end of it agrees better than the load does: 1743 N derived
+// against 1617 N measured, 7.8%, because the geometry between them is exact and only the load is
+// modelled.
+export struct SteeringLimitLoads
+{
+    // What one front wheel carries with the car at rest, newtons.
+    double staticPerWheel = 0.0;
+    // And what the outside and inside front carry at the limit. They sum to twice the static one:
+    // lateral transfer moves load across the axle, it does not add any.
+    double outside = 0.0;
+    double inside = 0.0;
+};
+
+export [[nodiscard]] SteeringLimitLoads steeringLimitLoad(const VehicleSetup& setup)
+{
+    auto mass = 0.0;
+    auto heightMoment = 0.0;
+    auto stationMoment = 0.0;
+
+    for (const auto& component : setup.sprung)
+    {
+        mass += component.mass;
+        heightMoment += component.mass * component.centre.y;
+        stationMoment += component.mass * component.centre.z;
+    }
+
+    for (const auto& corner : setup.corners)
+    {
+        mass += corner.unsprungMass;
+        heightMoment += corner.unsprungMass * corner.hardpoints.wheelCentre.y;
+        stationMoment += corner.unsprungMass * corner.hardpoints.wheelCentre.z;
+    }
+
+    if (mass <= 0.0)
+    {
+        return SteeringLimitLoads{};
+    }
+
+    const auto centreHeight = heightMoment / mass;
+    const auto centreStation = stationMoment / mass;
+
+    const auto frontStation = setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].hardpoints.wheelCentre.z;
+    const auto rearStation = setup.corners[static_cast<std::size_t>(Corner::RearLeft)].hardpoints.wheelCentre.z;
+    const auto wheelbase = frontStation - rearStation;
+
+    const auto track =
+        2.0 * std::abs(setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].hardpoints.wheelCentre.x);
+
+    if (std::abs(wheelbase) < 1e-9 || track < 1e-9)
+    {
+        return SteeringLimitLoads{};
+    }
+
+    const auto frontMass = mass * (centreStation - rearStation) / wheelbase;
+    const auto staticLoad = frontMass * earthGravity / 2.0;
+
+    const auto& tyre = setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].tyre;
+
+    auto load = staticLoad;
+    for (auto pass = 0; pass < 6; pass++)
+    {
+        const auto friction = tyreFriction(tyre, tyre.lateralPeak, load, 1.0);
+        load = staticLoad + friction * frontMass * earthGravity * centreHeight / track;
+    }
+
+    // The inside wheel gets what the outside did not take, floored at zero rather than allowed
+    // negative: a car whose transfer lifts the inside wheel has an inside tyre carrying nothing,
+    // which is the physical answer and not a clamp hiding one.
+    return SteeringLimitLoads{
+        .staticPerWheel = staticLoad, .outside = load, .inside = std::max(2.0 * staticLoad - load, 0.0)};
+}
 
 // Placeholder geometry for one corner, mirrored by side and placed at an axle station. Short-long
 // arm, so camber gain comes out of the linkage rather than being asked for.
@@ -898,25 +1049,59 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         chassisForces.torque += solution.contact.tyre.aligningMoment * solution.patch.normal;
     }
 
-    // --- Aero, after the suspension and not before it -------------------------------------------
+    // --- Ride height, then aero, and in that order ----------------------------------------------
     //
     // The ordering is the seam rather than a preference: a rake- or ride-height-sensitive map is
     // deferred, and the only thing that makes adding it a change to the coefficients instead of a
-    // change to the loop is that the suspension has already been solved by the time this runs. So
-    // the ride height is computed and passed even though nothing consumes it yet.
-    auto rideHeight = 0.0;
-    auto grounded = 0;
-    for (const auto& solution : result.corners)
+    // change to the loop is that the suspension has already been solved by the time this runs.
+    //
+    // See `RideHeight` for what is measured and for the three faults in the expression this
+    // replaces. Nothing reads it yet; it is reported rather than consumed.
     {
-        if (solution.patch.inContact)
+        const auto floor = setup.rideHeightReference;
+
+        // The plane the touching corners define, for any corner that is in the air.
+        auto meanPoint = glm::dvec3(0.0);
+        auto meanNormal = glm::dvec3(0.0);
+
+        for (const auto& solution : result.corners)
         {
-            rideHeight += state.chassis.position.y - solution.patch.centre.y;
-            grounded++;
+            if (solution.patch.inContact)
+            {
+                meanPoint += solution.patch.centre;
+                meanNormal += solution.patch.normal;
+                result.rideHeight.grounded++;
+            }
+        }
+
+        if (result.rideHeight.grounded > 0)
+        {
+            const auto count = static_cast<double>(result.rideHeight.grounded);
+            meanPoint /= count;
+            meanNormal = glm::length(meanNormal) > 1e-9 ? glm::normalize(meanNormal) : glm::dvec3(0.0, 1.0, 0.0);
+
+            for (auto index = std::size_t{0}; index < cornerCount; index++)
+            {
+                const auto& solution = result.corners[index];
+                const auto& patch = solution.patch;
+
+                // Directly above this corner's wheel centre, on the floor. The wheel centre's plan
+                // position is what puts the measurement at the corner rather than at the middle of
+                // the car, which is the whole reason this is four numbers.
+                const auto& design = setup.corners[index].hardpoints.wheelCentre;
+                const auto reference = bodyToWorld(state.chassis, glm::dvec3(design.x, floor, design.z));
+
+                const auto point = patch.inContact ? patch.centre : meanPoint;
+                const auto normal = patch.inContact ? patch.normal : meanNormal;
+
+                result.rideHeight.corners[index] = glm::dot(reference - point, normal);
+            }
+
+            result.rideHeight.front = 0.5 * (result.rideHeight.corners[0] + result.rideHeight.corners[1]);
+            result.rideHeight.rear = 0.5 * (result.rideHeight.corners[2] + result.rideHeight.corners[3]);
+            result.rideHeight.rake = result.rideHeight.rear - result.rideHeight.front;
         }
     }
-
-    rideHeight = grounded > 0 ? rideHeight / static_cast<double>(grounded) : rideHeight;
-    static_cast<void>(rideHeight);
 
     const auto airspeed = glm::length(state.chassis.linearVelocity);
     if (airspeed > 1e-6)
@@ -1022,11 +1207,16 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
     auto& frame = result.telemetry;
     frame.position = state.chassis.position;
     frame.velocity = state.chassis.linearVelocity;
-    frame.acceleration = (state.chassis.linearVelocity - previousVelocity) / deltaTime;
 
     const auto rotation = glm::mat3_cast(state.chassis.orientation);
     const auto forward = rotation * glm::dvec3(0.0, 0.0, 1.0);
     const auto right = rotation * glm::dvec3(1.0, 0.0, 0.0);
+
+    // **Into the car's own frame**, because that is what a channel called `G Force Long` means. The
+    // difference from a world-frame answer is invisible on a straight aimed along +z and is most of
+    // the signal on a circuit — see `TelemetryFrame::acceleration`.
+    frame.acceleration =
+        glm::conjugate(state.chassis.orientation) * ((state.chassis.linearVelocity - previousVelocity) / deltaTime);
 
     frame.yaw = std::atan2(forward.x, forward.z);
     frame.pitch = std::asin(std::clamp(forward.y, -1.0, 1.0));
@@ -1037,11 +1227,18 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
     frame.pitchRate = bodyRates.x;
     frame.rollRate = bodyRates.z;
 
+    // The axle means the ride-height solve above already produced. Copied rather than recomputed:
+    // one expression, whose three faults are recorded at `RideHeight`, and a second one here would
+    // be a second place for them to come back.
+    frame.rideHeightFront = result.rideHeight.front;
+    frame.rideHeightRear = result.rideHeight.rear;
+
     frame.steering = input.steering;
+    frame.steeringWheelAngle = input.steering * 0.5 * setup.steeringLockToLock;
     frame.throttle = input.throttle;
     frame.brake = input.brake;
     frame.gear = input.gear;
-    // `TelemetryFrame::engineSpeed` and the driveline channels beside it are filled by whoever
+    // `TelemetryFrame::engineSpeed`, `clutch` and the driveline channels beside them are filled by whoever
     // stepped the driveline: this partition does not import `:Driveline` and must not, and the
     // frame is a by-value member of the returned step for exactly that reason.
 
@@ -1061,6 +1258,8 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         frame.wheels[index].camber = solution.suspension.camber;
         frame.wheels[index].gripMultiplier = solution.patch.gripMultiplier;
         frame.wheels[index].inContact = solution.patch.inContact;
+        frame.wheels[index].contactingSamples = solution.patch.contactingSamples;
+        frame.wheels[index].patchDepthSpread = solution.patch.depthSpread;
     }
 
     return result;

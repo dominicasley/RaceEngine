@@ -146,6 +146,8 @@ target_sources(Engine PUBLIC
         Input/Api/InputMapping.cppm
         Input/Api/RackTorque.cppm
         Input/Api/ForceMapping.cppm
+        Input/Api/PedalFeedback.cppm
+        Input/Api/PedalMotors.cppm
         Input/Api/DirectInputContract.cppm
         Input/Api/InputBackendFactory.cppm
         # Implementation partitions, on the renderer's rule: both are built on both platforms so
