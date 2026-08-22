@@ -5,7 +5,6 @@ module;
 #include <expected>
 #include <functional>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -483,7 +482,7 @@ Engine::Engine() :
     // problems.
     if (const auto initialised = renderer->init(); !initialised)
     {
-        throw std::runtime_error("Renderer initialisation failed: " + initialised.error());
+        fail("Renderer initialisation failed: " + initialised.error());
     }
 
     renderer->setViewport(glfwWindow.state().windowWidth, glfwWindow.state().windowHeight);
@@ -568,7 +567,7 @@ Engine::Engine() :
     // holds its worlds in members declared after its engine and is bracketed by that.
     if (const auto physics = bringUpJolt(); !physics)
     {
-        throw std::runtime_error(physics.error());
+        fail(physics.error());
     }
 }
 

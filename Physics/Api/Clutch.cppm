@@ -34,14 +34,14 @@ export enum class DriveCouplingKind : std::uint32_t { FrictionClutch, TorqueConv
 // release mechanism, almost the whole of the clamp goes in over a narrow band in the middle, and the
 // bottom is a plate already fully released. That band is what a driver launches on, and its width is
 // the difference between a pedal and a switch.
-export [[nodiscard]] Curve roadClutchEngagement()
-{
-    return Curve{.points = {glm::dvec2(0.00, 1.00), glm::dvec2(0.35, 1.00), glm::dvec2(0.50, 0.62),
-                            glm::dvec2(0.62, 0.22), glm::dvec2(0.75, 0.00), glm::dvec2(1.00, 0.00)}};
-}
+export [[nodiscard]] Curve roadClutchEngagement();
 
 export struct FrictionClutch
 {
+    // `clutchCapacity`'s inverse is defined against this struct below, so anything that changes how
+    // pedal becomes clamp changes both directions at once and there is no second statement of the
+    // curve to fall out of step with the first.
+
     // Placeholder, and a single 240 mm organic plate's numbers: 8 kN of diaphragm clamp, 0.30 dry
     // friction, a 0.100 m mean effective radius and the two faces one plate has come to 480 N.m,
     // which is 1.37 times what this engine makes. Sized under that it slips in top gear on its own.
@@ -57,13 +57,20 @@ export struct FrictionClutch
 
 // Torque capacity at a given pedal. Clamp force through the friction surfaces, scaled by where the
 // pedal has the clamp — nothing here integrates or remembers anything.
-export [[nodiscard]] double clutchCapacity(const FrictionClutch& clutch, const double pedal)
-{
-    const auto engagement = std::clamp(clutch.engagement.at(std::clamp(pedal, 0.0, 1.0)), 0.0, 1.0);
+export [[nodiscard]] double clutchCapacity(const FrictionClutch& clutch, const double pedal);
 
-    return std::max(0.0, clutch.clampForce * clutch.frictionCoefficient * clutch.effectiveRadius *
-                             static_cast<double>(clutch.faces) * engagement);
-}
+// The pedal that commands a given capacity out of this clutch: `clutchCapacity` read backwards.
+//
+// This exists because a transmission controller commands a *torque* and the actuator this model has
+// is a pedal. A real TCU meters clutch pressure, which is capacity, and the pedal is the only way to
+// ask this clutch for one — so the alternative to inverting the curve is a second control law written
+// in pedal units, which is the same number stated twice with nothing keeping the two together.
+//
+// It returns the **least engaged** pedal that delivers the capacity, which matters at both ends
+// because both ends of the curve are flat. Commanding nothing must give a fully released pedal and
+// not the first pedal at which the clamp happens to reach zero: the difference is invisible in torque
+// and very visible in the pedal channel, which is what a fixture asserts its preconditions on.
+export [[nodiscard]] double clutchPedalForCapacity(const FrictionClutch& clutch, const double capacity);
 
 // The other kind, and it is not a variant of the friction clutch. A converter is a fluid coupling
 // with a third member, and all it shares with a plate is where it sits in the chain: the impeller
@@ -87,12 +94,7 @@ export [[nodiscard]] double clutchCapacity(const FrictionClutch& clutch, const d
 // measured curve does: slip is the only loss modelled here, and the churning and pumping losses that
 // bend a real curve back down would be a third table. There is next to no torque left up there to be
 // inefficient with, which is why the omission costs nothing and why a lockup clutch exists anyway.
-export [[nodiscard]] Curve converterTorqueRatio()
-{
-    return Curve{.points = {glm::dvec2(0.00, 2.10), glm::dvec2(0.20, 1.85), glm::dvec2(0.40, 1.60),
-                            glm::dvec2(0.60, 1.37), glm::dvec2(0.80, 1.13), glm::dvec2(0.88, 1.00),
-                            glm::dvec2(1.00, 1.00)}};
-}
+export [[nodiscard]] Curve converterTorqueRatio();
 
 // Speed ratio against the capacity coefficient C = T_impeller / omega_impeller^2, in N.m per
 // (rad/s)^2.
@@ -105,12 +107,7 @@ export [[nodiscard]] Curve converterTorqueRatio()
 // before the speed ratio gets there — which is precisely the range a converter without a lockup
 // spends its life cruising in. C is zero there, which is both finite and the truth: no relative
 // motion, no flow, no torque.
-export [[nodiscard]] Curve converterCapacity()
-{
-    return Curve{.points = {glm::dvec2(0.00, 0.006308), glm::dvec2(0.20, 0.006046), glm::dvec2(0.40, 0.005495),
-                            glm::dvec2(0.50, 0.005080), glm::dvec2(0.60, 0.004486), glm::dvec2(0.70, 0.003732),
-                            glm::dvec2(0.80, 0.002751), glm::dvec2(0.90, 0.001470), glm::dvec2(1.00, 0.0)}};
-}
+export [[nodiscard]] Curve converterCapacity();
 
 // The plate that bridges impeller and turbine once there is nothing left to multiply. It is in
 // *parallel* with the fluid rather than downstream of it, which is what a real lockup clutch is
@@ -172,58 +169,11 @@ export struct ConverterFlow
 // The fluid path alone, with no lockup in it. Pure, so what a converter does can be swept and read
 // off without a car around it.
 export [[nodiscard]] ConverterFlow converterFlow(const TorqueConverter& converter, const double impellerSpeed,
-                                                 const double turbineSpeed)
-{
-    // The speed ratio is always formed over the *faster* side, so there is never a small number
-    // underneath it — an impeller at rest is only ill-conditioned if it is also the divisor. When
-    // both sides are near rest the answer is a torque going as the square of a speed near zero,
-    // which is nothing whatever ratio is read.
-    const auto overrun = std::abs(turbineSpeed) > std::abs(impellerSpeed);
-    const auto pumpSpeed = overrun ? turbineSpeed : impellerSpeed;
-
-    if (std::abs(pumpSpeed) < 1e-9)
-    {
-        return ConverterFlow{};
-    }
-
-    // Clamped below zero as well as above, which is a decision rather than hygiene: a negative speed
-    // ratio is the turbine turning against the impeller — a car rolling backwards in drive — and it
-    // is read as stall. Published data there sits a little above the stall figure, so this is the
-    // conservative side of it and the car still gets the full multiplication pushing it back up.
-    const auto ratio = std::clamp((overrun ? impellerSpeed : turbineSpeed) / pumpSpeed, 0.0, 1.0);
-
-    const auto scale = overrun ? converter.overrunCapacityScale : 1.0;
-    const auto pumped = std::copysign(scale * converter.capacity.at(ratio) * pumpSpeed * pumpSpeed, pumpSpeed);
-
-    if (!overrun)
-    {
-        return ConverterFlow{.impeller = pumped, .turbine = converter.torqueRatio.at(ratio) * pumped};
-    }
-
-    // Reverse flow: the turbine is driving and the stator's one-way clutch has let go, so there is
-    // no reaction member and nothing to multiply against. Both sides see the same torque and it
-    // opposes the turbine.
-    return ConverterFlow{.impeller = -pumped, .turbine = -pumped};
-}
+                                                 const double turbineSpeed);
 
 // Where the lockup's apply pressure goes next, given what the car is doing.
 export [[nodiscard]] double advanceLockup(const ConverterLockup& lockup, const double apply, const double turbineSpeed,
-                                          const std::int32_t gear, const double deltaTime)
-{
-    const auto bleed = std::max(apply - std::max(lockup.releaseRate * deltaTime, 0.0), 0.0);
-
-    if (!lockup.enabled || gear < lockup.lowestGear)
-    {
-        return bleed;
-    }
-
-    if (turbineSpeed >= lockup.engageSpeed)
-    {
-        return std::min(apply + std::max(lockup.applyRate * deltaTime, 0.0), 1.0);
-    }
-
-    return turbineSpeed <= lockup.releaseSpeed ? bleed : apply;
-}
+                                          const std::int32_t gear, const double deltaTime);
 
 export struct DriveCoupling
 {
@@ -277,61 +227,7 @@ export struct DriveCouplingSolution
 // One tick of whatever is fitted.
 export [[nodiscard]] std::expected<DriveCouplingSolution, std::string>
 stepDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const CouplingSides& sides,
-                  const DriveCouplingCommand& command, const double deltaTime)
-{
-    switch (coupling.kind)
-    {
-    case DriveCouplingKind::FrictionClutch:
-    {
-        static_cast<void>(command.gear);
-
-        auto loaded = sides;
-        loaded.capacity = clutchCapacity(coupling.clutch, command.clutchPedal);
-
-        const auto solution = stepCoupling(coupling.clutch.coupling, state.coupling, loaded, deltaTime);
-
-        return DriveCouplingSolution{.drivingTorque = solution.torque,
-                                     .drivenTorque = solution.torque,
-                                     .slipSpeed = solution.slipSpeed,
-                                     .slipPower = std::abs(solution.torque * solution.slipSpeed),
-                                     .locked = solution.locked};
-    }
-    case DriveCouplingKind::TorqueConverter:
-    {
-        // A converter car has no third pedal, and this line is where that is said. Reading the field
-        // and dropping it is the difference between a pedal that is ignored and a pedal nobody wired
-        // up; fed into the fluid it would be a clutch that half works and reads as a feature.
-        static_cast<void>(command.clutchPedal);
-
-        const auto& converter = coupling.converter;
-        const auto flow = converterFlow(converter, sides.drivingSpeed, sides.drivenSpeed);
-
-        state.lockupApply =
-            advanceLockup(converter.lockup, state.lockupApply, sides.drivenSpeed, command.gear, deltaTime);
-
-        // The plate bridges the two sides, so what it has to hold is whatever the fluid has *not*
-        // already taken out of them — hand it the raw external torques and it would be asked to
-        // carry the fluid's work a second time.
-        auto bridged = sides;
-        bridged.drivingTorque = sides.drivingTorque - flow.impeller;
-        bridged.drivenTorque = sides.drivenTorque + flow.turbine;
-        bridged.capacity = std::max(converter.lockup.capacity, 0.0) * std::clamp(state.lockupApply, 0.0, 1.0);
-
-        const auto plate = stepCoupling(converter.lockup.coupling, state.coupling, bridged, deltaTime);
-
-        const auto slipSpeed = sides.drivingSpeed - sides.drivenSpeed;
-        const auto fluidHeat = flow.impeller * sides.drivingSpeed - flow.turbine * sides.drivenSpeed;
-
-        return DriveCouplingSolution{.drivingTorque = flow.impeller + plate.torque,
-                                     .drivenTorque = flow.turbine + plate.torque,
-                                     .slipSpeed = slipSpeed,
-                                     .slipPower = std::max(fluidHeat, 0.0) + std::abs(plate.torque * slipSpeed),
-                                     .locked = plate.locked};
-    }
-    }
-
-    return std::unexpected("the drive coupling slot holds a kind this build has no model for");
-}
+                  const DriveCouplingCommand& command, const double deltaTime);
 
 // What the slot does on a tick where nothing is connected through it — neutral, a gear change, or a
 // car with no driven axle. It is here rather than in the driveline because the two kinds answer
@@ -342,20 +238,7 @@ stepDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, cons
 // struct and that put a step in the one channel a shift is judged by — a plate that vanished in a
 // tick and took half a second to come back, on every gear change, for no reason a transmission
 // controller would recognise.
-export void idleDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const double deltaTime)
-{
-    state.coupling = CouplingState{};
-
-    switch (coupling.kind)
-    {
-    case DriveCouplingKind::FrictionClutch:
-        state.lockupApply = 0.0;
-        break;
-    case DriveCouplingKind::TorqueConverter:
-        state.lockupApply = advanceLockup(coupling.converter.lockup, state.lockupApply, 0.0, 0, deltaTime);
-        break;
-    }
-}
+export void idleDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const double deltaTime);
 
 // A layer over the *pedal*, not around the clutch. It produces a pedal position and nothing else, so
 // the friction model underneath is identical whoever is pressing — which is the whole point, because
@@ -369,8 +252,20 @@ export struct AutoClutch
     double releaseFraction = 0.40;
     double grabFraction = 1.20;
 
-    // Where it holds the engine on a launch, at full throttle.
+    // **Was the speed it held the engine at on a launch, and that rule is gone.** It held the clutch
+    // open until the engine had climbed to this — 250 rad/s, near 2400 rpm — and only then fed the
+    // clamp in against the revs. That is a launch assist and no dual clutch does it: from the seat it
+    // is flooring the throttle, hearing the engine flare, and going nowhere. A DSG *closes* the clutch
+    // when you ask for torque and lets the anti-stall protect the engine if it was too much.
+    //
+    // Kept as a field only because `[.vehicle-data]` enumerates it. Nothing reads it.
     double launchSpeed = 250.0;
+
+    // What the clutch answers the driver with instead: the accelerator travel at which the clamp is
+    // commanded fully home. A tenth of the pedal, so any real request for torque closes it and the
+    // take-up is the pedal's own rate limit — a quarter of a second from open to shut — rather than a
+    // regulator waiting on revs.
+    double engageThrottle = 0.10;
 
     // A foot has a speed limit and so does this. Without it the pedal is a step input into a
     // friction element, which is the one thing a coupling cannot be asked to answer sensibly.
@@ -387,53 +282,118 @@ export struct AutoClutch
     // because the whole term exists to keep the fight away from that floor, not to referee at it.
     double antiStallBegin = 0.90;
     double antiStallOpen = 0.55;
+
+    // --- creep ---
+    //
+    // A dual clutch in gear with the brakes released and no throttle crawls forward, and it does so
+    // because the controller *commands* it: there is nothing in a pair of dry plates that leaks
+    // torque the way a fluid coupling does at stall. That is the whole reason this is a rule here and
+    // a consequence of the hardware in `TorqueConverter`.
+    bool creep = true;
+
+    // **The torque, not the speed.** A real TCU commands a modest clutch pressure and lets the
+    // resulting speed fall out of whatever is loading the car, which is why a DSG creeps slower
+    // uphill, faster downhill and stalls against a kerb rather than climbing it. A speed regulator
+    // gets all three wrong, and gets them wrong in the direction that feels like an assist.
+    //
+    // N.m at the clutch. What it buys is grade authority and nothing else: through this car's first
+    // gear and final drive it is `creepTorque * 13.94 / 0.3186` newtons at the road, so 30 N.m is
+    // 1313 N against a 1348 kg car — a little under a ten percent gradient before it gives up. The
+    // speed it settles at on the flat is not set by this at all; see `creepPedal`.
+    double creepTorque = 30.0;
+
+    // How fast the commanded pressure may move, N.m per second. Two of them because a TCU raises
+    // creep pressure gently and drops it promptly, and because the pedal's own rate limit is no
+    // substitute: the engagement curve is nearly vertical where creep lives, so a pedal crawling
+    // through it at `pedalRate` still delivers the whole creep torque inside fifteen milliseconds.
+    //
+    // **Measured, and it does exactly one of the two things it was written for.** Swept from 400 down
+    // to 15 N.m/s it controls the clutch-torque rise precisely and by construction — 9.0 N.m per tick
+    // at 400, 0.042 at 15, 2.8 at the 100 here — so the take-up is a ramp rather than a step. What it
+    // does *not* touch is the engine: the worst idle excursion of a creep is **0.845 of idle at every
+    // rate across that whole range**, because that excursion is not the take-up at all. It is the
+    // lock-up a second and a half later, when `autoClutchPedal`'s catching-up term closes the clutch
+    // on the last of the slip. Nothing in this brief moves that, and the anti-stall catches it — see
+    // the note on it in `docs/vehicle-physics.md`.
+    double creepApplyRate = 100.0;
+    double creepReleaseRate = 400.0;
+
+    // Brake travel at which creep is cancelled, so the car sits still at a light rather than slipping
+    // its clutch against its own brakes for as long as the light is red.
+    //
+    // **A threshold and not a taper, and the difference is a burnt clutch.** A taper was tried first,
+    // creep falling linearly to nothing over the first fifth of the pedal, and it leaves a band where
+    // the brakes are already strong enough to hold the car and creep is still commanding torque into
+    // them: measured at a tenth of the pedal, that is the car stationary with the clutch slipping at
+    // **1.3 kW for as long as the driver waits** — 40 kJ over thirty seconds, which no dry plate
+    // survives being asked for at a set of lights. A threshold has no such band. The transition is
+    // ramped by `creepReleaseRate` in *time*, which is where a real controller ramps it, rather than
+    // by pedal position.
+    //
+    // **Where it goes is derived rather than chosen.** It has to sit below the brake application at
+    // which the brakes can hold the car against full creep, or the band comes back. This car's brakes
+    // make 4200 N.m at the wheels and full creep puts `creepTorque * 13.94` — 418 N.m — through the
+    // front axle, so they cross at a tenth of the pedal. A twentieth is half of that, and is also
+    // about where a real brake-light switch trips, which is the signal a real TCU cancels creep on.
+    //
+    // A driver resting a foot exactly on it gets creep ramping up and down at `creepApplyRate` rather
+    // than a step, which is the rate limit doing what it is for. If that ever proves to be felt, the
+    // fix is the two-thresholds-and-hysteresis shape `advanceRevLimiter` and `ConverterLockup`
+    // already use, and it is a real brake switch's shape too.
+    double creepBrakeCut = 0.05;
+
+    // And the accelerator travel the controller reads as "not pressed". Creep is the no-demand state:
+    // the moment the driver asks for torque the pedal map owns the clutch, and this is where that is
+    // said. A dead band rather than a threshold because a real accelerator has one, and because a
+    // sensor resting a percent off zero must not hold creep off for ever.
+    double creepThrottleLift = 0.03;
 };
+
+// Where the commanded creep torque goes next, in N.m at the clutch. `stepCoupling`'s shape: a target
+// this instant answers for, and a rate the state may approach it at.
+//
+// Every one of the four things that cancels it cancels it outright, because every one of them is a
+// statement about the car rather than a quantity to be traded off: out of gear there is nothing to
+// creep against, a dead engine is not creeping anywhere, a driver on the accelerator has taken the
+// clutch back, and a driver on the brake has asked the car to stay where it is. The smoothing is the
+// rate, in time, and there is nowhere else it belongs — see `creepBrakeCut`.
+export [[nodiscard]] double advanceCreep(const AutoClutch& assist, const double command, const double brake,
+                                         const double throttle, const bool inGear, const bool running,
+                                         const double deltaTime);
+
+// The pedal the creep rule is asking for, given what it has commanded.
+//
+// **A converter car has no creep rule and must not be given one.** A fluid coupling at stall already
+// passes torque — that is what a fluid coupling *is*, and it is why an automatic creeps without
+// anything deciding that it should. Commanding a creep on top of one would be the same behaviour
+// modelled twice, and the second copy would be the one with a number in it. So the dispatch is here,
+// in the file that owns the kinds, and `stepDriveline` asks for a pedal without learning which is
+// fitted — which is the same rule `stepDriveCoupling` is written under.
+export [[nodiscard]] double creepPedal(const DriveCoupling& coupling, const double command);
 
 // The pedal an automatic foot would be holding, given what the car is doing. `idleSpeed` arrives as a
 // number rather than as the engine model because `:Driveline` imports this partition and not the
 // other way about.
 export [[nodiscard]] double autoClutchPedal(const AutoClutch& assist, const double idleSpeed,
                                             const double clutchSideSpeed, const double engineSpeed,
-                                            const double throttle, const bool inGear)
-{
-    if (!inGear)
-    {
-        return 1.0;
-    }
-
-    const auto release = assist.releaseFraction * idleSpeed;
-    const auto grab = assist.grabFraction * idleSpeed;
-
-    // The car has caught up with the gear it is in, so there is nothing left to slip for.
-    const auto caught = std::clamp((std::abs(clutchSideSpeed) - release) / std::max(grab - release, 1e-9), 0.0, 1.0);
-
-    // And the launch. Revs the driver has asked for are revs this is allowed to spend, so the
-    // engagement closes as the engine rises and opens again the moment the clutch drags it down.
-    // That feedback is what holds a launch near `launchSpeed` without anything here naming a slip
-    // target or reading the capacity it is about to command.
-    const auto headroom =
-        std::clamp((engineSpeed - idleSpeed) / std::max(assist.launchSpeed - idleSpeed, 1e-9), 0.0, 1.0);
-
-    return 1.0 - std::max(caught, headroom * std::clamp(throttle, 0.0, 1.0));
-}
+                                            const double throttle, const bool inGear);
 
 // How far the clutch must be out *right now* because the engine is being dragged toward its stall
 // floor. Zero for a healthy engine, one by `antiStallOpen`, and computed from the engine's own speed
 // rather than the driveline side's — which is the hole the engagement logic above has: `caught`
 // watches the road, and a full brake application arrests the wheels faster than any pedal follows,
 // so the road-side answer arrives after the engine is already below its floor.
-export [[nodiscard]] double antiStallPedal(const AutoClutch& assist, const double idleSpeed, const double engineSpeed)
-{
-    if (!assist.enabled)
-    {
-        return 0.0;
-    }
-
-    const auto begin = assist.antiStallBegin * idleSpeed;
-    const auto open = assist.antiStallOpen * idleSpeed;
-
-    return std::clamp((begin - engineSpeed) / std::max(begin - open, 1e-9), 0.0, 1.0);
-}
+// **It only exists underneath the creep band.** Above it there is nothing for it to protect: a car
+// travelling faster than idle through its gear is turning the engine rather than being turned by it,
+// and an engine dragged down out there is being dragged down by a driver who has chosen the wrong
+// gear — which is a thing a car is allowed to do, and a clutch that quietly opened itself to prevent
+// it would be an assist nobody asked for. `grabFraction * idleSpeed` is the same line creep and the
+// catching-up term already use, so there is one threshold in this file and not three.
+//
+// `clutchSideSpeed` is signed and is compared as such: a car rolling backwards is under the band from
+// the wrong side, and that is exactly a stall coming.
+export [[nodiscard]] double antiStallPedal(const AutoClutch& assist, const double idleSpeed,
+                                           const double clutchSideSpeed, const double engineSpeed);
 
 // Where the pedal goes next, given where it is, what the driver is doing with it and what the
 // automation would like.
@@ -446,32 +406,6 @@ export [[nodiscard]] double antiStallPedal(const AutoClutch& assist, const doubl
 // the line between the two is the free play a real pedal already has rather than an invented
 // threshold.
 export [[nodiscard]] double advanceClutchPedal(const AutoClutch& assist, const double pedal, const double driverPedal,
-                                               const double automatic, const double antiStall, const double deltaTime)
-{
-    const auto driver = std::clamp(driverPedal, 0.0, 1.0);
-
-    // No rate limit on the driver: a real pedal answers an ankle directly, and dumping it is a thing
-    // a driver is allowed to do and this model is supposed to have an opinion about. The driver's
-    // foot beats the anti-stall too — a human deliberately biting the clutch is re-specifying what
-    // the engine is for, exactly as the cruise-control rule above says.
-    if (!assist.enabled || driver > assist.freePlay)
-    {
-        return driver;
-    }
-
-    // Because the state above has been tracking the driver's pedal all the while it was the
-    // driver's, the automation picks up where the foot left it instead of stepping.
-    const auto limit = std::max(assist.pedalRate * deltaTime, 0.0);
-    const auto followed =
-        std::clamp(pedal + std::clamp(std::clamp(automatic, 0.0, 1.0) - pedal, -limit, limit), 0.0, 1.0);
-
-    // The anti-stall is a floor past the rate limit, deliberately: the limit models a foot, and on
-    // the hardware this automation stands in for — a dual clutch's hydraulics — the emergency
-    // disengage is not a foot. Rate-limited, it loses the race it exists for: a full brake
-    // application locks the wheels in a few tens of milliseconds and the pedal needs a quarter of a
-    // second, so the engine is below its floor before the follow arrives. The floored value becomes
-    // the state, so recovery decays smoothly from wherever the emergency put it.
-    return std::max(followed, std::clamp(antiStall, 0.0, 1.0));
-}
+                                               const double automatic, const double antiStall, const double deltaTime);
 
 } // namespace raceengine

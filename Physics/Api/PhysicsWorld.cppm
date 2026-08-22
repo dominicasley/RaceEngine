@@ -3,7 +3,6 @@ module;
 #include <cstdint>
 #include <expected>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -49,64 +48,26 @@ export struct SurfaceHit
 // Move-only and RAII over the backend's handle, because a world is a large thing to copy by
 // accident and the alternative to owning it here is an explicit destroy call that a failing test
 // skips.
+//
+// **Every member is defined in Physics/Impl/PhysicsWorldImpl.cpp, not here.** A definition written
+// inside the class is part of this partition's BMI, so editing one rebuilds every importer of
+// `raceengine` — 117 ninja edges and ~87 s. Declared here and defined in an implementation unit,
+// the same edit is one object file. The accessors below are the only ones that lose an inline by
+// it, and both return a word from a member that is read once per wheel per tick. Full account:
+// docs/build-times.md.
 export class PhysicsWorld
 {
 public:
     PhysicsWorld(const PhysicsWorld&) = delete;
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
-    PhysicsWorld(PhysicsWorld&& other) noexcept :
-        world(std::exchange(other.world, 0)),
-        surfaceMaterials(std::move(other.surfaceMaterials))
-    {
-    }
-
-    PhysicsWorld& operator=(PhysicsWorld&& other) noexcept
-    {
-        if (this != &other)
-        {
-            raceengineJoltDestroyWorld(world);
-            world = std::exchange(other.world, 0);
-            surfaceMaterials = std::move(other.surfaceMaterials);
-        }
-
-        return *this;
-    }
-
-    ~PhysicsWorld()
-    {
-        raceengineJoltDestroyWorld(world);
-    }
+    PhysicsWorld(PhysicsWorld&& other) noexcept;
+    PhysicsWorld& operator=(PhysicsWorld&& other) noexcept;
+    ~PhysicsWorld();
 
     // The surface mesh becomes one static body with per-triangle materials. Requires `bringUpJolt`
     // to have run: Jolt's shape types register into a factory that does not exist before it.
-    [[nodiscard]] static std::expected<PhysicsWorld, std::string> create(const SurfaceMesh& mesh)
-    {
-        // Reported here rather than left to the bridge, because the bridge's own answer to an empty
-        // table is "triangle 0 names surface 0, of which there are 0", which reads as a bad index
-        // rather than as a missing table. The table is also what `materials()` hands the tire, and a
-        // patch aggregated against an empty one has no first element to fall back on.
-        if (mesh.materials.empty())
-        {
-            return std::unexpected("a collision mesh needs at least one surface material");
-        }
-
-        auto reason = std::string();
-
-        // glm::dvec3 is three doubles with no padding, which the static_assert below is what makes
-        // safe to rely on rather than assume — the whole vertex array crosses as one pointer.
-        const auto created =
-            raceengineJoltCreateWorld(&mesh.vertices.front().x, static_cast<std::uint32_t>(mesh.vertices.size()),
-                                      mesh.indices.data(), static_cast<std::uint32_t>(mesh.triangleCount()),
-                                      mesh.surfaces.data(), static_cast<std::uint32_t>(mesh.materials.size()), reason);
-
-        if (created == 0)
-        {
-            return std::unexpected("the physics world was not created: " + reason);
-        }
-
-        return PhysicsWorld(created, mesh.materials);
-    }
+    [[nodiscard]] static std::expected<PhysicsWorld, std::string> create(const SurfaceMesh& mesh);
 
     // What each surface index is worth to a tire, in the order the mesh declared them.
     //
@@ -116,10 +77,7 @@ public:
     // was querying, which is exact for a generated proving ground — the generator emits that table —
     // and silently wrong for anything else: an authored circuit states nine surfaces, and every
     // index past the third fell back on the first, so a wheel in the gravel gripped like tarmac.
-    [[nodiscard]] const std::vector<SurfaceMaterial>& materials() const
-    {
-        return surfaceMaterials;
-    }
+    [[nodiscard]] const std::vector<SurfaceMaterial>& materials() const;
 
     // Batched, and that is the interface rather than a convenience over a single cast: a wheel's
     // contact patch is a grid of samples taken at one instant, four wheels of them per tick, and
@@ -129,53 +87,15 @@ public:
     // reports `hit == false` with the distance left at maxDistance, so a caller aggregating a patch
     // can weight by hit without branching into a separate path.
     void castRays(const std::vector<glm::dvec3>& origins, const std::vector<glm::dvec3>& directions,
-                  const double maxDistance, std::vector<SurfaceHit>& results) const
-    {
-        const auto count = origins.size() < directions.size() ? origins.size() : directions.size();
-        results.assign(count, SurfaceHit{});
-
-        if (count == 0)
-        {
-            return;
-        }
-
-        // Scratch in the shape the bridge takes. Sized once per call rather than per sample, which
-        // is the only allocation on this path and the reason the call is batched.
-        auto points = std::vector<double>(count * 3);
-        auto normals = std::vector<double>(count * 3);
-        auto distances = std::vector<double>(count);
-        auto surfaces = std::vector<std::uint32_t>(count);
-        auto hits = std::vector<unsigned char>(count);
-
-        raceengineJoltCastRays(world, &origins.front().x, &directions.front().x, maxDistance,
-                               static_cast<std::uint32_t>(count), points.data(), normals.data(), distances.data(),
-                               surfaces.data(), hits.data());
-
-        for (auto index = std::size_t{0}; index < count; index++)
-        {
-            results[index] =
-                SurfaceHit{.point = glm::dvec3(points[index * 3], points[index * 3 + 1], points[index * 3 + 2]),
-                           .normal = glm::dvec3(normals[index * 3], normals[index * 3 + 1], normals[index * 3 + 2]),
-                           .distance = distances[index],
-                           .surface = surfaces[index],
-                           .hit = hits[index] != 0};
-        }
-    }
+                  const double maxDistance, std::vector<SurfaceHit>& results) const;
 
     // The backend's own identifier for this world. Exposed because the contact bridge is a second
     // entry point into the same world and has to name it; nothing outside this module's partitions
     // has any use for it.
-    [[nodiscard]] std::uint64_t handle() const
-    {
-        return world;
-    }
+    [[nodiscard]] std::uint64_t handle() const;
 
 private:
-    PhysicsWorld(const std::uint64_t created, std::vector<SurfaceMaterial> surfaces) :
-        world(created),
-        surfaceMaterials(std::move(surfaces))
-    {
-    }
+    PhysicsWorld(const std::uint64_t created, std::vector<SurfaceMaterial> surfaces);
 
     std::uint64_t world = 0;
     std::vector<SurfaceMaterial> surfaceMaterials;

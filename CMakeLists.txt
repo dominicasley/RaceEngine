@@ -55,8 +55,28 @@ add_library(EnginePhysicsBackend STATIC Physics/Backend/JoltBackend.cpp)
 target_link_libraries(EnginePhysicsBackend PRIVATE Jolt::Jolt)
 target_link_libraries(EnginePhysicsBackend PRIVATE raceengine_warnings)
 
+# Module *implementation* units are plain sources, deliberately not in the CXX_MODULES file set
+# below: that file set is module interfaces, and an interface is what produces an importable BMI.
+# These produce an object and nothing else, which is the whole reason they exist — see
+# Physics/Impl/TyreImpl.cpp and docs/build-times.md. CMake still scans them, because a unit saying
+# `module raceengine.physics;` has to be ordered after that module's interface.
 add_library (Engine STATIC
-        Io/ThirdPartyImpl.cpp)
+        Io/ThirdPartyImpl.cpp
+        Physics/Impl/ClutchImpl.cpp
+        Physics/Impl/ContactImpl.cpp
+        Physics/Impl/ContactPatchImpl.cpp
+        Physics/Impl/CouplingImpl.cpp
+        Physics/Impl/DrivelineImpl.cpp
+        Physics/Impl/JoltRuntimeImpl.cpp
+        Physics/Impl/PhysicsWorldImpl.cpp
+        Physics/Impl/ProvingGroundImpl.cpp
+        Physics/Impl/PublishedCarsImpl.cpp
+        Physics/Impl/RigidBodyImpl.cpp
+        Physics/Impl/SetupFileImpl.cpp
+        Physics/Impl/SuspensionImpl.cpp
+        Physics/Impl/TelemetryImpl.cpp
+        Physics/Impl/TyreImpl.cpp
+        Physics/Impl/VehicleImpl.cpp)
 
 target_sources(Engine PUBLIC
         FILE_SET CXX_MODULES
@@ -164,6 +184,20 @@ target_include_directories(Engine SYSTEM PUBLIC
         ${STB_INCLUDE_DIRS}
         ${TINYGLTF_INCLUDE_DIRS}
         ${ozz_animation_SOURCE_DIR}/include)
+
+# No precompiled header on this target, and that is a finding rather than an omission.
+#
+# A PCH is worth an enormous amount here in principle — a std header textually included in a global
+# module fragment has to be merged against the copy already inside every imported BMI, and in a unit
+# that imports `raceengine` that merge is most of the compile. Measured on a probe unit, best of
+# three: 11.13 s without a PCH, 1.74 s with one, the unit's own includes untouched.
+#
+# **clang-19 segfaults building this target's module units with one** (exit 139 in the frontend,
+# first on Graphics/Models/Scene.cppm). PCH plus C++20 module interfaces is not stable in this
+# compiler, and it fails as a crash rather than as a diagnostic, so there is nothing to work around.
+# It is applied to `EngineTests` instead, where the sources are plain translation units and it does
+# not crash — see Tests/CMakeLists.txt. Retest on clang-20+; the header is kept ready at
+# cmake/raceengine_pch.hpp. Full account: docs/build-times.md.
 
 target_compile_definitions(Engine PUBLIC GLM_ENABLE_EXPERIMENTAL)
 

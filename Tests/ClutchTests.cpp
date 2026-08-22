@@ -393,9 +393,13 @@ TEST_CASE("the driver's pedal is not overridden by the automation", "[physics][c
         REQUIRE(autoClutchPedal(assist, idle, 4.0 * idle, 300.0, 0.0, true) == Catch::Approx(0.0));
         // Neutral is neither: there is nothing on the other side of it.
         REQUIRE(autoClutchPedal(assist, idle, 0.0, 300.0, 1.0, false) == Catch::Approx(1.0));
-        // And revs the driver asked for are revs it will spend, which is what a launch is.
-        REQUIRE(autoClutchPedal(assist, idle, 0.0, 250.0, 1.0, true) == Catch::Approx(0.0));
-        REQUIRE(autoClutchPedal(assist, idle, 0.0, 250.0, 0.5, true) == Catch::Approx(0.5));
+        // And a driver asking for torque gets the clutch, directly. The rule this replaces scaled
+        // engagement by how far the engine had climbed toward `launchSpeed`, so full throttle from
+        // rest held the clutch open and let the engine flare — a launch assist, and not what a dual
+        // clutch does. Engine speed does not appear here at all now; it is the anti-stall's business.
+        REQUIRE(autoClutchPedal(assist, idle, 0.0, idle, 1.0, true) == Catch::Approx(0.0));
+        REQUIRE(autoClutchPedal(assist, idle, 0.0, idle, assist.engageThrottle, true) == Catch::Approx(0.0));
+        REQUIRE(autoClutchPedal(assist, idle, 0.0, idle, 0.5 * assist.engageThrottle, true) == Catch::Approx(0.5));
     }
 
     SECTION("the anti-stall opens past the rate limit, and the driver's foot still beats it")
@@ -404,19 +408,24 @@ TEST_CASE("the driver's pedal is not overridden by the automation", "[physics][c
 
         // A healthy engine asks for nothing, including at idle itself: the band begins below it so
         // the governor's own excursions never brush this.
-        REQUIRE(antiStallPedal(assist, idle, idle) == 0.0);
-        REQUIRE(antiStallPedal(assist, idle, assist.antiStallBegin * idle) == 0.0);
+        REQUIRE(antiStallPedal(assist, idle, 0.0, idle) == 0.0);
+        REQUIRE(antiStallPedal(assist, idle, 0.0, assist.antiStallBegin * idle) == 0.0);
         // Dragged into the band it is fully out by the band's floor, and the floor arrives whole
         // this tick — not at the foot's four-per-second — because the race it exists to win is over
         // in tens of milliseconds.
-        REQUIRE(antiStallPedal(assist, idle, 0.5 * idle) == 1.0);
+        REQUIRE(antiStallPedal(assist, idle, 0.0, 0.5 * idle) == 1.0);
         REQUIRE(advanceClutchPedal(assist, 0.0, 0.0, 0.0, 1.0, tick) == 1.0);
         // A foot past the free play is still the driver's, emergency or none.
         REQUIRE(advanceClutchPedal(assist, 0.0, 0.3, 0.0, 1.0, tick) == Catch::Approx(0.3));
 
         auto disabled = AutoClutch{};
         disabled.enabled = false;
-        REQUIRE(antiStallPedal(disabled, idle, 0.0) == 0.0);
+        REQUIRE(antiStallPedal(disabled, idle, 0.0, 0.0) == 0.0);
+
+        // **And it only exists underneath the creep band.** Out on the road there is nothing for it
+        // to protect: an engine being lugged at speed is a driver in the wrong gear, which is a thing
+        // a car is allowed to do and not a thing a clutch should quietly open itself to prevent.
+        REQUIRE(antiStallPedal(assist, idle, 2.0 * assist.grabFraction * idle, 0.5 * idle) == 0.0);
     }
 }
 
@@ -507,13 +516,44 @@ TEST_CASE("dumping the clutch at idle kills the engine", "[physics][clutch][stal
         auto assisted = Car{};
         settle(vehicle.value(), driveline, world.value(), assisted);
 
-        for (auto step = 0; step < 1080; step++)
+        // **These inputs are the creep state, and this section used to assert that nothing happened
+        // in it.** In gear, no throttle, no brake and the driver's foot off the clutch is exactly
+        // what a car at a green light is doing, and until the creep rule existed the answer was that
+        // the car sat inert with the engine untouched — so `engineSpeed == idle` three seconds in
+        // read as a statement about the automation and was really a statement about the missing rule.
+        // It fails now for the right reason: the car pulls away, the take-up loads the engine, and
+        // the governor is left a little high behind it.
+        //
+        // What the section is *for* is that the automation does not let the clutch kill the engine,
+        // and that is asserted directly rather than through a proxy: every tick above the anti-stall
+        // band's floor, and the idle recovered once the governor has had time to.
+        auto lowest = assisted.engine.engineSpeed;
+        auto crept = 0.0;
+
+        for (auto step = 0; step < 3600; step++)
         {
-            static_cast<void>(advance(vehicle.value(), driveline, world.value(), assisted, input));
+            const auto sample = advance(vehicle.value(), driveline, world.value(), assisted, input);
+            lowest = std::min(lowest, sample.engineSpeed);
+            crept = std::max(crept, sample.roadSpeed);
+
+            REQUIRE(!sample.stalled);
         }
 
+        CAPTURE(lowest, crept, assisted.engine.engineSpeed);
+
         REQUIRE(assisted.engine.engine == EngineState::Running);
-        REQUIRE(assisted.engine.engineSpeed == Catch::Approx(driveline.engine.idleSpeed).epsilon(0.05));
+
+        // Never dragged toward the floor. `antiStallOpen` is 0.55 of idle and the whole point of the
+        // band is that the fight stays away from it; the excursion a creep take-up costs is a couple
+        // of percent, not a third.
+        REQUIRE(lowest > 0.80 * driveline.engine.idleSpeed);
+
+        // And it crept, which is why the engine was disturbed at all. A section asserting the engine
+        // is undisturbed here would be asserting the rule away again.
+        REQUIRE(crept > 1.0);
+
+        // Ten seconds is long enough for the governor to put it back.
+        REQUIRE(assisted.engine.engineSpeed == Catch::Approx(driveline.engine.idleSpeed).epsilon(0.02));
     }
 }
 

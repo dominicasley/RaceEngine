@@ -21,6 +21,26 @@ import raceengine.resource;
 namespace raceengine
 {
 
+// Throws std::runtime_error carrying `message`. It exists for a build-time reason rather than a
+// design one, and the reason is specific enough to be worth stating: `#include <stdexcept>` in a
+// global module fragment costs about nine seconds in any translation unit that also imports
+// `raceengine`, because every declaration that header states has to be merged against the copy
+// already sitting inside the imported BMIs. Measured 2026-08-22 on clang-19, one sandbox unit:
+// 1.7s without the include, 10.8s with it, everything else held. It is `<stdexcept>` specifically
+// and not a rule about global module fragments — <vector> costs nothing the same way, <string>
+// three tenths of a second, <exception> and <new> about as little.
+//
+// So a game constructor that has to fail calls this instead of naming the exception, and its
+// global module fragment gets that much shorter. The exception type and what propagates out of it
+// are unchanged; only the throw site moves in here.
+//
+// Declared here and defined below the private fragment, so an importer never deserializes the body
+// either.
+//
+// A constructor is the one place in this project that still throws: everything able to report a
+// failure to a caller returns std::expected instead, and that rule is not relaxed by this.
+export [[noreturn]] void fail(const std::string& message);
+
 // Generational slot storage. std::deque still backs it and elements still never move, but that
 // address stability is no longer doing four jobs: it is only what makes a resolved borrow
 // (find/get below) usable for the length of a loop nest, while a background thread appends.
@@ -242,5 +262,17 @@ public:
     MemoryStorage<std::unique_ptr<ozz::animation::Skeleton>> skeletons;
     MemoryStorage<std::unique_ptr<ozz::animation::Animation>> animations;
 };
+
+} // namespace raceengine
+
+module :private;
+
+namespace raceengine
+{
+
+void fail(const std::string& message)
+{
+    throw std::runtime_error(message);
+}
 
 } // namespace raceengine

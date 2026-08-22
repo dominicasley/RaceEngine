@@ -202,21 +202,36 @@ TEST_CASE("a full brake application cannot stall the automation", "[physics][clu
 
 TEST_CASE("a stalled car in gear does not chatter", "[physics][driveline][antistall][stall]")
 {
-    // **Recorded as known and unfixed, and it is neither: it is fixed, by the anti-stall pedal, as a
-    // side effect nobody wrote down.** The entry said "a stalled car in gear with no brakes chatters
-    // ±480 N·m at the tick rate, because the clutch's slipping torque through first gear exceeds
-    // what the wheel's inertia absorbs in a tick". Measured now (`./EngineTests "[.stall-chatter]"`),
-    // the clutch torque through the whole of this case is **zero**: `antiStallPedal` opens the
-    // coupling the moment the engine falls under idle, so there is no slipping torque to exceed
-    // anything. That is correct for this car — the Golf is a dual clutch and its automation
-    // disengages hydraulically — and it means the driveline transmits nothing while stalled.
+    // The original entry said "a stalled car in gear with no brakes chatters ±480 N·m at the tick
+    // rate, because the clutch's slipping torque through first gear exceeds what the wheel's inertia
+    // absorbs in a tick". Chatter is what this asserts is absent, and the mechanism that makes it
+    // absent has now changed twice — so what is asserted below is the *absence of chatter* and not
+    // any particular reason for it.
     //
-    // Two things are asserted, and the second is the one that would catch it coming back.
+    // **It used to be that the clutch was held open, and that was wrong.** `antiStallPedal` fired
+    // whenever the engine was under idle at any road speed, so a dead engine anywhere disengaged the
+    // clutch and the driveline transmitted nothing. That is an assist nobody asked for: it is also
+    // what made flooring the throttle from rest flare the engine and go nowhere. Anti-stall is now
+    // gated to the creep band — `grabFraction * idleSpeed`, the same line creep and the catching-up
+    // term already use — so out here at 3 to 25 m/s it does not fire at all.
+    //
+    // **What holds the clutch open here now is a separate rule, and it had to be separated.** A dead
+    // engine gets a disengaged clutch at any speed, which is what a real dual clutch does and is not
+    // the same statement as "protect the engine from stalling". Tangled together, the second was
+    // doing the first's job everywhere and nobody could see it.
+    //
+    // Letting the clutch close on a stalled engine instead was measured, because it is the obvious
+    // alternative and it reads as the more physical one: `settleEngineSpeed` pins a stalled engine at
+    // exactly zero, so the closed clutch gives the compliant shaft an immovable wall to wind against
+    // and the driven wheels **ring 31 → 11 → 18 rad/s** at 10 m/s in first, 2732 N·m peak, 25 sign
+    // reversals in 720 ticks. That is not a car being dragged to a halt, it is a car shaking itself
+    // apart, and the pin is why. Bump-starting — a dead engine *motored* by the wheels rather than
+    // held at zero — is the thing that would make closing it honest, and no part of this model has it.
     //
     // **The recorded magnitude was probably never the model's.** Writing the stall into the state
     // without also placing the shaft reproduces −7438 N·m on the first tick at 25 m/s — the fixture
     // fault `placeDriveline` exists to prevent, which was itself found through a −2746 N·m first
-    // tick. Placed properly the same case peaks at 338 and decays.
+    // tick.
     const JoltGuard jolt;
 
     auto descriptor = ProvingGroundDescriptor{};
@@ -297,19 +312,24 @@ TEST_CASE("a stalled car in gear does not chatter", "[physics][driveline][antist
             settledPeak = std::max(settledPeak, std::abs(driven));
         }
 
-        // The clutch is held open the whole time, which is the mechanism.
+        // The clutch is open the whole time, which is the mechanism — now stated by its own rule
+        // rather than falling out of the anti-stall's.
         REQUIRE(std::abs(torques->clutch) < 1e-6);
     }
 
-    CAPTURE(peak, settledPeak, flips);
+    CAPTURE(peak, settledPeak, flips, car.state.chassis.linearVelocity.z);
 
     // The step is absorbed rather than sustained: a few hundred newton metres at most as the
-    // driveline takes up a dead engine, and under two once it has.
+    // driveline takes up a dead engine, and under five once it has.
     REQUIRE(peak < 500.0);
     REQUIRE(settledPeak < 5.0);
 
-    // **And it is not oscillating.** A torque alternating at the tick rate would flip hundreds of
-    // times in 720 ticks; this flips single digits, all of them in the first third of a second while
-    // the shaft is still taking up.
+    // **And it is not oscillating**, which is the whole of what this case is named for. A torque
+    // alternating at the tick rate would flip hundreds of times in 720 ticks; this flips single
+    // digits, all of them while the shaft is still taking up.
     REQUIRE(flips < 20);
+
+    // And the car coasts rather than being braked by a dead engine, which follows from the clutch
+    // being open and is the thing the closed-clutch alternative got wrong so violently.
+    REQUIRE(car.state.chassis.linearVelocity.z > speed - 1.0);
 }

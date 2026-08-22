@@ -20,21 +20,9 @@ namespace raceengine
 // object exists and torn down after the last one dies. That makes this the composition root's
 // business and nobody else's, which is why it is a pair of free functions rather than something a
 // service owns: two owners of a process-wide singleton is the bug it would be hiding.
-export [[nodiscard]] std::expected<void, std::string> bringUpJolt()
-{
-    auto reason = std::string();
-    if (!raceengineJoltBringUp(reason))
-    {
-        return std::unexpected("the physics backend would not start: " + reason);
-    }
-
-    return {};
-}
+export [[nodiscard]] std::expected<void, std::string> bringUpJolt();
 
 // Safe to call without a matching bring-up, so a partially constructed owner can unwind through it.
-export void tearDownJolt()
-{
-    raceengineJoltTearDown();
-}
+export void tearDownJolt();
 
 } // namespace raceengine

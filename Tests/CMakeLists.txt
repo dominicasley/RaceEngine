@@ -19,6 +19,8 @@ add_executable(EngineTests
         ComplianceTests.cpp
         ContactPatchChamferProbe.cpp
         ContactPatchTests.cpp
+        CreepDiagnosticProbe.cpp
+        CreepTests.cpp
         CriteriaGripSweepProbe.cpp
         CouplingTests.cpp
         DifferentialTests.cpp
@@ -85,6 +87,18 @@ target_sources(EngineTests PRIVATE
 target_link_libraries(EngineTests PRIVATE Engine)
 target_link_libraries(EngineTests PRIVATE Catch2::Catch2WithMain)
 target_link_libraries(EngineTests PRIVATE raceengine_warnings)
+
+# The precompiled header, on the one target that can take it. This is the largest target in the
+# tree by compile time — 536 s of the build's serial total — and its sixty-odd plain translation
+# units all import the engine and include the standard headers the PCH carries, which is exactly
+# the combination the PCH removes the cost of.
+#
+# **The three module units above are excluded, and must stay excluded**: clang-19 segfaults in the
+# frontend building a module interface unit against a PCH, which is why neither Engine nor
+# OpenStreetRace has one. A plain translation unit is fine. Full account: docs/build-times.md.
+set_source_files_properties(CapturedLog.cppm RecordingRenderBackend.cppm RecordingInputBackend.cppm
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+target_precompile_headers(EngineTests PRIVATE ${CMAKE_SOURCE_DIR}/RaceEngine/cmake/raceengine_pch.hpp)
 
 # One CTest entry per TEST_CASE, so a failure names the case rather than the binary. The
 # enumeration runs the freshly built binary, which is itself a check that it starts headless.
