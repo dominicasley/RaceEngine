@@ -132,8 +132,29 @@ struct World
 
     // Our surface index for each Jolt material, in the order the materials were handed over. A hit
     // reports a material *pointer*, and this is what turns it back into the index the surface table
-    // is keyed by — three entries, so a linear scan is the whole lookup.
+    // is keyed by.
+    //
+    // **The comment here used to say "three entries, so a linear scan is the whole lookup", and it
+    // was written against the proving ground.** A loaded circuit brings its own table: Bathurst's is
+    // nine, and the scan ran per ray for every one of the thirty-six a car casts per tick. Sorted
+    // once at creation and binary searched since — the world is immutable after `create`, so the
+    // ordering can never go stale.
+    //
+    // Honestly: this is **not** worth a measurable amount. The per-ray cost did not move outside the
+    // noise when it landed, because the scan broke on its first comparison for tarmac — which is
+    // most rays — and nine entries is a short walk even when it does not. It is kept because it
+    // removes a cost that grows with a track's surface count for no complexity, not because it was
+    // found to be slow.
     std::vector<const JPH::PhysicsMaterial*> materialOrder;
+    std::vector<std::pair<const JPH::PhysicsMaterial*, std::uint32_t>> materialLookup;
+
+    [[nodiscard]] std::uint32_t surfaceOf(const JPH::PhysicsMaterial* material) const
+    {
+        const auto found = std::lower_bound(materialLookup.begin(), materialLookup.end(), material,
+                                            [](const auto& entry, const auto* key) { return entry.first < key; });
+
+        return found != materialLookup.end() && found->first == material ? found->second : 0;
+    }
 };
 
 // Worlds are handed out as an index rather than as a pointer, so that a handle from a destroyed
@@ -287,6 +308,16 @@ std::uint64_t raceengineJoltCreateWorld(const double* vertexData, const std::uin
     // when every static body is known up front.
     world->system.OptimizeBroadPhase();
 
+    // The material lookup, built once beside the tree and for the same reason: everything about this
+    // world is known now and nothing changes it afterwards.
+    world->materialLookup.reserve(world->materialOrder.size());
+    for (auto index = std::size_t{0}; index < world->materialOrder.size(); index++)
+    {
+        world->materialLookup.emplace_back(world->materialOrder[index], static_cast<std::uint32_t>(index));
+    }
+    std::sort(world->materialLookup.begin(), world->materialLookup.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+
     worlds.push_back(std::move(world));
 
     return worlds.size();
@@ -333,13 +364,76 @@ void raceengineJoltCastRays(const std::uint64_t handle, const double* origins, c
         // Jolt carries the ray's length in its direction vector rather than as a separate limit.
         const JPH::RRayCast ray{origin, direction * static_cast<float>(maxDistance)};
 
+        // **The locking query, kept deliberately, and the measurement that says so is worth the
+        // comment.** This world is immutable after `create` — one static body, no `system.Update`
+        // anywhere — so `GetNarrowPhaseQueryNoLock` and `GetBodyLockInterfaceNoLock` are *safe*
+        // here, and they were tried on the strength of a decomposition that put about a third of the
+        // 324 ns per-ray cost outside tree traversal. **They bought about one percent, which is
+        // inside the run-to-run noise.** The lock was not where that third lives.
+        //
+        // So the precondition is not worth carrying: a no-lock query would have to be reverted the
+        // day anything adds a body or steps the system, and it buys nothing measurable today.
+        //
+        // The one case that would reopen this is the multi-car milestone *if it casts from several
+        // threads* — lock contention is a different question from lock acquisition, and this
+        // measurement says nothing about it.
+        // **A ray can miss a solid mesh, and it costs a wheel.** Measured 2026-08-22 on the kerb
+        // crossing: one ray of 31,851 came back with no hit while the two samples either side of it
+        // in the same row reported 19.5 and 18.8 millimetres of road, and that single ray is the
+        // whole of why `the imported car crosses a kerb continuously` fails — 25.9 mm of patch-centre
+        // movement in one tick and 665 N of load, out and straight back the next tick.
+        //
+        // Characterised rather than guessed at (`./EngineTests "[.kerb-discontinuity]"`): the misses
+        // lie in a band **35 micrometres wide in z and indifferent to x**, sitting beside a shared
+        // triangle edge of the ground mesh and not on it — a ray cast exactly on the edge hits, and 0
+        // of 200 row lines swept lose one. It is independent of the ray's length, so it is not the
+        // search distance. That is the signature of the float32 edge test inside the mesh shape
+        // losing its sign over a few units in the last place: the ground's own coordinates are tens
+        // of metres, where a float's spacing is about 4 um, and the band is a few of those.
+        //
+        // So the ray is re-cast from a millimetre away, twice, along two directions perpendicular to
+        // it and to each other. A dead band is a *line*, so an offset that is not parallel to it
+        // clears it, and two independent offsets cannot both be parallel to the same line. A
+        // millimetre is
+        // 30 times the band and a thirtieth of the contact grid's own pitch, so a retry that hits is
+        // reporting the same piece of road. A wheel genuinely over a void misses all three times and
+        // is still correctly reported as missing.
         JPH::RayCastResult result;
-        if (!world->system.GetNarrowPhaseQuery().CastRay(ray, result))
+        auto hitRay = ray;
+
+        if (!world->system.GetNarrowPhaseQuery().CastRay(hitRay, result))
         {
-            continue;
+            const auto axis = std::abs(direction.GetX()) < std::abs(direction.GetY())
+                                  ? (std::abs(direction.GetX()) < std::abs(direction.GetZ()) ? JPH::Vec3::sAxisX()
+                                                                                             : JPH::Vec3::sAxisZ())
+                                  : (std::abs(direction.GetY()) < std::abs(direction.GetZ()) ? JPH::Vec3::sAxisY()
+                                                                                             : JPH::Vec3::sAxisZ());
+
+            const auto first = direction.Cross(axis).Normalized() * 1.0e-3F;
+            const auto second = direction.Cross(first).Normalized() * 1.0e-3F;
+
+            auto recovered = false;
+            for (const auto& nudge : {first, second})
+            {
+                hitRay = JPH::RRayCast{origin + nudge, ray.mDirection};
+                if (world->system.GetNarrowPhaseQuery().CastRay(hitRay, result))
+                {
+                    recovered = true;
+                    break;
+                }
+            }
+
+            if (!recovered)
+            {
+                continue;
+            }
         }
 
-        const auto point = ray.GetPointOnRay(result.mFraction);
+        // The point on the ray that actually hit, which is the nudged one when a retry recovered it.
+        // Taking it off the original ray would report the road at the offset ray's depth under the
+        // original ray's position, which is a millimetre of road slope reported as a millimetre of
+        // tyre compression.
+        const auto point = hitRay.GetPointOnRay(result.mFraction);
 
         JPH::BodyLockRead lock(world->system.GetBodyLockInterface(), result.mBodyID);
         if (!lock.Succeeded())
@@ -360,14 +454,7 @@ void raceengineJoltCastRays(const std::uint64_t handle, const double* origins, c
         outNormals[index * 3 + 1] = static_cast<double>(normal.GetY());
         outNormals[index * 3 + 2] = static_cast<double>(normal.GetZ());
 
-        for (auto surface = std::size_t{0}; surface < world->materialOrder.size(); surface++)
-        {
-            if (world->materialOrder[surface] == material)
-            {
-                outSurfaces[index] = static_cast<std::uint32_t>(surface);
-                break;
-            }
-        }
+        outSurfaces[index] = world->surfaceOf(material);
     }
 }
 

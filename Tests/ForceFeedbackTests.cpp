@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -67,7 +68,10 @@ struct Rig
     InputService input;
     ForceFeedbackService service;
 
-    explicit Rig(ForceFeedbackOptions options) :
+    // `withPedalMotors` is taken here rather than set afterwards because the input service captures
+    // the device's capabilities when it attaches: a fake that grew its motors after that is a rig
+    // whose pedals the service never saw, which is exactly what the real gate checks for.
+    explicit Rig(ForceFeedbackOptions options, const bool withPedalMotors = false) :
         input(log.sink(), backend, window,
               []
               {
@@ -80,6 +84,11 @@ struct Rig
               }()),
         service(log.sink(), input, std::move(options))
     {
+        if (withPedalMotors)
+        {
+            backend.attachPedalMotors();
+        }
+
         backend.attach();
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
@@ -389,6 +398,10 @@ TEST_CASE("the damper has authority where the loop can serve it and not above", 
         options.engageRamp = std::chrono::milliseconds{0};
         options.mapping.slewRate = 1e9;
         options.mapping.damping = 0.4;
+        // The base's own damping is summed with the dial, and this case is about the *filter* rather
+        // than the level — so it is turned off here and the whole of the 0.4 below is the dial's,
+        // which is what `ideal` is written against.
+        options.mapping.deviceDamping = 0.0;
         options.mapping.damperBandwidth = bandwidth;
         options.mapping.ceilingTorque = 8.0;
 
@@ -940,4 +953,276 @@ TEST_CASE("the damper is outside the rate limit, because a rate-limited damper i
     const auto capped = mapRackTorque(device, tight, 0.0, 40.0, 0.0, tick, 1.0);
 
     REQUIRE(capped.commandedTorque == Catch::Approx(-2.0));
+}
+
+TEST_CASE("the clip histogram measures how long a clip lasted, not only that it happened",
+          "[input][ffb][mapping][clipping]")
+{
+    // **The instrument the gain is set from, which until now did not exist.**
+    //
+    // `ffb.gain 0.70` was derived by sweeping the gain over a session and reading sustained clipping
+    // to zero — twice, by hand, on a CSV, with a script that is not in this repository. The class
+    // that calls itself the clip histogram counted *fractions* and knew nothing about time, so the
+    // one number the derivation turns on could not be asked of it. It can now.
+    //
+    // The discriminator is duration and not percentage, and that is the whole point. A kerb strike
+    // should hit the rail: it is a real event and the wheel saying so is correct. A corner should
+    // not, because a corner is where the pneumatic trail collapses and that cue is the most useful
+    // thing the tyre says. A quarter of a second of continuous rail is long enough that it can only
+    // be the second kind.
+    constexpr auto ceiling = 8.0;
+    constexpr auto period = 1.0 / 500.0;
+
+    const auto hold = [](ClipHistogram& histogram, const double torque, const double seconds)
+    {
+        for (auto step = 0; step < static_cast<int>(seconds / period); step++)
+        {
+            histogram.add(torque, ceiling, period);
+        }
+    };
+
+    SECTION("a kerb strike is a spike and does not count")
+    {
+        auto histogram = ClipHistogram{};
+
+        hold(histogram, 2.0, 1.0);
+        // Forty milliseconds of rail, which is what a kerb gives.
+        hold(histogram, 20.0, 0.04);
+        hold(histogram, 2.0, 1.0);
+
+        REQUIRE(histogram.clippedPercentage() > 0.0);
+        REQUIRE(histogram.peakDemand() == Catch::Approx(2.5));
+        REQUIRE(histogram.longestClip() == Catch::Approx(0.04).margin(period));
+        REQUIRE(histogram.sustainedEpisodes() == 0);
+    }
+
+    SECTION("a corner held against the rail counts once")
+    {
+        auto histogram = ClipHistogram{};
+
+        hold(histogram, 2.0, 0.5);
+        hold(histogram, 12.0, 1.2);
+        hold(histogram, 2.0, 0.5);
+
+        REQUIRE(histogram.longestClip() == Catch::Approx(1.2).margin(2.0 * period));
+        // **Once**, not once per frame. Six hundred frames of continuous clipping is one episode,
+        // and a counter that said six hundred would be the percentage again under another name.
+        REQUIRE(histogram.sustainedEpisodes() == 1);
+    }
+
+    SECTION("two corners count twice, and a gap between them is what separates them")
+    {
+        auto histogram = ClipHistogram{};
+
+        hold(histogram, 12.0, 0.6);
+        hold(histogram, 2.0, 0.3);
+        hold(histogram, 12.0, 0.6);
+
+        REQUIRE(histogram.sustainedEpisodes() == 2);
+        REQUIRE(histogram.longestClip() == Catch::Approx(0.6).margin(2.0 * period));
+    }
+
+    SECTION("and lowering the gain is what takes the count to zero")
+    {
+        // The derivation itself, in miniature: the same demand, swept over gains, with the episode
+        // count falling to zero. This is the shape of the sweep that set 0.70 — what it needs to be
+        // run for real is a lap, because the scripted launch never reaches the ceiling at all.
+        const auto episodesAt = [&](const double gain)
+        {
+            auto histogram = ClipHistogram{};
+
+            hold(histogram, 10.0 * gain, 0.8);
+            hold(histogram, 3.0 * gain, 0.3);
+            hold(histogram, 9.0 * gain, 0.8);
+
+            return histogram.sustainedEpisodes();
+        };
+
+        REQUIRE(episodesAt(1.00) == 2);
+        REQUIRE(episodesAt(0.85) == 1);
+        REQUIRE(episodesAt(0.70) == 0);
+    }
+
+    SECTION("a caller that states no duration gets the counts and no episodes")
+    {
+        // The default, and it keeps every existing caller inert: a histogram fed without a period
+        // still answers the two questions it always did and reports no episodes rather than
+        // guessing at them.
+        auto histogram = ClipHistogram{};
+
+        for (auto step = 0; step < 1000; step++)
+        {
+            histogram.add(12.0, ceiling);
+        }
+
+        REQUIRE(histogram.clippedPercentage() == Catch::Approx(100.0));
+        REQUIRE(histogram.sustainedEpisodes() == 0);
+        REQUIRE(histogram.longestClip() == 0.0);
+    }
+}
+
+TEST_CASE("the pedal motors are driven from the car and silenced on the way out", "[input][ffb][pedals]")
+{
+    // Stage three, end to end: stage one's severity in one side, the codes the device takes out the
+    // other, with the profile that knows what a motor is living on the writer's side of the line.
+    auto options = ForceFeedbackOptions{};
+    options.unattended = true;
+    options.engageRamp = std::chrono::milliseconds{0};
+    options.pedals.hasMotors = true;
+    // Written whenever the answer changes, for a test that is not about pacing.
+    options.pedals.updateHz = 1e6;
+
+    auto rig = Rig(options, true);
+
+    const auto pump = [&]
+    {
+        rig.service.publish(RackFeedback{.steeringTorque = 0.0, .publishInterval = 1.0 / 120.0});
+        std::ignore = rig.service.step(std::chrono::steady_clock::now(), tick);
+    };
+
+    SECTION("a gripping car leaves them alone")
+    {
+        rig.service.publishPedals(raceengine::PedalFeedback{});
+        pump();
+
+        REQUIRE(rig.service.pedalMotors().silent());
+        REQUIRE(rig.backend.pedalMotorWord() == 0u);
+    }
+
+    SECTION("a locked wheel reaches the brake motor and nothing else")
+    {
+        rig.service.publishPedals(raceengine::PedalFeedback{.brake = 1.0});
+        pump();
+
+        const auto command = rig.service.pedalMotors();
+        REQUIRE(command.brake == 255);
+        REQUIRE(command.throttle == 0);
+        REQUIRE(rig.backend.pedalMotorWord() == 0x00FF00u);
+    }
+
+    SECTION("and wheelspin reaches the throttle motor")
+    {
+        rig.service.publishPedals(raceengine::PedalFeedback{.throttle = 1.0});
+        pump();
+
+        REQUIRE(rig.backend.pedalMotorWord() == 0xFF0000u);
+    }
+
+    SECTION("an unchanged answer is not rewritten")
+    {
+        // Every write is a USB control transfer on the same pipe the force feedback is using, and a
+        // motor already turning at a given duty has nothing to learn from being told again.
+        rig.service.publishPedals(raceengine::PedalFeedback{.brake = 0.5});
+        pump();
+
+        const auto after = rig.backend.pedalMotorWrites();
+        REQUIRE(after > 0);
+
+        for (auto step = 0; step < 20; step++)
+        {
+            pump();
+        }
+
+        REQUIRE(rig.backend.pedalMotorWrites() == after);
+    }
+
+    SECTION("**and letting go of the wheel stops them**, which writing no torque does not")
+    {
+        // The failure that matters most: a torque settles when the effect is removed, an eccentric
+        // mass keeps turning until it is told nought. Every path that releases has to say so.
+        rig.service.publishPedals(raceengine::PedalFeedback{.brake = 1.0, .throttle = 1.0});
+        pump();
+        REQUIRE(rig.backend.pedalMotorWord() != 0u);
+
+        // A simulation that has stopped publishing is what the watchdog releases on, and it is the
+        // ordinary way a session ends.
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        std::ignore = rig.service.step(std::chrono::steady_clock::now(), tick);
+
+        REQUIRE(rig.service.pedalMotors().silent());
+        REQUIRE(rig.backend.pedalMotorWord() == 0u);
+    }
+}
+
+TEST_CASE("pedals with no motors are asked for nothing at all", "[input][ffb][pedals]")
+{
+    // The default, and the common rig: CSL Elite and CSL LC pedals have no motors, and a ClubSport
+    // V3 set plugged into the base's RJ12 rather than its own USB cable has motors nothing on this
+    // platform can reach. Neither is an error to report — it is a rig that has not been wired for
+    // this — so the service must not spend a write per frame discovering it again.
+    auto options = ForceFeedbackOptions{};
+    options.unattended = true;
+    options.engageRamp = std::chrono::milliseconds{0};
+
+    REQUIRE_FALSE(options.pedals.hasMotors);
+
+    auto rig = Rig(options);
+
+    rig.service.publishPedals(raceengine::PedalFeedback{.brake = 1.0, .throttle = 1.0});
+
+    for (auto step = 0; step < 20; step++)
+    {
+        rig.service.publish(RackFeedback{.steeringTorque = 0.0, .publishInterval = 1.0 / 120.0});
+        std::ignore = rig.service.step(std::chrono::steady_clock::now(), tick);
+    }
+
+    REQUIRE(rig.backend.pedalMotorWrites() == 0);
+}
+
+TEST_CASE("a publish the writer was holding the lock against is still a numbered trace row", "[input][ffb][trace]")
+{
+    // The 2026-08-22 session's "two sequence gaps", which were neither two nor gaps. Every sequence
+    // from 1 to 72304 was present exactly once and one *extra* row sat between 36102 and 36103
+    // carrying a literal 0 — a real tick, on cadence, interpolating cleanly between its neighbours in
+    // all sixty-one physics columns. `publish` initialised its local sequence to zero and only filled
+    // it inside the branch that won the `try_lock`, so a contended publish wrote the tick with no
+    // number on it, and one unnumbered row in the middle of a run reads to any gap analysis as two
+    // discontinuities. The acceptance criterion this column exists to serve is literally "no sequence
+    // gaps", so the column has to be able to say that.
+    //
+    // The contention is **forced rather than waited for**: a second thread publishing into the same
+    // service is the one arrangement that reliably loses the `try_lock`, and without it this case
+    // would pass on a service that never took the branch at all.
+    auto options = ForceFeedbackOptions{};
+    options.unattended = true;
+    options.traceCapacity = 8192;
+
+    auto rig = Rig(options);
+
+    constexpr auto publishes = 2000;
+
+    auto contender = std::jthread(
+        [&rig](const std::stop_token& stopToken)
+        {
+            while (!stopToken.stop_requested())
+            {
+                rig.service.publish(RackFeedback{.steeringTorque = 1.0, .publishInterval = 1.0 / 360.0});
+            }
+        });
+
+    for (auto step = 0; step < publishes; step++)
+    {
+        rig.service.publish(RackFeedback{.steeringTorque = 0.5, .publishInterval = 1.0 / 360.0});
+    }
+
+    contender.request_stop();
+    contender.join();
+
+    const auto trace = rig.service.takeTrace();
+    REQUIRE(trace.size() > 0);
+
+    // The whole assertion in one line: consecutive, from one, no repeats and no zero — whatever the
+    // handoff did. A ring that has wrapped starts at whatever it starts at, so the step is what is
+    // checked rather than the first value.
+    for (auto index = std::size_t{1}; index < trace.size(); index++)
+    {
+        REQUIRE(trace[index].sequence == trace[index - 1].sequence + 1);
+    }
+
+    REQUIRE(trace.front().sequence > 0);
+
+    // And the branch was genuinely taken, so this case cannot quietly stop testing anything. The
+    // dropped publishes are still counted and still reported; what changed is that they no longer
+    // damage the column that says whether the *trace* lost anything.
+    REQUIRE(rig.service.report().find(" 0 publishes dropped,") == std::string::npos);
 }

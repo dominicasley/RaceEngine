@@ -20,6 +20,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <glm/glm.hpp>
 
 import raceengine.physics;
@@ -197,4 +198,118 @@ TEST_CASE("a full brake application cannot stall the automation", "[physics][clu
         REQUIRE(car.engine.engine == EngineState::Running);
         REQUIRE(glm::length(car.state.chassis.linearVelocity) > 3.0);
     }
+}
+
+TEST_CASE("a stalled car in gear does not chatter", "[physics][driveline][antistall][stall]")
+{
+    // **Recorded as known and unfixed, and it is neither: it is fixed, by the anti-stall pedal, as a
+    // side effect nobody wrote down.** The entry said "a stalled car in gear with no brakes chatters
+    // ±480 N·m at the tick rate, because the clutch's slipping torque through first gear exceeds
+    // what the wheel's inertia absorbs in a tick". Measured now (`./EngineTests "[.stall-chatter]"`),
+    // the clutch torque through the whole of this case is **zero**: `antiStallPedal` opens the
+    // coupling the moment the engine falls under idle, so there is no slipping torque to exceed
+    // anything. That is correct for this car — the Golf is a dual clutch and its automation
+    // disengages hydraulically — and it means the driveline transmits nothing while stalled.
+    //
+    // Two things are asserted, and the second is the one that would catch it coming back.
+    //
+    // **The recorded magnitude was probably never the model's.** Writing the stall into the state
+    // without also placing the shaft reproduces −7438 N·m on the first tick at 25 m/s — the fixture
+    // fault `placeDriveline` exists to prevent, which was itself found through a −2746 N·m first
+    // tick. Placed properly the same case peaks at 338 and decays.
+    const JoltGuard jolt;
+
+    auto descriptor = ProvingGroundDescriptor{};
+    descriptor.length = 800.0;
+    descriptor.width = 400.0;
+    descriptor.cellSize = 2.0;
+    descriptor.features = {};
+
+    const auto generated = generateProvingGround(descriptor);
+    REQUIRE(generated.has_value());
+    const auto world = PhysicsWorld::create(generated.value());
+    REQUIRE(world.has_value());
+
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+    const auto vehicle = built.value();
+    const auto driveline = golfGtiMk7Driveline();
+
+    const auto speed = GENERATE(3.0, 10.0, 25.0);
+    CAPTURE(speed);
+
+    auto car = Car{};
+    car.state.chassis.position = glm::dvec3(0.0, 0.52, 20.0);
+
+    for (auto step = 0; step < 1440; step++)
+    {
+        REQUIRE(stepVehicle(vehicle, car.state, VehicleInput{}, noDriveTorque, world.value(), tick).has_value());
+    }
+
+    startEngine(driveline, car.engine);
+
+    // Stalled and rolling, which is the state a crash or a botched launch leaves behind and which
+    // nothing in a session gets a car out of — `startEngine` runs once, at spawn.
+    car.engine.engine = raceengine::EngineState::Stalled;
+    car.engine.engineSpeed = 0.0;
+
+    car.state.chassis.linearVelocity = glm::dvec3(0.0, 0.0, speed);
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        car.state.corners[index].wheelSpeed = speed / 0.31;
+    }
+
+    raceengine::placeDriveline(driveline, car.engine, speed / 0.31);
+
+    auto input = VehicleInput{};
+    input.gear = 1;
+
+    auto previous = 0.0;
+    auto flips = 0;
+    auto peak = 0.0;
+    auto settledPeak = 0.0;
+
+    for (auto step = 0; step < 720; step++)
+    {
+        const auto torques = stepDriveline(driveline, car.engine,
+                                           {car.state.corners[0].wheelSpeed, car.state.corners[1].wheelSpeed,
+                                            car.state.corners[2].wheelSpeed, car.state.corners[3].wheelSpeed},
+                                           wheelInertias(vehicle), car.road, input, tick);
+        REQUIRE(torques.has_value());
+
+        const auto stepped = stepVehicle(vehicle, car.state, input, torques->wheel, world.value(), tick);
+        REQUIRE(stepped.has_value());
+        car.road = roadTorques(stepped.value());
+
+        const auto driven = torques->wheel[0];
+
+        if (step > 0 && driven * previous < 0.0)
+        {
+            flips++;
+        }
+
+        peak = std::max(peak, std::abs(driven));
+        previous = driven;
+
+        // Past a third of a second, which is long enough for the driveline to absorb the step.
+        if (step > 120)
+        {
+            settledPeak = std::max(settledPeak, std::abs(driven));
+        }
+
+        // The clutch is held open the whole time, which is the mechanism.
+        REQUIRE(std::abs(torques->clutch) < 1e-6);
+    }
+
+    CAPTURE(peak, settledPeak, flips);
+
+    // The step is absorbed rather than sustained: a few hundred newton metres at most as the
+    // driveline takes up a dead engine, and under two once it has.
+    REQUIRE(peak < 500.0);
+    REQUIRE(settledPeak < 5.0);
+
+    // **And it is not oscillating.** A torque alternating at the tick rate would flip hundreds of
+    // times in 720 ticks; this flips single digits, all of them in the first third of a second while
+    // the shaft is still taking up.
+    REQUIRE(flips < 20);
 }

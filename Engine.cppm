@@ -432,6 +432,14 @@ namespace
     // against the 3.5 it did; that is the price of the instrument still being the one described.
     options.traceCapacity = 108000;
 
+    // The pedals' motors, on for any set that has them. **Safe to state unconditionally**: the
+    // profile only says a ClubSport V3 *would* have motors, and nothing is written until the device
+    // link agrees they are attached and reachable — which on Linux means the pedals are on their own
+    // USB cable, because a set wired through the base's RJ12 is only axes and the driver exposes no
+    // control for it. On a rig with CSL pedals, or with V3 pedals wired the usual way, this costs a
+    // boolean and produces silence.
+    options.pedals.hasMotors = true;
+
     return options;
 }
 

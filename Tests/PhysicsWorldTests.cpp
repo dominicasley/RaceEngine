@@ -264,6 +264,63 @@ TEST_CASE("scene queries are deterministic", "[physics][world][determinism]")
     }
 }
 
+TEST_CASE("a ray fired straight down at solid ground always finds it", "[physics][world][determinism]")
+{
+    // **A ray can miss a mesh it is pointed straight at, and it cost a wheel.** This is the
+    // regression for that: it fires at the coordinates where one did.
+    //
+    // Found 2026-08-22 while dissecting why `the imported car crosses a kerb continuously` failed. One
+    // ray of 31,851 over a kerb crossing came back with no hit while its two neighbours in the same
+    // row of the contact grid reported 19.5 and 18.8 mm of road under them. That single lost ray was
+    // the whole of the failure: 25.9 mm of patch-centre movement in one tick and 665 N of load, out
+    // and back the next tick, against a distribution whose next-worst tick was 2.4 mm.
+    //
+    // Characterised before it was repaired. The misses lie in a band **35 micrometres wide in z and
+    // indifferent to x**, sitting *beside* a shared triangle edge rather than on it — a ray cast
+    // exactly on the row line hits, and none of 200 row lines swept loses one — and it does not depend
+    // on the ray's length. That is the float32 edge test inside the mesh shape losing its sign over a
+    // few units in the last place at coordinates of tens of metres. The repair is a retry from a
+    // millimetre away along two perpendicular directions, in `raceengineJoltCastRays`.
+    //
+    // The whole band is swept rather than the one origin, so this does not become a test that passes
+    // because the degeneracy moved a micrometre.
+    const JoltGuard jolt;
+
+    auto descriptor = ProvingGroundDescriptor{};
+    descriptor.length = 200.0;
+    descriptor.width = 30.0;
+    descriptor.cellSize = 0.10;
+    descriptor.kerbInnerEdge = 0.60;
+    descriptor.features = {Feature{.kind = FeatureKind::Kerb, .from = 40.0, .to = 160.0}};
+
+    const auto mesh = generateProvingGround(descriptor);
+    REQUIRE(mesh.has_value());
+    const auto world = PhysicsWorld::create(mesh.value());
+    REQUIRE(world.has_value());
+
+    // The lost ray's own origin, and the band it sits in, at a micrometre's resolution.
+    auto origins = std::vector<glm::dvec3>{};
+    for (auto step = 0; step <= 200; step++)
+    {
+        origins.emplace_back(2.3742377382, 1.0298479792, 63.4999 + 1e-6 * static_cast<double>(step));
+    }
+
+    auto directions = std::vector<glm::dvec3>(origins.size(), glm::dvec3(0.0, -1.0, 0.0));
+    auto hits = std::vector<SurfaceHit>{};
+    world->castRays(origins, directions, 2.0, hits);
+
+    REQUIRE(hits.size() == origins.size());
+    for (auto index = std::size_t{0}; index < hits.size(); index++)
+    {
+        CAPTURE(index, origins[index].z);
+        REQUIRE(hits[index].hit);
+
+        // And it found the road rather than something a metre away that a wild retry might have
+        // reached. The kerb's flat top is 50 mm here and the ground either side is zero.
+        REQUIRE(hits[index].point.y == Catch::Approx(descriptor.kerbHeight).margin(1e-3));
+    }
+}
+
 TEST_CASE("a world that cannot be built is reported", "[physics][world]")
 {
     const JoltGuard jolt;

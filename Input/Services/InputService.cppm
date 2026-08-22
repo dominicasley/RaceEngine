@@ -154,6 +154,11 @@ export struct DeviceLink
     // connected has no rim.
     bool hasRim = false;
     double rimDegrees = 0.0;
+    // Whether a pedal set with vibration motors is attached and reachable. **A different device from
+    // the wheel**, so it is its own answer rather than a refinement of `connected`: a rig can have a
+    // base with full force feedback and pedals with no motors, or with motors that are wired through
+    // the base and cannot be reached.
+    bool hasPedalMotors = false;
 };
 
 export struct InputOptions
@@ -199,6 +204,7 @@ export class InputService
     DeviceIdentity publishedIdentity;
     bool publishedConnected = false;
     bool publishedTakesTorque = false;
+    bool publishedPedalMotors = false;
     InputSourceKind publishedKind = InputSourceKind::None;
     // Bumped whenever the profile behind the sample changes, which is once per connection. The tick
     // copies the profile only when this moves, so the per-tick cost is a fixed-size struct and never
@@ -351,6 +357,11 @@ public:
     // Newton metres are not this function's business and never will be — see `ForceMapping`, which
     // is where the device's peak, its code grid and every other hardware fact live.
     [[nodiscard]] std::expected<void, std::string> writeTorque(double torqueFraction);
+
+    // The pedals' motors, under the same lifetime lock and for the same reason: the reader thread
+    // may close the device out from under this at any moment, and a write into a closed descriptor
+    // is the one race this service exists to prevent.
+    [[nodiscard]] std::expected<void, std::string> writePedalMotors(std::uint8_t throttle, std::uint8_t brake);
 };
 
 // Where profiles go when the game does not say. `XDG_CONFIG_HOME` then `HOME` on Linux, `APPDATA`
@@ -510,7 +521,8 @@ DeviceLink InputService::deviceLink() const
                       .identity = publishedIdentity,
                       .sampleTimestampNanos = publishedSample.timestampNanos,
                       .hasRim = wheel,
-                      .rimDegrees = rim};
+                      .rimDegrees = rim,
+                      .hasPedalMotors = publishedPedalMotors};
 }
 
 std::expected<void, std::string> InputService::writeTorque(const double torqueFraction)
@@ -523,6 +535,18 @@ std::expected<void, std::string> InputService::writeTorque(const double torqueFr
     }
 
     return backend.writeTorque(torqueFraction);
+}
+
+std::expected<void, std::string> InputService::writePedalMotors(const std::uint8_t throttle, const std::uint8_t brake)
+{
+    const auto guard = std::shared_lock<std::shared_mutex>(deviceLifetime);
+
+    if (!backend.opened())
+    {
+        return std::unexpected("no device is open");
+    }
+
+    return backend.writePedalMotors(throttle, brake);
 }
 
 void InputService::publish(const DeviceSample& sample)
@@ -682,6 +706,7 @@ void InputService::attach()
     publishedRate = rate;
     publishedConnected = true;
     publishedTakesTorque = description.capabilities.has(DeviceCapability::ConstantForce);
+    publishedPedalMotors = backend.capabilities().has(DeviceCapability::PedalMotors);
     publishedKind = kind;
     profileGeneration.fetch_add(1, std::memory_order_release);
 }
@@ -695,6 +720,7 @@ void InputService::detach(const std::string& reason)
     const auto guard = std::lock_guard<std::mutex>(publication);
     publishedConnected = false;
     publishedTakesTorque = false;
+    publishedPedalMotors = false;
     publishedKind = InputSourceKind::None;
     publishedIdentity = DeviceIdentity{};
     publishedSample = DeviceSample{};

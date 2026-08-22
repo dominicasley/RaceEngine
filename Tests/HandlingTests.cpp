@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -12,6 +13,7 @@
 import raceengine.physics;
 
 using raceengine::bringUpJolt;
+using raceengine::cornerCount;
 using raceengine::CornerSide;
 using raceengine::Feature;
 using raceengine::FeatureKind;
@@ -94,45 +96,144 @@ struct SteadyState
 // since settled into its steady state.
 SteadyState hold(const VehicleSetup& setup, const PhysicsWorld& world, const double steering, const double speed)
 {
+    // **Started with room in every direction.** The ground runs z from 0 to its length rather than
+    // being centred on the origin, and a ten-second hold at 20 m/s is 200 m of arc on a circle of
+    // about 54 m — so a car started at z = 20 curves straight off the negative-z end of the plate
+    // partway round. It then loses support, and what the convergence check sees is that rather than
+    // anything about the car. The callers hand this a plate long enough for the circle; this puts the
+    // car in the middle of it.
     auto state = VehicleState{};
-    settle(setup, state, world, speed);
+    settle(setup, state, world, speed, 400.0);
 
     auto input = VehicleInput{};
     input.steering = steering;
 
+    // **The car is driven, and without that this is not a skidpad.** Stepping with `noDriveTorque`
+    // the car coasts, and hard cornering scrubs it down — measured at 20 m/s falling to 5.9 by full
+    // lock — so what came out was a spiral decaying to whatever equilibrium cornering drag left, at a
+    // radius nobody chose. It also *inverted* the grip response: a lower-grip tyre scrubs less, keeps
+    // more speed and therefore recorded more lateral acceleration, so cutting grip 15% appeared to
+    // make the car corner harder. A real skidpad is driven, and the throttle it takes is part of the
+    // test rather than a contamination of it.
+    auto drive = std::array<double, cornerCount>{};
+    auto integral = 0.0;
+
     auto result = SteadyState{};
     auto samples = 0;
 
-    for (auto step = 0; step < 1440; step++)
+    // Held apart so the preconditions below can be checked over the sample window rather than
+    // averaged away: a mean speed on target says nothing about whether it was ever steady.
+    auto slowest = std::numeric_limits<double>::max();
+    auto fastest = 0.0;
+    auto worstKinematic = 0.0;
+    auto firstHalf = 0.0;
+    auto secondHalf = 0.0;
+
+    // Ten seconds, not four. At its limit this car needs about six to settle into a steady turn —
+    // the convergence check below caught it still moving after four — and it circles inside a 40 m
+    // radius, so a longer hold costs time and no more ground.
+    for (auto step = 0; step < 3600; step++)
     {
-        const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world, tick);
+        // Proportional on road speed, across whichever axle this car drives. It consumes grip exactly
+        // as a real car's does holding a skidpad, which is honest rather than intrusive.
+        const auto error = speed - glm::length(state.chassis.linearVelocity);
+        // Proportional alone leaves a standing error — it held 18.4 of an asked-for 20, because a
+        // constant drag needs a constant force and a P term only makes one from a constant error. The
+        // integral removes it, so the fixture holds the speed it names rather than one near it.
+        integral = std::clamp(integral + error * tick, -4.0, 4.0);
+        const auto perWheel = std::clamp(2000.0 * error + 6000.0 * integral, -8000.0, 8000.0) *
+                              setup.corners.front().hardpoints.wheelRadius / 2.0;
+        drive = setup.corners.front().hardpoints.wheelRadius > 0.0
+                    ? std::array<double, cornerCount>{perWheel, perWheel, 0.0, 0.0}
+                    : std::array<double, cornerCount>{};
+
+        const auto stepped = stepVehicle(setup, state, input, drive, world, tick);
         REQUIRE(stepped.has_value());
 
-        if (step >= 1080)
+        if (step >= 3240)
         {
-            // In the body frame, and **toward the car's own right** rather than toward +x. Lateral
-            // acceleration read off world x is meaningless the moment the car has yawed, which on a
-            // skidpad is immediately; read off body +x it is meaningless in a different way, because
-            // +x is the car's *left* (`outboardSign`). Both quantities are stated toward the right
-            // here so that every assertion below reads as a driver would say it: a positive demand
-            // is a right turn, so a positive answer is the car doing what it was asked.
+            // Both stated **toward the car's own right** rather than toward +x, which is the car's
+            // *left* (`outboardSign`). A positive demand is a right turn, so a positive answer here
+            // is the car doing what it was asked — and positive yaw about +y swings the nose the
+            // other way, which is the same relation ISO 8855 states.
             //
-            // Positive yaw about +y swings the nose toward +x, which is the car's left, so yawing to
-            // the right is the *opposite* sign — the same relation ISO 8855 states, and the reason
-            // this is a multiply rather than a negation is that it stays right if the frame ever is.
+            // The acceleration needs no rotating: `TelemetryFrame::acceleration` is in the car's own
+            // frame. It was in the *world's* until 2026-08-21, and this fixture did the rotation
+            // itself — correctly, which is why these criteria were measuring the right quantity all
+            // along even while the CSV column of the same name was not.
             constexpr auto toTheRight = outboardSign(CornerSide::Right);
 
-            const auto right = state.chassis.orientation * glm::dvec3(toTheRight, 0.0, 0.0);
-            result.lateralAcceleration += glm::dot(stepped->telemetry.acceleration, right);
-            result.yawRate += stepped->telemetry.yawRate * toTheRight;
-            result.speed += glm::length(state.chassis.linearVelocity);
+            // **And it is still on the ground.** This is the precondition the plate-edge fault
+            // violated, and it is the cheapest of the lot: a car that has driven off the end of the
+            // world reports a beautifully converged nothing.
+            //
+            // Three wheels and not four, because **lifting the inside rear is real** — it is what a
+            // stiff rear anti-roll bar does, and one of the criteria using this fixture exists to
+            // stiffen that bar. Requiring all four asserted the absence of the thing being measured.
+            // Leaving the world takes the front pair together and then the rest, so three still
+            // catches it.
+            auto supported = 0;
+            for (const auto& wheel : stepped->telemetry.wheels)
+            {
+                supported += wheel.inContact ? 1 : 0;
+            }
+            REQUIRE(supported >= 3);
+
+            const auto lateral = stepped->telemetry.acceleration.x * toTheRight;
+            const auto yaw = stepped->telemetry.yawRate * toTheRight;
+            const auto carried = glm::length(state.chassis.linearVelocity);
+
+            result.lateralAcceleration += lateral;
+            result.yawRate += yaw;
+            result.speed += carried;
             samples++;
+
+            slowest = std::min(slowest, carried);
+            fastest = std::max(fastest, carried);
+            // In a steady turn `a_y = v * yawRate`. Any disagreement means the car is not tracking a
+            // circle — it is sliding, spinning or still slowing — and every number below then
+            // describes a transient rather than a limit.
+            worstKinematic = std::max(worstKinematic, std::abs(lateral - carried * yaw));
+            (samples <= 180 ? firstHalf : secondHalf) += lateral;
         }
     }
 
     result.lateralAcceleration /= static_cast<double>(samples) * gravity;
     result.yawRate /= static_cast<double>(samples);
     result.speed /= static_cast<double>(samples);
+
+    // **The fixture asserts that it did what its name says.** All four of the faults this suite has
+    // turned up in a month were fixtures quietly measuring something else, and every one of them
+    // would have been caught here rather than several conclusions later. These are cheap and they run
+    // on every criterion that holds a steady state.
+    CAPTURE(steering, speed, result.speed, slowest, fastest, worstKinematic);
+
+    // **The speed check is the load-bearing one**, and it is the one the coasting fixture violated:
+    // it was down to 5.9 m/s of an asked-for 20 by full lock. Tight, because holding the speed is the
+    // whole difference between a skidpad and a spiral.
+    REQUIRE(slowest > 0.9 * speed);
+    REQUIRE(fastest < 1.1 * speed);
+
+    // A gross-departure check, and deliberately loose. `a_y = v * yawRate` holds only while the
+    // sideslip angle is *constant*, and the residual is `v * dbeta/dt` — so a car past its grip limit
+    // legitimately fails it, because it is ploughing rather than tracking a circle. **This criterion
+    // sweeps deliberately past the limit** to show the curve turn over, so a tight bound here would be
+    // asserting the absence of the very thing the test exists to find. What is worth catching is a car
+    // that has departed outright, where the two decouple completely.
+    //
+    // It is also worth being explicit that this would **not** have caught the coasting fault: that
+    // fixture's kinematics agreed perfectly all the way down, because a decaying spiral is still a
+    // spiral. It was the *speed* it got wrong, which is why that assertion above is the tight one and
+    // this is the loose one.
+    REQUIRE(worstKinematic < 0.5 * std::abs(result.lateralAcceleration) * gravity + 1.0);
+
+    // And it had converged: the two halves of the sample window agree. Scaled to the lateral
+    // acceleration for the same reason the departure check is — **past its grip limit the car ploughs
+    // and its lateral acceleration genuinely wanders**, and these criteria sweep deliberately past the
+    // limit to show the curve turn over. Verified still to catch what it was added for: the car
+    // driving off the end of the plate read 3.7 against a threshold of 1.2 here.
+    REQUIRE(std::abs(firstHalf / 180.0 - secondHalf / static_cast<double>(samples - 180)) <
+            0.15 * std::abs(result.lateralAcceleration) * gravity + 0.2);
 
     return result;
 }
@@ -147,7 +248,7 @@ TEST_CASE("a car driven straight goes straight and keeps its speed", "[physics][
 
     const auto setup = placeholderSedan();
     REQUIRE(setup.has_value());
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
     auto state = VehicleState{};
@@ -181,7 +282,7 @@ TEST_CASE("the skidpad has an understeer gradient and a limit", "[physics][handl
 
     const auto setup = placeholderSedan();
     REQUIRE(setup.has_value());
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
     const auto steerings = std::vector<double>{0.04, 0.08, 0.12, 0.16, 0.22, 0.30, 0.45, 0.60, 0.85};
@@ -254,7 +355,7 @@ TEST_CASE("a stiffer rear bar shifts the balance toward oversteer", "[physics][h
     // falls with load and for no other reason.
     const JoltGuard jolt;
 
-    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
     REQUIRE(world.has_value());
 
     const auto withRearBar = [&world](const double rate)
@@ -802,6 +903,133 @@ TEST_CASE("one vehicle fits inside its tick budget", "[physics][handling][budget
     REQUIRE(median < 150.0);
 }
 
+TEST_CASE("what fraction of a tick the contact sampler costs", "[.patch-cost]")
+{
+    // **A planning number for the multi-car milestone, and deliberately not an argument about which
+    // enveloping model to build.** The E-series brief is explicit that performance is not the
+    // constraint and the model must not be chosen on query count; what is wanted is how much of the
+    // tick the sampler is, and how that scales, so 24 cars can be costed before anything is built.
+    //
+    // The sampler is timed as the three calls the tick actually makes — build the grid, cast the
+    // whole car's rays in one batch, aggregate each corner — against a full `stepVehicle` on the
+    // same car, on the same world, on this machine, in the same run. A fraction taken from two
+    // numbers measured on different days is not a fraction.
+    const JoltGuard jolt;
+
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+    const auto setup = built.value();
+
+    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    REQUIRE(world.has_value());
+
+    auto state = VehicleState{};
+    settle(setup, state, world.value(), 25.0);
+
+    auto input = VehicleInput{};
+    input.steering = 0.10;
+
+    constexpr auto ticks = 2000;
+
+    // The whole tick first, so the sampler's share is measured against a car in the same state.
+    auto whole = std::vector<double>{};
+    whole.reserve(ticks);
+    {
+        auto rolling = state;
+        for (auto step = 0; step < ticks; step++)
+        {
+            const auto started = std::chrono::steady_clock::now();
+            const auto stepped = stepVehicle(setup, rolling, input, noDriveTorque, world.value(), tick);
+            whole.push_back(
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+
+            REQUIRE(stepped.has_value());
+        }
+    }
+
+    std::sort(whole.begin(), whole.end());
+    const auto wholeMedian = whole[whole.size() / 2];
+
+    std::printf("\n  one whole vehicle tick: median %.2f us over %d ticks, on this machine.\n", wholeMedian, ticks);
+    std::printf("\n%8s %8s %12s %12s %10s\n", "grid", "rays", "sampler us", "share", "vs 3x3");
+
+    auto baseline = 0.0;
+
+    for (const auto count : {3u, 5u, 7u, 9u, 15u})
+    {
+        auto sampling = setup.sampling;
+        sampling.across = count;
+        sampling.along = count;
+
+        // The wheels are held at the settled pose rather than re-solved each iteration: what is being
+        // timed is the sampler, and re-running the suspension solve inside the loop would fold it in.
+        auto poses = std::array<raceengine::WheelPose, raceengine::cornerCount>{};
+        for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
+        {
+            const auto& corner = setup.corners[index];
+            const auto solved = solveCorner(corner.hardpoints, state.corners[index].wishboneAngle, 0.0);
+            REQUIRE(solved.has_value());
+
+            const auto outboard = outboardSign(corner.hardpoints.side);
+            poses[index] = raceengine::WheelPose{
+                .centre = raceengine::bodyToWorld(state.chassis, solved->wheelCentre),
+                .spinAxis = state.chassis.orientation * (solved->uprightOrientation * glm::dvec3(outboard, 0.0, 0.0)),
+                .forward = state.chassis.orientation * (solved->uprightOrientation * glm::dvec3(0.0, 0.0, 1.0)),
+                .radius = corner.hardpoints.wheelRadius};
+        }
+
+        auto samples = std::vector<double>{};
+        samples.reserve(ticks);
+
+        for (auto step = 0; step < ticks; step++)
+        {
+            const auto started = std::chrono::steady_clock::now();
+
+            auto geometries = std::array<raceengine::ContactSampleGeometry, raceengine::cornerCount>{};
+            auto origins = std::vector<glm::dvec3>{};
+            auto directions = std::vector<glm::dvec3>{};
+
+            for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
+            {
+                geometries[index] = raceengine::contactPatchSamples(poses[index], sampling);
+                origins.insert(origins.end(), geometries[index].origins.begin(), geometries[index].origins.end());
+                directions.insert(directions.end(), geometries[index].directions.begin(),
+                                  geometries[index].directions.end());
+            }
+
+            auto hits = std::vector<raceengine::SurfaceHit>{};
+            world->castRays(origins, directions, sampling.searchDistance * 2.0, hits);
+
+            auto consumed = std::size_t{0};
+            for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
+            {
+                const auto span = geometries[index].origins.size();
+                const auto slice =
+                    std::vector<raceengine::SurfaceHit>(hits.begin() + static_cast<std::ptrdiff_t>(consumed),
+                                                        hits.begin() + static_cast<std::ptrdiff_t>(consumed + span));
+                consumed += span;
+
+                const auto patch =
+                    raceengine::aggregateContactPatch(geometries[index], slice, world->materials(), sampling);
+                REQUIRE(patch.totalSamples == span);
+            }
+
+            samples.push_back(
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+        }
+
+        std::sort(samples.begin(), samples.end());
+        const auto median = samples[samples.size() / 2];
+        baseline = baseline > 0.0 ? baseline : median;
+
+        std::printf("%6ux%-2u %8u %12.2f %11.1f%% %10.2f\n", count, count, count * count * 4, median,
+                    100.0 * median / wholeMedian, median / baseline);
+    }
+
+    std::printf("\n  at 360 Hz and 24 cars the sampler alone is %.1f%% of one core at 3x3.\n",
+                100.0 * 24.0 * 360.0 * baseline / 1e6);
+}
+
 TEST_CASE("a car resting against a barrier stays where it is", "[physics][handling][contact]")
 {
     // Acceptance criterion 2's first half, and the brief is right that resting contact is the hard
@@ -951,4 +1179,115 @@ TEST_CASE("positive steering turns the car toward its own right, whatever car it
 
     REQUIRE(placeholderRight > 1.0);
     REQUIRE(golfRight > 1.0);
+}
+
+TEST_CASE("the anti-roll bar resists the roll rather than helping it", "[physics][handling][balance][antiroll]")
+{
+    // **Nothing asserted this sign, anywhere.** The bar's force is
+    // `rate * (other.wheelTravel - this.wheelTravel)`, which is one subtraction away from a bar that
+    // *drives* the roll it is supposed to resist — and a car with a backwards bar does not fall over,
+    // it simply rolls more and understeers differently, which reads as a soft spring or a tall centre
+    // of gravity. The handedness audit left this one open because it survives every shape-based check
+    // the milestone made.
+    //
+    // Two statements, and the second is the one a wrong sign cannot survive: the force opposes the
+    // corner's own compression, and stiffening the bar transfers *more* load across its axle.
+    const JoltGuard jolt;
+
+    const auto world = PhysicsWorld::create(generateProvingGround(plate()).value());
+    REQUIRE(world.has_value());
+
+    // A steady right turn, held long enough to settle. Everything below is read off the last tick.
+    const auto rolled = [&world](const double frontRate)
+    {
+        auto setup = placeholderSedan();
+        REQUIRE(setup.has_value());
+
+        setup->corners[0].antiRollRate = frontRate;
+        setup->corners[1].antiRollRate = frontRate;
+
+        auto state = VehicleState{};
+        state.chassis.position = glm::dvec3(0.0, 0.52, 20.0);
+        state.chassis.linearVelocity = glm::dvec3(0.0, 0.0, 20.0);
+
+        for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
+        {
+            state.corners[index].wheelSpeed = 20.0 / 0.31;
+        }
+
+        auto input = VehicleInput{};
+        input.steering = 0.22;
+
+        auto last = raceengine::VehicleStep{};
+
+        for (auto step = 0; step < 1440; step++)
+        {
+            const auto stepped = stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick);
+            REQUIRE(stepped.has_value());
+            last = stepped.value();
+        }
+
+        return last;
+    };
+
+    const auto soft = rolled(0.0);
+    const auto stiff = rolled(40000.0);
+
+    SECTION("with no bar there is no bar force")
+    {
+        for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
+        {
+            REQUIRE(soft.corners[index].forces.antiRoll == 0.0);
+        }
+    }
+
+    SECTION("the bar pushes back on whichever wheel is further into bump")
+    {
+        // Which front wheel is loaded depends only on which way the car is turning, and a positive
+        // demand is a right turn — so the *outside* wheel is the car's left, which is corner 0 or 1
+        // depending on how the corners are laid out. Rather than assert which, the case reads the
+        // travels and requires the force to oppose whichever it finds, which is the statement that
+        // actually matters and is the one a flipped subtraction breaks.
+        const auto& left = stiff.corners[0];
+        const auto& right = stiff.corners[1];
+
+        const auto deeper = left.suspension.wheelTravel > right.suspension.wheelTravel ? &left : &right;
+        const auto shallower = deeper == &left ? &right : &left;
+
+        CAPTURE(left.suspension.wheelTravel, right.suspension.wheelTravel, left.forces.antiRoll, right.forces.antiRoll);
+
+        // A real difference across the axle, so the case is not passing on a rounding error.
+        REQUIRE(std::abs(left.suspension.wheelTravel - right.suspension.wheelTravel) > 1e-4);
+
+        // The compressed wheel is pushed back out; the extended one is pulled back in. A bar that
+        // had these the other way round would be adding to the roll it exists to resist.
+        REQUIRE(deeper->forces.antiRoll < 0.0);
+        REQUIRE(shallower->forces.antiRoll > 0.0);
+
+        // Equal and opposite, because a torsion bar between two wheels is an internal force and can
+        // put no net vertical load into the car.
+        REQUIRE(left.forces.antiRoll == Catch::Approx(-right.forces.antiRoll).epsilon(1e-9));
+    }
+
+    SECTION("and stiffening it transfers more load across its own axle")
+    {
+        // The physical consequence, and the one criterion 7 reads as a balance shift. A bar wired
+        // backwards would *reduce* this spread as it stiffened.
+        const auto spread = [](const raceengine::VehicleStep& step, const std::size_t first, const std::size_t second)
+        {
+            return std::abs(step.corners[first].forces.tireVertical - step.corners[second].forces.tireVertical);
+        };
+
+        const auto softFront = spread(soft, 0, 1);
+        const auto stiffFront = spread(stiff, 0, 1);
+
+        CAPTURE(softFront, stiffFront, spread(soft, 2, 3), spread(stiff, 2, 3));
+
+        REQUIRE(stiffFront > softFront * 1.05);
+
+        // And the rear, which has no bar in either car, gives some of its share up as the front
+        // takes more — which is what makes this a *balance* change and not simply more roll
+        // stiffness everywhere.
+        REQUIRE(spread(stiff, 2, 3) < spread(soft, 2, 3));
+    }
 }

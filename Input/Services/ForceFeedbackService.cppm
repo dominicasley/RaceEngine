@@ -21,6 +21,8 @@ module;
 export module raceengine.input:ForceFeedbackService;
 
 import :ForceMapping;
+import :PedalFeedback;
+import :PedalMotors;
 import :InputBackend;
 import :InputService;
 import :RackTorque;
@@ -38,9 +40,19 @@ namespace raceengine
 // sense of it: where the rack is, and which device report the whole chain was derived from.
 export struct RackFeedback
 {
-    // N·m at the rim. **Always in newton metres**, never a fraction of anything: a trace of this is
-    // the physics artefact and has to stay comparable across devices, sessions and future hardware.
+    // N·m at the rim, and **what the driver's hands are meant to feel** — this car's own power
+    // steering included, because that is between the road and the rim in the real car too. Always
+    // in newton metres, never a fraction of anything.
     double steeringTorque = 0.0;
+    // The same instant with no power steering in it: the road and the geometry alone. Nothing
+    // downstream acts on this and that is the point — it is the column of the trace that stays
+    // comparable across devices, sessions and future hardware, and it was carrying an assisted
+    // number until 2026-08-21 because the two were one field.
+    //
+    // A publisher is expected to state both. One that does not writes a flat zero into that column,
+    // which reads as obviously absent rather than as quietly wrong — the failure this whole split
+    // exists to make visible.
+    double unassistedTorque = 0.0;
     // Newtons at the rack: the whole of it, and the tyres' share of it. Carried so the trace can
     // show where a torque came from without the reader having to divide by a pinion radius they
     // would have to go and look up.
@@ -54,17 +66,30 @@ export struct RackFeedback
     // apart in the simulation — and a slope taken over the wall interval is then hundreds of times
     // too steep. Zero means no slope is continued and the writer holds the newest value.
     double publishInterval = 0.0;
-    // N·m per radian per second of measured rim speed the *simulation* asks for on top of the
-    // driver's `ForceMapping::damping` dial. An electric rack schedules its damping by road speed
-    // — heavy at parking speeds, where the carcass spring needs ~0.5 to return the released rim
-    // without ringing, fading to nothing as the car rolls — and which speed the car is doing is
-    // the simulation's fact, not this service's. The dial stays the driver's; this rides on it.
-    double damping = 0.0;
     // `steady_clock` nanoseconds, from `DeviceSample::timestampNanos`. Zero when the demand did not
     // come from a device — a keyboard, or the gate's scripted launch — in which case no end-to-end
     // latency is measurable and none is reported.
     std::uint64_t inputTimestampNanos = 0;
+
+    // What the car was doing on this tick, for the trace. Nothing downstream of here acts on it —
+    // no safety rule reads it and no torque is derived from it — it rides along so that the assist
+    // curve's *aim* is measurable and not only its shape. A publisher that leaves it default writes
+    // zeros, which reads as obviously absent rather than as quietly wrong.
+    VehicleTrace vehicle{};
 };
+
+// **There was a `damping` field on `RackFeedback` and it is gone**, and its going is the point rather
+// than a tidy-up. The simulation used to ask for 0.4 N·m per rad/s of rim speed at a standstill,
+// sized as 2·√(K·J) — but the `J` in it was fitted from *one wheel base's* limit cycle, so a device
+// inertia was reaching the pipeline dressed as a car's request. Reckoned honestly for the car it is
+// thirty times larger, and the reason the two disagree is that the simulation has no steering degree
+// of freedom at all: the rack angle is commanded from the demand, so the only inertia in the loop a
+// damper closes belongs to the motor, the belt and the rim.
+//
+// So the damper is stage two's, in `ForceMapping::deviceDamping`, which is where a number about a
+// wheel base is allowed to live. A car with a rack that has a mass may want that channel back; a car
+// without one has nothing to say through it, and an inert field is a feature that reads as
+// implemented and behaves as a comment.
 
 // Where a torque went, in tenths of a millisecond up to twenty. A fixed set of counters rather than
 // a list of samples because it is written on the output thread, where nothing may allocate.
@@ -152,6 +177,13 @@ export struct ForceFeedbackOptions
     // byte-identical with and without any of this.
     bool unattended = false;
 
+    // The pedals' own motors, and the driver's dials for them. Defaulted to a set with none, which
+    // is both the safe answer and the common one — CSL Elite and CSL LC pedals have no motors, and a
+    // ClubSport V3 set plugged into the base's RJ12 rather than its own USB cable has motors that
+    // nothing on this platform can reach.
+    PedalMotorProfile pedals{};
+    PedalMotorMapping pedalMapping{};
+
     // What the writer thread paces itself to. **Measured rather than assumed**: this base's driver
     // consumes its effect slots on a two millisecond `hrtimer` that is compile-time fixed, so five
     // hundred is the ceiling whatever the transport allows — and the transport does allow a
@@ -215,6 +247,21 @@ export class ForceFeedbackService
     // writer spends on the state it already had.
     mutable std::mutex publication;
     RackFeedback publishedState{};
+
+    // **The pedals ride on the rack's publish and are otherwise nothing to do with it.** One publish
+    // because they come off the same tick and a driver's feet and hands are being told about one
+    // instant; two structs because they are two devices, and the day the pedals are on their own USB
+    // cable — which is the only way their motors are reachable at all — that is literally true.
+    //
+    // Stage one only. Turning this into motor codes is the writer thread's job, because the profile
+    // that knows what a motor is belongs on the device's side of the line and not the car's.
+    PedalFeedback publishedPedals{};
+    PedalFeedback newestPedals{};
+    // What was last written, so the motors are only told when the answer changes and at a rate an
+    // eccentric mass can render. See `PedalMotorProfile::updateHz`.
+    PedalMotorCommand lastPedalCommand{};
+    std::chrono::steady_clock::time_point lastPedalWrite{};
+    bool pedalsSilenced = true;
     std::uint64_t publishedNanos = 0;
     std::uint64_t publishedSequence = 0;
 
@@ -284,6 +331,18 @@ export class ForceFeedbackService
     mutable std::mutex traceLock;
     RackTorqueRecorder trace;
     std::uint64_t traceEpochNanos = 0;
+    // **The trace's own count, and it is deliberately not `publishedSequence`.** That one is the
+    // freshness handshake with the writer thread and only advances when the `try_lock` below is
+    // taken; a tick whose handoff missed used to be written into the trace carrying a literal zero,
+    // because the local was initialised to zero and only filled inside the branch that got the lock.
+    // In a 200 s session that produced exactly one such row — a real, correctly computed tick, on
+    // cadence, interpolating cleanly between its neighbours in all 61 physics columns, labelled 0 —
+    // and it reads to any gap analysis as *two* discontinuities in the middle of the run. That is
+    // the one column whose whole job is to say nothing was lost. This counter is incremented under
+    // `traceLock`, which is held unconditionally, so a gap in it means a lost trace record and
+    // nothing else. Whether a publish reached the writer is a different fact and is counted by
+    // `droppedPublishes`, which the shutdown report already prints.
+    std::uint64_t traceSequence = 0;
 
     std::mutex waiting;
     std::condition_variable_any wake;
@@ -292,6 +351,7 @@ export class ForceFeedbackService
     void take();
     [[nodiscard]] double reconstruct(std::uint64_t nowNanos) const;
     void release();
+    void writePedals(std::chrono::steady_clock::time_point now);
 
     // Last, so it stops and joins before anything it touches on the way down is destroyed.
     std::jthread writer;
@@ -306,6 +366,19 @@ public:
 
     // Once per physics tick, by whoever computed stage one. Never blocks.
     void publish(const RackFeedback& feedback);
+
+    // Stage one for the pedals, from the same tick. Separate from the rack's publish because a car
+    // that has no opinion about its pedals — or a game that has not wired them — should not have to
+    // say so every tick, and because the two are different devices.
+    void publishPedals(const PedalFeedback& feedback);
+
+    // What the pedal motors are set to. Stated in the codes the device takes, because that is what
+    // was written; a trace of a cue nobody felt is answered by this rather than by the severity that
+    // asked for it.
+    [[nodiscard]] PedalMotorCommand pedalMotors() const
+    {
+        return lastPedalCommand;
+    }
 
     // The application lost the keyboard, so it has no business holding somebody's hands either. The
     // next output frame lets go, and the ramp starts again when focus returns.
@@ -417,14 +490,12 @@ void ForceFeedbackService::publish(const RackFeedback& feedback)
     // finite values resume.
     const auto sane = std::isfinite(feedback.steeringTorque) && std::isfinite(feedback.rackTravel) &&
                       std::isfinite(feedback.rackVelocity) && std::isfinite(feedback.publishInterval) &&
-                      std::isfinite(feedback.damping);
+                      std::isfinite(feedback.unassistedTorque);
 
     if (!sane)
     {
         nanRejections.fetch_add(1);
     }
-
-    auto sequence = std::uint64_t{0};
 
     {
         // try_lock, so the simulation can never be held up by the output thread — not even for the
@@ -439,8 +510,6 @@ void ForceFeedbackService::publish(const RackFeedback& feedback)
                 publishedNanos = stamp;
                 publishedSequence++;
             }
-
-            sequence = publishedSequence;
         }
         else
         {
@@ -464,9 +533,12 @@ void ForceFeedbackService::publish(const RackFeedback& feedback)
         traceEpochNanos = stamp;
     }
 
+    traceSequence++;
+
     trace.record(RackTorqueFrame{.time = static_cast<double>(stamp - traceEpochNanos) * 1e-9,
-                                 .sequence = sequence,
-                                 .steeringTorque = feedback.steeringTorque,
+                                 .sequence = traceSequence,
+                                 .steeringTorque = feedback.unassistedTorque,
+                                 .assistedTorque = feedback.steeringTorque,
                                  .rackForce = feedback.rackForce,
                                  .tyreRackForce = feedback.tyreRackForce,
                                  .rackTravel = feedback.rackTravel,
@@ -475,7 +547,19 @@ void ForceFeedbackService::publish(const RackFeedback& feedback)
                                  .commandedTorque = lastCommandedTorque.load(),
                                  .deliveredTorque = lastDelivered.load(),
                                  .clipped = lastClipped.load(),
-                                 .latencyMilliseconds = lastLatency.load()});
+                                 .latencyMilliseconds = lastLatency.load(),
+                                 .vehicle = feedback.vehicle});
+}
+
+void ForceFeedbackService::publishPedals(const PedalFeedback& feedback)
+{
+    // Same asymmetry as the rack's: the tick never waits, and a dropped publish costs the motors one
+    // update of freshness. They are rendered at 60 Hz against a tick at 360, so a miss is invisible.
+    auto held = std::unique_lock<std::mutex>(publication, std::try_to_lock);
+    if (held.owns_lock())
+    {
+        publishedPedals = feedback;
+    }
 }
 
 void ForceFeedbackService::setFocus(const bool focused)
@@ -503,6 +587,7 @@ void ForceFeedbackService::take()
     haveOlder = haveNewest;
 
     newest = publishedState;
+    newestPedals = publishedPedals;
     newestNanos = publishedNanos;
     takenSequence = publishedSequence;
     haveNewest = true;
@@ -580,6 +665,60 @@ double ForceFeedbackService::reconstruct(const std::uint64_t nowNanos) const
     return newest.steeringTorque + std::clamp(change * (ahead / span), -excursion, excursion);
 }
 
+// The pedals' motors, on the same thread and deliberately not at the same rate.
+//
+// **An eccentric mass has to spin up and down through its own inertia**, which takes tens of
+// milliseconds, so writing at the wheel's five hundred a second would be several hundred USB control
+// transfers a second the hardware cannot render — on the same pipe the force feedback is using, for
+// a cue that would look identical at a tenth of the rate. It is written when the answer changes and
+// no more often than `PedalMotorProfile::updateHz`.
+void ForceFeedbackService::writePedals(const std::chrono::steady_clock::time_point now)
+{
+    // **Two gates, and they say different things.** The profile says this pedal set has motors at
+    // all — CSL Elite and CSL LC have none, and no amount of cabling changes that. The device link
+    // says they are attached *and reachable*, which on Linux means the pedals are on their own USB
+    // cable rather than the base's RJ12, because that is the only wiring the driver exposes a
+    // control for. Either alone would be a guess.
+    if (!options.pedals.hasMotors || !input.deviceLink().hasPedalMotors)
+    {
+        return;
+    }
+
+    const auto command = mapPedalFeedback(options.pedals, options.pedalMapping, newestPedals);
+
+    // Silence goes out immediately and unconditionally. Everything else waits its turn: a cue that
+    // arrives a sixtieth of a second late is a cue, and a motor that stops a sixtieth of a second
+    // late against a driver who has already caught the slide is a motor buzzing about nothing.
+    const auto stopping = command.silent() && !pedalsSilenced;
+    const auto period = std::chrono::duration<double>(1.0 / std::max(options.pedals.updateHz, 1.0));
+
+    if (!stopping)
+    {
+        if (command.word() == lastPedalCommand.word())
+        {
+            return;
+        }
+
+        if (now - lastPedalWrite < std::chrono::duration_cast<std::chrono::steady_clock::duration>(period))
+        {
+            return;
+        }
+    }
+
+    if (const auto written = input.writePedalMotors(command.throttle, command.brake); !written)
+    {
+        // The pedals are a separate device and may be unplugged while the wheel keeps working. The
+        // backend drops its own capability when that happens, so this is counted and not repeated.
+        writeRefusals.fetch_add(1);
+
+        return;
+    }
+
+    lastPedalCommand = command;
+    lastPedalWrite = now;
+    pedalsSilenced = command.silent();
+}
+
 void ForceFeedbackService::release()
 {
     // The device's zero *code* rather than level zero. What the safety rules require is that the
@@ -598,6 +737,23 @@ void ForceFeedbackService::release()
     if (const auto written = input.writeTorque(quietForce(options.device).fraction); !written)
     {
         writeRefusals.fetch_add(1);
+    }
+
+    // **And stop the motors, which is not the same statement as writing no torque.** A torque
+    // settles the moment the effect is removed; an eccentric mass keeps turning until it is told
+    // nought, so every path that lets go of the wheel has to say so separately. Unconditional
+    // rather than filtered by `lastPedalCommand`, because the whole reason this is being called is
+    // that something has gone wrong and what the service believes it last wrote is exactly what is
+    // now in doubt.
+    lastPedalCommand = PedalMotorCommand{};
+    pedalsSilenced = true;
+
+    if (options.pedals.hasMotors)
+    {
+        // Not gated on the link: the whole reason this is being called may be that the device has
+        // gone, and a write that refuses costs nothing where a motor left turning costs the driver
+        // a rig they have to unplug.
+        static_cast<void>(input.writePedalMotors(0, 0));
     }
 }
 
@@ -739,10 +895,12 @@ ForceCommand ForceFeedbackService::step(const std::chrono::steady_clock::time_po
         haveRimAngle = false;
     }
 
-    // The car's scheduled damping joins the driver's dial here, clamped so a publisher cannot
-    // subtract the driver's own setting away.
+    // The base's own damping joins the driver's dial here, clamped so a configuration cannot
+    // subtract the driver's setting away. It used to be the *car's* request arriving through
+    // `RackFeedback` — see there for why a number fitted from a wheel base's limit cycle had no
+    // business travelling that way.
     auto mapping = options.mapping;
-    mapping.damping += std::max(newest.damping, 0.0);
+    mapping.damping += std::max(mapping.deviceDamping, 0.0);
 
     const auto command = mapRackTorque(profile, mapping, torque, rimSpeed, commanded, deltaTime, ramp);
 
@@ -758,12 +916,17 @@ ForceCommand ForceFeedbackService::step(const std::chrono::steady_clock::time_po
     // damper sits outside it, so feeding the damped value back would put the damper inside the
     // limiter it was deliberately moved out of. See `mapRackTorque`.
     commanded = command.slewedTorque;
-    clipping.add(command.requestedTorque, std::clamp(options.mapping.ceilingTorque, 0.0, profile.peakTorque));
+    // The output period goes in with it, so the histogram can say how *long* a clip lasted rather
+    // than only how often one happened — which is the discriminator the gain is actually set by.
+    clipping.add(command.requestedTorque, std::clamp(options.mapping.ceilingTorque, 0.0, profile.peakTorque),
+                 deltaTime);
 
     if (const auto written = input.writeTorque(command.fraction); !written)
     {
         writeRefusals.fetch_add(1);
     }
+
+    writePedals(now);
 
     const auto done = nanosOf(std::chrono::steady_clock::now());
 

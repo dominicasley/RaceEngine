@@ -138,7 +138,11 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
     // Distinct magnitudes on the two axes, so a swap between them fails rather than passing.
     frame.acceleration = glm::dvec3(4.903325, 0.0, 9.80665);
     frame.yaw = 3.14159265358979 / 2.0;
-    frame.steering = 3.14159265358979 / 4.0;
+    // A demand and the rim angle it makes, which are two different quantities and now two different
+    // columns. Half lock on a 756-degree rim is 189 degrees; the column used to carry the demand
+    // times a radians conversion and printed 28.6.
+    frame.steering = 0.5;
+    frame.steeringWheelAngle = 0.5 * 0.5 * 13.194689145077131;
     frame.throttle = 0.5;
     frame.brake = 0.25;
     frame.gear = 3;
@@ -167,8 +171,26 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
     SECTION("every row has exactly as many fields as the header")
     {
         REQUIRE(header.size() == values.size());
-        // 28 chassis, driver and driveline channels, then twelve per corner.
-        REQUIRE(header.size() == 28 + 12 * cornerCount);
+        // 32 chassis, driver and driveline channels, then fourteen per corner. Was 29 and twelve
+        // until the two axle ride heights, the clutch pedal and the per-corner contact-sample count
+        // were added for the telemetry expansion, and thirteen until `Patch Depth Spread` joined the
+        // per-corner block for the enveloping work.
+        REQUIRE(header.size() == 32 + 14 * cornerCount);
+    }
+
+    SECTION("the steering column is the rim's angle, and the demand is beside it")
+    {
+        // **A demand is not an angle**, and this column carried one for the whole of milestone 2:
+        // `input.steering` from -1 to 1, multiplied by 57.2958 and labelled degrees. That is the
+        // `Engine RPM` failure exactly — a units conversion applied to a quantity that has none.
+        const auto angle = std::find(header.begin(), header.end(), "Steering Angle [deg]");
+        REQUIRE(angle != header.end());
+        REQUIRE(std::stod(values[static_cast<std::size_t>(angle - header.begin())]) ==
+                Catch::Approx(189.0).epsilon(1e-4));
+
+        const auto demand = std::find(header.begin(), header.end(), "Steering Demand []");
+        REQUIRE(demand != header.end());
+        REQUIRE(std::stod(values[static_cast<std::size_t>(demand - header.begin())]) == Catch::Approx(0.5));
     }
 
     SECTION("the engine column is rpm, as its name has always claimed")
@@ -202,7 +224,9 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
             const auto tag = std::string(" ") + cornerAbbreviation(static_cast<Corner>(corner)) + " ";
             const auto count = std::count_if(header.begin(), header.end(), [&tag](const std::string& column)
                                              { return column.find(tag) != std::string::npos; });
-            REQUIRE(count == 12);
+            // Fourteen since `Patch Depth Spread` joined the contact-sample count in the per-corner
+            // block; thirteen before that.
+            REQUIRE(count == 14);
         }
     }
 
@@ -212,10 +236,10 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
         REQUIRE(yaw != header.end());
         REQUIRE(std::stod(values[static_cast<std::size_t>(yaw - header.begin())]) == Catch::Approx(90.0).epsilon(1e-4));
 
-        const auto steering = std::find(header.begin(), header.end(), "Steering Angle [deg]");
-        REQUIRE(steering != header.end());
-        REQUIRE(std::stod(values[static_cast<std::size_t>(steering - header.begin())]) ==
-                Catch::Approx(45.0).epsilon(1e-4));
+        // The steering column is checked in its own section above, because what makes it right is
+        // not only that a radian became a degree — it is that the field being converted is an angle
+        // at all. This one asserted `pi/4 -> 45` against a field holding a demand, which is a
+        // conversion test passing over a quantity that had no units to convert.
     }
 
     SECTION("speed is km/h and acceleration is g")
@@ -300,4 +324,78 @@ TEST_CASE("a long run comes out in the order it happened", "[physics][telemetry]
     }
 
     REQUIRE(previous == Catch::Approx(999.0 / 360.0));
+}
+
+TEST_CASE("each corner's columns carry that corner's own data", "[physics][telemetry][frame]")
+{
+    // **The corner mapping was wrong for most of milestone 2 and no test could see it.** `Susp Pos
+    // FL` and `Damper Vel FL` carried the *right* corner's numbers, because `outboardSign` had the
+    // two sides mirrored — in a file whose entire purpose is dropping into i2 beside a real car's.
+    // It was fixed with the rest of the handedness audit, and what was left behind was a case that
+    // checks the header string exists. A header is not a mapping.
+    //
+    // Four distinct values, one per corner, and each one asserted in its own column. A swap of any
+    // two corners fails here; so does an off-by-one, and so does a transposed axle.
+    auto frame = TelemetryFrame{};
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        const auto marker = 1000.0 * static_cast<double>(index + 1);
+
+        frame.wheels[index].verticalLoad = marker;
+        frame.wheels[index].slipRatio = 0.001 * static_cast<double>(index + 1);
+        frame.wheels[index].forceLateral = -marker;
+        // Millimetres after conversion: 1, 2, 3, 4.
+        frame.wheels[index].suspensionTravel = 0.001 * static_cast<double>(index + 1);
+        frame.wheels[index].damperVelocity = 0.01 * static_cast<double>(index + 1);
+        frame.wheels[index].inContact = index % 2 == 0;
+        // Millimetres after conversion: 5, 10, 15, 20. Distinct from every other marker in this
+        // fixture, so a column carrying the wrong *channel* fails as loudly as one carrying the
+        // wrong corner.
+        frame.wheels[index].patchDepthSpread = 0.005 * static_cast<double>(index + 1);
+    }
+
+    const auto rows = lines(telemetryToCsv({frame}));
+    REQUIRE(rows.size() == 2);
+
+    const auto header = split(rows[0], ',');
+    const auto values = split(rows[1], ',');
+
+    const auto readColumn = [&](const std::string& column)
+    {
+        const auto found = std::find(header.begin(), header.end(), column);
+        REQUIRE(found != header.end());
+
+        return std::stod(values[static_cast<std::size_t>(found - header.begin())]);
+    };
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        const auto tag = std::string(cornerAbbreviation(static_cast<raceengine::Corner>(index)));
+        const auto expected = 1000.0 * static_cast<double>(index + 1);
+
+        CAPTURE(tag);
+
+        REQUIRE(readColumn("Tyre Load " + tag + " [N]") == Catch::Approx(expected));
+        REQUIRE(readColumn("Tyre Force Y " + tag + " [N]") == Catch::Approx(-expected));
+        REQUIRE(readColumn("Slip Ratio " + tag + " []") == Catch::Approx(0.001 * static_cast<double>(index + 1)));
+        REQUIRE(readColumn("Susp Pos " + tag + " [mm]") == Catch::Approx(static_cast<double>(index + 1)));
+        REQUIRE(readColumn("Damper Vel " + tag + " [mm/s]") == Catch::Approx(10.0 * static_cast<double>(index + 1)));
+        REQUIRE(readColumn("In Contact " + tag + " []") == Catch::Approx(index % 2 == 0 ? 1.0 : 0.0));
+        REQUIRE(readColumn("Patch Depth Spread " + tag + " [mm]") ==
+                Catch::Approx(5.0 * static_cast<double>(index + 1)));
+    }
+
+    SECTION("and the four tags are the four corners, in the order the array is indexed")
+    {
+        // The other half of the mapping: `Corner`'s own order is what the wheel array is indexed by,
+        // so a column tagged FL is corner 0 because that enumerator is 0 and for no other reason.
+        REQUIRE(std::string(cornerAbbreviation(raceengine::Corner::FrontLeft)) == "FL");
+        REQUIRE(std::string(cornerAbbreviation(raceengine::Corner::FrontRight)) == "FR");
+        REQUIRE(std::string(cornerAbbreviation(raceengine::Corner::RearLeft)) == "RL");
+        REQUIRE(std::string(cornerAbbreviation(raceengine::Corner::RearRight)) == "RR");
+
+        REQUIRE(static_cast<std::size_t>(raceengine::Corner::FrontLeft) == 0);
+        REQUIRE(static_cast<std::size_t>(raceengine::Corner::RearRight) == cornerCount - 1);
+    }
 }

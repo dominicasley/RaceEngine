@@ -83,6 +83,21 @@ export struct SteeringTune
     std::optional<bool> invert;
 };
 
+// The pedal motors' cue thresholds, as multiples of the tyre's own peak slip — the range stage one
+// of the pedal feedback renders lockup and wheelspin over. On the sheet for the reason `ffb.gain`
+// is: how sensitive a cue should be is a feel number that belongs to whoever is driving, and a feel
+// number that needs a rebuild is one that never gets found. The two full points are separate because
+// the quantity is not symmetric — slip is bounded at −1 under braking and unbounded under power.
+//
+// Applied by the game beside the force-feedback tune rather than by an overload here, because the
+// consumer (`PedalFeedbackSetup`) lives in the input layer, which this module cannot name.
+export struct PedalTune
+{
+    std::optional<double> onsetPeaks;
+    std::optional<double> brakeFullPeaks;
+    std::optional<double> throttleFullPeaks;
+};
+
 export struct VehicleTune
 {
     AxleTune front;
@@ -90,6 +105,7 @@ export struct VehicleTune
     DifferentialTune differential;
     FeedbackTune feedback;
     SteeringTune steering;
+    PedalTune pedal;
 };
 
 namespace
@@ -273,6 +289,18 @@ export [[nodiscard]] std::expected<VehicleTune, std::string> parseVehicleTune(co
         {
             tune.feedback.damperBandwidth = *number;
         }
+        else if (key == "pedal.onset")
+        {
+            tune.pedal.onsetPeaks = *number;
+        }
+        else if (key == "pedal.brake_full")
+        {
+            tune.pedal.brakeFullPeaks = *number;
+        }
+        else if (key == "pedal.throttle_full")
+        {
+            tune.pedal.throttleFullPeaks = *number;
+        }
         else
         {
             known = false;
@@ -303,7 +331,8 @@ export [[nodiscard]] bool statesAnything(const VehicleTune& tune)
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
            tune.differential.coastRamp || tune.feedback.gain || tune.feedback.ceilingTorque || tune.feedback.damping ||
-           tune.feedback.damperBandwidth || tune.steering.invert;
+           tune.feedback.damperBandwidth || tune.steering.invert || tune.pedal.onsetPeaks ||
+           tune.pedal.brakeFullPeaks || tune.pedal.throttleFullPeaks;
 }
 
 // The tune onto a car. Absent fields leave what the car said, which is what makes a setup file that

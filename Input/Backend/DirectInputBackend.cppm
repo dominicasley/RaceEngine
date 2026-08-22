@@ -93,6 +93,16 @@ public:
     [[nodiscard]] std::expected<DeviceSample, std::string> read(std::chrono::milliseconds timeout) override;
     [[nodiscard]] std::expected<void, std::string> writeTorque(double torqueFraction) override;
 
+    // DirectInput has no notion of a pedal set's own motors: its force feedback is per *effect* on
+    // an axis, and the ClubSport pedals' motors are neither. On Windows they are reached through
+    // Fanatec's own SDK, which is a dependency this backend does not have and a decision nobody has
+    // made. Refused with a reason rather than left unimplemented, so the shortfall is a sentence in
+    // the log on the day somebody runs this there.
+    [[nodiscard]] std::expected<void, std::string> writePedalMotors(std::uint8_t, std::uint8_t) override
+    {
+        return std::unexpected("this platform reaches no pedal motors");
+    }
+
     [[nodiscard]] DeviceCapabilities capabilities() const override
     {
         return deviceCapabilities;

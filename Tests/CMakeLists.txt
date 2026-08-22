@@ -17,13 +17,19 @@ add_executable(EngineTests
         CarAudioTests.cpp
         ClutchTests.cpp
         ComplianceTests.cpp
+        ContactPatchChamferProbe.cpp
         ContactPatchTests.cpp
+        CriteriaGripSweepProbe.cpp
         CouplingTests.cpp
         DifferentialTests.cpp
         DrivelineTests.cpp
         EngineLayerTests.cpp
+        EnvelopeCandidateProbe.cpp
+        EnvelopeResolutionProbe.cpp
+        EnvelopeSolverProbe.cpp
         ForceFeedbackTests.cpp
         FrameDiagnosticsTests.cpp
+        FrameInvarianceTests.cpp
         FrustumTests.cpp
         GltfColourSpaceTests.cpp
         GltfNodeTransformTests.cpp
@@ -32,27 +38,39 @@ add_executable(EngineTests
         InputDeviceProbeTests.cpp
         InputServiceTests.cpp
         InputTests.cpp
+        KerbDiscontinuityProbe.cpp
+        LaunchDiagnosticProbe.cpp
         JoltRuntimeTests.cpp
         LookupTableTests.cpp
         MemoryStorageTests.cpp
         PhysicalCameraTests.cpp
+        PedalCueProbe.cpp
+        PedalFeedbackTests.cpp
         PhysicsWorldTests.cpp
         PostProcessingTests.cpp
         ProvingGroundTests.cpp
         PublishedGeometryTests.cpp
         RackTorqueTests.cpp
         RackSignTests.cpp
+        RackTraceCornerTests.cpp
         RendererSeamTests.cpp
         RigidBodyTests.cpp
         SceneManagerServiceTests.cpp
         SetupFileTests.cpp
         ShiftTests.cpp
+        StalledChatterProbe.cpp
+        SteeringGeometryProbe.cpp
         SteeringShimmyProbe.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp
+        TelemetryUnitsProbe.cpp
         TorqueConverterTests.cpp
         TyreLayerTests.cpp
+        TyreShapeProbe.cpp
         TyreTests.cpp
+        VehicleDataProbe.cpp
+        AssistPlacementProbe.cpp
+        VehicleDeltaProbe.cpp
         VehicleTests.cpp
         SphericalHarmonicsTests.cpp
         ShadowCascadesTests.cpp)

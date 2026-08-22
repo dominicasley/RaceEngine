@@ -92,6 +92,28 @@ export struct ForceMapping
     // the player's, stated per car in the setup sheet.
     double damping = 0.0;
 
+    // **The base's own oscillator, damped here because here is where a number about a wheel base is
+    // allowed to live.** Same units as the dial above and summed with it, so the driver's setting
+    // rides on top rather than replacing it.
+    //
+    // Until 2026-08-21 this was 0.4, scheduled down over 5 m/s of *road* speed, and it was published
+    // by the car as part of its rack. It was sized as 2·√(K·J) against a `J` of 3.1e-3 kg·m² fitted
+    // from the limit cycle **this base** was doing — so a device inertia was reaching the pipeline
+    // dressed as a car parameter, which is the one thing the three-stage split exists to prevent.
+    //
+    // What settled where it belongs is that the simulation has no steering degree of freedom: the
+    // rack angle is commanded straight from the driver's demand, so the only inertia physically in
+    // the loop this damper closes is the motor, the belt and the rim. The car's own steering inertia
+    // is 0.093 kg·m² and would ask for 0.83 — correct about an oscillator that is not being
+    // simulated, and a damper sized for a mass that is not there is wrong in whichever direction the
+    // numerics happen to point.
+    //
+    // **It no longer fades with road speed, and that is a change a driver will feel**: this layer
+    // does not know how fast the car is going, and telling it would be the same inversion by a
+    // different door. If it is too much at speed, the honest fix is a rack with a mass and a
+    // compliance in the vehicle model rather than a schedule here.
+    double deviceDamping = 0.4;
+
     // Hz. **The damper's own bandwidth, and it is a stability limit rather than a smoothing taste.**
     //
     // A damper is the one term here that closes a loop through the hardware: it measures the rim,
@@ -282,12 +304,30 @@ export class ClipHistogram
     std::uint64_t clipped = 0;
     double worst = 0.0;
 
+    // How long the ceiling has been refusing something without a break, and what that has amounted
+    // to. See `sustainedEpisodes` for why duration and not percentage.
+    double currentRun = 0.0;
+    double longestRun = 0.0;
+    std::uint64_t sustained = 0;
+
 public:
     // The top of the range the bins cover, as a multiple of the ceiling. Everything above it lands
     // in the overflow bin, which is `clipHistogramBins`.
     static constexpr double span = 2.0;
 
-    void add(const double requestedTorque, const double ceiling)
+    // How long a clip has to last before it counts as one the driver was denied something by.
+    //
+    // **This is the number the gain is set from, and it is a duration rather than a percentage.** A
+    // kerb strike *should* hit the rail — that is a real event and the wheel saying so is correct. A
+    // corner should not, because a corner is where the pneumatic trail collapses and that cue is the
+    // most useful thing the tyre says; a quarter of a second of rail is long enough that it can only
+    // be a corner. Sweeping the gain and reading this to zero is what set 0.70, twice, by hand.
+    static constexpr double sustainedSeconds = 0.25;
+
+    // `deltaSeconds` is how long this sample stands for — the output period. Zero, the default,
+    // records the demand and nothing about its duration, which is what every caller that does not
+    // care about episodes gets.
+    void add(const double requestedTorque, const double ceiling, const double deltaSeconds = 0.0)
     {
         if (!std::isfinite(requestedTorque) || ceiling <= 0.0)
         {
@@ -300,6 +340,27 @@ public:
         if (fraction > 1.0)
         {
             clipped++;
+        }
+
+        if (std::isfinite(deltaSeconds) && deltaSeconds > 0.0)
+        {
+            if (fraction > 1.0)
+            {
+                currentRun += deltaSeconds;
+                longestRun = std::max(longestRun, currentRun);
+
+                // Counted once, on the sample that crosses the threshold, rather than at the end of
+                // the run — so a session that is still clipping when it is asked has already
+                // reported the episode it is in.
+                if (currentRun >= sustainedSeconds && currentRun - deltaSeconds < sustainedSeconds)
+                {
+                    sustained++;
+                }
+            }
+            else
+            {
+                currentRun = 0.0;
+            }
         }
 
         worst = std::max(worst, fraction);
@@ -334,12 +395,30 @@ public:
         return index < counts.size() ? counts[index] : 0;
     }
 
+    // **The number the gain is chosen by.** How many separate times the ceiling refused something
+    // for longer than `sustainedSeconds` without a break. Zero is the target; a kerb strike does not
+    // reach it and a corner held against the rail does.
+    [[nodiscard]] std::uint64_t sustainedEpisodes() const
+    {
+        return sustained;
+    }
+
+    // The longest unbroken clip, in seconds. Reported beside the count because "one episode" reads
+    // very differently at 0.3 s and at 4 s.
+    [[nodiscard]] double longestClip() const
+    {
+        return longestRun;
+    }
+
     void clear()
     {
         counts = {};
         total = 0;
         clipped = 0;
         worst = 0.0;
+        currentRun = 0.0;
+        longestRun = 0.0;
+        sustained = 0;
     }
 
     // One line, because it is printed at shutdown beside everything else and a table nobody reads is
@@ -363,7 +442,8 @@ public:
         };
 
         text += number(clippedPercentage(), 2) + "% of " + std::to_string(total) + " frames clipped, peak demand " +
-                number(worst, 2) + "x, histogram [";
+                number(worst, 2) + "x, " + std::to_string(sustained) + " sustained (longest " +
+                number(longestRun, 2) + " s), histogram [";
 
         for (auto index = std::size_t{0}; index <= clipHistogramBins; index++)
         {
