@@ -33,6 +33,7 @@ add_executable(EngineTests
         FrameDiagnosticsTests.cpp
         FrameInvarianceTests.cpp
         FrustumTests.cpp
+        GradeTests.cpp
         GltfColourSpaceTests.cpp
         GltfNodeTransformTests.cpp
         GolfGtiTests.cpp

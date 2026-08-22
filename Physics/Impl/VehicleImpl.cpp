@@ -501,11 +501,32 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
             state.chassis.orientation *
                 glm::dvec3(0.0, suspension.travelPerAngle * state.corners[index].wishboneRate, 0.0);
 
-        const auto closingSpeed = -wheelVelocity.y;
-        solution.forces.tireVertical = solution.patch.inContact
-                                           ? std::max(0.0, corner.tireVerticalRate * solution.patch.penetration +
-                                                               corner.tireVerticalDamping * closingSpeed)
-                                           : 0.0;
+        // **Along the road's normal, not along the world's up**, and that is the whole of why a car
+        // in this model now rolls down a hill. A vertical force on a slope exactly cancels vertical
+        // gravity and leaves nothing along the surface, so the car was held up *and* held still: in
+        // neutral on a 45% slope with no brakes it moved 0.0000 m in five seconds, and creeping in
+        // gear it climbed one at walking pace on a quarter of the power that would take. The in-plane
+        // tyre forces were always taken in the patch's frame — which is why banking and kerbs worked
+        // and why this survived as long as it did — and only the load was flat-world.
+        //
+        // `patch.penetration` stays what it is: the **vertical** overlap, measured by vertical rays,
+        // documented as such and depended on by the enveloping work. What the tyre's spring actually
+        // compresses by is the perpendicular distance to the road, which for a vertical overlap
+        // against a plane is that overlap times the normal's own vertical component. So the
+        // conversion is one cosine and it lives here, at the point of use, rather than changing an
+        // aggregate three other things read.
+        //
+        // Flat ground is unaffected to the bit: the normal is world up there, the cosine is exactly
+        // one, and this is the same arithmetic it was.
+        const auto normal = solution.patch.inContact ? solution.patch.normal : glm::dvec3(0.0, 1.0, 0.0);
+        const auto normalOfVertical = std::max(normal.y, 0.0);
+
+        const auto closingSpeed = -glm::dot(wheelVelocity, normal);
+        solution.forces.tireVertical =
+            solution.patch.inContact
+                ? std::max(0.0, corner.tireVerticalRate * solution.patch.penetration * normalOfVertical +
+                                    corner.tireVerticalDamping * closingSpeed)
+                : 0.0;
 
         // The anti-roll bar resists the difference across its axle and nothing else, so a car
         // hitting a kerb with one wheel feels it and a car on a level road does not.
@@ -516,8 +537,19 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         const auto axisForce =
             solution.forces.spring + solution.forces.damper + solution.forces.bumpStop + solution.forces.droopStop;
 
-        const auto wheelUpForce =
-            solution.forces.tireVertical + solution.forces.antiRoll - corner.unsprungMass * earthGravity;
+        // The corner's one degree of freedom is the wheel travelling along the **body's** up axis, so
+        // what reaches it is the tyre load projected onto that axis rather than the load itself. On
+        // flat level ground the normal, the body's up and the world's up are one direction and this
+        // is the number it always was.
+        //
+        // The unsprung weight beside it is deliberately left as `m·g`, not `m·g·(ŷ·bodyUp)`. That is
+        // a separate flat-world approximation with its own reason to exist, it is a second-order term
+        // against a 49 kg corner on a 1348 kg car, and folding it in here would move every cambered
+        // and rolling frame for something that has nothing to do with slopes.
+        const auto bodyUp = state.chassis.orientation * glm::dvec3(0.0, 1.0, 0.0);
+
+        const auto wheelUpForce = solution.forces.tireVertical * std::max(glm::dot(normal, bodyUp), 0.0) +
+                                  solution.forces.antiRoll - corner.unsprungMass * earthGravity;
 
         solution.generalisedForce =
             axisForce * suspension.damperLengthPerAngle + wheelUpForce * suspension.travelPerAngle;
@@ -539,7 +571,8 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         // road it is standing on, not along the horizon.
         if (solution.patch.inContact && solution.forces.tireVertical > 0.0)
         {
-            const auto normal = solution.patch.normal;
+            // The same `normal` the load above is taken along, which is now one statement of it for
+            // both halves of what the tyre does rather than two.
             const auto heading =
                 state.chassis.orientation * (suspension.uprightOrientation * glm::dvec3(0.0, 0.0, 1.0));
 
@@ -607,9 +640,11 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         // The tire force goes on at the **contact patch**, which is what the brief is really after:
         // the moment it makes about the centre of gravity is where jacking and the lateral load
         // path come from, and that is preserved here.
+        //
+        // **And it goes on along the road's normal.** Applied along world up it balanced gravity
+        // exactly on any slope and left the car nothing to roll down — see the load above.
         const auto contactPoint = solution.patch.inContact ? solution.patch.centre : wheelWorld;
-        chassisForces.addForceAtPoint(glm::dvec3(0.0, solution.forces.tireVertical, 0.0), contactPoint,
-                                      worldCentreOfMass);
+        chassisForces.addForceAtPoint(solution.forces.tireVertical * normal, contactPoint, worldCentreOfMass);
 
         // The unsprung mass's weight, which the chassis carries whenever the tire is not, and its
         // inertia, which is what a wheel snatched upward by a kerb kicks back into the body with.
