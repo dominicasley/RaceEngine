@@ -52,6 +52,7 @@ using raceengine::startEngine;
 using raceengine::stepDriveline;
 using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
+using raceengine::TyreAxis;
 using raceengine::tyreFriction;
 using raceengine::VehicleInput;
 using raceengine::VehicleSetup;
@@ -289,10 +290,10 @@ struct Tick
         // What the tyre could have made at this load, at this surface, if it were exactly at its
         // peak. Load sensitivity is applied per corner rather than to the axle total, because the
         // whole point of load sensitivity is that it is not linear in load.
-        const auto availableLeft = tyreFriction(tyre, tyre.longitudinalPeak, stepped->corners[0].forces.tireVertical,
+        const auto availableLeft = tyreFriction(tyre, TyreAxis::Longitudinal, stepped->corners[0].forces.tireVertical,
                                                 stepped->corners[0].patch.gripMultiplier) *
                                    stepped->corners[0].forces.tireVertical;
-        const auto availableRight = tyreFriction(tyre, tyre.longitudinalPeak, stepped->corners[1].forces.tireVertical,
+        const auto availableRight = tyreFriction(tyre, TyreAxis::Longitudinal, stepped->corners[1].forces.tireVertical,
                                                  stepped->corners[1].patch.gripMultiplier) *
                                     stepped->corners[1].forces.tireVertical;
 

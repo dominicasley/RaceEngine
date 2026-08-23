@@ -627,16 +627,25 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         corner.wheelInertia = 1.45;
         corner.rollingResistance = 0.012;
 
-        // The tyre. Reference load, load sensitivity and both friction peaks are the file's:
-        // DY_REF/DX_REF state the friction at FZ0, which is exactly this model's
+        // The tyre. Reference load, both load-sensitivity exponents and both friction peaks are the
+        // file's: DY_REF/DX_REF state the friction at FZ0, which is exactly this model's
         // peak-at-nominal-load convention, and AC states the force as going with load to the LS_EXP
-        // power, so the exponent is that power less one with the sign turned over. The lateral
-        // exponent serves both axes because this model carries one (the file's longitudinal 0.8756
-        // is close). 1.28 lateral sits under the car's own rollover threshold — about 1.33 g for a
-        // 0.572 m centre of gravity on this track width — so the handling cases still measure the
-        // tyre and not the wrong failure.
+        // power, so the exponent is that power less one with the sign turned over. 1.28 lateral sits
+        // under the car's own rollover threshold — about 1.33 g for a 0.572 m centre of gravity on
+        // this track width — so the handling cases still measure the tyre and not the wrong failure.
+        //
+        // **Both are stated now, and until 2026-08-23 only one was.** This model carried a single
+        // exponent, the lateral one served both axes, and the comment that used to sit here said so
+        // and called the file's longitudinal figure "close". It is not close in the place it is
+        // asked: 0.1244 against 0.1926 is a 35% difference in how fast longitudinal grip falls away,
+        // and the two references this car is measured against — a 100-0 and a 0-100 — sit at
+        // opposite ends of the load curve, so an exponent that is wrong for the axis is wrong in
+        // opposite directions at each end. Restoring the file's own number is a faithfulness fix and
+        // not a tune; what it is worth in metres is measured in `[.in-gear]` and
+        // `docs/tyre-grip-ratio-brief.md`, not assumed here.
         corner.tyre.nominalLoad = 2939.0;
-        corner.tyre.loadSensitivity = 1.0 - 0.8074;
+        corner.tyre.lateralLoadSensitivity = 1.0 - 0.8074;
+        corner.tyre.longitudinalLoadSensitivity = 1.0 - 0.8756;
 
         // **The fourth number taken away from the mod** (2026-08-22), after the wheel radius, the
         // unsprung mass and `CG_LOCATION`. The file states DY_REF 1.28 and DX_REF 1.30 for its
@@ -827,6 +836,12 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto driven = std::array{true, true, false, false};
     assists.reference.driven = driven;
     assists.traction.driven = driven;
+
+    // Both brake-based channels take the turn's kinematics off the undriven pair, so both need the
+    // track widths as calibration. Stated twice rather than shared for the same reason `controlRate`
+    // is: they are separate controllers in the same box and nothing makes them agree.
+    assists.traction.frontTrack = golfFrontTrack;
+    assists.traction.rearTrack = golfRearTrack;
 
     assists.cornering.frontTrack = golfFrontTrack;
     assists.cornering.rearTrack = golfRearTrack;

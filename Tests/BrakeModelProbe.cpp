@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -143,6 +144,11 @@ struct StopResult
     double finalYaw = 0.0;
     double lateralTravel = 0.0;
     std::array<double, cornerCount> lowestWheelSpeed{};
+    // The lightest each corner ever got, and when it first read nothing at all. `grounded` is one
+    // bit over four wheels and thirty seconds, so a stop that lifts a wheel for a single tick and a
+    // stop that lifts one for a second are the same bit — these two say which.
+    std::array<double, cornerCount> lowestLoad{};
+    std::array<double, cornerCount> firstLiftTime{};
     bool stopped = false;
     bool grounded = true;
     bool onPlate = true;
@@ -158,6 +164,8 @@ struct StopResult
     auto lastStep = VehicleStep{};
     auto result = StopResult{};
     result.lowestWheelSpeed.fill(1e9);
+    result.lowestLoad.fill(1e9);
+    result.firstLiftTime.fill(-1.0);
 
     const auto sense = [&]
     {
@@ -216,6 +224,12 @@ struct StopResult
             {
                 result.lowestWheelSpeed[index] =
                     std::min(result.lowestWheelSpeed[index], state.corners[index].wheelSpeed);
+            }
+
+            result.lowestLoad[index] = std::min(result.lowestLoad[index], lastStep.corners[index].forces.tireVertical);
+            if (!lastStep.telemetry.wheels[index].inContact && result.firstLiftTime[index] < 0.0)
+            {
+                result.firstLiftTime[index] = result.time;
             }
 
             result.grounded = result.grounded && lastStep.telemetry.wheels[index].inContact;
@@ -739,4 +753,161 @@ TEST_CASE("what the two published references demand of this tyre, on the car as 
         std::printf("  %6.3f  %10.3f  %9.2f m  %9.2f  %7.3f   %s\n", muX, muX / setup.corners[0].tyre.lateralPeak, best,
                     bestPedal, bestRun.deceleration / gravity, bestRun.lowestWheelSpeed[0] < 0.5 ? "yes" : "no");
     }
+}
+
+TEST_CASE("what splitting the load-sensitivity exponent did to the stop", "[.brake-model]")
+{
+    // Stage 1 of `docs/tyre-grip-ratio-brief.md`, measured rather than interpolated. The brief
+    // estimated the split worth "about 1.1 m" of the 4.7 m gap by reading across a mu_x sweep; this
+    // is the run.
+    //
+    // The `as shipped` row is the car with `longitudinalLoadSensitivity` forced back to the lateral
+    // exponent, which is exactly what this model did until 2026-08-23 — so the two rows differ in one
+    // number and nothing else.
+    //
+    // The load columns are here because the split moved three anti-lock cases from green to red on
+    // `inContact`, and one bit over four wheels and thirty seconds cannot say whether that is a wheel
+    // lifting or a wheel touching down a millisecond late.
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    std::printf("\n=== the two load-sensitivity exponents, on the shipped brakes ===\n");
+    std::printf("  lateral 0.1926 (tyres.ini LS_EXP_Y), longitudinal 0.1244 (LS_EXP_X)\n");
+    std::printf("\n  car            pedal   100-0      mean g   min rear load   first lift   min rear w   grounded\n");
+
+    const auto sweep = [&](const char* name, const VehicleSetup& setup)
+    {
+        const auto assists = golfGtiMk7Assists(setup);
+
+        auto best = 1e9;
+        auto bestPedal = 0.0;
+        auto bestRun = StopResult{};
+
+        for (auto step = 2; step <= 20; step++)
+        {
+            const auto pedal = 0.05 * static_cast<double>(step);
+            const auto run = stop(setup, world.value(), assists, pedal);
+
+            if (run.stopped && run.distance < best)
+            {
+                best = run.distance;
+                bestPedal = pedal;
+                bestRun = run;
+            }
+        }
+
+        const auto rear = std::min(bestRun.lowestLoad[2], bestRun.lowestLoad[3]);
+        const auto lift = std::max(bestRun.firstLiftTime[2], bestRun.firstLiftTime[3]);
+
+        std::printf("  %-13s %5.2f  %7.2f m  %7.3f  %11.1f N   %8.3f s   %8.2f     %s\n", name, bestPedal, best,
+                    bestRun.deceleration / gravity, rear, lift,
+                    std::min(bestRun.lowestWheelSpeed[2], bestRun.lowestWheelSpeed[3]),
+                    bestRun.grounded ? "yes" : "no");
+    };
+
+    auto asShipped = base.value();
+    for (auto& corner : asShipped.corners)
+    {
+        corner.tyre.longitudinalLoadSensitivity = corner.tyre.lateralLoadSensitivity;
+    }
+
+    sweep("one exponent", asShipped);
+    sweep("two exponents", base.value());
+
+    // And the whole pedal for the car as it now is, because the optimum moves with grip and a row is
+    // not a curve.
+    std::printf("\n  pedal   100-0      mean g   min rear load   first lift   min rear w   min front w\n");
+
+    const auto assists = golfGtiMk7Assists(base.value());
+    for (auto step = 2; step <= 20; step++)
+    {
+        const auto pedal = 0.05 * static_cast<double>(step);
+        const auto run = stop(base.value(), world.value(), assists, pedal);
+
+        std::printf("  %5.2f  %7.2f m  %7.3f  %11.1f N   %8.3f s   %8.2f   %8.2f%s\n", pedal, run.distance,
+                    run.deceleration / gravity, std::min(run.lowestLoad[2], run.lowestLoad[3]),
+                    std::max(run.firstLiftTime[2], run.firstLiftTime[3]),
+                    std::min(run.lowestWheelSpeed[2], run.lowestWheelSpeed[3]),
+                    std::min(run.lowestWheelSpeed[0], run.lowestWheelSpeed[1]), run.stopped ? "" : "  (did not stop)");
+    }
+}
+
+TEST_CASE("the first half second of a stop, tick by tick", "[.brake-model]")
+{
+    // **Print the raw samples before theorising.** The exponent split moved the 100-0 the wrong way
+    // and three anti-lock cases from green to red, and both come back to one wheel: at the optimum
+    // pedal the rear reads *zero load* somewhere. A minimum over thirty seconds does not say whether
+    // that is a car whose rear axle is unloaded by braking or a car pitching about its dampers, and
+    // the two want completely different answers.
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    const auto trace = [&](const char* name, const VehicleSetup& setup, const double pedal)
+    {
+        auto state = VehicleState{};
+        settle(setup, state, world.value(), hundred);
+
+        auto assists = golfGtiMk7Assists(setup);
+        auto assistState = AssistState{};
+
+        for (auto step = 0; step < 180; step++)
+        {
+            const auto sensors = AssistSensors{};
+            const auto command = updateAssists(assists, assistState, sensors, {}, noBrakePressure, tick);
+            REQUIRE(stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world.value(), tick, command.brakes)
+                        .has_value());
+        }
+
+        auto input = VehicleInput{};
+        input.brake = pedal;
+
+        std::printf("\n  %s, pedal %.2f\n", name, pedal);
+        std::printf("    t [s]   speed   front load   rear load   front w   rear w   pitch [deg]\n");
+
+        for (auto step = 1; step <= 360; step++)
+        {
+            auto sensors = AssistSensors{};
+            for (auto index = std::size_t{0}; index < cornerCount; index++)
+            {
+                sensors.wheelSpeeds[index] = state.corners[index].wheelSpeed;
+            }
+
+            const auto command = updateAssists(assists, assistState, sensors, {.brake = pedal, .throttle = 0.0},
+                                               brakeCircuitPressures(setup, pedal), tick);
+            const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+
+            if (step % 12 != 0)
+            {
+                continue;
+            }
+
+            std::printf("   %6.3f  %6.2f  %10.1f  %10.1f  %8.2f %8.2f  %10.3f\n", static_cast<double>(step) * tick,
+                        state.chassis.linearVelocity.z,
+                        stepped->corners[0].forces.tireVertical + stepped->corners[1].forces.tireVertical,
+                        stepped->corners[2].forces.tireVertical + stepped->corners[3].forces.tireVertical,
+                        state.corners[0].wheelSpeed, state.corners[2].wheelSpeed,
+                        stepped->telemetry.pitch * 57.29577951308232);
+        }
+    };
+
+    auto asShipped = base.value();
+    for (auto& corner : asShipped.corners)
+    {
+        corner.tyre.longitudinalLoadSensitivity = corner.tyre.lateralLoadSensitivity;
+    }
+
+    std::printf("\n=== the transient the lock order is being read through ===\n");
+    trace("one exponent", asShipped, 0.35);
+    trace("two exponents", base.value(), 0.35);
 }

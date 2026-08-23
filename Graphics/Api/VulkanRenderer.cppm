@@ -78,7 +78,12 @@ constexpr uint32_t frameDataRingSlots = 16;
 constexpr uint32_t descriptorPoolMaxSets = 1024;
 constexpr uint32_t descriptorPoolUniformBuffers = 512;
 constexpr uint32_t descriptorPoolDynamicUniformBuffers = 16;
-constexpr uint32_t descriptorPoolCombinedImageSamplers = 4096;
+// Raised from 4096 when the material set grew from 6 samplers to 11 for the blended-material
+// feature: this scene's two models carry 281 materials between them, which at 11 apiece is 3091
+// before the shadow, occlusion and fullscreen sets are counted. Exhaustion is graceful — it reports
+// DescriptorSetUnavailable and drops the draw — which is exactly the kind of failure that reads as
+// "some geometry is missing sometimes", so the headroom is worth more than the handful of bytes.
+constexpr uint32_t descriptorPoolCombinedImageSamplers = 8192;
 
 // Set 0 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
 // A std140 array of these has a 16-byte element alignment, which 64 bytes already satisfies.
@@ -194,10 +199,25 @@ struct MaterialDataUbo
     glm::ivec4 useTextures;
     glm::ivec4 useTextures2;
     glm::mat4 textureTransform;
+    // Appended, and appended rather than inserted so that the four shaders which declare the block
+    // without it keep matching: a uniform block may be a prefix of the buffer backing it, and the
+    // range bound is this whole struct whatever any one stage reads. A field added anywhere above
+    // would silently move `textureTransform` under every one of them.
+    glm::vec4 blinnPhong;
+    // The blended-material feature, appended for the same reason: x..w are the four detail layers'
+    // tiling, in repeats per unit of the model's own space.
+    glm::vec4 detailTiling;
+    // x the blend strength, y non-zero when this material states detail layers at all. A shader
+    // reads y rather than testing the samplers, because every slot is written whatever the material
+    // carries — an unstated layer holds the 1x1 dummy, which is white and would blend as itself.
+    glm::vec4 blend;
 };
 
-static_assert(sizeof(MaterialDataUbo) == 128);
+static_assert(sizeof(MaterialDataUbo) == 176);
 static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
+static_assert(offsetof(MaterialDataUbo, blinnPhong) == 128);
+static_assert(offsetof(MaterialDataUbo, detailTiling) == 144);
+static_assert(offsetof(MaterialDataUbo, blend) == 160);
 
 // The fullscreen layout's push constant (vulkan-abi.md). Three vec4s rather than the one this used
 // to be: the tone curve has a shape as well as a brightness, a pass that walks a mip chain has to be
@@ -3379,6 +3399,16 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 continue;
             }
 
+            // The entity's flag keeps a whole renderable out of the depth pass; this one keeps a
+            // single mesh of it out. A track is the case that needs both: one model, and inside it
+            // the decals — skid marks, kerb overlays, painted lines — that must be drawn and must
+            // not cast, because each sits a millimetre above the surface it decorates and would
+            // otherwise print a dark ghost of its own outline onto it.
+            if (!shading && !mesh->castsShadow)
+            {
+                continue;
+            }
+
             if (!mesh->gpuResourceId.has_value())
             {
                 // upload() writes through mutate(), in place, so this borrow still names the same
@@ -5007,8 +5037,22 @@ void VulkanRenderer::uploadMaterialTextures(const Resource<Material>& materialKe
         return;
     }
 
-    for (const auto& textureKey :
-         {material->albedo, material->normal, material->metallicRoughness, material->emissive, material->occlusion})
+    // Every slot a material set will bind. This list is hand-written and that is a hazard worth
+    // naming: a slot added to `Material` and forgotten here is never uploaded, so `textureImage`
+    // finds no gpuResourceId, the descriptor takes the 1x1 white dummy, and the surface renders as
+    // though the texture were pure white — no warning, no missing-texture magenta, just a wrong
+    // picture. That is exactly what the blend layers did on their first run: the importer had them,
+    // the material had them, and they arrived at the shader as four layers of white.
+    for (const auto& textureKey : {material->albedo, material->normal, material->metallicRoughness, material->emissive,
+                                   material->occlusion, material->blendMask})
+    {
+        if (textureKey.has_value())
+        {
+            static_cast<void>(uploadTexture(textureKey.value()));
+        }
+    }
+
+    for (const auto& textureKey : material->detail)
     {
         if (textureKey.has_value())
         {
@@ -5383,13 +5427,36 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     // must not read the screen-space occlusion buffer, which holds one opaque surface per pixel and
     // not this one. Stated here rather than inferred from the fragment's alpha, which is a
     // threshold on a number that means something else.
-    materialData.useTextures2 = glm::ivec4(occlusion.has_value() ? 1 : 0, material.opaque ? 1 : 0, 0, 0);
+    // z says the Blinn-Phong block below was *stated* by the asset rather than left at its
+    // defaults, which is the difference between a shader shading from it and a shader falling back.
+    materialData.useTextures2 =
+        glm::ivec4(occlusion.has_value() ? 1 : 0, material.opaque ? 1 : 0, material.blinnPhong.has_value() ? 1 : 0, 0);
+    const auto blinnPhong = material.blinnPhong.value_or(BlinnPhongShading{});
+    materialData.blinnPhong =
+        glm::vec4(blinnPhong.ambient, blinnPhong.diffuse, blinnPhong.specular, blinnPhong.specularExponent);
+
+    const auto blend = material.blend.value_or(MaterialBlend{});
+    materialData.detailTiling =
+        glm::vec4(blend.layers[0].tiling, blend.layers[1].tiling, blend.layers[2].tiling, blend.layers[3].tiling);
+    materialData.blend = glm::vec4(blend.strength, material.blend.has_value() ? 1.0f : 0.0f, 0.0f, 0.0f);
     std::memcpy(mapped, &materialData, sizeof(materialData));
     ensure(vmaFlushAllocation(allocator, resource.allocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
-    const std::array sampledImages = {diffuse.value_or(fallbackTexture),   normal.value_or(fallbackTexture),
-                                      specular.value_or(fallbackTexture),  emissive.value_or(fallbackTexture),
-                                      occlusion.value_or(fallbackTexture), environment};
+    // The blend mask and the detail layers. An absent one takes the white dummy like every other
+    // slot, and `blend.y` above is what stops a shader reading it as a layer that is entirely white.
+    const auto blendMask = textureImage(material.blendMask);
+    const std::array sampledImages = {diffuse.value_or(fallbackTexture),
+                                      normal.value_or(fallbackTexture),
+                                      specular.value_or(fallbackTexture),
+                                      emissive.value_or(fallbackTexture),
+                                      occlusion.value_or(fallbackTexture),
+                                      environment,
+                                      blendMask.value_or(fallbackTexture),
+                                      textureImage(material.detail[0]).value_or(fallbackTexture),
+                                      textureImage(material.detail[1]).value_or(fallbackTexture),
+                                      textureImage(material.detail[2]).value_or(fallbackTexture),
+                                      textureImage(material.detail[3]).value_or(fallbackTexture)};
+    static_assert(std::tuple_size_v<decltype(sampledImages)> == materialTextureSlotCount);
 
     const VkDescriptorBufferInfo bufferInfo{resource.buffer, 0, sizeof(MaterialDataUbo)};
     std::array<VkDescriptorImageInfo, materialTextureSlotCount> imageInfos{};

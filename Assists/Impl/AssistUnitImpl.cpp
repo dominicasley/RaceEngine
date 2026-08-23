@@ -95,7 +95,8 @@ namespace
         advanceReferenceSpeed(setup.reference, state.reference, readings, braking, period);
 
         advanceTractionControl(setup.traction, state.traction, readings, setup.reference, peakTorque,
-                               state.reference.speed, state.reference.valid, demand.throttle, period);
+                               state.reference.speed, state.reference.valid, state.reference.coasting, demand.throttle,
+                               period);
 
         advanceCorneringBrake(setup.cornering, state.cornering, readings, setup.reference, peakTorque,
                               sensors.lateralAcceleration, period);

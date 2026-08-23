@@ -88,6 +88,11 @@ export inline constexpr uint32_t probeSpecularMipCount = 6;
 export inline constexpr uint32_t probeIrradianceSourceMip = 3;
 
 // Material texture slots in shader-declaration order.
+//
+// The five after Environment are the blended-material feature (Material.cppm, `MaterialBlend`): a
+// mask that says where each layer applies, and one texture per layer. They are appended so that
+// every existing slot keeps its binding — a slot's index *is* its binding, so inserting anywhere
+// above would silently rebind every shader's samplers.
 export enum class MaterialTextureSlot : uint32_t {
     Diffuse,
     Normal,
@@ -95,9 +100,16 @@ export enum class MaterialTextureSlot : uint32_t {
     Emissive,
     Occlusion,
     Environment,
+    BlendMask,
+    DetailR,
+    DetailG,
+    DetailB,
+    DetailA,
 };
 
-export inline constexpr uint32_t materialTextureSlotCount = 6;
+export inline constexpr uint32_t materialTextureSlotCount = 6 + 1 + detailLayerCount;
+
+static_assert(static_cast<uint32_t>(MaterialTextureSlot::DetailR) + detailLayerCount == materialTextureSlotCount);
 
 // Set 1 carries the MaterialData UBO at binding 0, so slot N is binding N + 1.
 export [[nodiscard]] constexpr uint32_t textureBinding(const MaterialTextureSlot slot)
@@ -234,7 +246,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 40;
+export inline constexpr size_t shaderContractMacroCount = 46;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -266,6 +278,12 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"TEXTURE_EMISSIVE", textureBinding(MaterialTextureSlot::Emissive)},
         {"TEXTURE_OCCLUSION", textureBinding(MaterialTextureSlot::Occlusion)},
         {"TEXTURE_ENVIRONMENT", textureBinding(MaterialTextureSlot::Environment)},
+        {"TEXTURE_BLEND_MASK", textureBinding(MaterialTextureSlot::BlendMask)},
+        {"TEXTURE_DETAIL_R", textureBinding(MaterialTextureSlot::DetailR)},
+        {"TEXTURE_DETAIL_G", textureBinding(MaterialTextureSlot::DetailG)},
+        {"TEXTURE_DETAIL_B", textureBinding(MaterialTextureSlot::DetailB)},
+        {"TEXTURE_DETAIL_A", textureBinding(MaterialTextureSlot::DetailA)},
+        {"DETAIL_LAYERS", detailLayerCount},
         {"SET_FRAME", frameDescriptorSet},
         {"SET_MATERIAL", materialDescriptorSet},
         {"SET_DRAW", drawDescriptorSet},

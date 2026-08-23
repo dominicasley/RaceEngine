@@ -42,6 +42,7 @@ add_executable(EngineTests
         GltfNodeTransformTests.cpp
         GolfGtiTests.cpp
         HandlingTests.cpp
+        InGearProbe.cpp
         InputDeviceProbeTests.cpp
         InputServiceTests.cpp
         InputTests.cpp
@@ -74,6 +75,7 @@ add_executable(EngineTests
         TorqueConverterTests.cpp
         TractionControlTests.cpp
         TyreLayerTests.cpp
+        TyreLoadSensitivityTests.cpp
         TyreShapeProbe.cpp
         TyreTests.cpp
         VehicleDataProbe.cpp

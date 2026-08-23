@@ -571,6 +571,15 @@ export struct VehicleTrace
 
     bool tractionBrakeActive = false;
     bool tractionEngineActive = false;
+
+    // **Fitted and active are two different questions and the trace needs both.** `corneringActive`
+    // is only true while XDS is applying a brake, so a lap driven with it switched on but never
+    // triggered reads exactly like a lap driven with it off — which is the confusion `ABS Fitted`
+    // and `TC Mode` were added to end for the other two, and XDS was left without its half of it.
+    // Found the hard way on 2026-08-23: a trace with 0 in the active column could not be told from
+    // one where the assist was never enabled, and the answer needed the setup sheet, which had been
+    // edited since.
+    bool corneringEnabled = false;
     bool corneringActive = false;
     // 0 with the driver's foot untouched, 1 with the throttle shut.
     double engineTorqueReduction = 0.0;
@@ -692,7 +701,7 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             "G Force Lat [g],G Force Long [g],Yaw Rate [deg/s],"
             "Ride Height F [mm],Ride Height R [mm],"
             "Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear [],Engine RPM [rpm],"
-            "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Active [],Engine Reduction [%]";
+            "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Fitted [],XDS Active [],Engine Reduction [%]";
 
     for (const auto* tag : tracedCornerAbbreviations)
     {
@@ -788,6 +797,7 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         appendRackInteger(text, static_cast<long long>(car.tractionMode));
         text += car.tractionBrakeActive ? ",1" : ",0";
         text += car.tractionEngineActive ? ",1" : ",0";
+        text += car.corneringEnabled ? ",1" : ",0";
         text += car.corneringActive ? ",1," : ",0,";
         appendRackNumber(text, car.engineTorqueReduction * 100.0, 3);
 

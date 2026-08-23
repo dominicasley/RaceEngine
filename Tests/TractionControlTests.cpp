@@ -12,6 +12,7 @@
 import raceengine.physics;
 
 using raceengine::advanceCorneringBrake;
+using raceengine::advanceTractionControl;
 using raceengine::AssistSensors;
 using raceengine::AssistSetup;
 using raceengine::AssistState;
@@ -41,6 +42,8 @@ using raceengine::stepVehicle;
 using raceengine::SurfaceMesh;
 using raceengine::tearDownJolt;
 using raceengine::TractionMode;
+using raceengine::TractionSetup;
+using raceengine::TractionState;
 using raceengine::updateAssists;
 using raceengine::VehicleInput;
 using raceengine::VehicleSetup;
@@ -86,6 +89,43 @@ struct JoltGuard
 // call, because a zero pressure array means "no brakes" and that should be legible.
 constexpr auto noBrakePressure = std::array<double, cornerCount>{};
 
+// Tarmac under one side, something slippery under the other. **The only surface on which a brake-
+// based traction intervention has anything to do**: it is a differential lock, so it needs a
+// difference across the axle to act on, and a uniform plate presents none however slippery it is.
+[[nodiscard]] SurfaceMesh splitPlate(const double leftGrip, const double rightGrip)
+{
+    auto descriptor = ProvingGroundDescriptor{};
+    descriptor.length = plateLength;
+    descriptor.width = plateWidth;
+    descriptor.cellSize = 2.0;
+    descriptor.features = std::vector<Feature>{};
+
+    auto mesh = generateProvingGround(descriptor);
+    REQUIRE(mesh.has_value());
+
+    mesh->materials.resize(2);
+    mesh->materials[0].gripMultiplier = leftGrip;
+    mesh->materials[0].bumpiness = 0.0;
+    mesh->materials[1].gripMultiplier = rightGrip;
+    mesh->materials[1].bumpiness = 0.0;
+
+    for (auto triangle = std::size_t{0}; triangle < mesh->triangleCount(); triangle++)
+    {
+        const auto centroid =
+            (mesh->vertices[mesh->indices[triangle * 3 + 0]] + mesh->vertices[mesh->indices[triangle * 3 + 1]] +
+             mesh->vertices[mesh->indices[triangle * 3 + 2]]) /
+            3.0;
+
+        // **+x is the car's LEFT in this frame**, which is stated once in `outboardSign` and is the
+        // trap that has cost this project a day before now. So the *positive* half of the plate is
+        // the one the left-hand wheels run on, and a fixture that reads `x < 0` as "left" puts the
+        // surfaces on the wrong sides and then blames the controller.
+        mesh->surfaces[triangle] = centroid.x > 0.0 ? std::uint32_t{0} : std::uint32_t{1};
+    }
+
+    return mesh.value();
+}
+
 [[nodiscard]] SurfaceMesh gripPlate(const double grip)
 {
     auto descriptor = ProvingGroundDescriptor{};
@@ -129,6 +169,9 @@ struct LaunchResult
     double toHundred = -1.0;
     double peakEngineReduction = 0.0;
     double peakTractionBrake = 0.0;
+    // Which corner the peak landed on. A differential lock is only doing its job if it is the
+    // *losing* wheel it brakes, and a scalar peak cannot say which one that was.
+    std::size_t peakTractionBrakeWheel = cornerCount;
     double firstBrakeIntervention = -1.0;
     double firstEngineIntervention = -1.0;
     double meanDrivenSlip = 0.0;
@@ -242,7 +285,11 @@ struct LaunchResult
 
         for (const auto wheel : {frontLeft, frontRight})
         {
-            result.peakTractionBrake = std::max(result.peakTractionBrake, command.channels.tractionBrakeTorque[wheel]);
+            if (command.channels.tractionBrakeTorque[wheel] > result.peakTractionBrake)
+            {
+                result.peakTractionBrake = command.channels.tractionBrakeTorque[wheel];
+                result.peakTractionBrakeWheel = wheel;
+            }
 
             if (result.firstBrakeIntervention < 0.0 && command.channels.tractionBrakeTorque[wheel] > 1.0)
             {
@@ -351,9 +398,17 @@ TEST_CASE("traction control is worth a little on dry tarmac and a great deal on 
         CAPTURE(plain.toHundred, assisted.toHundred, plain.peakDrivenSlip, assisted.peakDrivenSlip);
 
         // **The unassisted figure is the one already on record**, which is what says this fixture
-        // reproduces the launch the rest of the project measures rather than a new one: 6.55 s,
+        // reproduces the launch the rest of the project measures rather than a new one: 6.494 s,
         // against a published 6.4-6.7 s for a Mk7 GTI DSG without launch control.
-        REQUIRE(plain.toHundred == Catch::Approx(6.55).margin(0.02));
+        //
+        // **6.550 until 2026-08-23**, when the load-sensitivity exponent was split and the
+        // longitudinal axis took `tyres.ini`'s own `LS_EXP_X` instead of the lateral figure that had
+        // been standing in for it. A launch transfers weight *off* the driven axle, so the front tyres
+        // work below their nominal load, where a flatter exponent is worth a little less rather than a
+        // little more — 0.8% by hand calculation and 0.9% measured, which is about as close as an
+        // estimate of a whole-car figure from a single-wheel one has any right to be. Re-recorded
+        // rather than widened: the point of the number is that it is the same launch.
+        REQUIRE(plain.toHundred == Catch::Approx(6.494).margin(0.02));
 
         // Comparable or modestly better. Not transformative — on high grip there is not much
         // wheelspin to recover, and a system that found a lot here would be finding it somewhere it
@@ -393,11 +448,16 @@ TEST_CASE("traction control is worth a little on dry tarmac and a great deal on 
     }
 }
 
-TEST_CASE("the brake channel catches the transient and the engine channel sustains it", "[assists][traction][launch]")
+TEST_CASE("a launch with both wheels spinning together is the engine channel's alone", "[assists][traction][launch]")
 {
-    // **Criterion 8.** The design is the division of labour, so the telemetry has to be able to
-    // show it: brake torque and engine torque reduction on separate channels, with the brake
-    // arriving first because it is a valve and the engine channel is a throttle body.
+    // **This case did not exist until 2026-08-23 and its absence is what let the brake channel be
+    // the wrong device for as long as it was.** On a uniform surface both driven wheels break away
+    // together, and then there is no cross-axle torque to redistribute: braking either one takes
+    // drive away from the axle instead of moving it to the other side, and braking both is two discs
+    // absorbing engine power to no purpose. The brakes genuinely cannot help here and must stay out.
+    //
+    // The old brake channel intervened anyway, because it was keyed on each wheel's slip against the
+    // reference speed rather than against its partner — the engine channel's signal wired to a valve.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -410,16 +470,61 @@ TEST_CASE("the brake channel catches the transient and the engine channel sustai
 
     CAPTURE(run.firstBrakeIntervention, run.firstEngineIntervention, run.peakTractionBrake, run.peakEngineReduction);
 
+    // The wheels really did spin, or this proves nothing about restraint.
+    REQUIRE(run.peakEngineReduction > 0.2);
+    REQUIRE(run.firstEngineIntervention > 0.0);
+
+    // And the brakes did not touch it.
+    REQUIRE(run.peakTractionBrake == Catch::Approx(0.0).margin(1e-6));
+    REQUIRE(run.firstBrakeIntervention < 0.0);
+}
+
+TEST_CASE("the brake channel catches the transient and the engine channel sustains it", "[assists][traction][launch]")
+{
+    // **Criterion 8.** The design is the division of labour, so the telemetry has to be able to
+    // show it: brake torque and engine torque reduction on separate channels, with the brake
+    // arriving first because it is a valve and the engine channel is a throttle body.
+    //
+    // **Measured on a split surface since 2026-08-23**, and the change of surface is the criterion
+    // becoming honest rather than being weakened. It used to run on a uniform mu 0.35 plate, where a
+    // correctly built brake channel has nothing it can do — see the case above. A differential lock
+    // needs a difference across the axle, so a split surface is the case it exists for, and it is
+    // also the case a driver meets: one wheel on the wet line, one on the dry.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(splitPlate(1.0, 0.35));
+    REQUIRE(world.has_value());
+
+    const auto run = launch(setup.value(), world.value(), withTraction(setup.value(), TractionMode::Full), 20.0);
+
+    CAPTURE(run.firstBrakeIntervention, run.firstEngineIntervention, run.peakTractionBrake, run.peakEngineReduction);
+
     // Both channels did something.
     REQUIRE(run.firstBrakeIntervention > 0.0);
     REQUIRE(run.firstEngineIntervention > 0.0);
     REQUIRE(run.peakTractionBrake > 100.0);
     REQUIRE(run.peakEngineReduction > 0.2);
 
-    // The brake got there first. The engine channel is a throttle body with a 100 ms full-travel
-    // time and cannot; that is why a system with only an engine channel cannot catch a wheel
-    // breaking away.
-    REQUIRE(run.firstBrakeIntervention < run.firstEngineIntervention);
+    // **The ordering assertion that used to be here has moved to a unit case and this is why.** It
+    // required the brake channel to intervene before the engine channel, on the grounds that a valve
+    // is faster than a throttle body. That was a fair reading while both channels fired on the same
+    // signal at the same instant; since the reform they fire on *different* signals — the engine on
+    // axle-wide slip, the brake on a cross-axle difference — so which arrives first is a property of
+    // which condition the surface presents first, not of how quickly either actuator moves. On a
+    // launch from rest the whole axle breaks away before any difference develops across it, so the
+    // engine is first here, and that is the surface talking.
+    //
+    // The actuator claim is real and is still pinned, at the only level it can be stated cleanly:
+    // `the brake channel answers a step immediately and the engine channel takes a tenth of a
+    // second`, below.
+
+    // It braked the *slippery* side, which is the whole point of a differential lock: torque it
+    // cannot use goes back across the axle to the side that can.
+    CAPTURE(run.peakTractionBrakeWheel);
+    REQUIRE(run.peakTractionBrakeWheel == frontRight);
 
     // The brake channel is capped well below full braking, because it is a transient device: holding
     // a driven wheel against first gear would put tens of kilowatts into one disc.
@@ -713,4 +818,273 @@ TEST_CASE("the cornering brake changes what the car does on corner exit", "[assi
     // And what it does is take slip off the inside front and put force on the outside one.
     REQUIRE(assisted.insideFrontSlip < plain.insideFrontSlip);
     REQUIRE(assisted.outsideFrontForce > plain.outsideFrontForce);
+}
+
+TEST_CASE("the differential lock acts on the axle's own difference and on nothing else", "[assists][traction][eds]")
+{
+    // **The reformed brake channel, one condition at a time.** It is an electronic differential
+    // lock: it brakes whichever driven wheel is running away *from its partner*, so that an open
+    // diff passes the torque to the side that can use it. Everything below follows from that being
+    // the signal, and none of it was true of the channel this replaced on 2026-08-23, which keyed on
+    // each wheel's slip against the estimated road speed.
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    auto traction = TractionSetup{};
+    traction.mode = TractionMode::Full;
+
+    auto peaks = std::array<double, wheelCount>{};
+    for (auto index = std::size_t{0}; index < wheelCount; index++)
+    {
+        peaks[index] = setup->corners[index].brakeTorque;
+    }
+
+    const auto reference = ReferenceSpeedSetup{};
+
+    // 15 m/s, which is inside the channel's speed limit so that the limit is not what is being
+    // measured in the cases that are not about it.
+    const auto meanSpeed = 15.0;
+
+    auto wheels = WheelSpeedReadings{};
+    wheels[rearLeft] = reading(meanSpeed);
+    wheels[rearRight] = reading(meanSpeed);
+
+    SECTION("both driven wheels equally slow is not wheelspin, whatever the reference speed says")
+    {
+        // **The lock-up recovery, as the brake channel sees it.** Both fronts crawling at a fifth of
+        // road speed after a lock, and a reference speed that has collapsed to nothing — which is
+        // exactly the state that produced the defect Dominic found from the seat. The old channel
+        // saturated here. This one has no opinion, because left and right agree.
+        wheels[frontLeft] = reading(3.0);
+        wheels[frontRight] = reading(3.0);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, 0.01, true, 0.0, 0.5, tick);
+
+        CAPTURE(state.brakeFraction[frontLeft], state.brakeFraction[frontRight]);
+
+        REQUIRE_FALSE(state.brakeActive);
+        REQUIRE(state.brakeFraction[frontLeft] == 0.0);
+        REQUIRE(state.brakeFraction[frontRight] == 0.0);
+    }
+
+    SECTION("both driven wheels spinning together is the engine's job and not the brakes'")
+    {
+        // Nothing to redistribute: braking either wheel takes drive off the axle instead of moving
+        // it across, and braking both is two discs absorbing engine power to no purpose.
+        wheels[frontLeft] = reading(meanSpeed * 1.5);
+        wheels[frontRight] = reading(meanSpeed * 1.5);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+
+        REQUIRE_FALSE(state.brakeActive);
+
+        // But the engine channel has very much noticed.
+        REQUIRE(state.engineReduction > 0.0);
+    }
+
+    SECTION("one driven wheel running away is braked, and only it")
+    {
+        wheels[frontLeft] = reading(meanSpeed);
+        wheels[frontRight] = reading(meanSpeed + 1.0);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+
+        CAPTURE(state.brakeFraction[frontLeft], state.brakeFraction[frontRight]);
+
+        REQUIRE(state.brakeActive);
+        REQUIRE(state.brakeFraction[frontLeft] == 0.0);
+        REQUIRE(state.brakeFraction[frontRight] > 0.0);
+
+        // A metre a second of departure, less the deadband, against a gain sized to reach the ceiling
+        // at one metre a second: 1221 * 0.9 / 3665.5 = 0.300.
+        REQUIRE(state.brakeFraction[frontRight] == Catch::Approx(0.300).margin(0.005));
+    }
+
+    SECTION("and the mirror of it, so no side is special")
+    {
+        wheels[frontLeft] = reading(meanSpeed + 1.0);
+        wheels[frontRight] = reading(meanSpeed);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+
+        REQUIRE(state.brakeFraction[frontRight] == 0.0);
+        REQUIRE(state.brakeFraction[frontLeft] == Catch::Approx(0.300).margin(0.005));
+    }
+
+    SECTION("a corner is not wheelspin, however different the two driven wheels read")
+    {
+        // A turn tight enough to put 0.4 m/s across the rear axle. The fronts read the difference
+        // the kinematics demand of them and not a metre a second more, so nothing is running away —
+        // and a lock that did not take the corner out would brake the outside wheel all the way
+        // round every bend.
+        const auto across = 0.20;
+        wheels[rearLeft] = reading(meanSpeed - across);
+        wheels[rearRight] = reading(meanSpeed + across);
+
+        const auto yaw = 2.0 * across / traction.rearTrack;
+        const auto halfFront = 0.5 * traction.frontTrack;
+
+        wheels[frontLeft] = reading(meanSpeed - yaw * halfFront);
+        wheels[frontRight] = reading(meanSpeed + yaw * halfFront);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+
+        CAPTURE(yaw, state.brakeFraction[frontLeft], state.brakeFraction[frontRight]);
+
+        REQUIRE_FALSE(state.brakeActive);
+    }
+
+    SECTION("above the speed limit the brakes hand the whole job to the engine")
+    {
+        // It is a friction device with the engine on the other side of it, so everything it does
+        // becomes heat in one disc. 30 m/s is 108 km/h, well past the 80 the fade ends at.
+        // 5 m/s over, which is 17% of slip against a 10% target — comfortably enough for the engine
+        // channel to want to act, so that what is being measured is the brake channel declining.
+        const auto fast = 30.0;
+        wheels[rearLeft] = reading(fast);
+        wheels[rearRight] = reading(fast);
+        wheels[frontLeft] = reading(fast);
+        wheels[frontRight] = reading(fast + 5.0);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, fast, true, 0.0, 1.0, tick);
+
+        REQUIRE_FALSE(state.brakeActive);
+        REQUIRE(state.engineReduction > 0.0);
+    }
+}
+
+TEST_CASE("the brake channel answers a step immediately and the engine channel takes a tenth of a second",
+          "[assists][traction][eds]")
+{
+    // **The division of labour, stated where it can be stated cleanly.** This used to be inferred
+    // from which channel intervened first on a launch, which stopped being a fair reading once the
+    // two channels were given different signals to fire on. What the design actually claims is about
+    // the *actuators*: a hydraulic valve moves in a millisecond and a drive-by-wire throttle body
+    // takes its full-travel time, so the brake catches a departing wheel and the engine is what
+    // sustains the correction.
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    auto traction = TractionSetup{};
+    traction.mode = TractionMode::Full;
+
+    auto peaks = std::array<double, wheelCount>{};
+    for (auto index = std::size_t{0}; index < wheelCount; index++)
+    {
+        peaks[index] = setup->corners[index].brakeTorque;
+    }
+
+    const auto reference = ReferenceSpeedSetup{};
+    const auto meanSpeed = 15.0;
+
+    // One wheel departs, hard, in a single control step. Both conditions are present at once — the
+    // axle is slipping *and* the two sides disagree — so neither channel is waiting on a surface.
+    auto wheels = WheelSpeedReadings{};
+    wheels[rearLeft] = reading(meanSpeed);
+    wheels[rearRight] = reading(meanSpeed);
+    wheels[frontLeft] = reading(meanSpeed);
+    wheels[frontRight] = reading(meanSpeed + 3.0);
+
+    auto state = TractionState{};
+    advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+
+    CAPTURE(state.brakeFraction[frontRight], state.engineReduction);
+
+    // The valve is already at its ceiling.
+    REQUIRE(state.brakeFraction[frontRight] == Catch::Approx(traction.brakeCeiling).margin(1e-6));
+
+    // The throttle body has barely moved: one 1/360 s step against a 100 ms closing time is under
+    // 3% of the way, and that is the whole argument for having a brake channel at all.
+    REQUIRE(state.engineReduction < 0.05);
+
+    // Held there, it goes where a first-order lag goes. The demand is the slip error times the
+    // engine gain: a wheel 3 m/s over a 15 m/s reference is 0.20 of slip, less the 0.10 target, times
+    // a gain of 4, which is 0.40. After one time constant a lag is 63% of the way there.
+    const auto demand = std::clamp(traction.engineGain * (3.0 / meanSpeed - traction.fullTargetSlip), 0.0, 1.0);
+
+    for (auto step = 0; step < 36; step++)
+    {
+        advanceTractionControl(traction, state, wheels, reference, peaks, meanSpeed, true, 0.0, 1.0, tick);
+    }
+
+    CAPTURE(demand, state.engineReduction);
+
+    REQUIRE(demand == Catch::Approx(0.40).margin(1e-9));
+    REQUIRE(state.engineReduction == Catch::Approx(0.632 * demand).epsilon(0.05));
+}
+
+TEST_CASE("the differential lock withdraws when the wheels have stopped meaning anything", "[assists][traction][eds]")
+{
+    // **Found in the seat trace `traces/rack-20260823-noabs-tcsport-eds.csv`**, on the lap that
+    // accepted the reform: the car lands from a crest at 126 km/h with all four wheels stopped in
+    // the air, every reading is then a wheel spinning back up at its own rate, and the difference
+    // across the axle is noise. 3.3% of that lap's diff-lock interventions were in that state.
+    //
+    // Two things stop it, and they are different things. The estimator's `coasting` channel says the
+    // reference is being carried by its own rate limit rather than by a wheel — a plausibility check,
+    // which is what its own comment says it is for. And the speed gate reads the *estimate* rather
+    // than the wheels, because the estimate is bounded at 1.3 g where a raw reading goes to zero in
+    // a tick.
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    auto traction = TractionSetup{};
+    traction.mode = TractionMode::Full;
+
+    auto peaks = std::array<double, wheelCount>{};
+    for (auto index = std::size_t{0}; index < wheelCount; index++)
+    {
+        peaks[index] = setup->corners[index].brakeTorque;
+    }
+
+    const auto reference = ReferenceSpeedSetup{};
+
+    // The landing, as the sensors report it: the car is doing 35 m/s and every wheel is somewhere
+    // between stopped and half of it, all four at different rates.
+    auto wheels = WheelSpeedReadings{};
+    wheels[rearLeft] = reading(7.5);
+    wheels[rearRight] = reading(10.9);
+    wheels[frontLeft] = reading(17.6);
+    wheels[frontRight] = reading(20.7);
+
+    SECTION("a reference carried by its own limiter suspends the channel")
+    {
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, 35.0, true, 0.5, 1.0, tick);
+
+        CAPTURE(state.brakeFraction[frontLeft], state.brakeFraction[frontRight]);
+        REQUIRE_FALSE(state.brakeActive);
+    }
+
+    SECTION("and even believing the wheels, the speed gate is read off the estimate and holds")
+    {
+        // Coasting under the hold time, so the plausibility check is not what is being measured —
+        // the car is still doing 35 m/s and 35 m/s is past where this channel is allowed to act.
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, 35.0, true, 0.0, 1.0, tick);
+
+        REQUIRE_FALSE(state.brakeActive);
+    }
+
+    SECTION("but a genuine low-speed departure with a healthy reference still gets braked")
+    {
+        // The same shape of numbers at a speed the channel owns, with the reference tracking. It
+        // must not have become deaf.
+        wheels[rearLeft] = reading(15.0);
+        wheels[rearRight] = reading(15.0);
+        wheels[frontLeft] = reading(15.0);
+        wheels[frontRight] = reading(16.0);
+
+        auto state = TractionState{};
+        advanceTractionControl(traction, state, wheels, reference, peaks, 15.0, true, 0.0, 1.0, tick);
+
+        REQUIRE(state.brakeActive);
+        REQUIRE(state.brakeFraction[frontRight] > 0.0);
+    }
 }

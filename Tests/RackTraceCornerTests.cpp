@@ -137,8 +137,8 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     const auto values = split(rows[1], ',');
 
     REQUIRE(header.size() == values.size());
-    // Thirteen that were always there, then nine chassis channels, five driver ones, **six for the
-    // electronics** and **thirteen** per corner — eighty-five in total.
+    // Thirteen that were always there, then nine chassis channels, five driver ones, **seven for the
+    // electronics** and **thirteen** per corner — eighty-six in total.
     //
     // The history, because the count has been wrong in a brief before: it was nine per corner and
     // sixty-three until `Patch Depth Spread` joined the block for the enveloping work, then ten and
@@ -148,7 +148,11 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // driven with the anti-lock system on, and the setup sheet had been edited since. The telemetry
     // brief that asked for the original expansion counted forty-nine new and sixty-two, because it
     // listed nine chassis channels under a heading that said eight; the list is what was built.
-    REQUIRE(header.size() == 13 + 9 + 5 + 6 + 13 * tracedCornerCount);
+    //
+    // `XDS Fitted` joined the electronics group later the same day, taking it from six to seven: the
+    // other two assists each had a *fitted* column and XDS had only an *active* one, so a lap with it
+    // switched on and never triggered was indistinguishable from a lap without it.
+    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 13 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -208,6 +212,16 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
     // other file — every engine number read 9.55 times low — so it is pinned here from the start.
     car.engineSpeed = 440.0;
 
+    // Fitted-but-quiet on one assist and firing on the other, so the two halves of each pair cannot
+    // be confused with one another.
+    car.antilockEnabled = true;
+    car.tractionMode = 2;
+    car.tractionBrakeActive = true;
+    car.tractionEngineActive = false;
+    car.corneringEnabled = true;
+    car.corneringActive = false;
+    car.engineTorqueReduction = 0.425;
+
     const auto rows = lines(rackTorqueToCsv({frame}));
     REQUIRE(rows.size() == 2);
 
@@ -233,6 +247,19 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
     REQUIRE(named("Clutch Pos [%]") == Catch::Approx(50.0).epsilon(1e-9));
     REQUIRE(named("Gear []") == Catch::Approx(4.0).margin(1e-9));
     REQUIRE(named("Engine RPM [rpm]") == Catch::Approx(4201.7).epsilon(1e-4));
+
+    // **The electronics group, which nothing pinned until 2026-08-23.** Every flag is set to a
+    // different value from its neighbour so that a pair of columns swapped — `XDS Fitted` for
+    // `XDS Active`, `TC Brake` for `TC Engine` — fails here rather than passing because both were
+    // plausibly zero. That is the fault this whole file exists to catch, and the group that was
+    // added to answer "which assists was this lap driven with" was the one group not covered by it.
+    REQUIRE(named("ABS Fitted []") == Catch::Approx(1.0).margin(1e-9));
+    REQUIRE(named("TC Mode []") == Catch::Approx(2.0).margin(1e-9));
+    REQUIRE(named("TC Brake []") == Catch::Approx(1.0).margin(1e-9));
+    REQUIRE(named("TC Engine []") == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(named("XDS Fitted []") == Catch::Approx(1.0).margin(1e-9));
+    REQUIRE(named("XDS Active []") == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(named("Engine Reduction [%]") == Catch::Approx(42.5).epsilon(1e-9));
 }
 
 TEST_CASE("and the thirteen columns that were always there have not moved", "[input][ffb][trace]")

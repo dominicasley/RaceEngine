@@ -80,6 +80,18 @@ export struct Mesh
     std::map<std::string, int> skin;
     std::vector<glm::mat4> inverseBindPoseTransforms;
     glm::mat4 modelMatrix;
+    // Whether this mesh belongs in a shadow map, per *mesh* rather than per renderable — because
+    // whether a thing casts is a property of the thing, and one model routinely contains both.
+    //
+    // A **decal** is the case that makes this necessary: skid marks, kerb overlays, painted lines
+    // and wall graphics are separate geometry laid a millimetre above the surface they decorate, and
+    // a caster that sits on its own receiver shadows it. The result is a dark ghost of the decal's
+    // own silhouette printed onto the surface, slightly offset — which reads as a dirty texture
+    // rather than as a shadow bug, and gets *worse* as the shadow map sharpens, because a coarser
+    // map was blurring the decal's outline away.
+    //
+    // Defaults to true: a mesh that says nothing casts, which is what every ordinary mesh means.
+    bool castsShadow = true;
 };
 
 export struct Model

@@ -36,6 +36,7 @@ import raceengine.physics;
 
 using raceengine::evaluateTyre;
 using raceengine::golfGtiMk7;
+using raceengine::TyreAxis;
 using raceengine::tyreFriction;
 using raceengine::TyreModel;
 using raceengine::TyreSlip;
@@ -56,7 +57,7 @@ struct Shape
 
 [[nodiscard]] Shape shapeOf(const TyreModel& model, const double load)
 {
-    const auto available = tyreFriction(model, model.longitudinalPeak, load, 1.0) * load;
+    const auto available = tyreFriction(model, TyreAxis::Longitudinal, load, 1.0) * load;
 
     auto shape = Shape{};
 
@@ -98,7 +99,7 @@ TEST_CASE("what the longitudinal curve this car runs actually looks like", "[.ty
                 model.longitudinalStiffness, model.longitudinalCurvature, model.longitudinalPeak, load);
 
     // The derived B, which is the number the formula actually uses.
-    const auto friction = tyreFriction(model, model.longitudinalPeak, load, 1.0);
+    const auto friction = tyreFriction(model, TyreAxis::Longitudinal, load, 1.0);
     const auto derivedB = model.longitudinalStiffness / (model.longitudinalShape * friction);
     std::printf("  the Magic Formula's B is derived, not stated: K / (C * mu) = %.1f / (%.2f * %.3f) = %.3f\n",
                 model.longitudinalStiffness, model.longitudinalShape, friction, derivedB);
@@ -116,7 +117,7 @@ TEST_CASE("what the longitudinal curve this car runs actually looks like", "[.ty
     {
         const auto forces = evaluateTyre(model, load, TyreSlip{.slipRatio = ratio, .slipAngle = 0.0}, 1.0);
         std::printf("%7.2f %7.1f%%\n", ratio,
-                    100.0 * forces.longitudinal / (tyreFriction(model, model.longitudinalPeak, load, 1.0) * load));
+                    100.0 * forces.longitudinal / (tyreFriction(model, TyreAxis::Longitudinal, load, 1.0) * load));
     }
 }
 
@@ -161,7 +162,7 @@ TEST_CASE("the four candidates, judged where tyre data actually exists", "[.tyre
         model.longitudinalCurvature = candidate.curvature;
         model.longitudinalStiffness = candidate.stiffness;
 
-        const auto available = tyreFriction(model, model.longitudinalPeak, load, 1.0) * load;
+        const auto available = tyreFriction(model, TyreAxis::Longitudinal, load, 1.0) * load;
         const auto at = [&](const double ratio)
         {
             return evaluateTyre(model, load, TyreSlip{.slipRatio = ratio, .slipAngle = 0.0}, 1.0).longitudinal /

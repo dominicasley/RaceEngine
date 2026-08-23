@@ -8,6 +8,7 @@ import raceengine.physics;
 
 using raceengine::evaluateTyre;
 using raceengine::relaxTyre;
+using raceengine::TyreAxis;
 using raceengine::TyreForces;
 using raceengine::tyreFriction;
 using raceengine::TyreModel;
@@ -94,9 +95,9 @@ TEST_CASE("friction falls with load, and non-linearly", "[physics][tyre][loadsen
     // will move the balance.
     const auto model = TyreModel{};
 
-    const auto light = tyreFriction(model, model.lateralPeak, 2000.0, 1.0);
-    const auto nominal = tyreFriction(model, model.lateralPeak, 4000.0, 1.0);
-    const auto heavy = tyreFriction(model, model.lateralPeak, 8000.0, 1.0);
+    const auto light = tyreFriction(model, TyreAxis::Lateral, 2000.0, 1.0);
+    const auto nominal = tyreFriction(model, TyreAxis::Lateral, 4000.0, 1.0);
+    const auto heavy = tyreFriction(model, TyreAxis::Lateral, 8000.0, 1.0);
 
     REQUIRE(light > nominal);
     REQUIRE(nominal > heavy);
@@ -105,8 +106,10 @@ TEST_CASE("friction falls with load, and non-linearly", "[physics][tyre][loadsen
     SECTION("the fall is non-linear in load")
     {
         // Equal steps in load do not give equal steps in friction. A straight line would.
-        const auto firstStep = tyreFriction(model, 1.0, 2000.0, 1.0) - tyreFriction(model, 1.0, 4000.0, 1.0);
-        const auto secondStep = tyreFriction(model, 1.0, 4000.0, 1.0) - tyreFriction(model, 1.0, 6000.0, 1.0);
+        const auto firstStep =
+            tyreFriction(model, TyreAxis::Lateral, 2000.0, 1.0) - tyreFriction(model, TyreAxis::Lateral, 4000.0, 1.0);
+        const auto secondStep =
+            tyreFriction(model, TyreAxis::Lateral, 4000.0, 1.0) - tyreFriction(model, TyreAxis::Lateral, 6000.0, 1.0);
 
         REQUIRE(firstStep > secondStep * 1.2);
     }
@@ -116,7 +119,7 @@ TEST_CASE("friction falls with load, and non-linearly", "[physics][tyre][loadsen
         // The reason for a power law rather than the Magic Formula's usual linear term: linear load
         // sensitivity crosses zero somewhere above six times nominal load, and a tire with negative
         // friction shoves the car in whichever direction it was already sliding.
-        REQUIRE(tyreFriction(model, model.lateralPeak, 100000.0, 1.0) > 0.0);
+        REQUIRE(tyreFriction(model, TyreAxis::Lateral, 100000.0, 1.0) > 0.0);
     }
 
     SECTION("an axle loses grip when its load is transferred across it")
@@ -135,8 +138,8 @@ TEST_CASE("friction falls with load, and non-linearly", "[physics][tyre][loadsen
         // The seam the contact patch's blended grip arrives through, and the one a thermal model
         // will use later. Friction itself scales exactly; the swept peak only to the resolution of
         // the sweep, because halving the grip also halves the slip angle the peak sits at.
-        REQUIRE(tyreFriction(model, model.lateralPeak, 4000.0, 0.5) ==
-                Catch::Approx(tyreFriction(model, model.lateralPeak, 4000.0, 1.0) * 0.5));
+        REQUIRE(tyreFriction(model, TyreAxis::Lateral, 4000.0, 0.5) ==
+                Catch::Approx(tyreFriction(model, TyreAxis::Lateral, 4000.0, 1.0) * 0.5));
         REQUIRE(peakLateral(model, 4000.0, 0.5) == Catch::Approx(peakLateral(model, 4000.0, 1.0) * 0.5).epsilon(1e-4));
     }
 }

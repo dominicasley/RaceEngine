@@ -146,7 +146,7 @@ namespace raceengine
     auto load = staticLoad;
     for (auto pass = 0; pass < 6; pass++)
     {
-        const auto friction = tyreFriction(tyre, tyre.lateralPeak, load, 1.0);
+        const auto friction = tyreFriction(tyre, TyreAxis::Lateral, load, 1.0);
         load = staticLoad + friction * frontMass * earthGravity * centreHeight / track;
     }
 

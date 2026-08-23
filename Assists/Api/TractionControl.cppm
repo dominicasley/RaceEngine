@@ -46,12 +46,77 @@ export struct TractionSetup
     double fullTargetSlip = 0.10;
     double sportTargetSlip = 0.22;
 
-    // --- the brake channel: fast, per wheel, and expensive ---
+    // --- the brake channel: an electronic differential lock, not a second engine channel ---
     //
-    // Torque per unit of slip error beyond the target, N.m. Proportional and nothing else: an
-    // integrator on a channel that is arbitrating with a much slower one winds up during every
-    // transient the slow one is about to fix.
-    double brakeGain = 2600.0;
+    // **Reformed 2026-08-23, and what it was before was the wrong device.** It braked each driven
+    // wheel on that wheel's slip against the *reference speed* — which is the engine channel's
+    // signal wired to a valve. A real brake-based traction intervention (VW call it EDS, Bosch call
+    // it BTCS) is a **differential lock**: it brakes the wheel turning faster than its partner so
+    // that an open differential passes the torque to the other side. When both driven wheels spin
+    // together there is no cross-axle torque to redistribute and the brakes cannot help at all —
+    // that case belongs to the engine, and a system that brakes both wheels there is just heating
+    // two discs while the engine drives through them.
+    //
+    // **The structural benefit is that it no longer divides by the reference speed.** The defect
+    // found from the seat on 2026-08-23 — reference collapses after a lock-up, traction control
+    // reads the recovering wheels as wheelspin and holds them down — could not have happened to a
+    // channel keyed on left-against-right, because both wheels were equally slow and the difference
+    // was zero. Bounding the reference error fixed that instance; this makes the channel immune to
+    // the class.
+    //
+    // The Golf GTI Performance also has a **mechanical** limited-slip differential, so most of this
+    // work is already done in hardware on this car and the channel is the smaller of the two.
+    //
+    // Torque per m/s of cross-axle departure, N.m, proportional and nothing else: an integrator on a
+    // channel arbitrating with a much slower one winds up through every transient the slow one is
+    // about to fix.
+    //
+    // **Sized so the ceiling is reached at one metre per second of departure.** At the contact patch
+    // that is one driven wheel turning 3.1 rad/s faster than the other once the turn's own
+    // kinematics are taken out — unambiguous wheelspin rather than a differential doing its job in a
+    // corner. A third of this car's 3665 N.m front brake is 1221, and 1221 N.m per m/s puts the
+    // ceiling exactly there.
+    double brakeGain = 1221.0;
+
+    // Below this the difference is the sensors talking rather than the axle, m/s. One tone ring
+    // pulse at 100 km/h is 1.5 ms of staleness, which on a 48-pole ring is about 0.04 m/s of
+    // quantisation per wheel; 0.10 leaves room for two of them and is still a twentieth of what
+    // reaches the ceiling.
+    double brakeDeadband = 0.10;
+
+    // **The brake channel is speed limited and a real one has to be**, because it is a friction
+    // device with the engine on the other side of it: everything it does becomes heat in one disc.
+    // Volkswagen quote EDS as working to about 80 km/h and hand over to the engine above that, and
+    // a disc temperature model — which this engine does not have — is what a production unit uses
+    // to withdraw sooner. Faded rather than switched, over the last 10 km/h, because a step in brake
+    // torque at a threshold is felt as a bump through the car and no hydraulic unit produces one.
+    double brakeSpeedLimit = 22.222;
+    double brakeSpeedFade = 2.778;
+
+    // **How long the reference may be running on its own bound before the brake channel withdraws**,
+    // seconds. `ReferenceSpeedState::coasting` reports exactly this and its own comment says it is
+    // "what a plausibility check would watch"; this is that check.
+    //
+    // The case it exists for was measured rather than imagined: a lap of Bathurst with the car
+    // landing from a crest at 126 km/h with **all four wheels stopped in the air**. Every reading is
+    // then a wheel spinning back up at its own rate, the difference across the axle is noise, and a
+    // differential lock acting on it is braking a wheel for no reason. 3.3% of this channel's
+    // interventions over that lap were in that state.
+    //
+    // 20 ms, because a wheel crossing a bump has its reading carried for a control period or two and
+    // a wheel in the air has it carried for as long as it is off the ground. Long enough not to fire
+    // on the first, short enough to catch the second well inside a landing.
+    double brakePlausibilityHold = 0.020;
+
+    // Track widths, metres. **ECU calibration rather than vehicle state**, and the reason this
+    // channel needs them: two driven wheels in a corner turn at genuinely different speeds and an
+    // electronic diff lock that did not know it would brake the outside wheel all the way round
+    // every bend. The undriven pair's own speed difference over the rear track is the yaw rate the
+    // road is imposing, which predicts what the front pair's difference ought to be — and what is
+    // left over is wheelspin. `advanceCorneringBrake` below has taken its kinematics this way since
+    // it was written; this channel now does the same.
+    double frontTrack = 1.539;
+    double rearTrack = 1.516;
 
     // Ceiling, as a fraction of that corner's full brake torque.
     //
@@ -153,7 +218,8 @@ export [[nodiscard]] double tractionTargetSlip(const TractionSetup& setup);
 export void advanceTractionControl(const TractionSetup& setup, TractionState& state, const WheelSpeedReadings& wheels,
                                    const ReferenceSpeedSetup& reference,
                                    const std::array<double, wheelCount>& brakePeakTorque, const double referenceSpeed,
-                                   const bool referenceValid, const double throttle, const double deltaTime);
+                                   const bool referenceValid, const double referenceCoasting, const double throttle,
+                                   const double deltaTime);
 
 // What the throttle becomes once the engine channel has had it.
 export [[nodiscard]] double tractionThrottleScale(const TractionState& state);

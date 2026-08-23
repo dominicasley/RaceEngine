@@ -49,7 +49,10 @@ namespace
 
 // Friction at a given load. Falls with load, which is the single property that makes weight
 // transfer cost something and therefore makes every setup change do anything at all.
-[[nodiscard]] double tyreFriction(const TyreModel& model, const double peak, const double verticalLoad,
+//
+// The peak and the exponent are both taken off the axis rather than passed in, which is what stops
+// the two exponents from ever being crossed with the wrong peak — see the declaration in Tyre.cppm.
+[[nodiscard]] double tyreFriction(const TyreModel& model, const TyreAxis axis, const double verticalLoad,
                                   const double surfaceGrip)
 {
     if (verticalLoad <= 0.0)
@@ -57,9 +60,13 @@ namespace
         return 0.0;
     }
 
+    const auto peak = axis == TyreAxis::Lateral ? model.lateralPeak : model.longitudinalPeak;
+    const auto sensitivity =
+        axis == TyreAxis::Lateral ? model.lateralLoadSensitivity : model.longitudinalLoadSensitivity;
+
     const auto normalised = std::max(verticalLoad / std::max(model.nominalLoad, 1e-6), 1e-6);
 
-    return peak * std::pow(normalised, -model.loadSensitivity) * model.gripScale * surfaceGrip;
+    return peak * std::pow(normalised, -sensitivity) * model.gripScale * surfaceGrip;
 }
 
 // The carcass relaxation, integrated over one tick.
@@ -135,8 +142,8 @@ TyreDeflectionRate relaxTyre(const TyreModel& model, TyreState& state, const dou
         return forces;
     }
 
-    const auto lateralFriction = tyreFriction(model, model.lateralPeak, verticalLoad, surfaceGrip);
-    const auto longitudinalFriction = tyreFriction(model, model.longitudinalPeak, verticalLoad, surfaceGrip);
+    const auto lateralFriction = tyreFriction(model, TyreAxis::Lateral, verticalLoad, surfaceGrip);
+    const auto longitudinalFriction = tyreFriction(model, TyreAxis::Longitudinal, verticalLoad, surfaceGrip);
 
     const auto lateralLimit = lateralFriction * verticalLoad;
     const auto longitudinalLimit = longitudinalFriction * verticalLoad;

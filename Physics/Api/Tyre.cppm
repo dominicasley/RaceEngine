@@ -2,6 +2,7 @@ module;
 
 // Only what the *declarations* below need. <algorithm> and <cmath> moved to TyreImpl.cpp with the
 // bodies that use them — see the header of that file for why the bodies are no longer here.
+#include <cstdint>
 #include <type_traits>
 
 export module raceengine.physics:Tyre;
@@ -13,6 +14,11 @@ namespace raceengine
 //
 // Pure and stateless except for the two carcass deflections it is asked to carry, so it can be
 // swept, plotted and argued about without a chassis anywhere near it.
+
+// Which of the tyre's two directions a question is being asked about. It exists so that the peak and
+// the load-sensitivity exponent — of which there are now two apiece — can only ever be read as a
+// matched pair.
+export enum class TyreAxis : std::uint32_t { Lateral, Longitudinal };
 
 export struct TyreModel
 {
@@ -46,7 +52,18 @@ export struct TyreModel
     // friction pushes the car sideways in whichever direction it was already sliding. The power law
     // cannot do that, is non-linear as the brief requires, and is indistinguishable from linear over
     // the range either of them is calibrated in.
-    double loadSensitivity = 0.15;
+    //
+    // **One per axis, because a tyre has two and they are not the same number.** This was a single
+    // field until 2026-08-23, and the lateral exponent served both — while AC's `tyres.ini`, which
+    // is where this car's came from, states `LS_EXP_Y` *and* `LS_EXP_X`. The model was discarding a
+    // figure its own data source carries, which is a faithfulness defect whatever it turns out to be
+    // worth: the two ends of a stop and a launch sit at opposite ends of the load curve, so an axis
+    // that falls off at the wrong rate is wrong in opposite directions at each end.
+    //
+    // Both default to the same number, which is what makes the split invisible to any car that does
+    // not state two — pinned in `TyreLoadSensitivityTests`.
+    double lateralLoadSensitivity = 0.15;
+    double longitudinalLoadSensitivity = 0.15;
 
     // Distance constants for the carcass. This is the parameter that makes a tire feel like a tire
     // rather than like a spring-loaded skid: force builds over a distance travelled, not over a
@@ -172,7 +189,13 @@ export struct TyreAligningPeak
 //
 // Friction at a given load. Falls with load, which is the single property that makes weight
 // transfer cost something and therefore makes every setup change do anything at all.
-export [[nodiscard]] double tyreFriction(const TyreModel& model, const double peak, const double verticalLoad,
+//
+// **The axis is named rather than the peak passed**, and that is the whole of what the exponent
+// split cost at the interface. This used to take a peak, which every caller read off the model
+// anyway — and once there are two exponents, a caller holding a peak in one hand has to remember
+// which exponent goes with it. Naming the axis makes the pair unbreakable: there is no call that
+// can put `lateralPeak` against the longitudinal exponent, because neither is spelled at the call.
+export [[nodiscard]] double tyreFriction(const TyreModel& model, const TyreAxis axis, const double verticalLoad,
                                          const double surfaceGrip);
 
 // The carcass relaxation, integrated over one tick. Advances `state`'s two deflections and reports

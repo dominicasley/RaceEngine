@@ -316,7 +316,9 @@ TEST_CASE("the Golf's data, every field, against the real car or against arithme
     against("nominal load [N]", front.tyre.nominalLoad, 2939.0, 1.0, "tyres.ini FZ0, Semislicks");
     against("lateral peak []", front.tyre.lateralPeak, 1.28, 0.001, "tyres.ini DY_REF, Semislicks");
     against("longitudinal peak []", front.tyre.longitudinalPeak, 1.30, 0.001, "tyres.ini DX_REF, Semislicks");
-    against("load sensitivity []", front.tyre.loadSensitivity, 1.0 - 0.8074, 0.001, "1 - LS_EXPY");
+    against("lateral load sensitivity []", front.tyre.lateralLoadSensitivity, 1.0 - 0.8074, 0.001, "1 - LS_EXP_Y");
+    against("longitudinal load sensitivity []", front.tyre.longitudinalLoadSensitivity, 1.0 - 0.8756, 0.001,
+            "1 - LS_EXP_X, stated by the file and discarded by this model until 2026-08-23");
     against("tyre vertical rate [N/m]", front.tyre.nominalLoad > 0.0 ? front.tireVerticalRate : 0.0, 298926.0, 1.0,
             "tyres.ini the compound's carcass rate");
     against("patch width [m]", car.sampling.width, 0.235, 0.001, "tyres.ini WIDTH, a 225 section mounted");

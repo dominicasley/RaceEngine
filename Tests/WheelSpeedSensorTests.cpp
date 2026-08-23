@@ -10,6 +10,7 @@
 import raceengine.physics;
 
 using raceengine::advanceReferenceSpeed;
+using raceengine::advanceTractionControl;
 using raceengine::estimatedSlip;
 using raceengine::frontLeft;
 using raceengine::rearLeft;
@@ -335,4 +336,111 @@ TEST_CASE("slip is signed the same way for both controllers", "[assists][sensor]
     // A locked wheel against a moving car is total slip, and a stopped car is not a division by zero.
     REQUIRE(estimatedSlip(20.0, 0.0) == Catch::Approx(1.0));
     REQUIRE(std::isfinite(estimatedSlip(0.0, 0.0)));
+}
+
+TEST_CASE("coming off the brakes with the wheels still locked does not lose the reference speed",
+          "[assists][sensor][reference][lockrelease]")
+{
+    // **Dominic found this from the seat, 2026-08-23**: lock the wheels, release the brake, and the
+    // driven wheels do not come back — they stay down for seconds, and throttle does not help.
+    //
+    // It is not the tyre, the brakes or the clutch. It is here. `advanceReferenceSpeed` rations how
+    // fast the estimate may *fall* only while the brake light switch is on, and the switch goes out
+    // the instant the pedal does — while every wheel is still stationary. With the floor released to
+    // zero the estimate collapses to the slowest wheel in a single control period, and traction
+    // control, which divides by it, then reads the recovering driven wheels as enormous wheelspin
+    // and holds them down with the brakes and a full engine cut. Measured on the trace
+    // `traces/rack-exit-20260823-153900-noabs-lockup.csv`: front brake pressure went 7.1 bar at 4.5%
+    // pedal to **41.5 bar at 0% pedal** and sat near 30 bar for the next two seconds.
+    //
+    // **The estimator has three states and knows about two.** Under braking every wheel reads at or
+    // below road speed, so the fall is what needs bounding; under power a driven wheel can read
+    // above it, so the rise is. The third is *just off the brakes with the wheels still stopped*,
+    // where every wheel reads far below road speed and nothing bounds the fall at all. A car cannot
+    // decelerate faster than `fallLimit` whatever its brake light is doing, which is the fix and is
+    // the same physical sourcing that constant already carries.
+    const auto ring = ToneRing{};
+    const auto setup = ReferenceSpeedSetup{};
+
+    const auto trueSpeed = 35.0;
+
+    auto states = WheelSensorStates{};
+    auto reference = ReferenceSpeedState{};
+
+    for (auto step = 0; step < 1000; step++)
+    {
+        const auto readings = sampleWheelSensors(ring, states, allAt(omegaFor(trueSpeed)), controlPeriod);
+        advanceReferenceSpeed(setup, reference, readings, false, controlPeriod);
+    }
+
+    REQUIRE(reference.valid);
+    REQUIRE(reference.speed == Catch::Approx(trueSpeed).epsilon(0.01));
+
+    // Half a second of every wheel locked, with the pedal down. The estimate is allowed to fall at
+    // `fallLimit` and no faster, so it should still be within a couple of m/s of the truth.
+    const auto locked = allAt(0.0);
+    for (auto step = 0; step < 500; step++)
+    {
+        const auto readings = sampleWheelSensors(ring, states, locked, controlPeriod);
+        advanceReferenceSpeed(setup, reference, readings, true, controlPeriod);
+    }
+
+    const auto whileBraking = reference.speed;
+    CAPTURE(whileBraking, trueSpeed);
+
+    // 1.3 g for half a second is 6.4 m/s off a true 35 — the estimate is degraded, which is correct
+    // and is what `criterion 10` above already pins, but it has not collapsed.
+    REQUIRE(whileBraking > trueSpeed - 8.0);
+
+    SECTION("and one control period after the pedal releases it is still there")
+    {
+        // The wheels have not moved. Nothing about the car has changed. The only thing that changed
+        // is the brake light switch.
+        const auto readings = sampleWheelSensors(ring, states, locked, controlPeriod);
+        advanceReferenceSpeed(setup, reference, readings, false, controlPeriod);
+
+        CAPTURE(reference.speed, whileBraking);
+
+        // It may fall — at `fallLimit`, which over one period is 13 mm/s. It may not collapse.
+        REQUIRE(reference.speed > whileBraking - setup.fallLimit * controlPeriod - 1e-9);
+    }
+
+    SECTION("so traction control does not read the recovering wheels as wheelspin")
+    {
+        // The wheels start to come back, as they must: a locked tyre against a road doing 35 m/s has
+        // a torque on it of load times friction times radius, and nothing is holding it. This is the
+        // consequence the driver actually feels.
+        auto traction = raceengine::TractionSetup{};
+        traction.mode = raceengine::TractionMode::Full;
+        traction.driven = {true, true, false, false};
+
+        auto tractionState = raceengine::TractionState{};
+        const auto peak = std::array<double, wheelCount>{3665.0, 3665.0, 730.0, 730.0};
+
+        auto speeds = allAt(0.0);
+        auto worstBrake = 0.0;
+
+        for (auto step = 0; step < 200; step++)
+        {
+            // The fronts spinning back up through a tenth of road speed, which is where the trace
+            // shows them sitting when the controller clamps.
+            const auto fraction = 0.10 * static_cast<double>(step) / 200.0;
+            speeds[frontLeft] = omegaFor(fraction * trueSpeed);
+            speeds[raceengine::frontRight] = omegaFor(fraction * trueSpeed);
+
+            const auto readings = sampleWheelSensors(ring, states, speeds, controlPeriod);
+            advanceReferenceSpeed(setup, reference, readings, false, controlPeriod);
+            advanceTractionControl(traction, tractionState, readings, setup, peak, reference.speed, reference.valid,
+                                   reference.coasting, 0.05, controlPeriod);
+
+            worstBrake = std::max(worstBrake, tractionState.brakeFraction[frontLeft]);
+        }
+
+        CAPTURE(reference.speed, worstBrake, tractionState.engineReduction);
+
+        // A wheel turning at a tenth of road speed is not spinning, it is sliding. Traction control
+        // has nothing to do here and must do nothing.
+        REQUIRE(worstBrake == Catch::Approx(0.0).margin(1e-9));
+        REQUIRE(tractionState.engineReduction < 0.01);
+    }
 }

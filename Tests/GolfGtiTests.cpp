@@ -655,8 +655,10 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
 
 TEST_CASE("a stiffer rear bar shifts the imported car toward oversteer", "[physics][golf][balance]")
 {
-    // Criterion 7, and the brief's own test of whether load sensitivity is real. This car's exponent
-    // is the file's — one less LS_EXPY, or 0.1926 — rather than the placeholder's 0.15.
+    // Criterion 7, and the brief's own test of whether load sensitivity is real. This car's exponents
+    // are the file's — one less LS_EXP_Y, or 0.1926, laterally, and one less LS_EXP_X, or 0.1244,
+    // longitudinally — rather than the placeholder's single 0.15. What this case measures is the
+    // lateral one: a bar change moves load across an axle in a corner.
     const JoltGuard jolt;
 
     const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
@@ -1278,10 +1280,17 @@ TEST_CASE("the imported driveline is the one the file states", "[physics][golf][
         REQUIRE(driveline.gearbox.reduction(0) == 0.0);
     }
 
-    SECTION("an engine that makes what the car is quoted as making")
+    SECTION("an engine that makes what the *file* says, which is not what the car is quoted at")
     {
         // The peak of the *boosted* curve. power.lut alone is the naturally aspirated one, and reading
         // it as final reports 159 N.m for a car that makes 350.
+        //
+        // **This section pins the import, and its name was wrong until 2026-08-23.** It used to say
+        // "what the car is quoted as making", which is a claim about a Volkswagen and not about a
+        // file: VW quotes this car at 370 N.m from 1600 to 4300 rpm, and the curve below peaks at
+        // 349.8 at 4500 and is 26% under the stated plateau at 2000. What is faithful here is the
+        // *power* — matched to within 0.7% everywhere above 5000 rpm. The gap between those two
+        // sentences is a real defect and it has a test of its own below.
         auto peakTorque = 0.0;
         auto peakPower = 0.0;
         auto peakPowerSpeed = 0.0;
@@ -1353,4 +1362,95 @@ TEST_CASE("the car's own data steers it correctly, with no help from a setup she
 
     REQUIRE(setup->rackTravelPerInput > 0.0);
     REQUIRE(setup->rackTravelPerInput == Catch::Approx(0.0700).margin(5e-4));
+}
+
+TEST_CASE("the imported engine curve is exactly what the file's turbo model makes of power.lut",
+          "[physics][golf][driveline]")
+{
+    // **This is the case that separates "the file is wrong" from "we read the file wrong"**, and it
+    // exists because the `[!shouldfail]` below it was opened on 2026-08-23 with the wrong cause
+    // attached: the shortfall was written up as a turbo model exported at one condition instead of
+    // across the range. It is not. Recomputed here from the four numbers `engine.ini` states, the
+    // imported curve matches AC's own to **zero** at every point.
+    //
+    // AC's turbo is `boost = min(WASTEGATE, MAX_BOOST * (rpm / REFERENCE_RPM)^GAMMA)` and the
+    // crankshaft makes `power.lut(rpm) * (1 + boost)`. `[TURBO_0]` states MAX_BOOST 1.60, WASTEGATE
+    // 1.20, REFERENCE_RPM 2200 and GAMMA 2.5, which puts the wastegate on its stop at **1961 rpm** —
+    // so above two thousand revs the whole curve is simply `power.lut * 2.2`, and every newton metre
+    // the car is short of its published plateau is short in `power.lut` itself.
+    const auto driveline = golfGtiMk7Driveline();
+
+    // power.lut, verbatim, over the range the plateau question is asked in.
+    const auto powerLut = std::vector<std::pair<double, double>>{
+        {0.0, 95.0},     {500.0, 125.0},  {1000.0, 120.0}, {1500.0, 120.0}, {2000.0, 124.0},
+        {2500.0, 144.0}, {3000.0, 154.0}, {3500.0, 152.0}, {4000.0, 152.0}, {4500.0, 159.0},
+        {5000.0, 156.0}, {5500.0, 143.0}, {6500.0, 120.0}};
+
+    const auto boostAt = [](const double rpm)
+    {
+        return std::min(1.20, 1.60 * std::pow(rpm / 2200.0, 2.5));
+    };
+
+    for (const auto& [rpm, naturallyAspirated] : powerLut)
+    {
+        const auto expected = naturallyAspirated * (1.0 + boostAt(rpm));
+        const auto imported = driveline.engine.torque.at(rpm * 0.10471975511965977);
+
+        CAPTURE(rpm, naturallyAspirated, boostAt(rpm), expected, imported);
+        REQUIRE(imported == Catch::Approx(expected).margin(1e-6));
+    }
+
+    SECTION("and the wastegate is on its stop before two thousand revs, which is why the top end is right")
+    {
+        REQUIRE(boostAt(1960.0) < 1.20);
+        REQUIRE(boostAt(1962.0) == Catch::Approx(1.20));
+
+        // Above the knee the curve is the naturally aspirated one scaled by a constant, so its
+        // *shape* is power.lut's shape and nothing the turbo does can change it.
+        REQUIRE(driveline.engine.torque.at(4500.0 * 0.10471975511965977) == Catch::Approx(159.0 * 2.2));
+        REQUIRE(driveline.engine.torque.at(2000.0 * 0.10471975511965977) == Catch::Approx(124.0 * 2.2));
+    }
+}
+
+TEST_CASE("the imported engine makes the torque the real car is quoted as making",
+          "[physics][golf][driveline][!shouldfail]")
+{
+    // **It does not, and the account is in `docs/known-red.md`.** Found 2026-08-23 by the in-gear
+    // probe written for stage 3 of `docs/tyre-grip-ratio-brief.md`: run through a published test car's
+    // own gearing, this model's 80-120 km/h times come out 15.9% quick in fourth, 11.1% quick in fifth
+    // and 0.8% slow in sixth. A single wrong scale factor cannot produce a seventeen point spread
+    // across three consecutive gears; a wrong torque *curve* can, and does.
+    //
+    // The source is Volkswagen's own homologated statement for the Golf GTI Performance, which is two
+    // numbers: **370 N.m from 1600 to 4300 rpm** and **180 kW from 5000 to 6200**. The second holds
+    // here to within 0.7%. The first is missed by 7% at 4300 rpm, 26% at 2000 and 44% at 1600, because
+    // the imported curve has no plateau at all — it climbs to its peak at 4500 rpm, which is where a
+    // naturally aspirated engine peaks and not where a wastegated turbo does.
+    //
+    // **The cause is the mod's data and not the import, and that was checked rather than assumed** —
+    // the case above recomputes AC's turbo model from `engine.ini`'s own four numbers and the imported
+    // curve matches it to zero at every point. The wastegate is on its stop by 1961 rpm, so above two
+    // thousand revs the curve is `power.lut * 2.2` and the shortfall is entirely in `power.lut`: it
+    // carries 124 N.m at 2000 rpm where **168.2** would be needed to reach the published 370, and
+    // 144 / 154 / 152 / 156 across 2500-4300 against the same 168.2. Between 7% and 26% short, all of
+    // it in the naturally aspirated curve.
+    //
+    // **Who closes it.** Not this brief and not the tyre. It belongs to whoever authors a `power.lut`
+    // that reaches VW's published plateau — which is arithmetic once the transform above is pinned,
+    // because the plateau divided by 2.2 is a constant 168.2 from 1961 rpm to 4300 — and then
+    // re-derives everything downstream of it. **Not blocked on anything**: the whole of `data.acd` is
+    // unpacked in `~/dev/ac-car-data/out/vw_golf_gti_mk7.5_dsg.json` under `data['data']`, which is
+    // where all of the above was read.
+    const auto driveline = golfGtiMk7Driveline();
+
+    const auto atRpm = [&driveline](const double rpm)
+    {
+        return driveline.engine.torque.at(rpm * 0.10471975511965977);
+    };
+
+    // The plateau, at both ends and in the middle. 2% of margin, which is a data sheet's own rounding
+    // and nothing like the gap being measured.
+    REQUIRE(atRpm(1600.0) == Catch::Approx(370.0).epsilon(0.02));
+    REQUIRE(atRpm(3000.0) == Catch::Approx(370.0).epsilon(0.02));
+    REQUIRE(atRpm(4300.0) == Catch::Approx(370.0).epsilon(0.02));
 }

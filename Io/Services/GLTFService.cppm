@@ -1,5 +1,6 @@
 module;
 
+#include <array>
 #include <expected>
 #include <map>
 #include <optional>
@@ -45,6 +46,11 @@ public:
     [[nodiscard]] std::optional<PrimitiveAttributeType> toAttributeType(const std::string& attributeName) const;
     [[nodiscard]] TextureFormat toTextureFormat(int format) const;
     [[nodiscard]] glm::mat3 toTextureTransform(const tinygltf::TextureInfo& textureInfo) const;
+    [[nodiscard]] std::optional<BlinnPhongShading> toBlinnPhongShading(const tinygltf::Value& extras) const;
+    [[nodiscard]] std::optional<MaterialBlend> toMaterialBlend(const tinygltf::Value& extras) const;
+    // A glTF texture index out of an extras object, or -1 where the key is absent or not a number.
+    // -1 is what `textureFor` already reads as "no texture", so the two compose without a branch.
+    [[nodiscard]] int extrasTextureIndex(const tinygltf::Value& object, const std::string& key) const;
     [[nodiscard]] std::expected<Texture, std::string> getImageFromIndex(const tinygltf::Model& model, int index,
                                                                         ColourSpace colourSpace) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
@@ -193,6 +199,13 @@ std::expected<void, std::string> GLTFService::processNode(Model& model, const ti
     Mesh mesh;
     mesh.name = tinyGltfMesh.name;
     mesh.modelMatrix = transform;
+    // `extras.cast_shadows` on the **node**, not the mesh: it is a property of this placement of the
+    // geometry, which is where an exporter that has it puts it. Absent means yes, so a file that
+    // says nothing behaves exactly as it did before this was read.
+    if (node.extras.IsObject() && node.extras.Has("cast_shadows") && node.extras.Get("cast_shadows").IsBool())
+    {
+        mesh.castsShadow = node.extras.Get("cast_shadows").Get<bool>();
+    }
 
     if (node.skin != -1)
     {
@@ -395,8 +408,27 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
     std::set<int> colourImageSources;
     for (const auto& tinyGltfMaterial : tinyGltfModel.materials)
     {
-        for (const auto textureIndex :
-             {tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index, tinyGltfMaterial.emissiveTexture.index})
+        // A detail layer modulates base colour, so it is colour and decodes through the transfer
+        // function; the mask beside it selects between layers and is measurement, so it does not.
+        // Collected here with the rest because this pre-pass is the only place the decision can be
+        // made — a Texture has to know its colour space before it is added, and `add()` may be
+        // running on a worker while `mutate()` belongs to the main thread.
+        auto layerSources = std::vector<int>{};
+        const auto& blendExtras =
+            tinyGltfMaterial.extras.IsObject() ? tinyGltfMaterial.extras.Get("blend") : tinygltf::Value();
+        if (blendExtras.IsObject() && blendExtras.Get("layers").IsArray())
+        {
+            const auto& layers = blendExtras.Get("layers");
+            for (auto layer = size_t{0}; layer < layers.ArrayLen(); layer++)
+            {
+                layerSources.push_back(extrasTextureIndex(layers.Get(layer), "texture"));
+            }
+        }
+
+        layerSources.push_back(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture.index);
+        layerSources.push_back(tinyGltfMaterial.emissiveTexture.index);
+
+        for (const auto textureIndex : layerSources)
         {
             if (textureIndex < 0 || std::cmp_greater_equal(textureIndex, tinyGltfModel.textures.size()))
             {
@@ -454,6 +486,24 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
         const auto occlusionTexturePtr = textureFor(tinyGltfMaterial.occlusionTexture.index);
         const auto emissiveTexturePtr = textureFor(tinyGltfMaterial.emissiveTexture.index);
 
+        const auto blend = toMaterialBlend(tinyGltfMaterial.extras);
+        auto blendMaskTexture = std::optional<Resource<Texture>>{};
+        auto detailTextures = std::array<std::optional<Resource<Texture>>, detailLayerCount>{};
+        if (blend)
+        {
+            const auto& stated = tinyGltfMaterial.extras.Get("blend");
+            blendMaskTexture = textureFor(extrasTextureIndex(stated, "mask"));
+
+            const auto& layers = stated.Get("layers");
+            if (layers.IsArray())
+            {
+                for (auto layer = size_t{0}; layer < layers.ArrayLen() && layer < detailLayerCount; layer++)
+                {
+                    detailTextures[layer] = textureFor(extrasTextureIndex(layers.Get(layer), "texture"));
+                }
+            }
+        }
+
         auto material = memoryStorageService.materials.add(Material{
             .baseColour = glm::vec4(tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[0],
                                     tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[1],
@@ -473,11 +523,15 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
             // per texture reference, so a material transforming its maps differently is flattened
             // to whatever base colour asks for.
             .transform = toTextureTransform(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture),
+            .blinnPhong = toBlinnPhongShading(tinyGltfMaterial.extras),
+            .blend = blend,
             .albedo = albedoTexturePtr,
             .metallicRoughness = metallicRoughnessTexturePtr,
             .normal = normalTexturePtr,
             .occlusion = occlusionTexturePtr,
             .emissive = emissiveTexturePtr,
+            .blendMask = blendMaskTexture,
+            .detail = detailTextures,
         });
 
         model.materials.push_back(material);
@@ -663,6 +717,140 @@ glm::mat3 GLTFService::toTextureTransform(const tinygltf::TextureInfo& textureIn
     const auto stretch = glm::mat3(scale.x, 0.0f, 0.0f, 0.0f, scale.y, 0.0f, 0.0f, 0.0f, 1.0f);
 
     return translation * rotate * stretch;
+}
+
+// `extras.blinn_phong`, which is how an exporter states that this material was authored against the
+// classic reflectance model and hands over the four numbers it was authored with.
+//
+// extras rather than an extension, and extras is the right container: an extension changes what the
+// glTF *means* and every reader is entitled to fail on one it does not know, where this changes
+// nothing about the file — the PBR block beside it is still a complete, correct description of the
+// surface for anything that cannot do better. A reader that ignores this key loses the authoring and
+// keeps the asset.
+//
+// Every lookup is typed first, for the reason toTextureTransform states: Get() yields a null Value
+// for an absent key and that reads back as a numeric zero, so an unchecked read would silently
+// produce a black material rather than no material.
+std::optional<BlinnPhongShading> GLTFService::toBlinnPhongShading(const tinygltf::Value& extras) const
+{
+    if (!extras.IsObject() || !extras.Has("blinn_phong"))
+    {
+        return std::nullopt;
+    }
+
+    const auto& stated = extras.Get("blinn_phong");
+    if (!stated.IsObject())
+    {
+        return std::nullopt;
+    }
+
+    const auto read = [&stated](const std::string& key, const float fallback)
+    {
+        if (!stated.Has(key))
+        {
+            return fallback;
+        }
+
+        const auto& value = stated.Get(key);
+
+        return value.IsNumber() ? static_cast<float>(value.GetNumberAsDouble()) : fallback;
+    };
+
+    const auto defaults = BlinnPhongShading{};
+    // Guarded rather than trusted: pow(x, 0) is 1 everywhere, so an exponent of zero is a surface
+    // uniformly covered in its own highlight — which is what an authored 0 means arithmetically and
+    // is not what the artist who typed it can have been looking at.
+    const auto exponent = read("specular_exponent", defaults.specularExponent);
+
+    // The ambient and diffuse coefficients arrive as the source engine's own, and they are
+    // coefficients *against that engine's lighting* — its ambient constant and its sun, neither of
+    // which is in the asset. Used raw they would assert that two rigs' lighting agrees in absolute
+    // terms, which nothing has checked and which is false here by a factor of two.
+    //
+    // What the asset does state is its own ordinary material — the median over its materials — and
+    // dividing by it turns an absolute coefficient into a *relative* one: 1.0 means "an ordinary
+    // surface taking the ordinary amount of light", which this renderer can place from what it
+    // measures. Everything that departs from ordinary keeps exactly the departure it was authored
+    // with. An asset stating no reference divides by one and is unchanged, which is what makes this
+    // safe for anything that is not carrying the key.
+    const auto against = [&read](const std::string& key, const float value)
+    {
+        const auto reference = read(key, 1.0f);
+
+        return reference > 1e-6f ? value / reference : value;
+    };
+
+    return BlinnPhongShading{.ambient = against("ambient_reference", read("ambient", defaults.ambient)),
+                             .diffuse = against("diffuse_reference", read("diffuse", defaults.diffuse)),
+                             // Not anchored, and deliberately: there is no ordinary specular to
+                             // anchor to — most materials on content like this state none at all —
+                             // so it stays the source's own number against this rig's specular
+                             // colour.
+                             .specular = read("specular", defaults.specular),
+                             .specularExponent = exponent < 1.0f ? 1.0f : exponent};
+}
+
+int GLTFService::extrasTextureIndex(const tinygltf::Value& object, const std::string& key) const
+{
+    if (!object.IsObject() || !object.Has(key))
+    {
+        return -1;
+    }
+
+    const auto& value = object.Get(key);
+
+    // IsNumber rather than IsInt. Whether a JSON `85` arrives as tinygltf's INT_TYPE or its
+    // REAL_TYPE is a property of the parser, not of the file, and an index that failed this test
+    // silently became -1 — which is a *valid* answer meaning "no texture", so every layer fell back
+    // to the 1x1 white dummy and the blend came out 3.6x too bright rather than erroring.
+    return value.IsNumber() ? value.GetNumberAsInt() : -1;
+}
+
+// `extras.blend`: the detail layers a blended material carries, and how strongly they apply.
+//
+// glTF has no concept of a layered material, so this is extras for the reason the Blinn-Phong block
+// is — it adds to the file rather than changing what it means, and a reader that skips it draws the
+// base colour, which is a complete if flatter picture. What it cannot be is *inferred*: a mask and
+// four tiled textures are indistinguishable from five unrelated maps without something saying which
+// is which.
+//
+// The layer array is positional and its position is the mask channel that weights it — element 0 is
+// red — so a material using only the third layer still states four, three of them empty. That is
+// what keeps a layer's identity from depending on how many of its neighbours happen to be in use.
+std::optional<MaterialBlend> GLTFService::toMaterialBlend(const tinygltf::Value& extras) const
+{
+    if (!extras.IsObject() || !extras.Has("blend"))
+    {
+        return std::nullopt;
+    }
+
+    const auto& stated = extras.Get("blend");
+    if (!stated.IsObject())
+    {
+        return std::nullopt;
+    }
+
+    auto blend = MaterialBlend{};
+
+    if (stated.Has("strength") && stated.Get("strength").IsNumber())
+    {
+        blend.strength = static_cast<float>(stated.Get("strength").GetNumberAsDouble());
+    }
+
+    const auto& layers = stated.Get("layers");
+    if (layers.IsArray())
+    {
+        for (auto layer = size_t{0}; layer < layers.ArrayLen() && layer < detailLayerCount; layer++)
+        {
+            const auto& entry = layers.Get(layer);
+            if (entry.IsObject() && entry.Has("tiling") && entry.Get("tiling").IsNumber())
+            {
+                blend.layers[layer].tiling = static_cast<float>(entry.Get("tiling").GetNumberAsDouble());
+            }
+        }
+    }
+
+    return blend;
 }
 
 std::expected<Texture, std::string> GLTFService::getImageFromIndex(const tinygltf::Model& model, int index,

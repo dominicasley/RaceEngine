@@ -35,6 +35,117 @@ namespace
     return -estimatedSlip(referenceSpeed, wheelSpeed);
 }
 
+// Which wheel on each side the engine does not drive. Those two are a road-speed measurement that
+// owes the engine nothing, and their difference is the yaw rate the road is imposing.
+[[nodiscard]] std::size_t undrivenOn(const TractionSetup& setup, const WheelSpeedReadings& wheels,
+                                     const std::size_t near, const std::size_t far)
+{
+    if (!setup.driven[near] && wheels[near].valid)
+    {
+        return near;
+    }
+
+    if (!setup.driven[far] && wheels[far].valid)
+    {
+        return far;
+    }
+
+    return wheelCount;
+}
+
+// The brake channel, as an electronic differential lock.
+//
+// **The signal is the driven pair's own speed difference, corrected for the turn the car is in, and
+// nothing else** — no reference speed appears anywhere in it. Writing it out shows why the
+// correction is only one term: with `expected = mean -/+ yaw * halfFront` on each side, the *mean*
+// cancels in the difference and what is left is the yaw term over the front track. So this cannot
+// be fooled by both undriven wheels being wrong together, only by them being wrong differently,
+// which is the same limitation `advanceCorneringBrake` has and is a property of the sensor set.
+void advanceDifferentialLock(const TractionSetup& setup, TractionState& state, const WheelSpeedReadings& wheels,
+                             const ReferenceSpeedSetup& reference,
+                             const std::array<double, wheelCount>& brakePeakTorque, const double referenceSpeed,
+                             const double referenceCoasting)
+{
+    if (!wheels[frontLeft].valid || !wheels[frontRight].valid || setup.rearTrack <= 0.0)
+    {
+        return;
+    }
+
+    // **Plausibility, and it is the estimator's own opinion rather than a second guess at it.** When
+    // the reference is being carried by its rate limit the wheels have stopped meaning anything —
+    // all four in the air over a crest is the case that showed up in the seat — and a differential
+    // lock reading the difference between four numbers that are all wrong is braking at random.
+    if (referenceCoasting > setup.brakePlausibilityHold)
+    {
+        return;
+    }
+
+    const auto leftUndriven = undrivenOn(setup, wheels, rearLeft, frontLeft);
+    const auto rightUndriven = undrivenOn(setup, wheels, rearRight, frontRight);
+
+    // **No undriven pair, no differential lock.** On four-wheel drive there is no free road-speed
+    // measurement and therefore no way to tell wheelspin from a corner, so the channel withdraws and
+    // the engine keeps the whole job. That is a real limitation of a real sensor set rather than a
+    // simplification, and it is why traction control on a front-drive car is the easy case.
+    if (leftUndriven >= wheelCount || rightUndriven >= wheelCount)
+    {
+        return;
+    }
+
+    const auto drivenLeft = setup.driven[frontLeft] ? frontLeft : rearLeft;
+    const auto drivenRight = setup.driven[frontRight] ? frontRight : rearRight;
+
+    if (!setup.driven[drivenLeft] || !setup.driven[drivenRight])
+    {
+        return;
+    }
+
+    const auto yaw = (std::abs(sensedRoadSpeed(reference, wheels[rightUndriven])) -
+                      std::abs(sensedRoadSpeed(reference, wheels[leftUndriven]))) /
+                     setup.rearTrack;
+
+    const auto measured = std::abs(sensedRoadSpeed(reference, wheels[drivenRight])) -
+                          std::abs(sensedRoadSpeed(reference, wheels[drivenLeft]));
+
+    // Positive means the right-hand driven wheel is the one running away.
+    const auto departure = measured - yaw * setup.frontTrack;
+
+    const auto magnitude = std::abs(departure) - setup.brakeDeadband;
+    if (magnitude <= 0.0)
+    {
+        return;
+    }
+
+    // Speed limited and faded, because everything this channel does becomes heat in one disc.
+    //
+    // **Off the reference estimate rather than off the wheels**, and that is the one place in this
+    // channel where the reference belongs. The *signal* must not touch it — that is the whole design
+    // — but a gate wants the quantity that survives the wheels being wrong, and the estimate is
+    // bounded at 1.3 g where a raw wheel reading can go to zero in a tick. Taken off the wheels, a
+    // car landing at 126 km/h with all four stopped reads as walking pace and the limit lets the
+    // channel act at twice the speed it is allowed to.
+    const auto roadSpeed = std::abs(referenceSpeed);
+
+    const auto fade = setup.brakeSpeedFade > 0.0
+                          ? std::clamp((setup.brakeSpeedLimit - roadSpeed) / setup.brakeSpeedFade, 0.0, 1.0)
+                          : (roadSpeed < setup.brakeSpeedLimit ? 1.0 : 0.0);
+
+    if (fade <= 0.0)
+    {
+        return;
+    }
+
+    const auto spinning = departure > 0.0 ? drivenRight : drivenLeft;
+    const auto peak = brakePeakTorque[spinning];
+    if (peak <= 0.0)
+    {
+        return;
+    }
+
+    state.brakeFraction[spinning] = std::clamp(fade * setup.brakeGain * magnitude / peak, 0.0, setup.brakeCeiling);
+    state.brakeActive = state.brakeFraction[spinning] > 0.0;
+}
+
 } // namespace
 
 [[nodiscard]] double tractionTargetSlip(const TractionSetup& setup)
@@ -59,8 +170,8 @@ namespace
 
 void advanceTractionControl(const TractionSetup& setup, TractionState& state, const WheelSpeedReadings& wheels,
                             const ReferenceSpeedSetup& reference, const std::array<double, wheelCount>& brakePeakTorque,
-                            const double referenceSpeed, const bool referenceValid, const double throttle,
-                            const double deltaTime)
+                            const double referenceSpeed, const bool referenceValid, const double referenceCoasting,
+                            const double throttle, const double deltaTime)
 {
     state.brakeFraction = {};
     state.brakeActive = false;
@@ -75,9 +186,10 @@ void advanceTractionControl(const TractionSetup& setup, TractionState& state, co
 
     const auto target = tractionTargetSlip(setup);
 
-    // The engine channel acts on the whole axle because it has no choice — one throttle serves both
-    // driven wheels — so it is sized by the worst of them. The brake channel is per wheel, which is
-    // the entire reason a system with both is better than a system with either.
+    // --- the engine channel: the whole axle, because one throttle serves both wheels -------------
+    //
+    // Sized by the worse of the two driven wheels, and this is the channel that owns the case where
+    // both of them are spinning together — which is most of a launch.
     auto worstError = 0.0;
 
     for (auto index = std::size_t{0}; index < wheelCount; index++)
@@ -88,24 +200,16 @@ void advanceTractionControl(const TractionSetup& setup, TractionState& state, co
         }
 
         const auto wheelSpeed = std::abs(sensedRoadSpeed(reference, wheels[index]));
-        const auto error = driveSlip(referenceSpeed, wheelSpeed) - target;
-
-        if (error <= 0.0)
-        {
-            continue;
-        }
-
-        worstError = std::max(worstError, error);
-
-        const auto peak = brakePeakTorque[index];
-        if (peak <= 0.0)
-        {
-            continue;
-        }
-
-        state.brakeFraction[index] = std::clamp(setup.brakeGain * error / peak, 0.0, setup.brakeCeiling);
-        state.brakeActive = state.brakeActive || state.brakeFraction[index] > 0.0;
+        worstError = std::max(worstError, driveSlip(referenceSpeed, wheelSpeed) - target);
     }
+
+    worstError = std::max(worstError, 0.0);
+
+    // --- the brake channel: an electronic differential lock -------------------------------------
+    //
+    // Left against right, never against the reference speed. See the note on `TractionSetup` for
+    // why that distinction is the whole design and not a detail.
+    advanceDifferentialLock(setup, state, wheels, reference, brakePeakTorque, referenceSpeed, referenceCoasting);
 
     // A driver off the throttle is not asking for torque and there is nothing for this channel to
     // take away; the reduction is released rather than held, so lifting restores the pedal map

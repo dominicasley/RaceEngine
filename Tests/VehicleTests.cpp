@@ -444,7 +444,7 @@ TEST_CASE("the front axle's limit load is a fixed point, not a chosen manoeuvre"
         const auto frontMass = mass * (station - rear) / (front - rear);
 
         const auto& tyre = setup.corners[0].tyre;
-        const auto friction = raceengine::tyreFriction(tyre, tyre.lateralPeak, loads.outside, 1.0);
+        const auto friction = raceengine::tyreFriction(tyre, raceengine::TyreAxis::Lateral, loads.outside, 1.0);
         const auto again = loads.staticPerWheel + friction * frontMass * 9.80665 * height / track;
 
         REQUIRE(again == Catch::Approx(loads.outside).epsilon(1e-6));

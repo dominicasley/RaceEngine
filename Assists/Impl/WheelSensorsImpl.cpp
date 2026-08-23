@@ -205,8 +205,28 @@ void advanceReferenceSpeed(const ReferenceSpeedSetup& setup, ReferenceSpeedState
     // mu 0.35 surface a front wheel came back to 27.5 m/s against a true 26.7 while the estimate,
     // allowed to climb at 0.6 g, was still down at 24.9 and being dragged lower. It never caught up
     // for the whole stop, and the anti-lock system it feeds bought 1% over locked wheels.
+    // **The fall is rationed whatever the brake light is doing, and that was a defect until
+    // 2026-08-23.** The rule above is about the *ceiling* — which direction a wheel is free to lie
+    // in — and the floor used to be tied to the same flag, released to zero the moment the pedal came
+    // off. That assumes the car is only ever braking or driving, and there is a third state: **just
+    // off the brakes with the wheels still stopped.** Every wheel then reads far below road speed and
+    // nothing bounded the estimate at all, so it collapsed to the slowest wheel in one control
+    // period. Traction control divides by it, so the driven wheels coming back read as enormous
+    // wheelspin and were held down with the brakes and a full engine cut — for seconds, because the
+    // estimate may only climb again at `riseLimit`.
+    //
+    // Found from the seat: lock the wheels, release the brake, and the car will not spin them back
+    // up or take throttle. Reproduced with no car attached in
+    // `coming off the brakes with the wheels still locked does not lose the reference speed`, and
+    // measured on `traces/rack-exit-20260823-153900-noabs-lockup.csv` — front brake pressure went
+    // from 7.1 bar at 4.5% pedal to 41.5 bar at 0% pedal, which is the traction controller's own
+    // ceiling of 0.333.
+    //
+    // The bound needs no new number and no new state: a car cannot lose speed faster than
+    // `fallLimit`, which is already sourced to 1.3 g as the most any tyre gives a road car on any
+    // surface, and that is true with the driver's foot anywhere at all.
     const auto ceiling = braking ? std::max(candidate, state.speed) : state.speed + setup.riseLimit * deltaTime;
-    const auto floor = braking ? std::max(0.0, state.speed - setup.fallLimit * deltaTime) : 0.0;
+    const auto floor = std::max(0.0, state.speed - setup.fallLimit * deltaTime);
 
     if (!supported)
     {
