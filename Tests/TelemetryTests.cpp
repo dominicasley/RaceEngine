@@ -175,7 +175,7 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
         // until the two axle ride heights, the clutch pedal and the per-corner contact-sample count
         // were added for the telemetry expansion, and thirteen until `Patch Depth Spread` joined the
         // per-corner block for the enveloping work.
-        REQUIRE(header.size() == 32 + 14 * cornerCount);
+        REQUIRE(header.size() == 34 + 19 * cornerCount);
     }
 
     SECTION("the steering column is the rim's angle, and the demand is beside it")
@@ -224,9 +224,10 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
             const auto tag = std::string(" ") + cornerAbbreviation(static_cast<Corner>(corner)) + " ";
             const auto count = std::count_if(header.begin(), header.end(), [&tag](const std::string& column)
                                              { return column.find(tag) != std::string::npos; });
-            // Fourteen since `Patch Depth Spread` joined the contact-sample count in the per-corner
-            // block; thirteen before that.
-            REQUIRE(count == 14);
+            // Nineteen since the assist layer added five per corner — the hydraulic pressure, what
+            // each of the three brake-based systems asked of the caliper, and what the wheel speed
+            // sensor reported. Fourteen before that, thirteen before `Patch Depth Spread`.
+            REQUIRE(count == 19);
         }
     }
 

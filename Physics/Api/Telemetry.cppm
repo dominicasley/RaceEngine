@@ -11,6 +11,11 @@ module;
 
 export module raceengine.physics:Telemetry;
 
+// The assist layer's channels. Importing it here is safe and importing this from *there* is not:
+// `raceengine.assists` is a module of its own precisely so that the dependency runs one way, and a
+// controller that could name a `TelemetryFrame` could reach vehicle state through it.
+import raceengine.assists;
+
 namespace raceengine
 {
 
@@ -27,6 +32,14 @@ namespace raceengine
 // nobody checks.
 
 export enum class Corner : std::uint32_t { FrontLeft, FrontRight, RearLeft, RearRight };
+
+// Which axle a corner is on. Stated once rather than as `index < 2` at each site, because the brake
+// hydraulics ask the question per corner and an inverted comparison there is a car that proportions
+// its front circuit.
+export [[nodiscard]] constexpr bool rearAxle(const Corner corner)
+{
+    return corner == Corner::RearLeft || corner == Corner::RearRight;
+}
 
 export inline constexpr std::size_t cornerCount = 4;
 
@@ -92,6 +105,24 @@ export struct WheelTelemetry
     // the aggregate that the kerb case corrupts — the full argument is on
     // `ContactPatch::depthSpread`, which is where this is taken from.
     double patchDepthSpread = 0.0;
+
+    // --- what the electronics did to this wheel ---
+    //
+    // **Every source on its own channel**, because "the brakes came on" is not a finding. Zero
+    // throughout on a car with nothing switched on, which is every fixture but the assist suite's.
+    //
+    // The pressure the hydraulic unit ended the tick at, as a fraction of full system pressure, and
+    // then what each system asked of the caliper in newton metres. The anti-lock figure is what the
+    // modulator *removed* and is therefore zero or negative; the other two are additive.
+    double brakePressure = 0.0;
+    double antilockBrakeTorque = 0.0;
+    double tractionBrakeTorque = 0.0;
+    double corneringBrakeTorque = 0.0;
+
+    // What the wheel speed sensor reported, through the ECU's nominal radius, in m/s. Plotted
+    // against `Speed` it is the estimator's error made visible, which is the channel to read first
+    // when the electronics do something inexplicable.
+    double sensedWheelSpeed = 0.0;
 };
 
 export struct TelemetryFrame
@@ -157,6 +188,12 @@ export struct TelemetryFrame
     // and nothing consumes it yet; a channel that had to be integrated by whoever plotted it is a
     // channel that gets integrated differently twice.
     double clutchSlipEnergy = 0.0;
+
+    // The assist layer's two whole-car channels: what the ECU believes the road speed is, and how
+    // much of the driver's throttle traction control is holding back. Filled by whoever ran the
+    // assist layer, for the reason the driveline's channels are.
+    double referenceSpeed = 0.0;
+    double engineTorqueReduction = 0.0;
 
     std::array<WheelTelemetry, cornerCount> wheels{};
 };
@@ -224,6 +261,11 @@ private:
     std::size_t next = 0;
     std::size_t filled = 0;
 };
+
+// The assist layer's channels into a frame the vehicle tick already filled. Separate from the tick
+// for `fillDrivelineTelemetry`'s reason: the vehicle model does not know an assist layer exists, and
+// whoever ran one is who can say what it did.
+export void fillAssistTelemetry(TelemetryFrame& frame, const AssistChannels& channels);
 
 export [[nodiscard]] std::string telemetryToCsv(const std::vector<TelemetryFrame>& frames);
 

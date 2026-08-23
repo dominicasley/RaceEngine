@@ -330,17 +330,28 @@ export struct AutoClutch
     // ramped by `creepReleaseRate` in *time*, which is where a real controller ramps it, rather than
     // by pedal position.
     //
-    // **Where it goes is derived rather than chosen.** It has to sit below the brake application at
-    // which the brakes can hold the car against full creep, or the band comes back. This car's brakes
-    // make 4200 N.m at the wheels and full creep puts `creepTorque * 13.94` — 418 N.m — through the
-    // front axle, so they cross at a tenth of the pedal. A twentieth is half of that, and is also
-    // about where a real brake-light switch trips, which is the signal a real TCU cancels creep on.
+    // **Where it goes is derived rather than chosen, and the derivation moved when the brakes did.**
+    // It has to sit below the brake application at which the brakes can hold the car against full
+    // creep, or the band comes back.
+    //
+    // Full creep puts `creepTorque * 13.94` — 418 N.m — through this car's front axle. Against
+    // `brakes.ini`'s 4200 N.m they crossed at a tenth of the pedal and a twentieth was half of that,
+    // which is also about where a real brake-light switch trips. **Deriving the brakes from the
+    // hardware moved the crossing** (2026-08-23, `docs/brake-model-brief.md`): the car makes 8791 N.m
+    // at a fully applied pedal and the pedal is close to linear down here, so the brakes hold against
+    // creep by **0.048** of the pedal and a cut at 0.05 was *above* the crossing — which is the band
+    // this threshold exists to eliminate, and `CreepTests` caught it on the build that landed.
+    //
+    // 0.024 is half of the new crossing, on the same rule. It is below a brake-light switch's trip
+    // rather than at it, and that is the right way round: the constraint that binds is the one about
+    // the clutch, and a switch that trips later simply means creep is already gone by the time the
+    // light comes on.
     //
     // A driver resting a foot exactly on it gets creep ramping up and down at `creepApplyRate` rather
     // than a step, which is the rate limit doing what it is for. If that ever proves to be felt, the
     // fix is the two-thresholds-and-hysteresis shape `advanceRevLimiter` and `ConverterLockup`
     // already use, and it is a real brake switch's shape too.
-    double creepBrakeCut = 0.05;
+    double creepBrakeCut = 0.024;
 
     // And the accelerator travel the controller reads as "not pressed". Creep is the no-demand state:
     // the moment the driver asks for torque the pedal map owns the clutch, and this is where that is

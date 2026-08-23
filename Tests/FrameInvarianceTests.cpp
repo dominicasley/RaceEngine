@@ -216,7 +216,14 @@ TEST_CASE("a car's own channels do not depend on which way it is pointing", "[ph
 
             auto input = VehicleInput{};
             input.steering = std::min(0.08, 0.2 * time);
-            input.brake = time > 1.0 ? 0.20 : 0.0;
+            // **A tenth rather than a fifth of the pedal since 2026-08-23**, and it is the same
+            // application it always was. Deriving this car's brakes from its calipers roughly
+            // doubled what a pedal position asks for, so the old 0.20 brought the car to a stop
+            // inside the three seconds this runs for — and the fixture's own "it has to have gone
+            // somewhere" precondition caught it at 47.9 m against a 50 m floor. What is measured
+            // here is heading invariance and not braking, so the demand is scaled to keep the
+            // manoeuvre the same rather than to keep the number the same.
+            input.brake = time > 1.0 ? 0.10 : 0.0;
 
             const auto stepped = stepVehicle(vehicle, state, input, noDriveTorque, world.value(), tick);
             REQUIRE(stepped.has_value());
@@ -366,7 +373,14 @@ TEST_CASE("and where it went turns with it, without changing how far", "[physics
 
             auto input = VehicleInput{};
             input.steering = std::min(0.08, 0.2 * time);
-            input.brake = time > 1.0 ? 0.20 : 0.0;
+            // **A tenth rather than a fifth of the pedal since 2026-08-23**, and it is the same
+            // application it always was. Deriving this car's brakes from its calipers roughly
+            // doubled what a pedal position asks for, so the old 0.20 brought the car to a stop
+            // inside the three seconds this runs for — and the fixture's own "it has to have gone
+            // somewhere" precondition caught it at 47.9 m against a 50 m floor. What is measured
+            // here is heading invariance and not braking, so the demand is scaled to keep the
+            // manoeuvre the same rather than to keep the number the same.
+            input.brake = time > 1.0 ? 0.10 : 0.0;
 
             const auto stepped = stepVehicle(vehicle, state, input, noDriveTorque, world.value(), tick);
             REQUIRE(stepped.has_value());
@@ -392,8 +406,7 @@ TEST_CASE("and where it went turns with it, without changing how far", "[physics
         const auto referenceGround = glm::dvec2(reference.x, reference.z);
         const auto rotatedGround = glm::dvec2(rotated.x, rotated.z);
 
-        REQUIRE(glm::length(rotatedGround) ==
-                Catch::Approx(glm::length(referenceGround)).epsilon(0.03));
+        REQUIRE(glm::length(rotatedGround) == Catch::Approx(glm::length(referenceGround)).epsilon(0.03));
 
         // And which way. The chassis yaws about +y, and `TelemetryFrame::yaw` is `atan2(forward.x,
         // forward.z)` — so a heading of theta takes (x, z) to (x·cos + z·sin, z·cos - x·sin), which

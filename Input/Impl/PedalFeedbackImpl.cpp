@@ -36,11 +36,13 @@ namespace
 
 [[nodiscard]] PedalFeedback derivePedalFeedback(const PedalFeedbackSetup& setup,
                                                 const std::span<const SlippingWheel> wheels, const double brakePedal,
-                                                const double throttlePedal, const double staticShare)
+                                                const double throttlePedal, const double staticShare,
+                                                const double modulatorDisplacement)
 {
     auto result = PedalFeedback{};
 
-    if (!std::isfinite(brakePedal) || !std::isfinite(throttlePedal) || !std::isfinite(staticShare))
+    if (!std::isfinite(brakePedal) || !std::isfinite(throttlePedal) || !std::isfinite(staticShare) ||
+        !std::isfinite(modulatorDisplacement))
     {
         result.finite = false;
 
@@ -104,6 +106,23 @@ namespace
         {
             result.throttle = severity;
             result.throttleWheel = index;
+        }
+    }
+
+    // The hydraulic unit's own displacement, as the pedal feels it. Gated on the driver actually
+    // being on the pedal for the same reason every other cue here is: a foot that is not there has
+    // nothing to be told.
+    if (braking)
+    {
+        const auto pulsation = std::clamp(modulatorDisplacement, 0.0, 1.0);
+
+        if (pulsation > result.brake)
+        {
+            result.brake = pulsation;
+            // No wheel to name: this one is the unit's, not a corner's, and a trace saying "front
+            // left" about a pedal that is moving because the accumulator filled would be worse than
+            // saying nothing.
+            result.brakeWheel = pedalWheelLimit;
         }
     }
 

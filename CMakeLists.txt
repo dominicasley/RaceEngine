@@ -88,12 +88,17 @@ add_library (Engine STATIC
         Graphics/Impl/ShaderServiceImpl.cpp
         Graphics/Impl/ShadowServiceImpl.cpp
         Graphics/Impl/WindowImpl.cpp
+        Assists/Impl/AssistUnitImpl.cpp
+        Assists/Impl/BrakeControlImpl.cpp
+        Assists/Impl/TractionControlImpl.cpp
+        Assists/Impl/WheelSensorsImpl.cpp
         Impl/EngineImpl.cpp
         Input/Impl/DeviceProfileImpl.cpp
         Input/Impl/ForceFeedbackServiceImpl.cpp
         Input/Impl/PedalFeedbackImpl.cpp
         Input/Impl/PedalMotorsImpl.cpp
         Input/Impl/RackTorqueImpl.cpp
+        Physics/Impl/BrakesImpl.cpp
         Physics/Impl/ClutchImpl.cpp
         Physics/Impl/ContactImpl.cpp
         Physics/Impl/ContactPatchImpl.cpp
@@ -162,6 +167,13 @@ target_sources(Engine PUBLIC
         Graphics/Services/SceneService.cppm
         Graphics/Services/ShadowService.cppm
         Graphics/Services/AssetService.cppm
+        # raceengine.assists: its own module, not a partition of raceengine.physics, and
+        # raceengine.physics imports *it*. That direction is what makes "the controller cannot see
+        # vehicle state" a build failure rather than a review comment — see Assists/Api/WheelSensors.cppm.
+        Assists/Assists.cppm
+        Assists/Api/WheelSensors.cppm
+        Assists/Api/BrakeControl.cppm
+        Assists/Api/TractionControl.cppm
         Physics/Physics.cppm
         Physics/Api/RigidBody.cppm
         Physics/Api/JoltRuntime.cppm
@@ -172,6 +184,7 @@ target_sources(Engine PUBLIC
         Physics/Api/Tyre.cppm
         Physics/Api/Contact.cppm
         Physics/Api/Telemetry.cppm
+        Physics/Api/Brakes.cppm
         Physics/Api/Vehicle.cppm
         Physics/Api/Coupling.cppm
         Physics/Api/Clutch.cppm

@@ -515,6 +515,20 @@ export struct WheelTrace
     // loaded one on flat road, and the enveloping model is chosen against the distribution of the
     // pair over a real lap — see `WheelTelemetry::patchDepthSpread`.
     double patchDepthSpread = 0.0;
+
+    // --- what the electronics were doing at this wheel ---
+    //
+    // **Added 2026-08-23 because a trace could not answer the question it was being asked.** Working
+    // out whether a lap had been driven with the anti-lock system on meant going and reading the
+    // setup sheet, which by then said something else. A trace has to be self-describing: the state of
+    // the systems on the tick belongs beside the tyre they acted on.
+    bool antilockActive = false;
+    // Cumulative dumps on this wheel's channel. Differenced across a window it is the engagement
+    // rate; as a level it says whether the unit did anything at all on this lap.
+    std::uint32_t antilockCycles = 0;
+    // What the caliper is actually holding, pascals — the modulator's own state, and the channel that
+    // separates "the driver asked for full pressure" from "the wheel got it".
+    double brakePressure = 0.0;
 };
 
 export struct VehicleTrace
@@ -541,6 +555,25 @@ export struct VehicleTrace
     double clutch = 0.0;
     std::int32_t gear = 0;
     double engineSpeed = 0.0;
+
+    // --- which electronics were fitted, and what the car-wide ones were doing ---
+    //
+    // **`antilockEnabled` and `tractionMode` are constant for a run and are written every row on
+    // purpose.** They are what makes a lap self-describing: two traces taken ten minutes apart
+    // differed only in a setup-sheet line, and telling them apart meant reading a file that had since
+    // been edited. A column that never changes is cheap; a trace nobody can date is not.
+    //
+    // `tractionMode` is 0 off, 1 full, 2 sport — an integer rather than the enum because this module
+    // is `raceengine.input` and naming `TractionMode` here would couple the trace format to the
+    // assist layer for one column.
+    bool antilockEnabled = false;
+    std::uint32_t tractionMode = 0;
+
+    bool tractionBrakeActive = false;
+    bool tractionEngineActive = false;
+    bool corneringActive = false;
+    // 0 with the driver's foot untouched, 1 with the throttle shut.
+    double engineTorqueReduction = 0.0;
 
     std::array<WheelTrace, tracedCornerCount> wheels{};
 };
@@ -658,7 +691,8 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             "CoG X [m],CoG Z [m],Heading [deg],Speed [kph],"
             "G Force Lat [g],G Force Long [g],Yaw Rate [deg/s],"
             "Ride Height F [mm],Ride Height R [mm],"
-            "Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear [],Engine RPM [rpm]";
+            "Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear [],Engine RPM [rpm],"
+            "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Active [],Engine Reduction [%]";
 
     for (const auto* tag : tracedCornerAbbreviations)
     {
@@ -674,6 +708,9 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",Damper Vel" + corner + " [mm/s]";
         text += ",Contact Samples" + corner + " []";
         text += ",Patch Depth Spread" + corner + " [mm]";
+        text += ",ABS Active" + corner + " []";
+        text += ",ABS Cycles" + corner + " []";
+        text += ",Brake Pressure" + corner + " [bar]";
     }
 
     text += "\n";
@@ -747,6 +784,13 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",";
         appendRackNumber(text, car.engineSpeed * rackRadiansPerSecondToRevolutionsPerMinute, 1);
 
+        text += car.antilockEnabled ? ",1," : ",0,";
+        appendRackInteger(text, static_cast<long long>(car.tractionMode));
+        text += car.tractionBrakeActive ? ",1" : ",0";
+        text += car.tractionEngineActive ? ",1" : ",0";
+        text += car.corneringActive ? ",1," : ",0,";
+        appendRackNumber(text, car.engineTorqueReduction * 100.0, 3);
+
         // By index, in the order the header was written. Nothing here names a corner: the loop and
         // the header loop walk the same array, so a mapping fault would have to be a fault in the
         // array itself rather than in one of thirty-six hand-written lines.
@@ -774,6 +818,12 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             appendRackInteger(text, static_cast<long long>(wheel.contactingSamples));
             text += ",";
             appendRackNumber(text, wheel.patchDepthSpread * 1000.0, 3);
+
+            text += wheel.antilockActive ? ",1," : ",0,";
+            appendRackInteger(text, static_cast<long long>(wheel.antilockCycles));
+            text += ",";
+            // Bar, like every other pressure a person reads. The model carries pascals.
+            appendRackNumber(text, wheel.brakePressure / 1.0e5, 3);
         }
 
         text += "\n";

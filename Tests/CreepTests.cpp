@@ -19,7 +19,6 @@
 // `[.creep-gravity]` and written up in `docs/vehicle-physics.md`; it is not a transmission fault and
 // it is not this file's to assert around.
 
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -156,11 +155,10 @@ struct Script
 
     const auto step = [&](const VehicleInput& input)
     {
-        const auto torques =
-            stepDriveline(driveline, driveState,
-                          {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed, state.corners[2].wheelSpeed,
-                           state.corners[3].wheelSpeed},
-                          inertias, road, input, tick);
+        const auto torques = stepDriveline(driveline, driveState,
+                                           {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed,
+                                            state.corners[2].wheelSpeed, state.corners[3].wheelSpeed},
+                                           inertias, road, input, tick);
         REQUIRE(torques.has_value());
 
         const auto stepped = stepVehicle(setup, state, input, torques->wheel, world, tick);
@@ -652,9 +650,11 @@ TEST_CASE("a light brake holds the car against creep, and holds it quietly", "[p
     SECTION("and a hair below the cut-off it creeps, which is what keeps that band empty")
     {
         // The cut-off has to sit *below* the brake application at which the brakes can hold the car
-        // against full creep, or the cooked-plate band comes back. This car's brakes make 4200 N.m
-        // and full creep puts 418 N.m through the front axle, so they cross at a tenth of the pedal
-        // and the cut is at a twentieth.
+        // against full creep, or the cooked-plate band comes back. Full creep puts 418 N.m through
+        // the front axle; this car's brakes make 8791 N.m at a fully applied pedal since they were
+        // derived from the hardware on 2026-08-23, so they cross at 0.048 of the pedal and the cut is
+        // at half of that. **This case is what caught the old 0.05 being above the new crossing**,
+        // which is the exact band the threshold exists to keep empty.
         auto barely = Script{};
         barely.brake = 0.99 * driveline.autoClutch.creepBrakeCut;
 
@@ -784,11 +784,10 @@ TEST_CASE("creep never reaches a launch", "[physics][clutch][creep][launch]")
 
     const auto step = [&](const VehicleInput& input)
     {
-        const auto torques =
-            stepDriveline(driveline, driveState,
-                          {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed, state.corners[2].wheelSpeed,
-                           state.corners[3].wheelSpeed},
-                          inertias, road, input, tick);
+        const auto torques = stepDriveline(driveline, driveState,
+                                           {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed,
+                                            state.corners[2].wheelSpeed, state.corners[3].wheelSpeed},
+                                           inertias, road, input, tick);
         REQUIRE(torques.has_value());
 
         const auto stepped = stepVehicle(setup, state, input, torques->wheel, world.value(), tick);
@@ -858,11 +857,10 @@ TEST_CASE("creep does not close the clutch on a dead engine", "[physics][clutch]
 
     for (auto step = 0; step < 1080; step++)
     {
-        const auto torques =
-            stepDriveline(driveline, driveState,
-                          {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed, state.corners[2].wheelSpeed,
-                           state.corners[3].wheelSpeed},
-                          inertias, road, input, tick);
+        const auto torques = stepDriveline(driveline, driveState,
+                                           {state.corners[0].wheelSpeed, state.corners[1].wheelSpeed,
+                                            state.corners[2].wheelSpeed, state.corners[3].wheelSpeed},
+                                           inertias, road, input, tick);
         REQUIRE(torques.has_value());
 
         REQUIRE(torques->creepCommand == 0.0);

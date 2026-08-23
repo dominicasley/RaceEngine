@@ -14,6 +14,9 @@ module;
 
 export module raceengine.physics:Vehicle;
 
+import raceengine.assists;
+
+import :Brakes;
 import :Contact;
 import :ContactPatch;
 import :PhysicsWorld;
@@ -152,7 +155,14 @@ export struct CornerSetup
 
     // Placeholder: wheel, tire, hub and disc for a mid-size car.
     double wheelInertia = 1.2;
-    // Peak brake torque at this corner, N·m. Placeholder, and split front/rear by the setup.
+
+    // What this corner's brake makes at a **fully applied pedal**, N·m — after the hydraulics and
+    // after whatever the rear circuit's valve does to them, so it is the number a corner is actually
+    // worth rather than one an axle's share has to be applied to.
+    //
+    // Placeholder here. A car with real hardware derives it (`peakBrakeTorque` in `:Brakes`), which
+    // is what took `brakes.ini`'s `MAX_TORQUE` and `FRONT_SHARE` out of the Golf on 2026-08-23; the
+    // setup sheet can still override it, because a pad change is a setup change.
     double brakeTorque = 1400.0;
 };
 
@@ -182,6 +192,16 @@ export struct VehicleSetup
     std::vector<MassComponent> sprung;
 
     ContactPatchSampling sampling{};
+
+    // The brake system between the pedal and the four corners above.
+    //
+    // **This is where the other half of the brake bias lives**, and the half a set of calipers cannot
+    // express: `CornerSetup::brakeTorque` states what each corner makes at full pedal, and these two
+    // state how the pedal gets there — which is not the same shape on both axles once a valve is
+    // fitted. Defaults are a car with no servo and no valve, so the pedal maps linearly onto each
+    // corner's peak, which is exactly what this model did before either existed.
+    BrakeHydraulics brakeHydraulics;
+    ProportioningValve rearBrakeValve;
 
     std::vector<AeroSurface> aero;
 
@@ -242,6 +262,22 @@ export struct VehicleSetup
 // the two agree.
 export [[nodiscard]] std::array<double, cornerCount> wheelInertias(const VehicleSetup& setup);
 
+// What the caliper at each corner is at, pascals, for a given brake pedal. The master cylinder's own
+// characteristic for the front pair and the proportioning valve's output for the rear.
+//
+// It is a function of the *car* rather than of a corner because the two axles share one master
+// cylinder, which is the whole reason a fixed bias cannot be right everywhere.
+export [[nodiscard]] std::array<double, cornerCount> brakeCircuitPressures(const VehicleSetup& setup,
+                                                                           const double pedal);
+
+// The fraction of `CornerSetup::brakeTorque` a corner makes at a given pedal — that corner's pressure
+// against its own pressure at a fully applied pedal.
+//
+// **This is what makes the bias pedal-dependent instead of a constant ratio.** Both axles are linear
+// in it below the valve's knee and the servo's runout; above either, they are not, and they are not
+// in the same way. With no servo and no valve it is the pedal itself, to the bit.
+export [[nodiscard]] double brakePedalResponse(const VehicleSetup& setup, const std::size_t corner, const double pedal);
+
 export struct CornerState
 {
     // The corner's whole degree of freedom: where the lower wishbone is, and how fast it is moving.
@@ -265,6 +301,11 @@ export struct VehicleState
     RigidBodyState chassis;
     std::array<CornerState, cornerCount> corners{};
 };
+
+// `raceengine.assists` restates its own wheel count rather than importing this one, because it must
+// not be able to import anything from this module — see the head of `Assists/Api/WheelSensors.cppm`.
+// This is the join: two statements of one number that the compiler will not let disagree.
+static_assert(wheelCount == cornerCount, "the assist layer and the vehicle must agree on how many wheels a car has");
 
 static_assert(std::is_trivially_copyable_v<VehicleState>, "the harness saves and restores this by copying its bytes");
 static_assert(std::is_standard_layout_v<VehicleState>, "and rollback will later");
@@ -456,8 +497,16 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> placeholderSedan()
 // driver's — steering, throttle, brake, gear — and is the packet a rollback netcode would transmit
 // and replay. Driveline torque is *derived* from state and must be recomputed on a replay rather
 // than trusted from the wire, so it has no business in the struct that gets sent.
+//
+// `brakes` is the assist layer's output and follows the same rule for the same reason. Defaulted,
+// and the default is not "no brakes" — it is **"nobody intervened"**, under which this function
+// applies the driver's demand against each corner's own peak exactly as it did before an assist
+// layer existed. That is what lets every fixture in the suite go on calling this with six arguments
+// and get an answer identical to the bit rather than merely close, which is the only kind of
+// regression evidence worth having for a car underneath a controller.
 export [[nodiscard]] std::expected<VehicleStep, std::string>
 stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& input,
-            const std::array<double, cornerCount>& driveTorques, const PhysicsWorld& world, const double deltaTime);
+            const std::array<double, cornerCount>& driveTorques, const PhysicsWorld& world, const double deltaTime,
+            const BrakeCommand& brakes = {});
 
 } // namespace raceengine

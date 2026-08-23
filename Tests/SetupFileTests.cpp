@@ -212,3 +212,75 @@ TEST_CASE("the pedal cue's thresholds are the driver's dials", "[physics][setup]
     REQUIRE(onset.has_value());
     REQUIRE(onset->pedal.onsetPeaks == 1.05);
 }
+
+TEST_CASE("a setup sheet states which electronics are fitted", "[physics][setup][assists]")
+{
+    // The assists live on the sheet rather than in the environment, because which of them are on is
+    // a driver's setting in the way `ffb.gain` is: felt, argued about, and changed between two laps.
+
+    SECTION("absent keys leave the car with none of them, which is what the factory default here is")
+    {
+        const auto tune = raceengine::parseVehicleTune("front.spring 40000\n");
+        REQUIRE(tune.has_value());
+
+        REQUIRE_FALSE(tune->assists.antilock.has_value());
+        REQUIRE_FALSE(tune->assists.traction.has_value());
+        REQUIRE_FALSE(tune->assists.cornering.has_value());
+
+        const auto built = raceengine::golfGtiMk7();
+        REQUIRE(built.has_value());
+
+        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        raceengine::applyVehicleTune(tune.value(), assists);
+
+        REQUIRE_FALSE(assists.antilock.enabled);
+        REQUIRE(assists.traction.mode == raceengine::TractionMode::Off);
+        REQUIRE_FALSE(assists.cornering.enabled);
+    }
+
+    SECTION("and stated keys switch exactly what they name")
+    {
+        const auto tune = raceengine::parseVehicleTune("assist.abs 1\nassist.tc sport\nassist.xds 1\n");
+        REQUIRE(tune.has_value());
+        REQUIRE(raceengine::statesAnything(tune.value()));
+
+        const auto built = raceengine::golfGtiMk7();
+        REQUIRE(built.has_value());
+
+        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        raceengine::applyVehicleTune(tune.value(), assists);
+
+        REQUIRE(assists.antilock.enabled);
+        REQUIRE(assists.traction.mode == raceengine::TractionMode::Sport);
+        REQUIRE(assists.cornering.enabled);
+    }
+
+    SECTION("a mode is a name, so a number is not one")
+    {
+        // `assist.tc 2` would be a sheet nobody can read and a typo nobody can see.
+        const auto refused = raceengine::parseVehicleTune("assist.tc 2\n");
+        REQUIRE_FALSE(refused.has_value());
+        REQUIRE(refused.error().find("assist.tc") != std::string::npos);
+
+        const auto misspelled = raceengine::parseVehicleTune("assist.tc ful\n");
+        REQUIRE_FALSE(misspelled.has_value());
+    }
+
+    SECTION("switching one off is a line that says so, not a line deleted")
+    {
+        // The overlay is applied to a freshly built car every time, so a deleted line reverts. This
+        // is the other direction: an explicit `off` on a car that had it on.
+        const auto tune = raceengine::parseVehicleTune("assist.tc off\n");
+        REQUIRE(tune.has_value());
+
+        const auto built = raceengine::golfGtiMk7();
+        REQUIRE(built.has_value());
+
+        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        assists.traction.mode = raceengine::TractionMode::Full;
+
+        raceengine::applyVehicleTune(tune.value(), assists);
+
+        REQUIRE(assists.traction.mode == raceengine::TractionMode::Off);
+    }
+}

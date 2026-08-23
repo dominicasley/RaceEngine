@@ -1,11 +1,11 @@
-// **Thirty-six columns, thirty-six assertions, and not one of them is "the header says FL".**
+// **Fifty-two per-corner columns, fifty-two assertions, and not one of them is "the header says FL".**
 //
 // The rack trace grew from thirteen channels to sixty-three so that the power assist's *aim* could be
-// measured and not only its shape — see `VehicleTrace`. Nine of the new channels are per corner, and
-// four corners of nine signed quantities is thirty-six fresh opportunities for the FL column to carry
-// the FR corner. That fault is invisible in every plot: the numbers are all the right size, all the
-// right sign, and all in the wrong place, and the first thing it costs is a conclusion about which
-// end of the car is losing grip.
+// measured and not only its shape — see `VehicleTrace` — and to eighty-five when the electronics
+// joined it on 2026-08-23. Thirteen of the channels are per corner, and four corners of thirteen is
+// fifty-two fresh opportunities for the FL column to carry the FR corner. That fault is invisible in every plot: the
+// numbers are all the right size, all the right sign, and all in the wrong place, and the first thing it costs is a
+// conclusion about which end of the car is losing grip.
 //
 // A test that checked the header strings existed would pass against a writer that emitted the corners
 // backwards, so this does the opposite: every channel of every corner is given a value that no other
@@ -119,6 +119,15 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         // other one here, because what this test is built to catch is a corner swap and the writer
         // has no opinion about the sign of what it is handed.
         wheel.patchDepthSpread = sentinel(corner, 8) / 1000.0;
+
+        // The electronics' per-corner channels, joined 2026-08-23. Two of the three are unsigned, so
+        // they are made distinct per corner by construction rather than by the alternating sentinel:
+        // a swap between two corners has to be visible in every column of the block or the block is
+        // not covered by this test.
+        wheel.antilockActive = corner % 2 == 0;
+        wheel.antilockCycles = static_cast<std::uint32_t>(31 + corner);
+        // Pascals in, bar out.
+        wheel.brakePressure = sentinel(corner, 9) * 1.0e5;
     }
 
     const auto rows = lines(rackTorqueToCsv({frame}));
@@ -128,13 +137,18 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     const auto values = split(rows[1], ',');
 
     REQUIRE(header.size() == values.size());
-    // Thirteen that were always there, then nine chassis channels, five driver ones and **ten** per
-    // corner — sixty-seven in total. It was nine per corner and sixty-three until `Patch Depth
-    // Spread` joined the block for the enveloping work; the telemetry brief that asked for the
-    // expansion counted forty-nine new and sixty-two, because it listed nine chassis channels under
-    // a heading that said eight. The list is what was built, so the count has always been one higher
-    // than that brief's own summary line.
-    REQUIRE(header.size() == 13 + 9 + 5 + 10 * tracedCornerCount);
+    // Thirteen that were always there, then nine chassis channels, five driver ones, **six for the
+    // electronics** and **thirteen** per corner — eighty-five in total.
+    //
+    // The history, because the count has been wrong in a brief before: it was nine per corner and
+    // sixty-three until `Patch Depth Spread` joined the block for the enveloping work, then ten and
+    // sixty-seven. On 2026-08-23 the electronics joined it — `ABS Fitted`, `TC Mode` and the three
+    // active flags with the engine reduction on the chassis side, and `ABS Active`, `ABS Cycles` and
+    // `Brake Pressure` per corner. That was added because a trace could not say whether it had been
+    // driven with the anti-lock system on, and the setup sheet had been edited since. The telemetry
+    // brief that asked for the original expansion counted forty-nine new and sixty-two, because it
+    // listed nine chassis channels under a heading that said eight; the list is what was built.
+    REQUIRE(header.size() == 13 + 9 + 5 + 6 + 13 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -160,6 +174,9 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         REQUIRE(named("Damper Vel", "[mm/s]") == Catch::Approx(sentinel(corner, 7)).epsilon(1e-9));
         REQUIRE(named("Contact Samples", "[]") == Catch::Approx(static_cast<double>(7 + corner)).margin(1e-9));
         REQUIRE(named("Patch Depth Spread", "[mm]") == Catch::Approx(sentinel(corner, 8)).epsilon(1e-9));
+        REQUIRE(named("ABS Active", "[]") == Catch::Approx(corner % 2 == 0 ? 1.0 : 0.0).margin(1e-9));
+        REQUIRE(named("ABS Cycles", "[]") == Catch::Approx(static_cast<double>(31 + corner)).margin(1e-9));
+        REQUIRE(named("Brake Pressure", "[bar]") == Catch::Approx(sentinel(corner, 9)).epsilon(1e-9));
     }
 }
 
@@ -197,7 +214,10 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
     const auto header = split(rows[0], ',');
     const auto values = split(rows[1], ',');
 
-    const auto named = [&](const std::string& channel) { return std::stod(values[columnOf(header, channel)]); };
+    const auto named = [&](const std::string& channel)
+    {
+        return std::stod(values[columnOf(header, channel)]);
+    };
 
     REQUIRE(named("CoG X [m]") == Catch::Approx(123.25));
     REQUIRE(named("CoG Z [m]") == Catch::Approx(-456.75));

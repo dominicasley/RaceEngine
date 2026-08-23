@@ -12,6 +12,7 @@ module;
 
 export module raceengine.physics:PublishedCars;
 
+import :Brakes;
 import :Contact;
 import :ContactPatch;
 import :Coupling;
@@ -132,6 +133,31 @@ export [[nodiscard]] CornerHardpoints golfMk7FrontCorner(const CornerSide side);
 // wishbone's clothes. The curves it produces are a road car's, but it is a model of a model.
 export [[nodiscard]] CornerHardpoints golfMk7RearCorner(const CornerSide side);
 
+// The Golf's brakes, as the parts on the car rather than as `brakes.ini`'s scalar.
+//
+// **This is the sixth number taken away from the mod** (2026-08-23), after the wheel radius, the
+// unsprung mass, `CG_LOCATION`, the tyre peaks and `MAX_TORQUE` itself — and it is the one that
+// deletes a number rather than replacing it, because nothing below was chosen. `MAX_TORQUE` and
+// `FRONT_SHARE` are both gone: the torque falls out of the piston, the pad and the disc, and the
+// share falls out of the two of them against one line pressure. Every part is sourced in
+// `PublishedCarsImpl.cpp` and the two that had to be estimated are marked there.
+//
+// The car is the **Performance** variant, which is what the mod is, so these are the Performance
+// Pack's brakes: 340 x 30 vented front, 310 x 22 vented rear, single-piston sliding calipers on both
+// axles.
+export [[nodiscard]] BrakeHardware golfMk7FrontBrake();
+export [[nodiscard]] BrakeHardware golfMk7RearBrake();
+
+// And the one hydraulic system that feeds them. Per car, which is the whole reason the front/rear
+// split is a property of the calipers and not a setting — and, with the valve below, the reason it
+// is not a *constant* either.
+export [[nodiscard]] BrakeHydraulics golfMk7Hydraulics();
+
+// The rear circuit's proportioning valve, which is the second half of the bias: the calipers make
+// 0.686 out of one pressure, and the pressure the rear calipers see is not the one the fronts do.
+// Derived from this car's own two lock pressures — see `PublishedCarsImpl.cpp`.
+export [[nodiscard]] ProportioningValve golfMk7RearProportioningValve();
+
 // The Golf GTI Mk7.5, assembled. Fallible for the same reasons `placeholderSedan` is: every corner's
 // geometry is swept and its setup validated before the car is handed back, so a bad number is an
 // error at load time rather than a car that flies away on the tick that first reaches it.
@@ -145,5 +171,15 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7();
 // 159 N.m and 110 bhp for a car that makes 350 and 243 — a wrong number that looks like a right one,
 // which is the only kind worth guarding against. The points below are the boosted curve.
 export [[nodiscard]] DrivelineSetup golfGtiMk7Driveline();
+
+// The same car's electronics, calibrated against the car that was just built rather than against a
+// second copy of its numbers: brake peaks come off `setup.corners[i].brakeTorque`, the tone rings
+// and the reference radius off the wheel, the tracks off the geometry.
+//
+// **Everything is switched off.** A Mk7 GTI leaves the factory with all of it switched on, and this
+// does not, deliberately: the suite's job is to validate the car underneath the electronics, and a
+// default that quietly assisted every fixture would be a suite that could no longer see the car at
+// all. A game or a test that wants the systems says so, once, at the call.
+export [[nodiscard]] AssistSetup golfGtiMk7Assists(const VehicleSetup& setup);
 
 } // namespace raceengine

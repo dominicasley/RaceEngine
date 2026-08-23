@@ -40,6 +40,33 @@ namespace raceengine
     return inertias;
 }
 
+[[nodiscard]] std::array<double, cornerCount> brakeCircuitPressures(const VehicleSetup& setup, const double pedal)
+{
+    const auto master = brakeLinePressure(setup.brakeHydraulics, pedal);
+    const auto rear = proportionedPressure(setup.rearBrakeValve, master);
+
+    auto pressures = std::array<double, cornerCount>{};
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        pressures[index] = rearAxle(static_cast<Corner>(index)) ? rear : master;
+    }
+
+    return pressures;
+}
+
+[[nodiscard]] double brakePedalResponse(const VehicleSetup& setup, const std::size_t corner, const double pedal)
+{
+    const auto full = brakeCircuitPressures(setup, 1.0);
+
+    if (corner >= cornerCount || full[corner] <= 0.0)
+    {
+        return 0.0;
+    }
+
+    return brakeCircuitPressures(setup, pedal)[corner] / full[corner];
+}
+
 [[nodiscard]] std::array<double, cornerCount> roadTorques(const VehicleStep& step)
 {
     auto torques = std::array<double, cornerCount>{};
@@ -357,7 +384,8 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const VehicleSetup& setup, VehicleState& state,
                                                                   const VehicleInput& input,
                                                                   const std::array<double, cornerCount>& driveTorques,
-                                                                  const PhysicsWorld& world, const double deltaTime)
+                                                                  const PhysicsWorld& world, const double deltaTime,
+                                                                  const BrakeCommand& brakes)
 {
     auto result = VehicleStep{};
 
@@ -783,9 +811,23 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         // not a force at the patch: the contact pressure is higher at the leading edge of the patch
         // than the trailing one, so the vertical resultant acts *ahead* of the wheel centre and the
         // moment that makes is what a coastdown is measuring.
+        //
+        // The brake torque itself is the assist layer's when one ran and the driver's demand against
+        // this corner's peak when none did. Written as a branch rather than as an always-present
+        // command because an unassisted car has to reach the *same expression* it always did: the two
+        // arms are one multiplication apart and a car with the electronics switched off must be
+        // identical to the bit, not to a tolerance.
+        //
+        // **The demand is the pedal's own pressure response and not the pedal** (2026-08-23). A car
+        // with no servo and no proportioning valve — which is every car here that does not state
+        // hydraulics — gets exactly `brakeTorque * pedal` back out of it, so the change is inert for
+        // them. A car that states them gets the servo's runout on both axles and the valve's knee on
+        // the rear, which is the only place a *pedal-dependent* brake bias can come from.
         const auto rolling =
             setupCorner.rollingResistance * solution.forces.tireVertical * solution.contact.effectiveRadius;
-        const auto commanded = setupCorner.brakeTorque * std::clamp(input.brake, 0.0, 1.0) + rolling;
+        const auto braking = brakes.commanded ? std::max(0.0, brakes.wheels[index])
+                                              : setupCorner.brakeTorque * brakePedalResponse(setup, index, input.brake);
+        const auto commanded = braking + rolling;
 
         if (commanded > 0.0 && std::abs(corner.wheelSpeed) > 0.0)
         {

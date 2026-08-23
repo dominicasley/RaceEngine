@@ -77,7 +77,8 @@ constexpr auto gravity = 9.80665;
             "Steering Angle [deg],Steering Demand [],Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear,"
             "Shift Phase [],"
             "Engine RPM [rpm],"
-            "Engine Torque [Nm],Clutch Torque [Nm],Clutch Slip [rad/s],Clutch Slip Energy [J]";
+            "Engine Torque [Nm],Clutch Torque [Nm],Clutch Slip [rad/s],Clutch Slip Energy [J],"
+            "Reference Speed [km/h],Engine Cut [%]";
 
     for (auto corner = std::size_t{0}; corner < cornerCount; corner++)
     {
@@ -97,6 +98,11 @@ constexpr auto gravity = 9.80665;
         text += ",In Contact " + tag + " []";
         text += ",Contact Samples " + tag + " []";
         text += ",Patch Depth Spread " + tag + " [mm]";
+        text += ",Brake Pressure " + tag + " []";
+        text += ",ABS Torque " + tag + " [Nm]";
+        text += ",TC Torque " + tag + " [Nm]";
+        text += ",XDS Torque " + tag + " [Nm]";
+        text += ",Sensed Wheel Speed " + tag + " [m/s]";
     }
 
     text += "\n";
@@ -167,6 +173,10 @@ constexpr auto gravity = 9.80665;
         appendNumber(text, frame.clutchSlip, 4);
         text += ",";
         appendNumber(text, frame.clutchSlipEnergy, 1);
+        text += ",";
+        appendNumber(text, frame.referenceSpeed * metresPerSecondToKilometresPerHour, 4);
+        text += ",";
+        appendNumber(text, frame.engineTorqueReduction * 100.0, 3);
 
         for (const auto& wheel : frame.wheels)
         {
@@ -198,12 +208,39 @@ constexpr auto gravity = 9.80665;
             appendInteger(text, static_cast<long long>(wheel.contactingSamples));
             text += ",";
             appendNumber(text, wheel.patchDepthSpread * 1000.0, 3);
+            text += ",";
+            appendNumber(text, wheel.brakePressure, 4);
+            text += ",";
+            appendNumber(text, wheel.antilockBrakeTorque, 2);
+            text += ",";
+            appendNumber(text, wheel.tractionBrakeTorque, 2);
+            text += ",";
+            appendNumber(text, wheel.corneringBrakeTorque, 2);
+            text += ",";
+            appendNumber(text, wheel.sensedWheelSpeed, 4);
         }
 
         text += "\n";
     }
 
     return text;
+}
+
+void fillAssistTelemetry(TelemetryFrame& frame, const AssistChannels& channels)
+{
+    frame.referenceSpeed = channels.referenceSpeed;
+    frame.engineTorqueReduction = channels.engineTorqueReduction;
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        auto& wheel = frame.wheels[index];
+
+        wheel.brakePressure = channels.pressure[index];
+        wheel.antilockBrakeTorque = channels.antilockBrakeTorque[index];
+        wheel.tractionBrakeTorque = channels.tractionBrakeTorque[index];
+        wheel.corneringBrakeTorque = channels.corneringBrakeTorque[index];
+        wheel.sensedWheelSpeed = channels.sensedWheelSpeed[index];
+    }
 }
 
 } // namespace raceengine

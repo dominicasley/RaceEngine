@@ -256,6 +256,129 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
 
 } // namespace
 
+// --- the brakes, from the hardware -------------------------------------------------------------
+//
+// **`brakes.ini` is not consulted at all any more**, and that is the change. It stated
+// `MAX_TORQUE=4200` and `FRONT_SHARE=0.75`; the first was verified at source on 2026-08-23, found to
+// be identical across all four cars in the pack, found unable to lock this car's front wheels at any
+// pedal position, and replaced with 5600 — **another chosen number**, marked as one at the time. The
+// bound under it was arithmetic; everything above the bound was a feel question. What follows is
+// `docs/brake-model-brief.md`'s answer to that: parts, each with a source, and no scalar.
+//
+// **Sources, one per part.** The car is a Mk7.5 GTI **Performance**, which is the variant the mod is,
+// and the Performance Pack's brakes are shared with the Mk7 Golf R and the 8V Audi S3:
+//
+//   front  340 x 30 mm vented disc      Brembo 09.C306.11, catalogued against this car
+//          175 x 70 x 20 mm pad         Brembo P 85 144, front axle, the pad for that disc
+//          60 mm single piston          TRW/Lucas sliding caliper, 5Q0407253A/254A; the piston
+//                                       diameter is quoted by the caliper vendors that sell the set
+//   rear   310 x 22 mm vented disc      Brembo 09.A200.10/11, catalogued against this car
+//          106 x 57 x 17 mm pad         Brembo P 85 073, rear axle
+//          42 mm single piston          ATE sliding caliper, 3Q0615423F, quoted with the caliper
+//
+// Both calipers are **single-piston sliders**, which is what every factory Golf VII brake is: one
+// piston, two pads, and the caliper body carries the reaction onto the outboard side. `pistons = 1`
+// with `frictionFaces = 2` is that, and the pair is the thing to get right — a second piston here
+// would double the car's brake torque on a fiction.
+//
+// **Two parts are estimates and are marked as such.** `padOuterClearance` at 5 mm is universal
+// practice rather than a measurement of this pad, and it moves the front effective radius by 3.8%.
+// The friction couple at 0.40 is the midpoint of SAE J866's F band, which is what an OE pad's edge
+// code says and is the largest uncertainty in the whole derivation at +/-12.5%. Everything else is
+// measured to the millimetre.
+[[nodiscard]] BrakeHardware golfMk7FrontBrake()
+{
+    return BrakeHardware{.pistonBore = 0.060,
+                         .pistons = 1,
+                         .discDiameter = 0.340,
+                         .padRadialHeight = 0.070,
+                         .padOuterClearance = 0.005,
+                         .frictionFaces = 2,
+                         .couple = lowMetallicOnCastIron()};
+}
+
+[[nodiscard]] BrakeHardware golfMk7RearBrake()
+{
+    return BrakeHardware{.pistonBore = 0.042,
+                         .pistons = 1,
+                         .discDiameter = 0.310,
+                         .padRadialHeight = 0.057,
+                         .padOuterClearance = 0.005,
+                         .frictionFaces = 2,
+                         .couple = lowMetallicOnCastIron()};
+}
+
+// The hydraulics, which are what turn a pedal into the pressure both axles see.
+//
+// **The master cylinder is the only sourced part**: 23.81 mm, which is what Bosch, Delphi, LPR and
+// TRW all state for a Golf VII cylinder. The pedal ratio and the servo are class-typical figures
+// rather than this car's own — a pedal ratio of 3.2:1 to 4:1 is the published range for a boosted
+// passenger car, a light-vehicle servo gain is 3 to 4, and a 10 inch diaphragm at 0.75 bar of
+// depression is an ordinary one. **All four are marked guessed** under criterion 2 of the brief.
+//
+// **They are nonetheless checked, and the check is the reason to believe them.** This car reaches its
+// own braking limit — the 0.945 g it can actually brake at, which needs 59 bar — at **236 N of pedal
+// force**. A boosted passenger car is designed to reach a maximum-effort stop at 200 to 300 N, which
+// is a figure with nothing to do with any of the parts above, and the chain lands in the middle of
+// it. That is a stronger statement about the hydraulics than any one component's tolerance.
+//
+// A second one falls out for free, and it settles something the mod was internally inconsistent
+// about. `brakes.ini` states `HANDBRAKE_TORQUE=1200` against a rear *service* brake of 1050 N.m — a
+// cable out-braking the hydraulics it pulls on, which is not a thing. Off these calipers the rear
+// makes **3357 N.m across the axle** before the proportioning valve has any say, and a handbrake
+// cable pulls on the caliper directly rather than through the valve, so 1200 is suddenly an ordinary
+// figure with room to spare. Nothing was fitted to make that happen.
+[[nodiscard]] BrakeHydraulics golfMk7Hydraulics()
+{
+    return BrakeHydraulics{.masterCylinderBore = 0.02381,
+                           .pedalRatio = 3.5,
+                           .boostRatio = 4.0,
+                           .boosterDiaphragm = 0.254,
+                           .boosterVacuum = 75000.0,
+                           .maxPedalForce = 500.0};
+}
+
+// The rear circuit's proportioning valve — **the other half of the brake bias, and the half the
+// calipers cannot state**.
+//
+// The calipers alone put 0.686 of this car's brake torque on the front axle. That is a fixed number
+// and the ideal one is not: load transfer moves it from 0.647 at 0.3 g to about 0.81 where this car
+// locks, so a fixed 0.686 is roughly right in the middle of a stop and **locks the rear axle first**
+// at the top of one — the unstable order, and the reason `brakes.ini`'s stated 0.75 looked better
+// than the hardware it claimed to describe. A real Mk7 answers this with EBD inside its anti-lock
+// unit; this model has no EBD, so it gets the component EBD replaced, which is a fixed valve.
+//
+// **Both numbers are measured against one stated criterion and neither is chosen**, and the criterion
+// is the one every brake regulation is written around: *the front axle must lock first*. A car that
+// locks its rears first is a car that swaps ends, and UN ECE R13-H's adhesion-utilisation annex
+// exists to forbid exactly that. So the valve is the **most rear braking this car can carry while
+// still locking its front axle first**, and that is a maximum rather than a preference.
+//
+// Swept and measured — `./EngineTests "[.brake-model]"`, the lock-pressure tables. With no valve at
+// all, which is what the calipers alone describe:
+//
+//     the front axle locks at pedal 0.375 -> 58.95 bar
+//     the rear axle locks at  pedal 0.250 -> 39.30 bar     <- first, and by a long way
+//
+// Then across knees of 24 to 32 bar and slopes of 0 to 0.30, **on dry tarmac and on mu 0.35**,
+// because the ideal distribution moves with grip as well as with deceleration and a valve checked at
+// one point of that range has been checked at one point. The largest admissible pair is 24 bar and
+// 0.30: the rear then locks at pedal 0.450 against the front's 0.375 on dry and never before the
+// front on mu 0.35, while 28 bar at the same slope already fails. It carries **730 N.m a side**
+// against the 323 a plain limiter at the same knee would allow.
+//
+// What it buys is a bias that *moves*: 0.686 below the knee, where the calipers alone decide, rising
+// to **0.834 at a fully applied pedal**. The ideal runs from 0.647 at 0.3 g to about 0.81 at the
+// limit, so the valved car tracks the ideal band instead of crossing it — which is the whole of what
+// a proportioning valve is for and the whole of what `FRONT_SHARE=0.75` was standing in for.
+//
+// The cross-check nothing was fitted to: production fixed valves are quoted with knees of 25 to 40
+// bar and slopes of 0.3 to 0.5. The slope lands in that band and the knee sits a bar under it.
+[[nodiscard]] ProportioningValve golfMk7RearProportioningValve()
+{
+    return ProportioningValve{.kneePressure = 24.0e5, .slope = 0.30};
+}
+
 [[nodiscard]] std::expected<VehicleSetup, std::string> golfGtiMk7()
 {
     auto setup = VehicleSetup{};
@@ -431,9 +554,43 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto reboundKnee = std::array{0.140, 0.140, 0.140, 0.140};
     const auto antiRoll = std::array{34000.0, 34000.0, 15000.0, 15000.0};
 
-    // brakes.ini: one total torque split by FRONT_SHARE and then between the two wheels of an axle.
-    const auto brakeTorque =
-        std::array{4200.0 * 0.75 / 2.0, 4200.0 * 0.75 / 2.0, 4200.0 * 0.25 / 2.0, 4200.0 * 0.25 / 2.0};
+    // The brakes, and **`brakes.ini` no longer appears in this line at all** (2026-08-23). Neither
+    // `MAX_TORQUE` nor `FRONT_SHARE` is read: the peak is `peakBrakeTorque` on the hardware above and
+    // the split is whatever the two calipers make of one line pressure. Sources per part and the two
+    // estimates are at `golfMk7FrontBrake` above; the case for doing it at all, and what it
+    // deliberately does not fix, are `docs/brake-model-brief.md`.
+    //
+    // **What it says, which was not what was expected.** 3666 N.m at each front corner and 1679 at
+    // each rear — **10688 N.m in total against the 5600 it replaces**, and a front share of **0.686
+    // against the mod's stated 0.75**. Both differences are the point rather than an error:
+    //
+    // - A road car *is* over-braked. Its brakes are sized for fade and for pedal effort, not for the
+    //   grip limit, so full pressure is far past anything a tyre can use — 2.5 g here if grip were
+    //   unlimited. What the size buys is where on the pedal the car reaches its limit: the fronts now
+    //   lock at 0.47 of the pedal and the rears at 0.31, against 0.83 and 0.73 before. That is the
+    //   whole feel change, and it is one a real car has.
+    // - 0.75 was never a hardware figure. The calipers make 0.686, and the ideal share at this car's
+    //   braking limit is 0.811 — so the raw hydraulics lock the **rear axle first**, by a wide margin.
+    //   That is not a fault in the derivation; it is what a fixed split does on a car whose load
+    //   transfer moves, and it is precisely what EBD exists to correct. A real Mk7 has EBD in the same
+    //   unit as its ABS. This model does not, and the gap is now a **describable missing system**
+    //   rather than a share somebody picked to hide it.
+    //
+    // The mod's 0.75 measured the shortest stop of everything swept, which is why it looked right. It
+    // was right about the *distance* and wrong about the *hardware*, and those are separable now.
+    setup.brakeHydraulics = golfMk7Hydraulics();
+    setup.rearBrakeValve = golfMk7RearProportioningValve();
+
+    const auto frontBrake = golfMk7FrontBrake();
+    const auto rearBrake = golfMk7RearBrake();
+
+    // Each corner's peak is its own circuit's pressure at a fully applied pedal — so the rear's is
+    // taken after the valve, and the front/rear ratio at full pedal is *not* `frontBrakeShare`. That
+    // is the point of the valve: the share moves with the pedal.
+    const auto fullPressure = brakeCircuitPressures(setup, 1.0);
+    const auto frontPeak = torquePerPressure(frontBrake) * fullPressure[static_cast<std::size_t>(Corner::FrontLeft)];
+    const auto rearPeak = torquePerPressure(rearBrake) * fullPressure[static_cast<std::size_t>(Corner::RearLeft)];
+    const auto brakeTorque = std::array{frontPeak, frontPeak, rearPeak, rearPeak};
 
     // Sprung load by statics about the other axle, from the sprung centre solved above.
     const auto frontSprung = sprungMass * standardGravity * (sprungCentre.z - golfRearAxle) / golfWheelbase;
@@ -636,6 +793,50 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     setup.differential = clutchPackLsd(0.0, 0.25, 0.25);
 
     return setup;
+}
+
+[[nodiscard]] AssistSetup golfGtiMk7Assists(const VehicleSetup& setup)
+{
+    auto assists = AssistSetup{};
+
+    // What the hydraulics reach at a fully applied pedal, and what each corner's brake is worth per
+    // pascal of it.
+    //
+    // **Divided out of the car rather than read off the hardware**, deliberately. `golfMk7FrontBrake`
+    // is where these come from, so calling it here would be the shorter line — and it would make the
+    // electronics deaf to a setup sheet that has moved `brake.front`. The ECU is calibrated against
+    // the car that was just built, which is the whole claim in this function's comment, and a tuned
+    // brake is exactly the case where a second copy of a number would diverge unnoticed.
+    const auto fullPressure = brakeCircuitPressures(setup, 1.0);
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        assists.maximumWheelPressure[index] = fullPressure[index];
+        assists.brakeTorquePerPressure[index] =
+            fullPressure[index] > 0.0 ? setup.corners[index].brakeTorque / fullPressure[index] : 0.0;
+    }
+
+    // The radius the ECU converts wheel speed with. **The unloaded one on purpose**: the tyre's real
+    // rolling radius is smaller than this under load, so the electronics read every wheel slightly
+    // slow and think there is a little more slip than there is. That error is a real system's and is
+    // not corrected here — see `ReferenceSpeedSetup::nominalRadius`.
+    assists.reference.nominalRadius = golfTyreRadius;
+
+    // Front-wheel drive, which is why traction control on this car is the easy case: the rear pair
+    // is a road speed measurement that owes the engine nothing.
+    const auto driven = std::array{true, true, false, false};
+    assists.reference.driven = driven;
+    assists.traction.driven = driven;
+
+    assists.cornering.frontTrack = golfFrontTrack;
+    assists.cornering.rearTrack = golfRearTrack;
+
+    // One ECU, one clock, as on the car.
+    assists.antilock.controlRate = assists.controlRate;
+    assists.traction.controlRate = assists.controlRate;
+    assists.cornering.controlRate = assists.controlRate;
+
+    return assists;
 }
 
 } // namespace raceengine

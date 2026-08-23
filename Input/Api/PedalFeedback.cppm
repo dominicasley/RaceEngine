@@ -128,9 +128,26 @@ export struct PedalFeedback
 // `staticShare` is a quarter of the car's weight in newtons — the load a wheel carries standing
 // still — which is what `minimumLoadShare` is a share *of*. Passed rather than derived because this
 // partition does not know what a vehicle is.
+//
+// `modulatorDisplacement` is how far the anti-lock unit has taken the wheel pressure away from what
+// the pedal is asking for, as a fraction of full system pressure, worst wheel. Zero on a car with no
+// anti-lock system, or with one that is not intervening.
+//
+// **This is where the pulsation a driver feels under ABS comes from, and it is deliberately not a
+// vibration anybody wrote.** A hydraulic unit that dumps a caliper takes the fluid into a
+// low-pressure accumulator and the pump pushes it back; the pedal moves because the volume under it
+// moved. So the cue is the *displacement itself*, which oscillates at whatever frequency the
+// modulator happens to be cycling at — measured at 5 to 20 Hz, and nothing in this file or in
+// `raceengine.assists` states a frequency. Synthesising a buzz here would have produced something
+// that felt the same on every surface and at every speed, which is exactly what real ABS does not.
+//
+// It is taken as the *stronger* of the two brake cues rather than added to the slip one: they are one
+// pedal and one foot, and under anti-lock control the wheel is by design *not* locking, so the slip
+// cue is quiet at precisely the moment the pulsation is loudest.
 export [[nodiscard]] PedalFeedback derivePedalFeedback(const PedalFeedbackSetup& setup,
                                                        const std::span<const SlippingWheel> wheels,
                                                        const double brakePedal, const double throttlePedal,
-                                                       const double staticShare);
+                                                       const double staticShare,
+                                                       const double modulatorDisplacement = 0.0);
 
 } // namespace raceengine

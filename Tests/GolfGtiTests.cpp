@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -13,6 +14,7 @@
 
 import raceengine.physics;
 
+using raceengine::brakeCircuitPressures;
 using raceengine::bringUpJolt;
 using raceengine::computeMassProperties;
 using raceengine::Corner;
@@ -20,9 +22,12 @@ using raceengine::cornerCount;
 using raceengine::CornerSide;
 using raceengine::Feature;
 using raceengine::FeatureKind;
+using raceengine::frontBrakeShare;
 using raceengine::generateProvingGround;
 using raceengine::golfGtiMk7;
 using raceengine::golfGtiMk7Driveline;
+using raceengine::golfMk7FrontBrake;
+using raceengine::golfMk7RearBrake;
 using raceengine::noDriveTorque;
 using raceengine::outboardSign;
 using raceengine::PhysicsWorld;
@@ -30,6 +35,7 @@ using raceengine::ProvingGroundDescriptor;
 using raceengine::solveCornerWithJacobian;
 using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
+using raceengine::torquePerPressure;
 using raceengine::validateCornerSetup;
 using raceengine::VehicleInput;
 using raceengine::VehicleSetup;
@@ -350,9 +356,48 @@ TEST_CASE("every corner of the imported car validates", "[physics][golf]")
         const auto wheelRate = corner.springRate * design->motionRatio * design->motionRatio;
         REQUIRE(wheelRate == Catch::Approx(index < 2 ? 35000.0 : 57000.0).epsilon(1e-9));
 
-        // suspensions.ini [ARB], and brakes.ini split by FRONT_SHARE and then between the two wheels.
+        // suspensions.ini [ARB], straight from the file.
         REQUIRE(corner.antiRollRate == Catch::Approx(index < 2 ? 34000.0 : 15000.0));
-        REQUIRE(corner.brakeTorque == Catch::Approx(index < 2 ? 1575.0 : 525.0));
+
+        // **Neither of the mod's two brake numbers survives** (2026-08-23, `docs/brake-model-brief.md`).
+        // `MAX_TORQUE=4200` was verified at source, found identical across all four cars in the pack,
+        // and could not lock this car's front wheels at any pedal position; it was corrected to a
+        // chosen 5600 and is now not stated at all. `FRONT_SHARE=0.75` is gone with it, because a
+        // brake split is not a setting: it is what two sets of calipers make of one line pressure,
+        // and then what the rear circuit's proportioning valve makes of that.
+        //
+        // Asserted against the parts rather than against a literal, so this fails when a caliper or a
+        // pad changes and not when the arithmetic is rounded differently.
+        const auto hardware = index < 2 ? golfMk7FrontBrake() : golfMk7RearBrake();
+        const auto pressure = brakeCircuitPressures(setup.value(), 1.0)[index];
+
+        REQUIRE(corner.brakeTorque == Catch::Approx(torquePerPressure(hardware) * pressure));
+    }
+
+    SECTION("and the brake bias is not a number at all, because a proportioning valve moves it")
+    {
+        // The calipers alone put 0.6859 on the front axle. That is the whole bias only below the
+        // valve's knee; above it the rear is limited and the share climbs. What it must not do is
+        // stay put — a fixed share is the thing this replaced.
+        const auto low = brakeCircuitPressures(setup.value(), 0.10);
+        const auto high = brakeCircuitPressures(setup.value(), 1.00);
+
+        const auto shareAt = [&](const std::array<double, cornerCount>& pressures)
+        {
+            const auto front = pressures[0] * torquePerPressure(golfMk7FrontBrake());
+            const auto rear = pressures[2] * torquePerPressure(golfMk7RearBrake());
+
+            return front / (front + rear);
+        };
+
+        // Below the knee the valve is transparent and the share is the calipers' own.
+        REQUIRE(shareAt(low) == Catch::Approx(frontBrakeShare(golfMk7FrontBrake(), golfMk7RearBrake())));
+
+        // And at a fully applied pedal it has moved a long way toward the ideal at the limit, which
+        // this car's own axle loads put at about 0.81.
+        CAPTURE(shareAt(low), shareAt(high));
+        REQUIRE(shareAt(high) > shareAt(low) + 0.10);
+        REQUIRE(shareAt(high) < 0.90);
     }
 
     SECTION("and the steering reaches the lock the car states, the way round the car states")

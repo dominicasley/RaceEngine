@@ -117,6 +117,35 @@ namespace
                                        .append("' has a key and no value"));
         }
 
+        // **Word-valued keys are read before the value is taken as a number**, because a mode is a
+        // name and not a magnitude: `assist.tc 2` is a sheet nobody can read and a typo nobody can
+        // see. Every other key on the sheet is a quantity and goes through `positive` below.
+        if (key == "assist.tc")
+        {
+            if (value == "off")
+            {
+                tune.assists.traction = TractionMode::Off;
+            }
+            else if (value == "full")
+            {
+                tune.assists.traction = TractionMode::Full;
+            }
+            else if (value == "sport")
+            {
+                tune.assists.traction = TractionMode::Sport;
+            }
+            else
+            {
+                return std::unexpected(std::string("line ")
+                                           .append(std::to_string(lineNumber))
+                                           .append(": 'assist.tc' takes 'off', 'full' or 'sport', not '")
+                                           .append(value)
+                                           .append("'"));
+            }
+
+            continue;
+        }
+
         const auto number = positive(key, value);
         if (!number)
         {
@@ -180,6 +209,14 @@ namespace
         {
             tune.steering.invert = *number != 0.0;
         }
+        else if (key == "assist.abs")
+        {
+            tune.assists.antilock = *number != 0.0;
+        }
+        else if (key == "assist.xds")
+        {
+            tune.assists.cornering = *number != 0.0;
+        }
         else if (key == "ffb.gain")
         {
             tune.feedback.gain = *number;
@@ -235,8 +272,8 @@ namespace
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
            tune.differential.coastRamp || tune.feedback.gain || tune.feedback.ceilingTorque || tune.feedback.damping ||
-           tune.feedback.damperBandwidth || tune.steering.invert || tune.pedal.onsetPeaks ||
-           tune.pedal.brakeFullPeaks || tune.pedal.throttleFullPeaks;
+           tune.feedback.damperBandwidth || tune.steering.invert || tune.assists.antilock || tune.assists.traction ||
+           tune.assists.cornering || tune.pedal.onsetPeaks || tune.pedal.brakeFullPeaks || tune.pedal.throttleFullPeaks;
 }
 
 void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
@@ -300,6 +337,13 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
     axle(tune.front, vehicle.corners[1]);
     axle(tune.rear, vehicle.corners[2]);
     axle(tune.rear, vehicle.corners[3]);
+}
+
+void applyVehicleTune(const VehicleTune& tune, AssistSetup& assists)
+{
+    assists.antilock.enabled = tune.assists.antilock.value_or(assists.antilock.enabled);
+    assists.traction.mode = tune.assists.traction.value_or(assists.traction.mode);
+    assists.cornering.enabled = tune.assists.cornering.value_or(assists.cornering.enabled);
 }
 
 void applyVehicleTune(const VehicleTune& tune, DrivelineSetup& driveline)

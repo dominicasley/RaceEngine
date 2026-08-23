@@ -13,6 +13,8 @@ module;
 
 export module raceengine.physics:SetupFile;
 
+import raceengine.assists;
+
 import :Driveline;
 import :Vehicle;
 
@@ -98,6 +100,23 @@ export struct PedalTune
     std::optional<double> throttleFullPeaks;
 };
 
+// The car's electronics, as three lines a driver can change between laps.
+//
+// **On the sheet rather than in the environment, and that is where they belong.** Which assists are
+// on is a driver's setting in exactly the way `ffb.gain` and the pedal cue are: it is felt, it is
+// argued about, and a setting that needs an environment variable is one nobody changes twice.
+//
+// Optional like everything else here, and absent means **off**, because that is what
+// `golfGtiMk7Assists` builds and a setup file is an overlay on a car rather than a car. A real Mk7
+// GTI leaves the factory with all three on; making that the default is a decision with a golden
+// re-bless attached, not a line in a parser.
+export struct AssistTune
+{
+    std::optional<bool> antilock;
+    std::optional<TractionMode> traction;
+    std::optional<bool> cornering;
+};
+
 export struct VehicleTune
 {
     AxleTune front;
@@ -106,6 +125,7 @@ export struct VehicleTune
     FeedbackTune feedback;
     SteeringTune steering;
     PedalTune pedal;
+    AssistTune assists;
 };
 
 // One tune, from the text of a file. Line oriented, `key value`, `#` to the end of the line is a
@@ -134,5 +154,14 @@ export void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle);
 
 // And onto the driveline, which owns the one thing on a setup sheet that is not a corner.
 export void applyVehicleTune(const VehicleTune& tune, DrivelineSetup& driveline);
+
+// And onto the electronics. An overload here rather than in the game — unlike `PedalTune`, whose
+// consumer lives in the input layer this module cannot name — because `raceengine.physics` imports
+// `raceengine.assists` and can therefore say what an `AssistSetup` is.
+//
+// **The car must be freshly built here too**, for the reason stated above: an overlay applied on top
+// of itself can only ever add, so deleting `assist.tc` from the sheet would leave traction control
+// on with nothing in the file to explain it.
+export void applyVehicleTune(const VehicleTune& tune, AssistSetup& assists);
 
 } // namespace raceengine

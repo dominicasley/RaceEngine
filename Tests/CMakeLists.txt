@@ -12,7 +12,11 @@ find_package(Catch2 3 CONFIG REQUIRED)
 add_executable(EngineTests
         AccessorUtilityTests.cpp
         AntiStallTests.cpp
+        AntilockBrakingTests.cpp
+        AssistDiagnosticProbe.cpp
         BackendParityTests.cpp
+        BrakeHardwareTests.cpp
+        BrakeModelProbe.cpp
         CameraServiceTests.cpp
         CarAudioTests.cpp
         ClutchTests.cpp
@@ -68,6 +72,7 @@ add_executable(EngineTests
         TelemetryTests.cpp
         TelemetryUnitsProbe.cpp
         TorqueConverterTests.cpp
+        TractionControlTests.cpp
         TyreLayerTests.cpp
         TyreShapeProbe.cpp
         TyreTests.cpp
@@ -75,6 +80,7 @@ add_executable(EngineTests
         AssistPlacementProbe.cpp
         VehicleDeltaProbe.cpp
         VehicleTests.cpp
+        WheelSpeedSensorTests.cpp
         SphericalHarmonicsTests.cpp
         ShadowCascadesTests.cpp)
 
