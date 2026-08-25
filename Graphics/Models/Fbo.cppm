@@ -60,7 +60,19 @@ export struct Fbo
 // writing level 3 of and a pass that reads an image it is also rendering into.
 export struct PostProcessInput
 {
-    Resource<FboAttachment> attachment;
+    // Defaulted rather than required, because an input naming a texture below leaves this unset and
+    // a handle that names nothing is exactly what that means.
+    Resource<FboAttachment> attachment{};
+    // An image loaded from disk rather than produced by an earlier pass, and when it is set it is
+    // what this input names — `attachment` is then not read at all.
+    //
+    // Both are images a fullscreen shader samples, and the split is only in where they came from: an
+    // attachment is something this frame drew and therefore has a layout that has to be moved and a
+    // level that has to be chosen, and a texture is a picture that was uploaded once and has neither.
+    // The distinction matters to the backend and to nothing else, which is why it is two fields on
+    // one input rather than two kinds of input. A lens dirt plate is the case it was added for: a
+    // photograph of a dirty piece of glass is not something a render pass can produce.
+    std::optional<Resource<Texture>> texture{};
     unsigned int level = 0;
 };
 

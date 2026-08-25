@@ -221,7 +221,41 @@ export struct Gearbox
     // Ratios by gear, index 0 being first. Reverse and neutral are handled by `gear` below rather
     // than by living in here.
     std::vector<double> ratios;
-    double finalDrive = 4.37;
+
+    // **A transverse VW transaxle has two final drives, and this model carried one until
+    // 2026-08-24.** Every published box in this project turns out to have a pair — VW's own sheet
+    // gives the 7-speed DSG 4.17 and 3.13, the six-speed manual 3.24 and 2.62, and auto motor und
+    // sport's test car 3.45 and 2.76. The giveaway in a ratio table is a gear whose *raw* ratio is
+    // numerically **above** the one below it: 5th 0.71 against 6th 0.76 is not a misprint, it is two
+    // gears on different axles.
+    //
+    // Carrying one final drive is not a small simplification. Applying the low-gear final to the
+    // whole box left this car's 4th to 7th **35% to 47% too short** while 1st stayed within 1.7% —
+    // which is exactly why it survived: anything that only checks a standing start sees a nearly
+    // right car. `docs/engine-curve-validation-brief.md` has the table.
+    double finalDrive = 4.17;
+
+    // The final drive each gear runs through, parallel to `ratios`. **Empty means a box with a single
+    // final drive** — every fixture that does not state one is unchanged to the bit.
+    //
+    // A per-gear list rather than a split point, and that is a correction rather than generality for
+    // its own sake. The first cut here said "gears 1..n on the first final, the rest on the second",
+    // which reads like the obvious shape and is **wrong for a dual-clutch box**: the DSG's mapping is
+    // `I, II, II, I, I, II, II`, gears alternating between two output shafts in pairs, and no split
+    // point can express it.
+    //
+    // **The mapping is not published and is inferred, so the inference has to be checkable.** Six
+    // assignments of this box give monotonically decreasing overall reductions and monotonicity alone
+    // does not choose between them. What does is that a gearbox's *steps* close up as it goes up —
+    // and exactly one assignment has steps that rise all the way (0.607, 0.644, 0.700, 0.763, 0.803,
+    // 0.842). Two things then support it rather than one: the same pattern is the best fit on a second
+    // DQ381 application, and **the same rule applied to the six-speed manual picks precisely the split
+    // auto motor und sport publishes for it** — I-IV on the first axle, V-VI on the second. A rule
+    // validated where the answer is known and then applied where it is not is an inference; picking
+    // the arrangement that looked tidiest would have been a guess. `EngineCurveValidationProbe` runs
+    // that validation rather than trusting this comment.
+    std::vector<double> finalDrivePerGear;
+
     double reverseRatio = 3.6;
 
     // What turns at the gearbox *input*: the clutch's driven plate or the converter's turbine, plus
@@ -273,11 +307,25 @@ export struct Gearbox
         return ratios[std::min(static_cast<std::size_t>(gear - 1), ratios.size() - 1)];
     }
 
+    // Which axle this gear drives through. Reverse and neutral take the first, which is where a
+    // reverse idler physically sits and is in any case the only answer that is not arbitrary.
+    [[nodiscard]] double finalFor(const std::int32_t gear) const
+    {
+        if (finalDrivePerGear.empty() || gear <= 0)
+        {
+            return finalDrive;
+        }
+
+        const auto index = static_cast<std::size_t>(gear - 1);
+
+        return index < finalDrivePerGear.size() ? finalDrivePerGear[index] : finalDrive;
+    }
+
     // Total reduction from the flywheel to the differential input. Zero in neutral, which is what
     // disconnects the chain — not a special case anywhere else, just a ratio of nothing.
     [[nodiscard]] double reduction(const std::int32_t gear) const
     {
-        return ratio(gear) * finalDrive;
+        return ratio(gear) * finalFor(gear);
     }
 };
 
@@ -477,9 +525,17 @@ export [[nodiscard]] double revMatchThrottle(const EngineModel& engine, const Sh
 // angle. Two halfshafts of a small hatchback are about 25 kN.m/rad at the wheel, which twists eleven
 // degrees under this car's 4879 N.m of peak axle torque; through 4.37 that is **1331 N.m/rad here**,
 // and the same shaft appears as a different number on a car with a different final drive, which is
-// why `placeholderAutomatic` restates it rather than inheriting it. The damping is a ratio of 0.08
-// on the driveline mode, which is why shunt rings a few times rather than either buzzing or
-// vanishing.
+// why `placeholderAutomatic` and `golfGtiMk7Driveline` both restate it rather than inheriting it. The damping is a
+// ratio of 0.08 on the driveline mode, which is why shunt rings a few times rather than either buzzing or vanishing.
+//
+// **A recorded limitation as of 2026-08-24: one rate against two final drives.** A transverse VW
+// transaxle has two output axles, and the same halfshafts referred through each give different rates
+// at the gearbox output — for the Golf, 25000/4.17^2 = 1438 against 25000/3.13^2 = **2552**, so its
+// sixth and seventh are really about 1.8 times stiffer up there than one number can say, and the
+// shuffle frequency with them. Each car states the rate for its *first* final drive, which is where
+// the torque is and where every gear that shunts lives. Correcting it means a rate per axle, and the
+// figure it would be derived from (`25 kN.m/rad`) is itself representative rather than measured, so
+// there is nothing to be gained by making an unmeasured number gear-dependent.
 //
 // **It was 500, and that is worth recording because of how it failed.** Too soft is not merely a
 // softer car: first gear then asks for more twist than `maximumTwist` allows — 6.1 rad on the
@@ -511,10 +567,51 @@ export struct DrivelineCompliance
     double maximumTwist = 3.0;
 };
 
+// The mechanical losses between the gearbox output and the wheels, and **where they sit is the whole
+// of what this type is for**. The chain is
+//
+//     engine -> clutch/converter -> gearbox -> gearbox output -> LOSSES -> differential -> halfshafts -> wheels
+//
+// A blanket multiplier on the engine's torque curve would be arithmetically identical for the
+// tractive force and wrong for two things that matter. It would slow the **crank** down — a loss in
+// the final drive does not make the flywheel lighter to accelerate, and the engine's own inertia is
+// what a rev-match and a launch are fought against. And it would be wrong on **overrun**, where the
+// wheels drive the engine and the loss has to make engine braking *stronger* at the road rather than
+// weaker.
+//
+// **Derived, not fitted** (2026-08-24, `docs/engine-curve-validation-brief.md`). Solved on a
+// *different* car — auto motor und sport's 230 PS Mk7, whose engine, mass, gearing and in-gear times
+// are all separately published, leaving efficiency the only unknown in it — which is what makes it
+// evidence here rather than a number tuned until this car's numbers came out. Three gears sampling
+// three different rpm bands agree on 0.879 to 0.945, a spread of 7.3%, and the midpoint is taken.
+export struct DrivelineLosses
+{
+    // Torque out over torque in, in the direction power is flowing. 1.0 is a lossless driveline and
+    // is the default, so every fixture that does not state one is unchanged to the bit.
+    //
+    // **Constant, and a real one is not.** Efficiency falls at low torque, where a fixed churning and
+    // pumping drag is a larger share of what is going through, and varies with speed and oil
+    // temperature. Modelling that needs a map nobody here has; a constant is the honest first cut and
+    // this is the field a map would replace.
+    double efficiency = 1.0;
+};
+
+// What actually reaches the differential, given what the gearbox output is carrying.
+//
+// **The sign rule is the point.** Power flows toward the wheels when torque and speed agree, and the
+// receiving side always gets `efficiency` times what the supplying side gives. Driving, that means
+// the wheels see less than the gearbox made. On overrun it means the *wheels* must supply more than
+// the engine absorbs — so the torque at the road end is divided rather than multiplied, and a lossy
+// driveline coasts down harder. Writing `torque * efficiency` in both directions would have a car
+// with a worn gearbox engine-braking more gently than a new one.
+export [[nodiscard]] double throughDrivelineLosses(const DrivelineLosses& losses, const double torque,
+                                                   const double speed);
+
 export struct DrivelineSetup
 {
     EngineModel engine;
     Gearbox gearbox;
+    DrivelineLosses losses;
     // The slot between the engine's inertia and the gearbox input, and this file names neither of the
     // two things that can be in it after this line.
     DriveCoupling coupling;
@@ -569,6 +666,11 @@ export struct DrivelineState
 
     // The coupling slot's own state, whichever kind is fitted.
     DriveCouplingState coupling{};
+    // Whether the launch programme is holding the car. One bit, because the regulator itself is
+    // stateless — it reads the engine and commands a capacity — and the only thing that has to persist
+    // is which side of the arm/release hysteresis the driver is on.
+    bool launchArmed = false;
+
     // The pedal actually being held, which is the driver's when the driver is on it and the
     // automation's when nobody is. Kept rather than recomputed so the handover between the two is
     // continuous — see `advanceClutchPedal`.

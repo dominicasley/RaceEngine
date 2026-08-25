@@ -240,6 +240,59 @@ stepDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, cons
 // controller would recognise.
 export void idleDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state, const double deltaTime);
 
+// Launch control, as the car has it: brake and throttle together, the engine held at a target while
+// the clutch slips, and the car released when the brake comes off.
+//
+// **It is a clutch-pressure regulator and not a rev limiter, and that distinction is the whole
+// implementation.** Holding a car on its brakes at full throttle, the engine's speed is set by how
+// much torque the clutch is taking off it: open the plate and the engine runs away, close it and the
+// engine is dragged toward a stall. So the controller commands a *capacity* — which is what a real
+// TCU meters as pressure — and the speed falls out. `clutchPedalForCapacity` is the inverse that
+// makes that expressible against a pedal, and it exists for exactly this reason.
+//
+// **Off by default**, like every other assist in this project, because every measurement here is of
+// the car underneath its electronics.
+//
+// A converter car does not get one and must not: a fluid coupling at stall already does this, and
+// commanding a launch on top would be the same behaviour modelled twice. `launchControlPedal`
+// dispatches on the kind for the same reason `creepPedal` does.
+export struct LaunchControl
+{
+    bool enabled = false;
+
+    // Where the engine is held while the brake is down, rad/s. ~3000 rpm, which is what this car
+    // does — high enough to be on boost when the clutch takes up, low enough not to simply light the
+    // tyres.
+    double targetSpeed = 314.16;
+
+    // How much of each pedal arms it. Both are needed at once, which is what makes it a deliberate
+    // action rather than something that fires whenever somebody rests a foot on the brake.
+    double armThrottle = 0.85;
+    double armBrake = 0.40;
+
+    // And where the launch is let go. Below this the brake is no longer holding the car and the
+    // regulator hands the clutch back to the ordinary automation, which closes it on the throttle
+    // that is already flat.
+    double releaseBrake = 0.15;
+
+    // Above this **wheel** speed there is nothing to launch, rad/s. What stops the regulator
+    // re-arming mid-run if a driver brushes the brake with the throttle still down.
+    //
+    // In rad/s of wheel and not m/s of road because `stepDriveline` does not know the tyre's radius
+    // and has no business learning it — the driveline deals in shaft speeds throughout. 6.3 rad/s is
+    // about 2 m/s on this car's 0.3186 m tyre, which is walking pace.
+    double maximumWheelSpeed = 6.3;
+
+    // Clutch capacity per rad/s of engine speed error, N.m per rad/s.
+    //
+    // **Derived rather than tuned.** With the car held, the engine's equation is `I·dω/dt = T - C`;
+    // commanding `C = T + g·(ω - ω_target)` makes that `I·dω/dt = -g·(ω - ω_target)`, a first-order
+    // lag with time constant `I/g`. This engine's inertia is 0.15 kg·m², so 1.5 gives a tenth of a
+    // second — fast enough to catch the engine before it runs past the target, slow enough not to
+    // chatter the plate against it.
+    double gain = 1.5;
+};
+
 // A layer over the *pedal*, not around the clutch. It produces a pedal position and nothing else, so
 // the friction model underneath is identical whoever is pressing — which is the whole point, because
 // the rig has a real clutch pedal and a human slipping it from rest is the best test this model has.
@@ -353,12 +406,27 @@ export struct AutoClutch
     // already use, and it is a real brake switch's shape too.
     double creepBrakeCut = 0.024;
 
+    // The launch programme, which is the one rule here that owns the pedal outright while it is armed
+    // rather than voting on it with the others.
+    LaunchControl launch;
+
     // And the accelerator travel the controller reads as "not pressed". Creep is the no-demand state:
     // the moment the driver asks for torque the pedal map owns the clutch, and this is where that is
     // said. A dead band rather than a threshold because a real accelerator has one, and because a
     // sensor resting a percent off zero must not hold creep off for ever.
     double creepThrottleLift = 0.03;
 };
+
+// Whether launch control should be holding the car this tick, given what the driver is doing. Pure,
+// and separate from the pedal it produces so that the *decision* can be tested without a clutch.
+export [[nodiscard]] bool launchControlArmed(const LaunchControl& launch, const bool armed, const double brake,
+                                             const double throttle, const double wheelSpeed, const bool inGear,
+                                             const bool running);
+
+// The pedal the launch regulator is asking for, given what the engine is doing and making. Returns a
+// fully released pedal for a converter, which has no use for one.
+export [[nodiscard]] double launchControlPedal(const DriveCoupling& coupling, const LaunchControl& launch,
+                                               const double engineTorque, const double engineSpeed);
 
 // Where the commanded creep torque goes next, in N.m at the clutch. `stepCoupling`'s shape: a target
 // this instant answers for, and a rate the state may approach it at.

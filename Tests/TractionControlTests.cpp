@@ -259,8 +259,11 @@ struct LaunchResult
 
         // Shifted on road speed through the gear, which is what `LaunchDiagnosticProbe` established:
         // any signal taken off the driven wheels upshifts on wheelspin rather than on progress.
-        const auto roadSideSpeed = std::abs(state.chassis.linearVelocity.z) / tyreRadius *
-                                   driveline.gearbox.finalDrive * driveline.gearbox.ratio(gear);
+        // `reduction`, not `ratio * finalDrive`: this car has **two** final drives since 2026-08-24 and
+        // the gear decides which one it runs through, so the product is the right answer only for the
+        // gears that happen to sit on the first axle.
+        const auto roadSideSpeed =
+            std::abs(state.chassis.linearVelocity.z) / tyreRadius * driveline.gearbox.reduction(gear);
         if (roadSideSpeed > upshiftSpeed && gear < driveline.gearbox.topGear())
         {
             gear++;
@@ -370,6 +373,63 @@ TEST_CASE("traction control is off unless something switches it on", "[assists][
     REQUIRE(command.throttleScale == 1.0);
 }
 
+TEST_CASE("the car reaches 100 km/h in the time an instrumented test measured", "[assists][traction][launch]")
+{
+    // **Closed 2026-08-24 by fixing the control variable, having been red for a few hours.**
+    //
+    // It asserted that the car reached 100 km/h in the measured 6.5-6.6 s and it did not: 6.842 s.
+    // Every candidate had been eliminated by measurement — the engine curve, the gearing, the mass,
+    // the driveline efficiency, the road load — which left the tyre, and a `docs/tyre-grip-ratio-brief.md`
+    // sweep was being lined up to raise its longitudinal grip.
+    //
+    // **The defect was in the comparison.** Both instrumented references — MOTOR Australia's 6.6 s at
+    // Heathcote and auto motor und sport's 6.5 s — are measurements of a *car*, with the electronics
+    // it leaves the factory with doing their job. This fixture ran with everything switched off,
+    // because that is the correct default for the other 490 cases in this suite and nobody had
+    // noticed it was the wrong one *here*. Measured at `[.grip-ratio]`:
+    //
+    //     launch   traction     0-100      peak driven slip
+    //      off      off         6.842          5.375
+    //      off      sport       6.547          3.024
+    //      on       off         6.775          5.850
+    //      on       sport       6.469          3.350
+    //
+    // **Traction control in sport is worth 0.295 s and launch control is worth 0.067.** The car was
+    // spinning its driven wheels to five times road speed and riding the far tail of the longitudinal
+    // curve; holding slip near the peak is worth four times what pre-loading the engine is. With the
+    // car configured the way the reference cars were driven, this model lands **inside** the measured
+    // range with nothing about the tyre touched.
+    //
+    // **So the tyre grip ratio is not indicated by 0-100 at all**, and the sweep that was about to
+    // change it would have been fitting a tyre to a control-variable error. That is the fourth time
+    // this project has caught one — see `check-the-control-variable`.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    // **The car as the reference cars were driven**: traction control in its sport setting, which is
+    // what a Mk7 GTI is in with ESC Sport selected and what a magazine timing a launch would use.
+    const auto assisted = launch(setup.value(), world.value(), withTraction(setup.value(), TractionMode::Sport), 20.0);
+
+    REQUIRE(assisted.onPlate);
+    REQUIRE(assisted.toHundred > 0.0);
+
+    CAPTURE(assisted.toHundred, assisted.peakDrivenSlip);
+
+    // MOTOR Australia 6.6 s (180 kW Performance Edition, timed at Heathcote); amS Supertest 6.5 s
+    // (230 PS manual). n = 2, so a tenth either side for the quoting precision of both.
+    REQUIRE(assisted.toHundred >= 6.4);
+    REQUIRE(assisted.toHundred <= 6.7);
+
+    // And the mechanism, so a future change that lands the time by some other route is still caught:
+    // it is quick because it is *not* spinning, not because it found more grip.
+    REQUIRE(assisted.peakDrivenSlip < 4.0);
+}
+
 TEST_CASE("traction control is worth a little on dry tarmac and a great deal on a slippery one",
           "[assists][traction][launch]")
 {
@@ -399,7 +459,7 @@ TEST_CASE("traction control is worth a little on dry tarmac and a great deal on 
 
         // **The unassisted figure is the one already on record**, which is what says this fixture
         // reproduces the launch the rest of the project measures rather than a new one: 6.494 s,
-        // against a published 6.4-6.7 s for a Mk7 GTI DSG without launch control.
+        // against the measured 6.5-6.6 s described on the case below.
         //
         // **6.550 until 2026-08-23**, when the load-sensitivity exponent was split and the
         // longitudinal axis took `tyres.ini`'s own `LS_EXP_X` instead of the lateral figure that had
@@ -408,7 +468,29 @@ TEST_CASE("traction control is worth a little on dry tarmac and a great deal on 
         // little more — 0.8% by hand calculation and 0.9% measured, which is about as close as an
         // estimate of a whole-car figure from a single-wheel one has any right to be. Re-recorded
         // rather than widened: the point of the number is that it is the same launch.
-        REQUIRE(plain.toHundred == Catch::Approx(6.494).margin(0.02));
+        //
+        // **6.494 until 2026-08-24, then 6.600, and 7.097 since.** The first step was VW's published
+        // torque curve replacing the mod's (`docs/engine-curve-brief.md`); the second was the three
+        // corrections that came out of the evidence pass — the manufacturer's gearing in place of the
+        // mod's single final drive, the car's real mass, and driveline losses put where they belong
+        // (`docs/engine-curve-validation-brief.md`).
+        //
+        // Every one of those made the car **slower**, and each for a reason that was predicted rather
+        // than explained afterwards: more torque into a traction-limited launch becomes wheelspin,
+        // +104 kg is +104 kg, and a driveline that eats 8.8% was eating nothing before.
+        //
+        // **And 6.842 after the shift points were corrected.** The harness upshifts on road speed
+        // through the gear and was computing that as `ratio * finalDrive` — which is the reduction only
+        // for the gears on the first axle. The mapping is `I, II, II, I, I, II, II`, so **2nd and 3rd
+        // are on the tall axle** and the product over-stated them by 33%: the car was being shifted out
+        // of the two gears a 0-100 spends most of its time in, far too early. Worth 0.255 s, and it is
+        // the fixture that was wrong rather than the car.
+        //
+        // **6.842 s is outside the measured 6.5-6.6 s and that is a documented red** — see the
+        // `[!shouldfail]` case below, which asserts the band rather than the characterisation. This
+        // line is the characterisation: it says the launch is the same launch the rest of the project
+        // measures, and it is deliberately tight so that anything moving it has to say why.
+        REQUIRE(plain.toHundred == Catch::Approx(6.842).margin(0.02));
 
         // Comparable or modestly better. Not transformative — on high grip there is not much
         // wheelspin to recover, and a system that found a lot here would be finding it somewhere it
@@ -417,7 +499,29 @@ TEST_CASE("traction control is worth a little on dry tarmac and a great deal on 
         REQUIRE(assisted.toHundred > 0.85 * plain.toHundred);
 
         // And it got there by taking the wheelspin away rather than by some other route.
-        REQUIRE(assisted.peakDrivenSlip < 0.5 * plain.peakDrivenSlip);
+        //
+        // **Stated as an amount as well as a fraction, because the fraction was a proxy that moved
+        // with the engine** (2026-08-24). This read `assisted < 0.5 * plain` and had been passing at
+        // 0.490 — two percent of margin, which nobody had noticed was margin at all. Giving the
+        // engine VW's published curve (`docs/engine-curve-brief.md`) took it to 0.569 and the case
+        // went red, and the reason is the opposite of a regression:
+        //
+        //     curve      plain slip   assisted slip   removed   ratio
+        //     the mod's      4.381         2.146       2.234    0.490
+        //     VW's           5.837         3.321       2.516    0.569
+        //
+        // **The controller removes more wheelspin than it did, not less.** What grew faster is how
+        // much there is to remove — a third more peak slip off the line, because the torque the front
+        // tyres cannot put down has to go somewhere. A ratio between two quantities that both move
+        // with engine torque is not a statement about the controller, which is what this case is
+        // about.
+        //
+        // So both halves are asserted: a substantial share of the peak is taken away, and the absolute
+        // reduction does not fall below what has been measured on either curve. The second is what
+        // would catch a controller that had genuinely stopped working, and the first no longer has to
+        // carry that alone.
+        REQUIRE(assisted.peakDrivenSlip < 0.7 * plain.peakDrivenSlip);
+        REQUIRE(plain.peakDrivenSlip - assisted.peakDrivenSlip > 2.0);
     }
 
     SECTION("on a slippery one")

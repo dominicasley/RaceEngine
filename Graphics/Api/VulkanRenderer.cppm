@@ -15,6 +15,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <expected>
 #include <limits>
@@ -67,6 +68,10 @@ constexpr uint32_t drawDataRingSlots = 16384;
 // the ring that has to stay short — and it can, because a skinned draw is a character rather than
 // a body panel and the two counts are not related.
 constexpr uint32_t jointDataRingSlots = 128;
+// Car paint, sized by the painted draws alone for the reason the palette above is: only the body
+// panels of a car take one, and a grid of cars is still a few hundred draws a frame against the
+// sixteen thousand the draw ring carries. Sixty-four bytes a slot makes this ring 64 KiB.
+constexpr uint32_t paintDataRingSlots = 1024;
 // FrameData is per view, not per frame: Engine::step records every camera into one command
 // buffer, so a single slot would have the last camera's view matrix and position shading all
 // of them. 16 views in a frame is far past a split-screen game's needs at 352 bytes each.
@@ -145,13 +150,60 @@ struct FrameDataUbo
     // x = light probes in use (0 = the view has no image-based lighting at all).
     glm::ivec4 probeParams;
     std::array<ProbeUbo, maxIblProbes> probes;
+    // The air, appended — and appended rather than inserted for the reason the material block's
+    // fifth vec4 was: a uniform block may be a prefix of the buffer backing it, so a shader that
+    // declares the block only as far as the field it reads keeps matching, and a field added
+    // anywhere above would silently move every probe under every one of them. Three vec4s:
+    //  - x extinction at the reference height per world unit, y the reciprocal of the scale height,
+    //    z that reference height, w how far along a ray the medium is integrated;
+    //  - xyz the single-scatter albedo, w Henyey-Greenstein's asymmetry;
+    //  - xyz a tint on the derived ambient in-scatter, w a gain on the sun's half.
+    // Zero density is the disabled scene, and every shader's fog is one branch on it. See Fog.
+    glm::vec4 fogDensity;
+    glm::vec4 fogScatter;
+    glm::vec4 fogAmbient;
+    // Appended after the air, under the same prefix rule: x the simulated instant in seconds
+    // (ticks x the fixed step — the one clock anything temporal in a shader may read, so a
+    // capture's frame N is the same image on every machine), y the scene's rain intensity,
+    // z the ground speed in metres per second and w the airflow phase — the accumulated integral
+    // of speed squared, Scene::rainMotion, which is what lets a drop's drift accumulate smoothly
+    // through a changing speed without the shader holding any state. Zero rain is the dry scene,
+    // and every shader's rain is one branch on it that leaves z and w unread.
+    glm::vec4 timeRain;
+    // xyz the car's forward direction in world space, a full unit vector and not a flattened
+    // heading — Scene::rainForward, whose comment carries why. What a pane's rain does with the
+    // airstream depends on whether the pane faces it, and the pane's own normal cannot answer that
+    // alone: the windscreen and the rear window both put their normal along the car's axis, one
+    // into the airflow and one hiding from it. w is unused.
+    glm::vec4 rainWind;
+    // The wipers, appended under the same prefix rule and stated as geometry plus a timing law: two
+    // arcs (pivot uv, inner radius, outer radius), where each blade parks and how far it sweeps, and
+    // the cycle. What is deliberately absent is the blade's current *angle* — that is a closed-form
+    // function of the clock the frame already carries, and so is the question the shader actually
+    // asks, which is when a given point of the glass was last swept. See Wipers.
+    glm::vec4 wiperArcA;
+    glm::vec4 wiperArcB;
+    glm::vec4 wiperSweep;  // parkA, spanA, parkB, spanB, in radians
+    glm::vec4 wiperTiming; // period, sweep seconds, cycle start, blade half width
+    glm::vec4 wiperPane;   // x the pane's v-to-u aspect; see Wipers::paneAspect
+    // xyz the car's up direction in world space, the companion to rainWind and the other half of
+    // the body frame the rain is expressed in. Appended rather than packed beside the forward axis
+    // because both are now full vectors: the flattened pair they replace could not state a body
+    // axis without leaning against it whenever the car pitched, and a lean multiplied by an
+    // accumulating displacement is the fault that put the water on a shear. w is unused.
+    //
+    // **Read in the vertex stage, uniquely among the rain fields**, which is why the pass-through
+    // vertex shader declares the block this far: it turns both axes into the model space of the
+    // primitive being drawn, where they are constant, and hands the fragment stage a frame that
+    // owes nothing to the camera, to the car's attitude, or to a screen-space derivative.
+    glm::vec4 rainBody;
 };
 
 // Four split distances, four texel sizes and four depth scales ride in one vec4 each, which is
 // what bounds the cascade count rather than any GPU limit.
 static_assert(shadowCascadeCount <= 4);
 static_assert(sizeof(LightUbo) == 64);
-static_assert(sizeof(FrameDataUbo) == 2224);
+static_assert(sizeof(FrameDataUbo) == 2400);
 static_assert(offsetof(FrameDataUbo, lightCount) == 80);
 static_assert(offsetof(FrameDataUbo, lights) == 96);
 static_assert(offsetof(FrameDataUbo, shadowMatrices) == 352);
@@ -161,6 +213,37 @@ static_assert(offsetof(FrameDataUbo, shadowDepthScale) == 640);
 static_assert(offsetof(FrameDataUbo, shadowParams) == 656);
 static_assert(offsetof(FrameDataUbo, probeParams) == 672);
 static_assert(offsetof(FrameDataUbo, probes) == 688);
+static_assert(offsetof(FrameDataUbo, fogDensity) == 2224);
+static_assert(offsetof(FrameDataUbo, fogScatter) == 2240);
+static_assert(offsetof(FrameDataUbo, fogAmbient) == 2256);
+static_assert(offsetof(FrameDataUbo, timeRain) == 2272);
+static_assert(offsetof(FrameDataUbo, rainWind) == 2288);
+static_assert(offsetof(FrameDataUbo, wiperArcA) == 2304);
+static_assert(offsetof(FrameDataUbo, wiperArcB) == 2320);
+static_assert(offsetof(FrameDataUbo, wiperSweep) == 2336);
+static_assert(offsetof(FrameDataUbo, wiperTiming) == 2352);
+static_assert(offsetof(FrameDataUbo, wiperPane) == 2368);
+static_assert(offsetof(FrameDataUbo, rainBody) == 2384);
+
+// The scene's air, into the block a shading view is handed. Disabled leaves the three fields at the
+// zero the block was value-initialised to, which is the block this engine uploaded before they
+// existed — so a scene that states no fog is byte-identical rather than nearly so.
+//
+// The reciprocal of the scale height is taken here rather than in the shader because it is a
+// per-scene constant and the shader would be computing it per fragment; the floor under it is what
+// keeps a level that states zero from handing a division by zero to sixteen marched steps.
+void uploadFog(const Fog& fog, FrameDataUbo& frameData)
+{
+    if (!fog.enabled)
+    {
+        return;
+    }
+
+    frameData.fogDensity = glm::vec4(fog.density, 1.0f / std::max(fog.scaleHeight, 1.0e-3f), fog.baseHeight,
+                                     fog.maximumDistance);
+    frameData.fogScatter = glm::vec4(fog.scatteringAlbedo, fog.anisotropy);
+    frameData.fogAmbient = glm::vec4(fog.ambientTint, fog.sunIntensity);
+}
 
 // Set 2 binding 0, dynamic-offset (vulkan-abi.md); ring-buffered per frame in flight.
 struct DrawDataUbo
@@ -188,6 +271,35 @@ struct JointDataUbo
 
 static_assert(sizeof(JointDataUbo) == 8192);
 static_assert(offsetof(JointDataUbo, jointTransforms) == 0);
+
+// Set 2 binding PAINT_DATA_BINDING, dynamic-offset, on a ring of its own (vulkan-abi.md). Every draw
+// binds it because the layout declares it; only a draw whose renderable states `Paint::enabled`
+// allocates a slot, and everything else binds offset zero — the same arrangement, and the same
+// reason, as the skinning palette beside it.
+//
+// `Paint` is per *renderable* rather than per material, so this is the one per-draw block that says
+// which car is being drawn rather than what it is made of. See Paint.
+struct PaintDataUbo
+{
+    // xyz the base coat, w how much of the surface is flake.
+    glm::vec4 colour;
+    // xyz the flake's own colour, w how fine it is.
+    glm::vec4 flake;
+    // x clearcoat strength, y its roughness, z orange peel amount, w orange peel scale.
+    glm::vec4 clearcoat;
+    // x how much of the material's scratch map to apply, y the same for its dirt map, **z non-zero
+    // when this renderable states paint at all**. That flag is not redundant with the numbers
+    // beside it: every draw binds this block and an unpainted one binds offset zero, so a shader
+    // reading the zeroed block has to be able to tell "no paint" from "black paint, no clearcoat"
+    // — and without it a material tagged for this shader on a renderable nobody painted renders
+    // black rather than falling back to what its own textures say.
+    glm::vec4 wear;
+};
+
+static_assert(sizeof(PaintDataUbo) == 64);
+static_assert(offsetof(PaintDataUbo, flake) == 16);
+static_assert(offsetof(PaintDataUbo, clearcoat) == 32);
+static_assert(offsetof(PaintDataUbo, wear) == 48);
 
 // Set 1 binding 0 (vulkan-abi.md); std140-compatible, so the C++ layout is the GPU layout.
 // textureTransform carries a 3x3 UV transform in a mat4 slot: std140 pads a mat3's columns to
@@ -219,12 +331,13 @@ static_assert(offsetof(MaterialDataUbo, blinnPhong) == 128);
 static_assert(offsetof(MaterialDataUbo, detailTiling) == 144);
 static_assert(offsetof(MaterialDataUbo, blend) == 160);
 
-// The fullscreen layout's push constant (vulkan-abi.md). Three vec4s rather than the one this used
+// The fullscreen layout's push constant (vulkan-abi.md). Eight vec4s rather than the one this used
 // to be: the tone curve has a shape as well as a brightness, a pass that walks a mip chain has to be
-// told which level it is on, and a pass that reads a depth buffer has to be told what the camera
-// that filled it was looking through. A push constant rather than a block because it changes per
-// pass and is 48 bytes against the 128 every Vulkan implementation guarantees, and a fullscreen
-// shader that declares none of it simply does not see it — the range belongs to the layout.
+// told which level it is on, a pass that reads a depth buffer has to be told what the camera that
+// filled it was looking through, and a pass that draws weather has to be told where that camera
+// stands and what time it is. A push constant rather than a block because it changes per pass and
+// fills exactly the 128 bytes every Vulkan implementation guarantees, and a fullscreen shader that
+// declares only a prefix of it simply does not see the rest — the range belongs to the layout.
 struct FullscreenPushConstants
 {
     // x exposure, y contrast, z toe, w shoulder. See ToneCurve and evaluateToneCurve, which is the
@@ -245,12 +358,33 @@ struct FullscreenPushConstants
     // second push constant range because a range is per pipeline layout and every fullscreen pass
     // shares one.
     glm::vec4 effect;
+    // Where the view stands and which way it faces, as the three columns of the view-to-world
+    // rotation with the camera's position riding the w components. `view` above is the projection
+    // run backwards; these are the *view transform* run backwards, and together they let a
+    // fullscreen pass turn a pixel and a view depth into a world position — which is what a pass
+    // that draws weather into the frame needs and the occlusion gather, working in view space,
+    // never did. Appended rather than a second range for the reason `effect` is one field: every
+    // fullscreen pass shares one layout, and a shader that declares the block only as far as it
+    // reads keeps matching. 128 bytes total, which is exactly the size every Vulkan implementation
+    // guarantees.
+    glm::vec4 viewRight; // xyz the view's +x in world space, w the camera's world x
+    glm::vec4 viewUp;    // xyz the view's +y in world space, w the camera's world y
+    glm::vec4 viewBack;  // xyz the view's +z in world space — the view looks down -z — w the world z
+    // The scene state a weather pass reads: x the simulated instant in seconds (the same tick-driven
+    // clock the frame block carries, so a capture's frame N is the same image on every machine),
+    // y the scene's rain intensity, zw the camera's own world velocity — x and z, in world units
+    // per second, derived from where this camera stood when it last recorded a shading view. The
+    // vertical component is deliberately not carried: what reads this is a streak's motion-blur
+    // tilt, which the horizontal motion dominates, and the two spare lanes are what there are.
+    glm::vec4 weather;
 };
 
-static_assert(sizeof(FullscreenPushConstants) == 64);
+static_assert(sizeof(FullscreenPushConstants) == 128);
 static_assert(offsetof(FullscreenPushConstants, pass) == 16);
 static_assert(offsetof(FullscreenPushConstants, view) == 32);
 static_assert(offsetof(FullscreenPushConstants, effect) == 48);
+static_assert(offsetof(FullscreenPushConstants, viewRight) == 64);
+static_assert(offsetof(FullscreenPushConstants, weather) == 112);
 
 [[nodiscard]] constexpr uint32_t channelCount(const TextureFormat format)
 {
@@ -332,6 +466,43 @@ static_assert(offsetof(FullscreenPushConstants, effect) == 48);
         return VK_FORMAT_D32_SFLOAT;
     default:
         return std::nullopt;
+    }
+}
+
+// What one texel of a colour attachment is made of, for the raw readback in captureBuffers: how
+// many components it carries, how many bytes it occupies, and whether those components are halves,
+// floats or unsigned bytes. Zero components means a format that readback does not decode, which it
+// reports and skips rather than guessing a stride for.
+enum class ReadbackComponent { UnsignedByte, Half, Float };
+
+struct ReadbackLayout
+{
+    unsigned int components = 0;
+    unsigned int texelBytes = 0;
+    ReadbackComponent component = ReadbackComponent::UnsignedByte;
+};
+
+[[nodiscard]] constexpr ReadbackLayout readbackLayout(const VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R8_UNORM:
+        return {1, 1, ReadbackComponent::UnsignedByte};
+    case VK_FORMAT_R8G8_UNORM:
+        return {2, 2, ReadbackComponent::UnsignedByte};
+    case VK_FORMAT_R8G8B8_UNORM:
+        return {3, 3, ReadbackComponent::UnsignedByte};
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        return {4, 4, ReadbackComponent::UnsignedByte};
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return {4, 8, ReadbackComponent::Half};
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return {4, 16, ReadbackComponent::Float};
+    default:
+        return {};
     }
 }
 
@@ -982,10 +1153,14 @@ private:
         VkBuffer jointDataBuffer = VK_NULL_HANDLE;
         VmaAllocation jointDataAllocation = nullptr;
         void* jointDataMapped = nullptr;
+        VkBuffer paintDataBuffer = VK_NULL_HANDLE;
+        VmaAllocation paintDataAllocation = nullptr;
+        void* paintDataMapped = nullptr;
         VkDescriptorSet frameDataSet = VK_NULL_HANDLE;
         VkDescriptorSet drawDataSet = VK_NULL_HANDLE;
         uint32_t drawDataSlotsUsed = 0;
         uint32_t jointDataSlotsUsed = 0;
+        uint32_t paintDataSlotsUsed = 0;
         uint32_t frameDataSlotsUsed = 0;
         // Byte offset of the view currently being recorded; every draw in that view binds it.
         VkDeviceSize frameDataOffset = 0;
@@ -1177,6 +1352,7 @@ private:
     VkSampler attachmentSampler = VK_NULL_HANDLE;
     VkDeviceSize drawDataStride = 0;
     VkDeviceSize jointDataStride = 0;
+    VkDeviceSize paintDataStride = 0;
     VkDeviceSize frameDataStride = 0;
     VkSurfaceFormatKHR surfaceFormat{};
     VkExtent2D swapchainExtent{};
@@ -1213,13 +1389,36 @@ private:
     mutable std::vector<
         std::pair<std::pair<std::array<PostProcessBinding, postProcessInputCount>, unsigned int>, VkDescriptorSet>>
         attachmentSets;
-    // Cascade sets, keyed by the whole tuple of depth image ids and the occlusion image bound
-    // beside them. A vector rather than a map because there are two live entries in practice — the
-    // shading view's and the fallback — and `<map>` in a second global module fragment breaks the
-    // sandbox link on clang-19 (see CLAUDE.md).
-    mutable std::vector<
-        std::pair<std::pair<std::array<unsigned int, shadowCascadeCount>, unsigned int>, VkDescriptorSet>>
-        shadowSets;
+    // Cascade sets, keyed by the whole tuple of depth image ids and the two images bound beside
+    // them — the occlusion and the behind copy. A vector rather than a map because there are two
+    // live entries in practice — the shading view's and the fallback — and `<map>` in a second
+    // global module fragment breaks the sandbox link on clang-19 (see CLAUDE.md).
+    struct ShadowSetKey
+    {
+        std::array<unsigned int, shadowCascadeCount> cascades;
+        unsigned int occlusion;
+        unsigned int behind;
+
+        [[nodiscard]] bool operator==(const ShadowSetKey&) const = default;
+    };
+    mutable std::vector<std::pair<ShadowSetKey, VkDescriptorSet>> shadowSets;
+    // The behind copy each shading camera's blended draws sample, keyed by the colour attachment it
+    // copies: destroyImageResource retires the copy with its attachment, so a resize takes both.
+    // Renderer-internal rather than an FboAttachment because nothing renders into it — it is
+    // written by blit and owns nothing a framebuffer would.
+    mutable std::unordered_map<unsigned int, unsigned int> sceneBehindImages;
+    // Where each Scene camera stood when it last recorded a shading view, and on what simulated
+    // instant: the difference is the camera's own velocity, which the weather push constant
+    // carries so a streak can smear along the apparent fall. Keyed by the camera's address, which
+    // is stable — Scene::cameras is an add-only deque — and Scene-role cameras only, because the
+    // prepass and probe views are built on the stack and a recycled stack address is not a camera.
+    // A function of tick-driven positions, so captures reproduce.
+    struct CameraTrack
+    {
+        glm::vec3 position;
+        double simulationTime;
+    };
+    std::unordered_map<const Camera*, CameraTrack> cameraTracks;
     std::unordered_map<std::string, VkPipeline> scenePipelines;
     // Fullscreen pipelines that render into an offscreen attachment, keyed by shader id and
     // the target's format: the format comes from FboAttachment::internalFormat, which is not
@@ -1281,6 +1480,10 @@ private:
     // and endFrame is the one place that submits and presents.
     bool frameOpen = false;
     bool swapchainPassRecorded = false;
+    // The simulated instant this frame renders, in seconds, as beginFrame was told it. Every view
+    // uploads it into the frame block, which is what makes shader time per-frame and deterministic
+    // under capture rather than a reading of any clock of this backend's own.
+    double frameSimulationTime = 0.0;
     uint32_t currentImageIndex = 0;
     std::optional<PresentPass> lastPresentPass;
     // Submissions this backend has issued, ever. It is the clock the retirement queue is keyed
@@ -1300,7 +1503,7 @@ public:
     [[nodiscard]] std::expected<void, std::string> init() override;
     void setViewport(int width, int height) override;
 
-    [[nodiscard]] bool beginFrame() override;
+    [[nodiscard]] bool beginFrame(double simulationTime) override;
     void recordView(Scene& scene, Camera& camera, float delta) override;
     void recordProbeCapture(Scene& scene, LightProbe& probe) override;
     void recordAmbientOcclusion(Scene& scene, Camera& camera, float delta) override;
@@ -1321,6 +1524,7 @@ public:
     [[nodiscard]] GpuResourceCensus gpuResourceCensus() const override;
 
     [[nodiscard]] std::expected<void, std::string> captureFrame(const std::string& path) override;
+    [[nodiscard]] std::expected<void, std::string> captureBuffers(const std::string& pathPrefix) override;
 
 private:
     void createInstance();
@@ -1362,12 +1566,37 @@ private:
     [[nodiscard]] ShIrradiance projectProbeIrradiance() const;
     // The scene's probes as the frame block carries them, written into `frameData`.
     void uploadProbes(const Scene& scene, FrameDataUbo& frameData) const;
+    // Everything recordSceneBehindCopy needs to suspend the pass, copy the opaque colour into the
+    // behind chain and resume: the two image ids, the rendering info to re-begin with, and the
+    // attachment structs it names — whose load ops become LOAD, because the resumed pass continues
+    // over what the first half drew. `depthStoreAfterCopy` is the store policy the first half
+    // overrode: a split pass must store its depth for the blended draws to test against, but the
+    // resumed half owes nothing beyond what the unsplit pass stored.
+    struct SceneBehindCopy
+    {
+        unsigned int colorImageId;
+        unsigned int behindImageId;
+        VkRenderingInfo* renderingInfo;
+        VkRenderingAttachmentInfo* colorAttachment;
+        VkRenderingAttachmentInfo* depthAttachment;
+        VkAttachmentStoreOp depthStoreAfterCopy;
+    };
+    // Ends the current rendering block, blits the opaque colour into the behind image and its mip
+    // chain, and re-begins rendering loading what is already there. Called between the opaque and
+    // blended draws of a shading view, and only when there are blended draws to order it against.
+    void recordSceneBehindCopy(const SceneBehindCopy& copy);
+    // The behind image for a colour attachment, created on first use at the attachment's size with
+    // sceneBehindMipCount levels. Returns the dummy texture when the attachment is unknown, which
+    // shades as "nothing behind" rather than failing the view.
+    [[nodiscard]] unsigned int sceneBehindImage(unsigned int colorImageId);
     // The entity/mesh/primitive walk both a camera's view and a probe's face record. `staticOnly`
     // is what a probe capture adds: a car baked into the environment goes on lighting the street
-    // from wherever it was parked when the capture ran.
+    // from wherever it was parked when the capture ran. `behindCopy` is non-null only for a shading
+    // camera's view, and is what splits the pass between the opaque draws and the blended ones.
     [[nodiscard]] unsigned int recordSceneDraws(Scene& scene, const Camera& camera, float delta, bool shading,
                                                 bool staticOnly, unsigned int viewShaderId, VkFormat colorFormat,
-                                                VkFormat depthFormat, VkDescriptorSet shadowDescriptors);
+                                                VkFormat depthFormat, VkDescriptorSet shadowDescriptors,
+                                                const SceneBehindCopy* behindCopy);
     [[nodiscard]] unsigned int createProbeImage(uint32_t resolution, uint32_t mipLevels, uint32_t layers,
                                                 VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                                                 bool cube) const;
@@ -1385,8 +1614,13 @@ private:
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
                     const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
-                    VkFormat colorFormat, VkFormat depthFormat, VkDescriptorSet shadowDescriptors, bool doubleSided,
-                    bool depthWrite);
+                    VkDeviceSize paintOffset, VkFormat colorFormat, VkFormat depthFormat,
+                    VkDescriptorSet shadowDescriptors, bool doubleSided, bool depthWrite);
+    // One slot of the paint ring, filled from a renderable's own paint. Allocated **per renderable
+    // per view** rather than per draw, which is the shape the data actually has: paint describes a
+    // car, so all eight hundred of a car's primitives read one block. Per draw it was not merely
+    // wasteful — one car exhausted a thousand-slot ring in a single frame and drew itself unpainted.
+    [[nodiscard]] VkDeviceSize writePaintSlot(const Paint& paint);
     // One fullscreen pass: bind the inputs, push the parameters, draw the oversized triangle. The
     // inputs are expected to be in SHADER_READ_ONLY_OPTIMAL already — the caller moves them,
     // because it is the caller that knows whether one of them is a level of the image being
@@ -1424,7 +1658,7 @@ private:
     // statically uses must have a descriptor whether or not the shader's cascade count says to
     // read it.
     [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
-                                            unsigned int occlusionImageId);
+                                            unsigned int occlusionImageId, unsigned int behindImageId);
     // The image a shading view samples its occlusion from, or the 1x1 white one when it gathers
     // none. Not const: the fallback is created on first use, as every other dummy here is.
     [[nodiscard]] unsigned int ambientOcclusionImage(const Camera& camera);
@@ -1483,6 +1717,7 @@ private:
     void releaseShaderObject(unsigned int shaderId);
     [[nodiscard]] std::optional<VkDeviceSize> allocateDrawDataSlot();
     [[nodiscard]] std::optional<VkDeviceSize> allocateJointDataSlot();
+    [[nodiscard]] std::optional<VkDeviceSize> allocatePaintDataSlot();
     [[nodiscard]] std::optional<VkDeviceSize> allocateFrameDataSlot();
 };
 
@@ -1635,6 +1870,12 @@ VulkanRenderer::~VulkanRenderer()
         {
             vmaDestroyBuffer(allocator, frame.drawDataBuffer, frame.drawDataAllocation);
         }
+        if (frame.paintDataBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(allocator, frame.paintDataBuffer, frame.paintDataAllocation);
+            frame.paintDataBuffer = VK_NULL_HANDLE;
+        }
+
         if (frame.jointDataBuffer != VK_NULL_HANDLE)
         {
             vmaDestroyBuffer(allocator, frame.jointDataBuffer, frame.jointDataAllocation);
@@ -2257,7 +2498,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
                                                                   VK_SHADER_STAGE_VERTEX_BIT, nullptr},
                                      VkDescriptorSetLayoutBinding{jointDataBinding,
                                                                   VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
-                                                                  VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
+                                                                  VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+                                     // The fragment stage, unlike the two above: paint is shading
+                                     // rather than transform, and no vertex stage reads it.
+                                     VkDescriptorSetLayoutBinding{paintDataBinding,
+                                                                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+                                                                  VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     drawDataSetLayout = makeSetLayout(drawBindings);
 
     // Scene set 3: one combined sampler per cascade, read by the fragment stage only. A set of
@@ -2275,6 +2521,11 @@ void VulkanRenderer::createDescriptorInfrastructure()
         VkDescriptorSetLayoutBinding{shadowMapBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, shadowCascadeCount,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         VkDescriptorSetLayoutBinding{ambientOcclusionBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // Binding 2 is the behind copy — the opaque scene as it stood when the blended draws
+        // started — and it lives here for the occlusion image's reason word for word: per camera
+        // pass, produced earlier in this frame, readable only by a view that shades.
+        VkDescriptorSetLayoutBinding{sceneBehindBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     shadowSetLayout = makeSetLayout(shadowBindings);
 
@@ -2366,6 +2617,7 @@ void VulkanRenderer::createDescriptorInfrastructure()
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
     drawDataStride = (sizeof(DrawDataUbo) + alignment - 1) / alignment * alignment;
     jointDataStride = (sizeof(JointDataUbo) + alignment - 1) / alignment * alignment;
+    paintDataStride = (sizeof(PaintDataUbo) + alignment - 1) / alignment * alignment;
     frameDataStride = (sizeof(FrameDataUbo) + alignment - 1) / alignment * alignment;
 
     for (auto& frame : frames)
@@ -2379,6 +2631,8 @@ void VulkanRenderer::createDescriptorInfrastructure()
         // still one the pipeline may statically use and must therefore address real memory.
         createHostVisibleUniformBuffer(jointDataStride * jointDataRingSlots, frame.jointDataBuffer,
                                        frame.jointDataAllocation, frame.jointDataMapped);
+        createHostVisibleUniformBuffer(paintDataStride * paintDataRingSlots, frame.paintDataBuffer,
+                                       frame.paintDataAllocation, frame.paintDataMapped);
 
         const std::array setLayouts = {frameDataSetLayout, drawDataSetLayout};
         std::array<VkDescriptorSet, 2> sets{};
@@ -2398,8 +2652,11 @@ void VulkanRenderer::createDescriptorInfrastructure()
         // Likewise one palette, on its own ring: a skinned draw walks it and every other draw
         // binds offset zero.
         const VkDescriptorBufferInfo jointDataInfo{frame.jointDataBuffer, 0, sizeof(JointDataUbo)};
+        // And one car's paint, on a ring of its own: a painted draw walks it and every other draw
+        // binds offset zero.
+        const VkDescriptorBufferInfo paintDataInfo{frame.paintDataBuffer, 0, sizeof(PaintDataUbo)};
 
-        std::array<VkWriteDescriptorSet, 3> writes{};
+        std::array<VkWriteDescriptorSet, 4> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = frame.frameDataSet;
         writes[0].dstBinding = 0;
@@ -2418,6 +2675,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[2].pBufferInfo = &jointDataInfo;
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = frame.drawDataSet;
+        writes[3].dstBinding = paintDataBinding;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        writes[3].pBufferInfo = &paintDataInfo;
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
@@ -2451,8 +2714,12 @@ void VulkanRenderer::recreateSwapchainIfNeeded()
     recreateNeeded = false;
 }
 
-bool VulkanRenderer::beginFrame()
+bool VulkanRenderer::beginFrame(const double simulationTime)
 {
+    // Held for the frame: every view this frame records uploads the same instant, which is what
+    // makes anything temporal in a shader per-frame rather than per-view.
+    frameSimulationTime = simulationTime;
+
     recreateSwapchainIfNeeded();
     if (swapchain == VK_NULL_HANDLE)
     {
@@ -2470,6 +2737,7 @@ bool VulkanRenderer::beginFrame()
     // the views and draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
     frame.jointDataSlotsUsed = 0;
+    frame.paintDataSlotsUsed = 0;
     frame.frameDataSlotsUsed = 0;
     frame.frameDataOffset = 0;
 
@@ -2586,6 +2854,7 @@ bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
     ensure(vmaFlushAllocation(allocator, frame.frameDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
     ensure(vmaFlushAllocation(allocator, frame.drawDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
     ensure(vmaFlushAllocation(allocator, frame.jointDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
+    ensure(vmaFlushAllocation(allocator, frame.paintDataAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
     VkSemaphoreSubmitInfo waitSemaphoreInfo{};
     waitSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -2798,7 +3067,13 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
                                                 .pass = glm::vec4(0.0f, 1.0f, static_cast<float>(swapchainExtent.width),
                                                                   static_cast<float>(swapchainExtent.height)),
                                                 .view = glm::vec4(0.0f),
-                                                .effect = parameters};
+                                                .effect = parameters,
+                                                // Zero, like the projection above: the present pass
+                                                // stands nowhere and draws no weather.
+                                                .viewRight = glm::vec4(0.0f),
+                                                .viewUp = glm::vec4(0.0f),
+                                                .viewBack = glm::vec4(0.0f),
+                                                .weather = glm::vec4(0.0f)};
     recordFullScreenPass(presentInputs, lookupTableImageId, swapchainImageViews[currentImageIndex], swapchainExtent,
                          shader->second.swapchainTargetPipeline, pushConstants);
 
@@ -2963,6 +3238,21 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
     uploadProbes(scene, frameData);
+    uploadFog(scene.fog, frameData);
+    // The rain through this view's own scale — a sheltered view (Camera::rainScale) shades its
+    // surfaces dry while the weather push constant below stays the scene's, so the streaks outside
+    // a dry cabin still fall.
+    frameData.timeRain = glm::vec4(static_cast<float>(frameSimulationTime), scene.rain * camera.rainScale,
+                                   scene.rainMotion.x, scene.rainMotion.y);
+    frameData.rainWind = glm::vec4(scene.rainForward, 0.0f);
+    frameData.rainBody = glm::vec4(scene.rainBodyUp, 0.0f);
+    frameData.wiperArcA = scene.wipers.bladeA;
+    frameData.wiperArcB = scene.wipers.bladeB;
+    frameData.wiperSweep = glm::vec4(scene.wipers.parkAngle.x, scene.wipers.sweepAngle.x, scene.wipers.parkAngle.y,
+                                     scene.wipers.sweepAngle.y);
+    frameData.wiperTiming = glm::vec4(scene.wipers.cyclePeriod, scene.wipers.sweepSeconds, scene.wipers.cycleStart,
+                                      scene.wipers.bladeHalfWidth);
+    frameData.wiperPane = glm::vec4(scene.wipers.paneAspect, 0.0f, 0.0f, 0.0f);
 
     // A cascade is a producer and samples nothing; only the views that shade read the maps, and a
     // cascade sampling its own attachment while rendering into it would be a feedback loop.
@@ -2971,8 +3261,21 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // The occlusion this view samples rides in the same set, so it is resolved with the cascades and
     // falls back with them: a view that gathers none binds white, and white is no occlusion at all.
     const auto occlusionImage = shading ? ambientOcclusionImage(camera) : dummyTexture();
+    // Likewise the behind copy, resolved up front so the one set this view binds already names it:
+    // the image only gains its contents mid-pass, but a descriptor names a view, not contents, and
+    // nothing samples it before the copy runs — the opaque shaders never declare the binding. An
+    // opaque-only view can never split — the copy runs between the halves and it has only one — so
+    // it binds the dummy rather than allocating a full-resolution chain nothing will ever fill.
+    const auto behindImage =
+        shading && hasColor && hasDepth && camera.partition != DrawPartition::OpaqueOnly
+            ? sceneBehindImage(colorImageId.value())
+            : dummyTexture();
+    // Splitting is only worth anything when there is a real behind image to fill; a view whose
+    // colour attachment could not be resolved shades over the white dummy exactly as a view with
+    // no occlusion does.
+    const auto splitForBehind = shading && hasColor && hasDepth && behindImage != dummyTexture();
     auto shadowDescriptors =
-        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), occlusionImage) : VK_NULL_HANDLE;
+        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), occlusionImage, behindImage) : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -3048,21 +3351,29 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // what it writes is geometry, not colour, and every consumer of it reads a zero distance as "the
     // camera saw nothing here". Cleared to white, the sky would arrive at the gather as a surface
     // one unit in front of the eye — which is not a subtle error but it is a plausible-looking one.
-    const auto& clear = camera.role == CameraRole::DepthNormalPrepass ? prepassClearColour : clearColour;
+    // A camera's own clearColour wins over both: a layer buffer clears to transparent black because
+    // where nothing drew there must be nothing for the composite to lay over.
+    const auto& contractClear = camera.role == CameraRole::DepthNormalPrepass ? prepassClearColour : clearColour;
+    const auto clear =
+        camera.clearColour.value_or(glm::vec4(contractClear[0], contractClear[1], contractClear[2], contractClear[3]));
 
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView = colorImage.view;
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // A camera that continues a frame begins from what the previous view left; every other camera
+    // clears. The contents are defined because the view that filled them stored and the tracked
+    // transitions in between preserve — only a transition out of UNDEFINED discards, and a loading
+    // camera's target was written, and therefore tracked, earlier in this same frame.
+    colorAttachment.loadOp = camera.loadColour ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = VkClearColorValue{{clear[0], clear[1], clear[2], clear[3]}};
+    colorAttachment.clearValue.color = VkClearColorValue{{clear.x, clear.y, clear.z, clear.w}};
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     depthAttachment.imageView = depthImage.view;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.loadOp = camera.loadDepth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     // Kept only where something reads it, which on this engine is exactly the shadow cascades. A
     // depth attachment is given a sampler when, and only when, its FboAttachment asked for a
     // comparison — so the handle being null *is* the statement that nothing samples this buffer,
@@ -3075,8 +3386,18 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // cost — forces a depth decompression when the image is moved to a read layout afterwards. The
     // move itself stays: the descriptor written for it promises that layout whether or not the
     // shader reads it, and a mismatch there is undefined even for a binding nothing samples.
-    depthAttachment.storeOp =
-        depthImage.sampler != VK_NULL_HANDLE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // A split view is the exception to the policy above, for its first half only: ending the
+    // rendering block between the opaque and blended draws makes the store real — the resumed half
+    // loads this depth and the blended draws test against it — so a view that may split stores
+    // whether or not anything samples the buffer afterwards. recordSceneBehindCopy puts the policy
+    // store op back for the resumed half, which is the half the comment above was written about.
+    // `keepDepth` joins the sampler in the policy rather than the split exception: a layered
+    // frame's depth is consumed by the *next view's* rasteriser, which no sampler handle can prove,
+    // so the camera states it and it holds for the resumed half of a split too.
+    const auto depthStorePolicy = depthImage.sampler != VK_NULL_HANDLE || camera.keepDepth
+                                      ? VK_ATTACHMENT_STORE_OP_STORE
+                                      : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.storeOp = splitForBehind ? VK_ATTACHMENT_STORE_OP_STORE : depthStorePolicy;
     depthAttachment.clearValue.depthStencil = VkClearDepthStencilValue{1.0f, 0};
 
     // A camera with no colour attachment renders colour-less and one with no depth attachment
@@ -3113,9 +3434,19 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     const VkRect2D scissor{VkOffset2D{0, 0}, extent};
     vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
 
+    // Handed down rather than acted on here because only the draw walk knows whether this view has
+    // blended draws at all: a view with none never splits, and the whole pass records exactly as it
+    // did before the behind copy existed.
+    const SceneBehindCopy behindCopy{.colorImageId = hasColor ? colorImageId.value() : 0u,
+                                     .behindImageId = behindImage,
+                                     .renderingInfo = &renderingInfo,
+                                     .colorAttachment = &colorAttachment,
+                                     .depthAttachment = &depthAttachment,
+                                     .depthStoreAfterCopy = depthStorePolicy};
+
     const auto recordedDraws =
         recordSceneDraws(scene, camera, delta, shading, false, viewShader != nullptr ? viewShader->gpuResourceId : 0u,
-                         colorFormat, depthFormat, shadowDescriptors);
+                         colorFormat, depthFormat, shadowDescriptors, splitForBehind ? &behindCopy : nullptr);
 
     vkCmdEndRendering(frame.commandBuffer);
 
@@ -3133,6 +3464,25 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     if (hasDepth)
     {
         transitionTracked(frame.commandBuffer, depthImageId.value(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    // The camera's own velocity, from where it stood on the last shading view it recorded. Zero on
+    // the first frame and on any camera that holds still, which is every gate capture's.
+    auto cameraVelocity = glm::vec3(0.0f);
+    if (camera.role == CameraRole::Scene)
+    {
+        const auto [track, firstVisit] =
+            cameraTracks.try_emplace(&camera, CameraTrack{camera.position, frameSimulationTime});
+        if (!firstVisit)
+        {
+            const auto elapsed = frameSimulationTime - track->second.simulationTime;
+            if (elapsed > 0.0)
+            {
+                cameraVelocity = (camera.position - track->second.position) / static_cast<float>(elapsed);
+            }
+
+            track->second = CameraTrack{camera.position, frameSimulationTime};
+        }
     }
 
     for (const auto& postProcessKey : camera.postProcesses)
@@ -3160,13 +3510,27 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         inputs.reserve(postProcess->inputs.size());
         for (const auto& input : postProcess->inputs)
         {
-            const auto* attachment = memoryStorageService.bufferAttachments.find(input.attachment);
-            if (attachment == nullptr || !attachment->gpuResourceId.has_value())
+            // A picture rather than something this frame drew — uploaded on first use exactly as the
+            // colour grade is, and level zero because a plate has no chain worth walking. It is
+            // resolved first because when it is set it *is* the input, and `attachment` is then a
+            // default-constructed handle naming nothing.
+            std::optional<unsigned int> imageId;
+            if (input.texture.has_value())
+            {
+                imageId = uploadTexture(input.texture.value());
+            }
+            else if (const auto* attachment = memoryStorageService.bufferAttachments.find(input.attachment);
+                     attachment != nullptr)
+            {
+                imageId = attachment->gpuResourceId;
+            }
+
+            if (!imageId.has_value())
             {
                 continue;
             }
 
-            const auto image = imageResources.find(attachment->gpuResourceId.value());
+            const auto image = imageResources.find(imageId.value());
             if (image == imageResources.end())
             {
                 continue;
@@ -3176,7 +3540,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             // descriptor cannot end up naming different subresources: one of them falling back to
             // the whole image while the other moved a level is exactly the layout mismatch this
             // per-level bookkeeping exists to prevent.
-            inputs.push_back(PostProcessBinding{.gpuResourceId = attachment->gpuResourceId.value(),
+            inputs.push_back(PostProcessBinding{.gpuResourceId = imageId.value(),
                                                 .level = std::min(input.level, image->second.mipLevels - 1u)});
         }
 
@@ -3262,6 +3626,10 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                                          ? std::tan(glm::radians(camera.fieldOfView) * 0.5f)
                                          : 0.0f;
 
+        // The view transform run backwards, for the passes that work in the world: the rotation is
+        // orthonormal, so its transpose is its inverse and nothing is inverted per pass.
+        const auto viewToWorld = glm::transpose(glm::mat3(camera.modelViewMatrix));
+
         const FullscreenPushConstants parameters{
             .tone =
                 glm::vec4(camera.exposure, camera.toneCurve.contrast, camera.toneCurve.toe, camera.toneCurve.shoulder),
@@ -3269,7 +3637,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                               static_cast<float>(targetExtent.width), static_cast<float>(targetExtent.height)),
             .view = glm::vec4(tanHalfVertical * camera.aspectRatio, tanHalfVertical, camera.nearClippingPlane,
                               camera.farClippingPlane),
-            .effect = postProcess->parameters};
+            .effect = postProcess->parameters,
+            .viewRight = glm::vec4(viewToWorld[0], camera.position.x),
+            .viewUp = glm::vec4(viewToWorld[1], camera.position.y),
+            .viewBack = glm::vec4(viewToWorld[2], camera.position.z),
+            .weather =
+                glm::vec4(static_cast<float>(frameSimulationTime), scene.rain, cameraVelocity.x, cameraVelocity.z)};
 
         // Every pass before the present works in radiance, where a grade has no meaning.
         recordFullScreenPass(inputs, neutralLookupTable(), targetView, targetExtent, pipeline, parameters);
@@ -3306,7 +3679,8 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
 unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera, const float delta, const bool shading,
                                               const bool staticOnly, const unsigned int viewShaderId,
                                               const VkFormat colorFormat, const VkFormat depthFormat,
-                                              const VkDescriptorSet shadowDescriptors)
+                                              const VkDescriptorSet shadowDescriptors,
+                                              const SceneBehindCopy* behindCopy)
 {
     // Same hoisting rule the GL pass had: every handle is resolved at the outermost loop where it
     // is constant and read through for the nest below, so the pass costs
@@ -3342,6 +3716,9 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
         const MeshPrimitive* primitive;
         Resource<Material> materialKey;
         const std::vector<glm::mat4>* joints;
+        // The slot this renderable's paint was written into, taken once for the whole renderable
+        // before its primitives were walked.
+        VkDeviceSize paintOffset;
         glm::mat4 entityModelMatrix;
         unsigned int shaderId;
         float viewDepth;
@@ -3366,6 +3743,16 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
             continue;
         }
 
+        // A camera draws the layers its mask names, which is the whole of how a layered frame
+        // splits: everything is born on layer 1 and the default mask draws every layer, so a scene
+        // that never states layers is unchanged. The occlusion prepass arrives here with its mask
+        // forced to every layer whatever its shading camera drew (recordAmbientOcclusion carries
+        // why: the contact shadow under a car is exactly the pixel where two layers meet).
+        if ((camera.layerMask & entity.layers) == 0u)
+        {
+            continue;
+        }
+
         const auto* model = memoryStorageService.models.find(entity.model);
         const auto* instanceShader = memoryStorageService.shaders.find(entity.shader);
         if (model == nullptr || instanceShader == nullptr)
@@ -3380,6 +3767,12 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
         // materials live in shared storage, so two renderables built from one model would
         // otherwise restyle each other.
         const auto shaderId = viewShaderId != 0 ? viewShaderId : instanceShader->gpuResourceId;
+
+        // This renderable's paint, written once here and read by every primitive it is about to
+        // draw. Per renderable and not per draw, because that is the scope the data has: a car is
+        // one colour, and eight hundred body panels asking the ring for eight hundred copies of it
+        // exhausted a thousand slots in one frame and drew the car unpainted.
+        const auto paintOffset = writePaintSlot(entity.paint);
 
         // Around the entity's submission, which on this backend is where its commands are
         // recorded: the same point in the frame GL calls them at.
@@ -3404,7 +3797,19 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
             // the decals — skid marks, kerb overlays, painted lines — that must be drawn and must
             // not cast, because each sits a millimetre above the surface it decorates and would
             // otherwise print a dark ghost of its own outline onto it.
-            if (!shading && !mesh->castsShadow)
+            //
+            // **The cascades only, and that is the whole of the distinction.** `castsShadow` is a
+            // statement about casting, and the occlusion prepass is not a shadow: it records the
+            // geometry a surface is *made of* so the gather can measure how much sky each pixel can
+            // see. Tested against `!shading` this also emptied the prepass — on this circuit the
+            // road itself is flagged non-casting along with its decals, so the tarmac was absent
+            // from the occlusion buffer entirely while the posts and trunks standing on it were
+            // not. The gather then had an occluder with no ground around it and printed the post's
+            // own outline onto road it could not see, which is the "I can see the tree trunk
+            // through the road" that was reported from the seat and took six diagnoses to find.
+            // Measured on that view: the prepass went from 540 draws covering 36.5% of the frame to
+            // 582 covering 79.0%, and its nearest recorded surface from 3.75 m to 0.33 m.
+            if (camera.role == CameraRole::ShadowCascade && !mesh->castsShadow)
             {
                 continue;
             }
@@ -3447,6 +3852,24 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                     diagnostics.record(FrameDiagnostic::PrimitiveWithoutMaterial, [&] { return "mesh " + mesh->name; });
 
                     continue;
+                }
+
+                // A material that *declared* a shader is drawn with it, and this is the one place a
+                // material may decide a pipeline. `Material::shader` still may not — it holds the
+                // renderable's own choice written through as a default, and picking from it would let
+                // one car restyle every other car built from the same model. A declared shader is the
+                // asset's, so every renderable built from that model wants it equally.
+                //
+                // A view with an override still wins over both: a shadow cascade draws depth, and
+                // what a surface would rather be shaded by does not come into it.
+                auto primitiveShaderId = shaderId;
+                if (viewShaderId == 0 && material->declaredShaderHandle.has_value())
+                {
+                    if (const auto* declared = memoryStorageService.shaders.find(material->declaredShaderHandle.value());
+                        declared != nullptr)
+                    {
+                        primitiveShaderId = declared->gpuResourceId;
+                    }
                 }
 
                 if (!primitive.gpuVao.has_value())
@@ -3499,14 +3922,23 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 // their shaders carry no alpha at all — so only a shading view defers.
                 if (shading && !material->opaque)
                 {
+                    // A view that draws only the opaque half of the frame leaves every blended draw
+                    // to the view that finishes it, where the global back-to-front sort still holds
+                    // across layers. See DrawPartition.
+                    if (camera.partition == DrawPartition::OpaqueOnly)
+                    {
+                        continue;
+                    }
+
                     const auto centreInView =
                         camera.modelViewMatrix * entityModelMatrix * glm::vec4(primitive.boundsCentre, 1.0f);
 
                     blendedDraws.push_back(DeferredDraw{.primitive = &primitive,
                                                         .materialKey = primitive.material.value(),
                                                         .joints = &joints,
+                                                        .paintOffset = paintOffset,
                                                         .entityModelMatrix = entityModelMatrix,
-                                                        .shaderId = shaderId,
+                                                        .shaderId = primitiveShaderId,
                                                         // The view looks down -z, so the distance
                                                         // in front of the eye is -z (the same
                                                         // convention the shadow lookup reads).
@@ -3515,9 +3947,17 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                     continue;
                 }
 
-                recordDraw(primitive, primitive.material.value(), *material, shaderId, entityModelMatrix, camera,
-                           clipCorrectedViewProjection, joints, colorFormat, depthFormat, shadowDescriptors, staticOnly,
-                           true);
+                // The other half of the same split: the view that finishes a layered frame records
+                // the blended draws alone. It still walks the opaque primitives above for the side
+                // effects a view owes — the upload, the palette, the hooks — and records none.
+                if (shading && camera.partition == DrawPartition::BlendedOnly)
+                {
+                    continue;
+                }
+
+                recordDraw(primitive, primitive.material.value(), *material, primitiveShaderId, entityModelMatrix, camera,
+                           clipCorrectedViewProjection, joints, paintOffset, colorFormat, depthFormat,
+                           shadowDescriptors, staticOnly, true);
                 recordedDraws++;
             }
         }
@@ -3533,6 +3973,15 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
     // swapping between frames as the camera moves and the comparison flips.
     std::stable_sort(blendedDraws.begin(), blendedDraws.end(), [](const DeferredDraw& left, const DeferredDraw& right)
                      { return left.viewDepth > right.viewDepth; });
+
+    // The seam the behind copy exists for: everything opaque is in the attachment and nothing has
+    // blended over it yet, so what the copy captures is exactly what every blended draw below is
+    // about to be composited onto. Skipped when this view has nothing blended — the copy would
+    // record a pause, a blit and a resume that no draw ever reads.
+    if (behindCopy != nullptr && !blendedDraws.empty())
+    {
+        recordSceneBehindCopy(*behindCopy);
+    }
 
     for (const auto& deferred : blendedDraws)
     {
@@ -3551,12 +4000,144 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
 
         // No depth write: these are the blended draws, and the sort above is what orders them.
         recordDraw(*deferred.primitive, deferred.materialKey, *material, deferred.shaderId, deferred.entityModelMatrix,
-                   camera, clipCorrectedViewProjection, *deferred.joints, colorFormat, depthFormat, shadowDescriptors,
-                   staticOnly, false);
+                   camera, clipCorrectedViewProjection, *deferred.joints, deferred.paintOffset, colorFormat,
+                   depthFormat, shadowDescriptors, staticOnly, false);
         recordedDraws++;
     }
 
     return recordedDraws;
+}
+
+void VulkanRenderer::recordSceneBehindCopy(const SceneBehindCopy& copy)
+{
+    auto& frame = frames[frameIndex];
+    const auto colour = imageResources.find(copy.colorImageId);
+    const auto behind = imageResources.find(copy.behindImageId);
+    if (colour == imageResources.end() || behind == imageResources.end())
+    {
+        return;
+    }
+
+    // Everything opaque is in the attachment; seal the block so the copy may read it.
+    vkCmdEndRendering(frame.commandBuffer);
+
+    transitionTracked(frame.commandBuffer, copy.colorImageId, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transitionTracked(frame.commandBuffer, copy.behindImageId, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    const auto levelExtent = [](const uint32_t size, const uint32_t mip)
+    { return static_cast<int32_t>(std::max(size >> mip, 1u)); };
+
+    // Level 0 is an exact copy — identical extents, so the filter never runs and NEAREST says so.
+    VkImageBlit blit{};
+    blit.srcSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = VkOffset3D{levelExtent(colour->second.width, 0), levelExtent(colour->second.height, 0), 1};
+    blit.dstSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = VkOffset3D{levelExtent(behind->second.width, 0), levelExtent(behind->second.height, 0), 1};
+    vkCmdBlitImage(frame.commandBuffer, colour->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   behind->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+    // The chain, by blit, exactly as the probe prefilter halves its scratch cube: each level is
+    // written as a destination and then read as the next one's source, which is what the per-mip
+    // layout tracking exists to say honestly.
+    for (auto mip = 1u; mip < behind->second.mipLevels; mip++)
+    {
+        transitionTrackedLevel(frame.commandBuffer, copy.behindImageId, mip - 1,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkImageBlit level{};
+        level.srcSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, 0, 1};
+        level.srcOffsets[1] =
+            VkOffset3D{levelExtent(behind->second.width, mip - 1), levelExtent(behind->second.height, mip - 1), 1};
+        level.dstSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+        level.dstOffsets[1] =
+            VkOffset3D{levelExtent(behind->second.width, mip), levelExtent(behind->second.height, mip), 1};
+        vkCmdBlitImage(frame.commandBuffer, behind->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       behind->second.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &level, VK_FILTER_LINEAR);
+    }
+
+    transitionTracked(frame.commandBuffer, copy.behindImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transitionTracked(frame.commandBuffer, copy.colorImageId, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    // Resume over what the first half drew. Dynamic state — the viewport and scissor set at the
+    // top of the pass — is command-buffer state and survives the boundary; pipelines and
+    // descriptor sets are bound per draw regardless.
+    copy.colorAttachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    copy.depthAttachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    copy.depthAttachment->storeOp = copy.depthStoreAfterCopy;
+    vkCmdBeginRendering(frame.commandBuffer, copy.renderingInfo);
+}
+
+unsigned int VulkanRenderer::sceneBehindImage(const unsigned int colorImageId)
+{
+    if (const auto existing = sceneBehindImages.find(colorImageId); existing != sceneBehindImages.end())
+    {
+        return existing->second;
+    }
+
+    const auto source = imageResources.find(colorImageId);
+    if (source == imageResources.end())
+    {
+        return dummyTexture();
+    }
+
+    const auto width = source->second.width;
+    const auto height = source->second.height;
+    const auto levels = std::clamp(sceneBehindMipCount, 1u, mipLevelCount(width, height));
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = source->second.format;
+    imageInfo.extent = VkExtent3D{width, height, 1};
+    imageInfo.mipLevels = levels;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // Written only ever by blit — level 0 from the colour attachment, the chain from itself — and
+    // read only ever by a sampler, so nothing here is a render target.
+    imageInfo.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocationCreateInfo{};
+    allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    ensure(vmaCreateImage(allocator, &imageInfo, &allocationCreateInfo, &image, &allocation, nullptr),
+           "vmaCreateImage");
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = source->second.format;
+    viewInfo.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+
+    VkImageView view = VK_NULL_HANDLE;
+    ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
+
+    // No sampler of its own: the shared attachment sampler is trilinear with an open LOD clamp,
+    // which is exactly what a textureLod over the chain wants.
+    const auto id = nextResourceId++;
+    imageResources.emplace(id, ImageResource{.image = image,
+                                             .allocation = allocation,
+                                             .view = view,
+                                             .sampler = VK_NULL_HANDLE,
+                                             .format = source->second.format,
+                                             .mipLevels = levels,
+                                             .width = width,
+                                             .height = height,
+                                             .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                             .layouts = std::vector<VkImageLayout>(levels, VK_IMAGE_LAYOUT_UNDEFINED),
+                                             .levelViews = {}});
+
+    sceneBehindImages.emplace(colorImageId, id);
+
+    logger.info("Vulkan scene-behind image {} ready: {}x{}, {} level(s), copying colour attachment {}", id, width,
+                height, levels, colorImageId);
+    return id;
 }
 
 // The material arrives already resolved — both the handle, which keys the descriptor set cache,
@@ -3565,7 +4146,7 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
                                 const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
-                                const VkFormat colorFormat, const VkFormat depthFormat,
+                                const VkDeviceSize paintOffset, const VkFormat colorFormat, const VkFormat depthFormat,
                                 const VkDescriptorSet shadowDescriptors, const bool doubleSided, const bool depthWrite)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
@@ -3707,11 +4288,13 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
                          bound->second.indexType);
 
     const std::array descriptorSets = {frame.frameDataSet, set, frame.drawDataSet, shadowDescriptors};
-    // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then
-    // set 2's draw slot and its palette slot. The count is the *layout's* dynamic descriptors,
-    // not the shader's — a stage that declares no palette still binds one.
+    // One offset per dynamic descriptor, in set-then-binding order: set 0's view slot, then set 2's
+    // draw slot, its palette slot and its paint slot. The count is the *layout's* dynamic
+    // descriptors, not the shader's — a stage that declares neither palette nor paint still binds
+    // both.
     const std::array dynamicOffsets = {static_cast<uint32_t>(frame.frameDataOffset),
-                                       static_cast<uint32_t>(slot.value()), static_cast<uint32_t>(jointOffset)};
+                                       static_cast<uint32_t>(slot.value()), static_cast<uint32_t>(jointOffset),
+                                       static_cast<uint32_t>(paintOffset)};
     vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout, 0,
                             static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
                             static_cast<uint32_t>(dynamicOffsets.size()), dynamicOffsets.data());
@@ -4144,6 +4727,20 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
     // view that shades, and this one has not shaded anything. The occlusion settings stay on the
     // copy because the gather reads its radius and strength out of them.
     prepass.postProcesses = occlusion.passes;
+    // **Every layer, whatever this camera's own mask says.** The prepass records the geometry the
+    // frame is made of so the gather can measure how much sky each pixel sees, and under a layered
+    // frame one gather serves every layer's shading — so a prepass that drew only its own camera's
+    // layer would erase the car from under its own contact shadow: the darkening under a tyre is
+    // exactly the pixel where the two layers meet. This is the same class of decision as the
+    // castsShadow guard in recordSceneDraws, and it is made here for the same reason it was made
+    // there: the prepass is a statement about what exists, not about what this view shades. The
+    // continuity fields reset with it — a prepass opens its own target and keeps nothing.
+    prepass.layerMask = ~0u;
+    prepass.partition = DrawPartition::All;
+    prepass.loadColour = false;
+    prepass.loadDepth = false;
+    prepass.keepDepth = false;
+    prepass.clearColour.reset();
 
     recordScenePass(scene, prepass, delta);
 }
@@ -4372,6 +4969,14 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
+    // No `uploadFog` here, and the omission is the rule rather than an oversight. A probe photographs
+    // the world so that a surface can be given the light it cannot see directly; fog baked into that
+    // photograph comes back as the surface's ambient light, and the surface then fogs a second time
+    // on the way to the eye. It is the same double count the solar disc is kept out of a capture for,
+    // and it is settled here — by uploading nothing — rather than as a flag each shader has to
+    // remember to test. The fog's own ambient colour is read *from* these probes, so a capture that
+    // contained it would also be feeding itself.
+
     // The capture is shaded, cascades and all: a probe that recorded the world unshadowed would
     // put the sun's full radiance into the very shadow the direct term just removed, which is the
     // defect this whole path exists to fix, reintroduced one level down.
@@ -4379,7 +4984,8 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     // space has no answer for a face pointing somewhere the screen never looked.
     const auto cascadeImages = shadowCascadeImages(scene);
     auto shadowDescriptors =
-        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture()) : VK_NULL_HANDLE;
+        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture(), dummyTexture())
+                                  : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -4475,7 +5081,7 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
 
     static_cast<void>(recordSceneDraws(scene, camera, delta, true, true, 0,
                                        imageResources.at(probeRadianceImageId).format,
-                                       imageResources.at(probeDepthImageId).format, shadowDescriptors));
+                                       imageResources.at(probeDepthImageId).format, shadowDescriptors, nullptr));
 
     vkCmdEndRendering(frame.commandBuffer);
 }
@@ -5218,7 +5824,7 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 
     std::array<unsigned int, shadowCascadeCount> images{};
     images.fill(dummyShadowMap());
-    dummyShadowSet = shadowSet(images, dummyTexture());
+    dummyShadowSet = shadowSet(images, dummyTexture(), dummyTexture());
 
     return dummyShadowSet;
 }
@@ -5228,11 +5834,12 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 // a set of its own rather than a stale view. Linear scan over a list that holds one entry per view
 // in a running game, and the one the fallback added.
 VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
-                                          const unsigned int occlusionImageId)
+                                          const unsigned int occlusionImageId, const unsigned int behindImageId)
 {
+    const ShadowSetKey wanted{imageIds, occlusionImageId, behindImageId};
     for (const auto& [key, set] : shadowSets)
     {
-        if (key.first == imageIds && key.second == occlusionImageId)
+        if (key == wanted)
         {
             return set;
         }
@@ -5282,10 +5889,23 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
         occlusionImage->second.sampler != VK_NULL_HANDLE ? occlusionImage->second.sampler : attachmentSampler,
         occlusionImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
+    // The behind copy beside it, another plain sampled image on the shared attachment sampler —
+    // which is trilinear with an open LOD clamp, so a reader's textureLod walks the copy's whole
+    // chain. A view that takes no copy arrives here with the 1x1 white one.
+    const auto behindImage = imageResources.find(behindImageId);
+    if (behindImage == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const VkDescriptorImageInfo behindInfo{
+        behindImage->second.sampler != VK_NULL_HANDLE ? behindImage->second.sampler : attachmentSampler,
+        behindImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
     // One write covering the cascade binding's whole array: they are consecutive elements of a
     // single binding, so imageInfos is handed over in one go rather than a write per cascade. The
-    // occlusion is a second binding and therefore a second write.
-    std::array<VkWriteDescriptorSet, 2> writes{};
+    // occlusion and the behind copy are bindings of their own and therefore writes of their own.
+    std::array<VkWriteDescriptorSet, 3> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = shadowMapBinding;
@@ -5302,9 +5922,17 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[1].pImageInfo = &occlusionInfo;
 
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = set;
+    writes[2].dstBinding = sceneBehindBinding;
+    writes[2].dstArrayElement = 0;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &behindInfo;
+
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-    shadowSets.emplace_back(std::pair{imageIds, occlusionImageId}, set);
+    shadowSets.emplace_back(wanted, set);
 
     return set;
 }
@@ -5876,6 +6504,57 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateDrawDataSlot()
 
     const auto offset = static_cast<VkDeviceSize>(frame.drawDataSlotsUsed) * drawDataStride;
     frame.drawDataSlotsUsed++;
+    return offset;
+}
+
+VkDeviceSize VulkanRenderer::writePaintSlot(const Paint& paint)
+{
+    // Offset zero is the unpainted block every other draw binds, so a renderable that states no
+    // paint — or one the ring has no room left for — reads zeros and the shader falls back to what
+    // the material's own textures say. That is why the block carries an explicit painted flag:
+    // without it, "no slot left" and "black paint" would be the same sixty-four bytes.
+    if (!paint.enabled)
+    {
+        return 0;
+    }
+
+    const auto slot = allocatePaintDataSlot();
+    if (!slot.has_value())
+    {
+        return 0;
+    }
+
+    auto& frame = frames[frameIndex];
+
+    const PaintDataUbo block{
+        .colour = glm::vec4(paint.colour, paint.flakeDensity),
+        .flake = glm::vec4(paint.flakeColour, paint.flakeScale),
+        .clearcoat = glm::vec4(paint.clearcoat, paint.clearcoatRoughness, paint.orangePeel, paint.orangePeelScale),
+        .wear = glm::vec4(paint.scratch, paint.dirt, 1.0f, 0.0f)};
+
+    std::memcpy(static_cast<unsigned char*>(frame.paintDataMapped) + slot.value(), &block, sizeof(block));
+
+    return slot.value();
+}
+
+std::optional<VkDeviceSize> VulkanRenderer::allocatePaintDataSlot()
+{
+    auto& frame = frames[frameIndex];
+    if (frame.paintDataSlotsUsed >= paintDataRingSlots)
+    {
+        diagnostics.record(FrameDiagnostic::PaintDataRingExhausted,
+                           [&]
+                           {
+                               return "the ring holds " + std::to_string(paintDataRingSlots) + " slots of " +
+                                      std::to_string(paintDataStride) + " bytes";
+                           });
+
+        return std::nullopt;
+    }
+
+    const auto offset = static_cast<VkDeviceSize>(frame.paintDataSlotsUsed) * paintDataStride;
+    frame.paintDataSlotsUsed++;
+
     return offset;
 }
 
@@ -6635,15 +7314,15 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
                       return true;
                   });
 
-    // A cascade set names up to shadowCascadeCount views and the occlusion image beside them, so
-    // one destroyed image invalidates every set that mentions it — on the same schedule and for the
-    // same reason as the fullscreen set above. The next frame that asks for a set with a live tuple
-    // builds a new one.
+    // A cascade set names up to shadowCascadeCount views and the two images beside them — the
+    // occlusion and the behind copy — so one destroyed image invalidates every set that mentions
+    // it, on the same schedule and for the same reason as the fullscreen set above. The next frame
+    // that asks for a set with a live tuple builds a new one.
     std::erase_if(shadowSets,
                   [&](const auto& entry)
                   {
-                      if (std::ranges::find(entry.first.first, id) == entry.first.first.end() &&
-                          entry.first.second != id)
+                      if (std::ranges::find(entry.first.cascades, id) == entry.first.cascades.end() &&
+                          entry.first.occlusion != id && entry.first.behind != id)
                       {
                           return false;
                       }
@@ -6659,6 +7338,16 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
 
                       return true;
                   });
+
+    // The behind copy shadows its colour attachment's lifetime: an attachment rebuilt by a resize
+    // arrives with a new id and takes a fresh copy, so one keyed by the old id would never be
+    // asked for again and would hold a window-sized chain forever.
+    if (const auto behindEntry = sceneBehindImages.find(id); behindEntry != sceneBehindImages.end())
+    {
+        const auto behindId = behindEntry->second;
+        sceneBehindImages.erase(behindEntry);
+        destroyImageResource(behindId);
+    }
 
     const auto& resource = entry->second;
 
@@ -7057,7 +7746,8 @@ std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string&
         auto presented = false;
         for (auto attempt = 0; attempt < 2 && !presented; attempt++)
         {
-            if (!beginFrame())
+            // The replay is the same simulated instant as the frame it replays.
+            if (!beginFrame(frameSimulationTime))
             {
                 continue;
             }
@@ -7127,6 +7817,181 @@ std::expected<void, std::string> VulkanRenderer::captureFrame(const std::string&
         }
 
         logger.info("Frame dump written to {}", path);
+        return {};
+    }
+    catch (const std::exception& exception)
+    {
+        return std::unexpected(exception.what());
+    }
+}
+
+// Every colour attachment, as the numbers the pass wrote rather than as a picture.
+//
+// The file is a one-line ASCII header and then width*height*components little-endian float32, rows
+// top-down, which is the order Vulkan already stores them in. Deliberately not a PNG: eight bits
+// cannot hold a view depth in world units, and the moment a readback has to be decoded through the
+// tone curve it stops being a measurement.
+std::expected<void, std::string> VulkanRenderer::captureBuffers(const std::string& pathPrefix)
+{
+    try
+    {
+        if (device == VK_NULL_HANDLE)
+        {
+            return std::unexpected("there is no device to read attachments back from");
+        }
+
+        // The copies below read images this frame's passes wrote, so nothing may still be running.
+        ensure(vkDeviceWaitIdle(device), "vkDeviceWaitIdle");
+
+        auto manifest = std::string("# framebuffer colour attachments, level 0\n"
+                                    "# file: <prefix>-fbo<fbo>-att<attachment>.raw\n"
+                                    "# each: ASCII header line 'RAWBUF <w> <h> <components>\\n' then float32 data\n");
+        auto written = 0u;
+
+        for (const auto& [fboId, fbo] : fboResources)
+        {
+            for (const auto attachmentId : fbo.attachmentIds)
+            {
+                const auto entry = imageResources.find(attachmentId);
+                if (entry == imageResources.end())
+                {
+                    continue;
+                }
+
+                // Held by value: the transitions below write into imageResources, and a reference
+                // into a container the loop mutates is the kind of borrow this codebase's storage
+                // rules exist to stop.
+                const auto image = entry->second;
+                if (image.aspect != VK_IMAGE_ASPECT_COLOR_BIT || image.width == 0 || image.height == 0 ||
+                    image.layouts.empty())
+                {
+                    continue;
+                }
+
+                const auto layout = readbackLayout(image.format);
+                if (layout.components == 0)
+                {
+                    manifest += "fbo" + std::to_string(fboId) + "-att" + std::to_string(attachmentId) +
+                                ": skipped, VkFormat " + std::to_string(static_cast<int>(image.format)) +
+                                " is not decoded by this readback\n";
+
+                    continue;
+                }
+
+                const auto texelCount = static_cast<size_t>(image.width) * image.height;
+                const auto byteCount = static_cast<VkDeviceSize>(texelCount) * layout.texelBytes;
+
+                VkBufferCreateInfo bufferInfo{};
+                bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bufferInfo.size = byteCount;
+                bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+                VmaAllocationCreateInfo allocationCreateInfo{};
+                allocationCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+                allocationCreateInfo.flags =
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+                VkBuffer buffer = VK_NULL_HANDLE;
+                VmaAllocation allocation = nullptr;
+                VmaAllocationInfo allocationInfo{};
+                ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationCreateInfo, &buffer, &allocation,
+                                       &allocationInfo),
+                       "vmaCreateBuffer");
+
+                // Put the level back where the frame left it. Every colour attachment already
+                // carries TRANSFER_SRC — the exposure meter's copy-back made that unconditional —
+                // so nothing about image creation has to change for this. UNDEFINED is not a layout
+                // a barrier may target, so a level that was never written stays where it lands.
+                const auto previousLayout = image.layouts.front();
+                const auto commandBuffer = beginUploadCommands();
+                transitionTrackedLevel(commandBuffer, attachmentId, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+                VkBufferImageCopy region{};
+                region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = VkExtent3D{image.width, image.height, 1};
+                vkCmdCopyImageToBuffer(commandBuffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
+                                       &region);
+
+                if (previousLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+                {
+                    transitionTrackedLevel(commandBuffer, attachmentId, 0, previousLayout);
+                }
+
+                finishUploadCommands(commandBuffer);
+                ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
+
+                auto values = std::vector<float>(texelCount * layout.components);
+                const auto* bytes = static_cast<const unsigned char*>(allocationInfo.pMappedData);
+                for (size_t index = 0; index < values.size(); index++)
+                {
+                    switch (layout.component)
+                    {
+                    case ReadbackComponent::UnsignedByte:
+                        // Normalised on the way out, because UNORM is what the sampler would have
+                        // given the shader and the shader is what this is being compared against.
+                        values[index] = static_cast<float>(bytes[index]) / 255.0f;
+                        break;
+                    case ReadbackComponent::Half:
+                    {
+                        uint16_t half = 0;
+                        std::memcpy(&half, bytes + index * sizeof(uint16_t), sizeof(half));
+                        values[index] = halfToFloat(half);
+                        break;
+                    }
+                    case ReadbackComponent::Float:
+                        std::memcpy(&values[index], bytes + index * sizeof(float), sizeof(float));
+                        break;
+                    }
+                }
+
+                vmaDestroyBuffer(allocator, buffer, allocation);
+
+                const auto path = pathPrefix + "-fbo" + std::to_string(fboId) + "-att" + std::to_string(attachmentId) +
+                                  ".raw";
+                auto* file = std::fopen(path.c_str(), "wb");
+                if (file == nullptr)
+                {
+                    return std::unexpected("could not open " + path + " for writing");
+                }
+
+                const auto header = "RAWBUF " + std::to_string(image.width) + " " + std::to_string(image.height) +
+                                    " " + std::to_string(layout.components) + "\n";
+                const auto headerWritten = std::fwrite(header.data(), 1, header.size(), file) == header.size();
+                const auto dataWritten =
+                    std::fwrite(values.data(), sizeof(float), values.size(), file) == values.size();
+                std::fclose(file);
+
+                if (!headerWritten || !dataWritten)
+                {
+                    return std::unexpected("could not write the whole of " + path);
+                }
+
+                manifest += "fbo" + std::to_string(fboId) + "-att" + std::to_string(attachmentId) + ": " +
+                            std::to_string(image.width) + "x" + std::to_string(image.height) + ", " +
+                            std::to_string(layout.components) + " component(s), VkFormat " +
+                            std::to_string(static_cast<int>(image.format)) + "\n";
+                written++;
+            }
+        }
+
+        const auto manifestPath = pathPrefix + "-manifest.txt";
+        auto* manifestFile = std::fopen(manifestPath.c_str(), "wb");
+        if (manifestFile == nullptr)
+        {
+            return std::unexpected("could not open " + manifestPath + " for writing");
+        }
+
+        const auto manifestWritten = std::fwrite(manifest.data(), 1, manifest.size(), manifestFile) == manifest.size();
+        std::fclose(manifestFile);
+
+        if (!manifestWritten)
+        {
+            return std::unexpected("could not write the whole of " + manifestPath);
+        }
+
+        logger.info("Attachment dump: {} buffer(s) beside {}, listed in {}", written, pathPrefix, manifestPath);
+
         return {};
     }
     catch (const std::exception& exception)

@@ -81,6 +81,7 @@ add_library (Engine STATIC
         Graphics/Impl/LookupTableImpl.cpp
         Graphics/Impl/PostProcessServiceImpl.cpp
         Graphics/Impl/PostProcessingImpl.cpp
+        Graphics/Impl/VolumetricFogImpl.cpp
         Graphics/Impl/PresenterServiceImpl.cpp
         Graphics/Impl/RenderBackendFactoryBodies.cpp
         Graphics/Impl/RenderableEntityServiceImpl.cpp
@@ -138,6 +139,7 @@ target_sources(Engine PUBLIC
         Graphics/Api/ShadowCascades.cppm
         Graphics/Api/Frustum.cppm
         Graphics/Api/PostProcessing.cppm
+        Graphics/Api/VolumetricFog.cppm
         Graphics/Api/LookupTable.cppm
         Graphics/Api/PhysicalCamera.cppm
         Graphics/Api/FrameDiagnostics.cppm

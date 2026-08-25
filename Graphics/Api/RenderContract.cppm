@@ -145,6 +145,12 @@ export inline constexpr uint32_t drawDescriptorSet = 2;
 // 512-slot ring in the first cascade and drew nothing else all frame. Split, a draw slot is a
 // couple of hundred bytes and the palette ring is sized by the skinned draws alone.
 export inline constexpr uint32_t jointDataBinding = 1;
+// Car paint, beside the palette in the per-draw set and there for the same reason: it is per draw,
+// only some draws want it, and a slot in the draw block would make every draw in the frame pay for
+// something a handful of body panels read. It rides the *renderable* rather than the material
+// because materials are shared storage — see Paint — so this is the one binding that carries a fact
+// about which car is being drawn rather than about what it is made of.
+export inline constexpr uint32_t paintDataBinding = 2;
 // The cascades get a set of their own rather than a tail of set 1: they are per *frame*, and
 // writing them into every material set would mean rewriting every material set whenever a cascade
 // target is rebuilt.
@@ -160,6 +166,20 @@ export inline constexpr uint32_t shadowMapBinding = 0;
 // A view with no occlusion buffer binds a 1x1 white image, so the sample site is unconditional.
 export inline constexpr uint32_t ambientOcclusionBinding = 1;
 
+// What was already drawn behind the surface being drawn: a copy of the opaque scene colour, taken
+// between the opaque draws and the blended ones, so a blended surface can sample what it is being
+// composited over — which the render target itself cannot legally provide while it is being written.
+// Beside the cascades and the occlusion for their reason exactly: one image per camera pass,
+// produced earlier in this frame, read only by a view that shades. A view that takes no copy binds
+// the 1x1 white image, so the sample site is unconditional.
+export inline constexpr uint32_t sceneBehindBinding = 2;
+
+// How many levels the behind copy halves down through. The chain is what turns the copy into a
+// choice of scattering cone — level 0 is exact refraction, each level up reads a cone twice as
+// wide — and seven reaches 1/64th of the frame, which is a halo the width a windscreen's grime
+// spreads a low sun over. Past that a level costs a blit and buys a blur wider than the pane.
+export inline constexpr uint32_t sceneBehindMipCount = 7;
+
 // How the occlusion is gathered: directions through the pixel, and steps marched along each. Both
 // sides count them — the shader marches them and the engine reports them once at bring-up — so they
 // are contract numbers rather than literals in the shader. Three by four is the cheap end of GTAO
@@ -167,6 +187,17 @@ export inline constexpr uint32_t ambientOcclusionBinding = 1;
 // noise a texture rather than a pattern.
 export inline constexpr uint32_t gtaoSliceCount = 3;
 export inline constexpr uint32_t gtaoStepsPerSlice = 4;
+
+// How many steps the volumetric fog's in-scattering march takes between the eye and the surface.
+//
+// It is a quality number and not a correctness one, which is a property of the quadrature rather
+// than a hope: each step is weighted by the *difference* in transmittance across it, so the sum
+// telescopes to exactly the analytic in-scattering total whenever the shadow term is one. Fewer
+// steps therefore move where a shaft's edge falls and never how much light there is — and the march
+// runs per shaded fragment in a forward pass, so this is also the one number that decides what the
+// feature costs. Sixteen is where the dither stops reading as banding on this scene.
+// docs/volumetric-fog-brief.md has the derivation.
+export inline constexpr uint32_t fogMarchSteps = 8;
 
 // How far a bloom chain is allowed to halve. Six levels from half of 1080p is a bottom level about
 // thirty texels across, which is a spill the width of the screen; past that the chain is buying
@@ -246,7 +277,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 46;
+export inline constexpr size_t shaderContractMacroCount = 50;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -288,10 +319,13 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"SET_MATERIAL", materialDescriptorSet},
         {"SET_DRAW", drawDescriptorSet},
         {"JOINT_DATA_BINDING", jointDataBinding},
+        {"PAINT_DATA_BINDING", paintDataBinding},
         {"SET_SHADOW", shadowDescriptorSet},
         {"SHADOW_CASCADES", shadowCascadeCount},
         {"SHADOW_MAP_BINDING", shadowMapBinding},
         {"AO_MAP_BINDING", ambientOcclusionBinding},
+        {"SCENE_BEHIND_BINDING", sceneBehindBinding},
+        {"SCENE_BEHIND_MIPS", sceneBehindMipCount},
         {"GTAO_SLICES", gtaoSliceCount},
         {"GTAO_STEPS", gtaoStepsPerSlice},
         {"SHADOW_PCF_RADIUS", shadowPcfRadius},
@@ -310,6 +344,7 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"POST_INPUT_BINDING", postProcessInputBinding},
         {"POST_INPUTS", postProcessInputCount},
         {"LUT_BINDING", lookupTableBinding},
+        {"FOG_MARCH_STEPS", fogMarchSteps},
     }};
 }
 

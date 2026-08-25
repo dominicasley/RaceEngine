@@ -176,7 +176,9 @@ struct PullResult
     drivelineState.targetGear = gear;
     drivelineState.shiftFrom = gear;
     drivelineState.engineSpeed = entry / radius * reduction;
-    drivelineState.shaftSpeed = entry / radius * driveline.gearbox.finalDrive;
+    // The shaft sits between the gearbox output and the final drive, so which axle is downstream of
+    // it — and therefore what speed it turns at — is a property of the gear on a two-final transaxle.
+    drivelineState.shaftSpeed = entry / radius * driveline.gearbox.finalFor(gear);
 
     const auto inertias = wheelInertias(setup);
     auto road = noRoadTorque;
@@ -215,7 +217,15 @@ struct PullResult
             // engine is geared to the road and not slipping against it; all four wheels on the ground;
             // and straight. A pull measured through a slipping clutch is a clutch measurement, and a
             // pull measured on a car with a wheel in the air is nothing at all.
-            CAPTURE(gear, drivelineState.gear, drivelineState.clutchPedal, drivelineState.engineSpeed, speed);
+            // Everything the four assertions below can fail on, captured together — a precondition
+            // that reports only the quantity it tested makes the reader guess which of the chain's
+            // links moved. `clutchSlip` and `clutchLocked` are here because the locked-chain check at
+            // the bottom and the 5 rad/s slip bound above can disagree: 0.5% of engine speed is
+            // 1.18 rad/s in fifth, so the tighter of the two binds and it is not the one named
+            // "clutch".
+            CAPTURE(gear, drivelineState.gear, drivelineState.clutchPedal, drivelineState.engineSpeed, speed,
+                    torques->clutchSlip, torques->clutchLocked, torques->engine, torques->windUp,
+                    drivelineState.shaftSpeed);
 
             REQUIRE(drivelineState.gear == gear);
             REQUIRE(drivelineState.shiftPhase == ShiftPhase::Engaged);
@@ -227,17 +237,35 @@ struct PullResult
                 REQUIRE(stepped->telemetry.wheels[index].inContact);
             }
 
-            // And the engine really is geared to the *wheels*: the chain from crank to hub is locked,
-            // so what turns is one body and the ratio is the whole of the relationship.
+            // And the engine really is geared to the gearbox *output*: from crank to there the chain
+            // is rigid, so what turns is one body and the ratio is the whole of the relationship.
             //
-            // Against the wheels rather than against the road, which is the distinction that matters
-            // here. A driven tyre transmits force by slipping, so at full throttle the hub runs a few
-            // percent ahead of the road however healthy the driveline is — measured, 3.4% in fourth.
-            // Asserting the engine against *road* speed would fold that slip into a driveline check
-            // and would tighten or loosen with grip, which is the one thing this probe must not be
-            // sensitive to.
-            const auto driven = 0.5 * (state.corners[0].wheelSpeed + state.corners[1].wheelSpeed);
-            REQUIRE(drivelineState.engineSpeed == Catch::Approx(driven * reduction).epsilon(0.005));
+            // Against the wheels rather than against the road is the distinction this used to make,
+            // and it is still the right one — a driven tyre transmits force by slipping, so at full
+            // throttle the hub runs a few percent ahead of the road however healthy the driveline is,
+            // and folding that into a driveline check would make the check sensitive to grip.
+            //
+            // **But crank-to-hub is not rigid and this assertion used to say it was** (corrected
+            // 2026-08-24, by the engine curve exposing it). There is a torsional element between the
+            // gearbox output and the differential, on purpose, and while torque is *changing* it
+            // twists — so the two ends of it genuinely turn at different speeds and no epsilon makes
+            // that false. Measured on the build that exposed it: VW's 370 N.m wound the shaft
+            // 0.285 rad, putting the gearbox output 1.12 rad/s ahead of the differential input. That
+            // is 0.54%, it tripped a 0.5% bound, and it was the driveline working rather than
+            // failing. The old form passed only because the mod's weaker curve wound the shaft less,
+            // which is the worst reason for a check to pass.
+            //
+            // So the rigid claim is made where the chain is rigid, and the compliant element is
+            // checked as a compliance below instead of being asserted out of existence.
+            const auto shaftSpeed = drivelineState.shaftSpeed;
+            REQUIRE(drivelineState.engineSpeed ==
+                    Catch::Approx(shaftSpeed * driveline.gearbox.ratio(gear)).epsilon(0.005));
+
+            // The shaft is wound and not coming apart. `maximumTwist` is the guard that keeps a
+            // failed solve diagnosable rather than a NaN, so a pull sitting anywhere near it is not a
+            // pull worth quoting — half of it is a wide berth and still far above the 0.285 rad a
+            // full-torque plateau actually asks for.
+            REQUIRE(std::abs(drivelineState.windUp) < 0.5 * driveline.compliance.maximumTwist);
 
             startTime = now;
             result.startRpm = drivelineState.engineSpeed * radiansPerSecondToRpm;
@@ -287,33 +315,31 @@ struct PullResult
     return driveline;
 }
 
-// The engine VW publishes, as a curve. **Two statements and nothing invented between them**: 370 N.m
-// from 1600 to 4300 rpm, and 180 kW from 5000 to 6200 — which is the whole of what a manufacturer
-// homologates and is exactly the shape a wastegated turbo makes. Torque between 4300 and 5000 is the
-// straight line joining the two, and above 6200 it tapers to the mod's own figure at the limiter,
-// because nothing published says where it ends.
+// **The curve the mod stated, kept as history rather than as a proposal** — the roles here inverted
+// on 2026-08-24, when VW's published curve was promoted into `golfGtiMk7Driveline()` itself
+// (`docs/engine-curve-brief.md`). What this file used to hold was the *published* curve as a
+// diagnostic against a car carrying the mod's; the car carries the published one now, so the only
+// thing worth stating separately is what it replaced.
 //
-// Below 1600 rpm nothing is stated and the mod's own curve is kept. No pull in this file goes below
-// 1824 rpm, so that stretch decides nothing here and is not a place to be inventing data.
+// These are AC's `power.lut` through its own turbo, which the import reproduces at all eighteen
+// points: no torque plateau at all, a 349.8 N.m peak at 4500 rpm where the real engine is flat at 370
+// from 1600, and a top end that was already right because power is what the mod got from a
+// homologation figure.
 //
-// **This is a diagnostic, not a proposal.** It exists to answer one question — how much of the gap to
-// the published in-gear times is the torque curve — and replacing the car's engine is a different
-// piece of work with its own brief.
-[[nodiscard]] Curve publishedEngineCurve()
+// It is kept so the correction stays *measurable* rather than merely recorded. Delete it and the
+// deficit table below becomes a comparison of the car against itself.
+[[nodiscard]] Curve modEngineCurve()
 {
     const auto atRpm = [](const double rpm, const double torque)
     {
         return glm::dvec2(rpm / radiansPerSecondToRpm, torque);
     };
 
-    const auto atPower = [&atRpm](const double rpm, const double watts)
-    {
-        return atRpm(rpm, watts / (rpm / radiansPerSecondToRpm));
-    };
-
-    return Curve{.points = {atRpm(0.0, 95.0), atRpm(500.0, 129.92491), atRpm(1000.0, 146.745119), atRpm(1600.0, 370.0),
-                            atRpm(4300.0, 370.0), atPower(5000.0, 180000.0), atPower(5500.0, 180000.0),
-                            atPower(6200.0, 180000.0), atRpm(6500.0, 264.0), atRpm(6800.0, 248.16)}};
+    return Curve{.points = {atRpm(0.0, 95.0), atRpm(500.0, 129.92491), atRpm(1000.0, 146.745119),
+                            atRpm(1500.0, 193.70088), atRpm(1768.0, 235.290486), atRpm(1904.0, 260.621688),
+                            atRpm(2000.0, 272.8), atRpm(2500.0, 316.8), atRpm(2650.0, 325.6), atRpm(3000.0, 338.8),
+                            atRpm(3500.0, 334.4), atRpm(4000.0, 334.4), atRpm(4500.0, 349.8), atRpm(5000.0, 343.2),
+                            atRpm(5500.0, 314.6), atRpm(6300.0, 272.8), atRpm(6500.0, 264.0), atRpm(6800.0, 248.16)}};
 }
 
 // A constant driveline efficiency, applied where it is arithmetically identical to one: every newton
@@ -372,8 +398,11 @@ TEST_CASE("what an in-gear pull says about the engine, with no traction in it", 
     std::printf("\n=== 80-120 km/h in gear, against auto motor und sport's Supertest sheet ===\n");
     std::printf("  reference: Golf VII GTI Performance, 230 PS / 350 N.m, 6-speed manual, 1406 kg,\n");
     std::printf("             225/40 R 18 — 80-120 in 5.1 / 6.3 / 7.8 s in 4th / 5th / 6th\n");
-    std::printf("  this car:  %.0f kg, engine curve peaking at 349.8 N.m, quoted 245 PS / 370 N.m\n",
+    std::printf("  this car:  %.0f kg, VW's published curve since 2026-08-24 — 370 N.m 1600-4300,\n",
                 sprung->mass + setup->unsprungMass());
+    std::printf("             180 kW 5000-6200, quoted 245 PS\n");
+    std::printf("  expected:  ours is lighter and stronger, so it should beat every row by about\n");
+    std::printf("             (1348/1406)*(350/370) = 0.907, i.e. roughly -9%%\n");
 
     std::printf("\n--- our engine and mass, through the reference car's gearing ---\n");
     std::printf("  gear                            time      rpm band       mean T   pk slip  published    error\n");
@@ -393,22 +422,30 @@ TEST_CASE("what an in-gear pull says about the engine, with no traction in it", 
         }
     }
 
-    // **Two things are known to be missing, and both are quantified here rather than argued about.**
+    // **One of the two known omissions is closed and the other is not, so this block is now a
+    // before-and-after rather than a pair of corrections.**
     //
-    //   1. There is no driveline efficiency anywhere in this model. `stepDriveline` multiplies engine
-    //      torque by the ratio and hands the product to the wheels; a real transverse front-drive
-    //      manual loses about 8 to 12% of it in the gearset, the final drive and the joints. Scaling
-    //      the curve is exactly equivalent to a constant efficiency for the tractive force, which is
-    //      why that is how it is measured.
-    //   2. The engine curve matches the car's *power* and not its *torque*. It peaks at 349.8 N.m
-    //      where VW states 370, and it reaches that peak at 4500 rpm where the real one is flat from
-    //      1600 — so it is right at the top of the range and increasingly wrong below it, which is
-    //      precisely where an in-gear pull in a tall gear lives.
-    std::printf("\n--- the same gearing, with the two known omissions put back ---\n");
+    //   1. The engine curve matched the car's *power* and not its *torque* — right at the top of the
+    //      range and increasingly wrong below it, which is precisely where an in-gear pull in a tall
+    //      gear lives. **Closed 2026-08-24**, `docs/engine-curve-brief.md`. The mod's curve is kept in
+    //      `modEngineCurve()` so the correction stays measurable, and it is the first pair of rows.
+    //   2. There is still no driveline efficiency anywhere in this model. `stepDriveline` multiplies
+    //      engine torque by the ratio and hands the product to the wheels; a real transverse
+    //      front-drive transaxle loses about 8 to 14% of it in the gearset, the final drive and the
+    //      joints. Scaling the curve is exactly equivalent to a constant efficiency for the tractive
+    //      force, which is why that is how it is stood in for here — it is **not** equivalent for the
+    //      engine's own inertia, so this remains a diagnostic and not a model.
+    //
+    // **Read the spread across gears, not the offset.** A wrong scalar — efficiency, mass, drag, or
+    // the reference car itself — moves all three gears together; a wrong curve moves them apart,
+    // because each gear samples a different part of the rev band. The spread is what the curve owns.
+    std::printf("\n--- the same gearing: the curve that was replaced, and the one that replaced it ---\n");
     std::printf("  gear                            time      rpm band       mean T   pk slip  published    error\n");
 
     {
-        const auto lossy = withEfficiency(referenceManualDriveline(), 0.92);
+        auto legacy = referenceManualDriveline();
+        legacy.engine.torque = modEngineCurve();
+        const auto lossy = withEfficiency(legacy, 0.92);
 
         for (const auto gear : {4, 5, 6})
         {
@@ -416,13 +453,11 @@ TEST_CASE("what an in-gear pull says about the engine, with no traction in it", 
             const auto run = pullInGear(setup.value(), lossy, world.value(), gear, eighty, onetwenty);
 
             char label[64];
-            std::snprintf(label, sizeof(label), "our curve x 0.92, %dth", gear);
+            std::snprintf(label, sizeof(label), "the mod's curve x 0.92, %dth", gear);
             report(label, run, published);
         }
 
-        auto published = referenceManualDriveline();
-        published.engine.torque = publishedEngineCurve();
-        const auto both = withEfficiency(published, 0.92);
+        const auto both = withEfficiency(referenceManualDriveline(), 0.92);
 
         for (const auto gear : {4, 5, 6})
         {
@@ -430,23 +465,23 @@ TEST_CASE("what an in-gear pull says about the engine, with no traction in it", 
             const auto run = pullInGear(setup.value(), both, world.value(), gear, eighty, onetwenty);
 
             char label[64];
-            std::snprintf(label, sizeof(label), "VW's curve x 0.92, %dth", gear);
+            std::snprintf(label, sizeof(label), "shipped curve x 0.92, %dth", gear);
             report(label, run, reference);
         }
     }
 
-    std::printf("\n--- what this car's engine makes against what VW says it makes ---\n");
-    std::printf("    rpm     this model    VW published    deficit\n");
+    std::printf("\n--- what the car makes now against what the mod stated ---\n");
+    std::printf("    rpm     this model     the mod's     correction\n");
 
     {
         const auto ours = golfGtiMk7Driveline().engine.torque;
-        const auto stated = publishedEngineCurve();
+        const auto legacy = modEngineCurve();
 
         for (const auto rpm : {1600.0, 2000.0, 2500.0, 3000.0, 3500.0, 4000.0, 4300.0, 5000.0, 5500.0, 6200.0})
         {
             const auto speed = rpm / radiansPerSecondToRpm;
             const auto mine = ours.at(speed);
-            const auto theirs = stated.at(speed);
+            const auto theirs = legacy.at(speed);
 
             std::printf("   %5.0f    %8.1f N.m  %8.1f N.m   %+7.1f%%\n", rpm, mine, theirs,
                         100.0 * (mine - theirs) / theirs);
@@ -586,8 +621,8 @@ TEST_CASE("what the driveline's two omissions are worth to the number the brief 
         for (auto step = 1; step <= 360 * 20; step++)
         {
             const auto roadSideSpeed = std::abs(state.chassis.linearVelocity.z) /
-                                       setup->corners.front().hardpoints.wheelRadius * driveline.gearbox.finalDrive *
-                                       driveline.gearbox.ratio(input.gear);
+                                       setup->corners.front().hardpoints.wheelRadius *
+                                       driveline.gearbox.reduction(input.gear);
 
             if (roadSideSpeed > upshiftSpeed && input.gear < driveline.gearbox.topGear())
             {
@@ -619,16 +654,17 @@ TEST_CASE("what the driveline's two omissions are worth to the number the brief 
         }
 
         std::printf("  %-34s %7.3f s   through gear %d   %s\n", label, reached, topGearUsed,
-                    reached < 6.4 ? "under the band" : (reached > 6.7 ? "over the band" : "inside 6.4-6.7"));
+                    reached < 6.5 ? "under the measured range" : (reached > 6.6 ? "over it" : "inside 6.5-6.6"));
     };
 
-    std::printf("\n=== 0-100 km/h, against the published 6.4-6.7 s for a DSG without launch control ===\n");
+    std::printf("\n=== 0-100 km/h, against a MEASURED 6.5-6.6 s (n=2; see the validation brief) ===\n");
     launch("as it ships", golfGtiMk7Driveline());
     launch("with a 92% efficient driveline", withEfficiency(golfGtiMk7Driveline(), 0.92));
 
     {
-        auto published = golfGtiMk7Driveline();
-        published.engine.torque = publishedEngineCurve();
-        launch("VW's curve, 92% efficient", withEfficiency(published, 0.92));
+        auto legacy = golfGtiMk7Driveline();
+        legacy.engine.torque = modEngineCurve();
+        launch("the mod's curve", legacy);
+        launch("the mod's curve, 92% efficient", withEfficiency(legacy, 0.92));
     }
 }

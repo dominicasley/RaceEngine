@@ -23,6 +23,14 @@ private:
 public:
     explicit FboService(MemoryStorageService& memoryStorageService, IGpuResourceFactory& gpuResourceFactory);
     [[nodiscard]] std::expected<Resource<Fbo>, std::string> create(const CreateFboDTO& createFboDTO) const;
+    // A framebuffer over attachments other framebuffers already own. No image is created and none is
+    // owned: every pass resolves an attachment through its own element, so a composed target follows
+    // whatever recreates and resizes its members' owners perform. It is how one camera renders into
+    // another camera's depth buffer, which is what a view that continues a frame needs. Resizing or
+    // recreating a composed framebuffer recreates the shared images through the same elements — the
+    // owners stay coherent, at the cost of the work being done once per framebuffer that names them.
+    [[nodiscard]] std::expected<Resource<Fbo>, std::string>
+    compose(const std::vector<Resource<FboAttachment>>& attachments) const;
     [[nodiscard]] std::expected<void, std::string> recreate(const Resource<Fbo>& fbo) const;
     [[nodiscard]] std::expected<void, std::string> resize(const Resource<Fbo>& fbo, unsigned int width,
                                                           unsigned int height) const;

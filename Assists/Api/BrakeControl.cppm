@@ -163,6 +163,32 @@ export struct AntilockSetup
     // can manufacture, so it separates a wheel that has genuinely come back from one that has merely
     // stopped going away. 2.0 * 9.80665 = 19.613.
     double recoverySurge = 19.613;
+
+    // **The recovery law reads how far the estimated slip is from the controller's own band**, and
+    // this is the switch that turns that off for an A/B. On, the law this closes over is the one
+    // `docs/braking-chain-brief.md`'s instrument convicted: every recovery decision was written as
+    // though "not departing" meant "recovered", and a lightly loaded wheel past the tyre's peak is
+    // neither — road torque nearly balances brake torque there, so the wheel neither departs nor
+    // surges, and the old law re-applied into that equilibrium and held the rear axle at three times
+    // its peak slip for an entire stop, delivering 0.74 of its capacity against the fronts' 0.85.
+    //
+    // Three legs, all anchored on the `slipEnter`/`slipExit` band already calibrated above — no new
+    // threshold is introduced anywhere:
+    //
+    //  - a dump does not end merely because the wheel stopped departing while the estimated slip is
+    //    still past the band: equilibrium past the peak is what "stopped departing at 0.42 slip" is;
+    //  - a channel in recovery whose wheel is neither departing nor genuinely re-accelerating, with
+    //    slip still past the band, is **stuck** and dumps again rather than re-applying into it;
+    //  - the re-apply gradient tapers as the estimated slip approaches the band from below, so
+    //    pressure comes back gently near the peak and at the full rate well under it.
+    //
+    // **Every leg is gated on the reference being valid and reading past the band**, which is what
+    // keeps the estimator-collapse case honest: on a uniformly slippery surface the estimated slip
+    // reads far *below* the truth (the reference is biased low when every wheel slips at once), the
+    // guards then never fire, and the channel behaves exactly as the previous law did. Slip reading
+    // low disables this law; only the first version of this file, which required slip to *confirm*
+    // an intervention, could be disarmed by it.
+    bool slipAwareRecovery = true;
 };
 
 // One channel of the modulator and of the controller that drives it.
@@ -189,6 +215,14 @@ export struct AntilockChannelState
     // still climbing back towards the road's speed, and re-applying into it puts it straight back
     // down again.
     bool surged = false;
+
+    // What the channel was holding when the wheel last departed, pascals — the memory a production
+    // unit's two-stage re-apply is built on, written on every entry to the dump. The re-apply runs
+    // at the full gradient below it and hands over to the slip-proximity taper at it: below the
+    // level that provably held this wheel moments ago there is nothing to probe for, and crawling
+    // back through that region at the taper's rate was measured leaving the rear axle under-braked
+    // for tenths of a second per cycle. Meaningless while the channel is passive.
+    double departurePressure = 0.0;
 
     // How many times this channel has released pressure. **Counted on entering the dump and nowhere
     // else**, which is a correction: counting the entry to `Hold` instead counts a threshold

@@ -159,7 +159,7 @@ Engine::Engine() :
     bloomService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
     colourGradeService(*logger, memoryStorageService),
     shadowService(cameraService),
-    sceneService(renderableEntityService, cameraService, sceneManagerService),
+    sceneService(renderableEntityService, cameraService, sceneManagerService, shaderService),
     // Null: DirectInput's cooperative level is set against a window and this composition root has no
     // portable way to name one. A Windows build that wants exclusive access — which is what force
     // feedback needs there — passes its HWND here, and that is a one-line change to this call rather
@@ -355,6 +355,7 @@ void Engine::step()
         update(fixedTimeStep);
         accumulator -= fixedTimeStep;
         ticks++;
+        simulatedTicks++;
     }
 
     interpolationAlpha = accumulator / fixedTimeStep;
@@ -388,7 +389,7 @@ void Engine::step()
     //
     // A backend that cannot open a frame — a swapchain gone out of date, a minimised window —
     // records nothing this step and skips the close, which is the one path with no present.
-    if (renderer->beginFrame())
+    if (renderer->beginFrame(static_cast<double>(simulatedTicks) * static_cast<double>(fixedTimeStep)))
     {
         // The cascades first: a shadow cascade produces the depth map everything downstream
         // samples, and a producer recorded after its consumer is read before it is written (see
@@ -524,6 +525,18 @@ void Engine::dumpFrameIfRequested()
     }
 
     stopRequested = true;
+
+    // Before the frame capture rather than after it: `captureFrame` replays the presenter's pass
+    // onto a freshly acquired swapchain image, which runs the post chain again, and the buffers
+    // wanted here are the ones this frame's passes left behind.
+    if (const char* bufferPrefix = std::getenv("RACEENGINE_DUMP_BUFFERS"); bufferPrefix != nullptr)
+    {
+        if (const auto dumped = renderer->captureBuffers(bufferPrefix); !dumped)
+        {
+            logger->error("Attachment dump beside {} did not produce files: {}", bufferPrefix, dumped.error());
+            exitStatus = 1;
+        }
+    }
 
     if (const auto captured = renderer->captureFrame(dumpPath); !captured)
     {

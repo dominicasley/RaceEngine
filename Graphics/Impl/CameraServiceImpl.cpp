@@ -54,45 +54,61 @@ std::expected<Camera, std::string> CameraService::createCamera()
 
 std::expected<Camera, std::string> CameraService::createCamera(const CreateCameraDTO& createCameraDTO)
 {
-    const auto wantsColour = createCameraDTO.target != CameraTarget::DepthOnly;
-    const auto wantsDepth = createCameraDTO.target != CameraTarget::ColourOnly;
-
-    std::vector<CreateFboAttachmentDTO> attachments;
-
-    // Colour first, so the attachment order an existing camera's framebuffer has is unchanged and
-    // so the presenter's "first colour attachment" stays the first element.
-    if (wantsColour)
+    // A stated target first: a camera built over a composed framebuffer draws into attachments
+    // other cameras own, so there is nothing here to create and the size fields are not read.
+    auto output = createCameraDTO.output;
+    if (output.has_value())
     {
-        attachments.push_back(CreateFboAttachmentDTO{.width = createCameraDTO.width,
-                                                     .height = createCameraDTO.height,
-                                                     .type = FboAttachmentType::Color,
-                                                     .captureFormat = TextureFormat::RGBA,
-                                                     .internalFormat = TextureFormat::RGBA16F});
+        if (memoryStorageService.frameBuffers.find(output.value()) == nullptr)
+        {
+            return std::unexpected("the camera's stated render target names no live framebuffer");
+        }
     }
-
-    if (wantsDepth)
+    else
     {
-        // A depth-only target is one a shader is going to compare against, so its precision is
-        // named rather than left to the driver — see TextureFormat::DepthComponent32F. A camera
-        // that also has colour is using its depth buffer as a depth *test*, where the driver's
-        // choice has always been fine and changing it would move pixels for nothing.
-        const auto depthFormat = wantsColour ? TextureFormat::DepthComponent : TextureFormat::DepthComponent32F;
+        const auto wantsColour = createCameraDTO.target != CameraTarget::DepthOnly;
+        const auto wantsDepth = createCameraDTO.target != CameraTarget::ColourOnly;
 
-        attachments.push_back(CreateFboAttachmentDTO{.width = createCameraDTO.width,
-                                                     .height = createCameraDTO.height,
-                                                     .type = FboAttachmentType::Depth,
-                                                     .captureFormat = TextureFormat::DepthComponent,
-                                                     .internalFormat = depthFormat,
-                                                     .depthComparison = createCameraDTO.depthComparison});
-    }
+        std::vector<CreateFboAttachmentDTO> attachments;
 
-    // A camera is the render target it draws into; one that could not get its buffers is not a
-    // camera with a missing field, so it is not handed back at all.
-    const auto output = fboService.create(CreateFboDTO{.type = FboType::Planar, .attachments = std::move(attachments)});
+        // Colour first, so the attachment order an existing camera's framebuffer has is unchanged
+        // and so the presenter's "first colour attachment" stays the first element.
+        if (wantsColour)
+        {
+            attachments.push_back(CreateFboAttachmentDTO{.width = createCameraDTO.width,
+                                                         .height = createCameraDTO.height,
+                                                         .type = FboAttachmentType::Color,
+                                                         .captureFormat = TextureFormat::RGBA,
+                                                         .internalFormat = TextureFormat::RGBA16F});
+        }
 
-    if (!output)
-    {
-        return std::unexpected("the camera has no output buffer: " + output.error());
+        if (wantsDepth)
+        {
+            // A depth-only target is one a shader is going to compare against, so its precision is
+            // named rather than left to the driver — see TextureFormat::DepthComponent32F. A camera
+            // that also has colour is using its depth buffer as a depth *test*, where the driver's
+            // choice has always been fine and changing it would move pixels for nothing.
+            const auto depthFormat = wantsColour ? TextureFormat::DepthComponent : TextureFormat::DepthComponent32F;
+
+            attachments.push_back(CreateFboAttachmentDTO{.width = createCameraDTO.width,
+                                                         .height = createCameraDTO.height,
+                                                         .type = FboAttachmentType::Depth,
+                                                         .captureFormat = TextureFormat::DepthComponent,
+                                                         .internalFormat = depthFormat,
+                                                         .depthComparison = createCameraDTO.depthComparison});
+        }
+
+        // A camera is the render target it draws into; one that could not get its buffers is not a
+        // camera with a missing field, so it is not handed back at all.
+        const auto created =
+            fboService.create(CreateFboDTO{.type = FboType::Planar, .attachments = std::move(attachments)});
+
+        if (!created)
+        {
+            return std::unexpected("the camera has no output buffer: " + created.error());
+        }
+
+        output = created.value();
     }
 
     // The clipping planes default to the values the projection used to hardcode, so wiring the
@@ -121,7 +137,7 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
                   .farClippingPlane = 5000.0f,
                   .direction = glm::vec3(0, 0, 1),
                   .roll = glm::vec3(0, 1, 0),
-                  .output = output.value()};
+                  .output = output};
 }
 
 void CameraService::setExposure(Camera& camera, const float exposure) const

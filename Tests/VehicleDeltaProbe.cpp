@@ -537,8 +537,7 @@ TEST_CASE("what the corrected data did to the car", "[.vehicle-delta]")
 
         // What the gearing says the terminal speed *should* be if the engine were on the limiter in
         // top: a hand check on the same 3.5% the radius carries.
-        const auto topRatio = driveline.gearbox.ratios[static_cast<std::size_t>(driveline.gearbox.topGear()) - 1] *
-                              driveline.gearbox.finalDrive;
+        const auto topRatio = driveline.gearbox.reduction(driveline.gearbox.topGear());
         std::printf("  geared speed at limiter in top %.2f kph  (radius %.4f m, top reduction %.3f)\n",
                     driveline.engine.limiterSpeed / topRatio * setup.corners[0].hardpoints.wheelRadius * 3.6,
                     setup.corners[0].hardpoints.wheelRadius, topRatio);

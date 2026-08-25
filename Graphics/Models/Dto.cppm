@@ -46,14 +46,21 @@ export enum class CameraTarget { ColourAndDepth, ColourOnly, DepthOnly };
 // window resize leaves alone.
 export struct CreateCameraDTO
 {
-    unsigned int width;
-    unsigned int height;
+    // Zero is spellable now because the `output` form below does not read them; a camera that owns
+    // its target still has to state both, and a zero reaches the backend's minimised-window clamp.
+    unsigned int width = 0;
+    unsigned int height = 0;
     CameraTarget target = CameraTarget::ColourAndDepth;
     // Applied to the depth attachment, if there is one. See DepthComparison.
     DepthComparison depthComparison = DepthComparison::None;
     // See CameraRole and Camera::overrideShader.
     CameraRole role = CameraRole::Scene;
     std::optional<Resource<Shader>> overrideShader{};
+    // A render target this camera draws into instead of owning one — typically an Fbo composed over
+    // attachments other framebuffers already own (FboService::compose), which is how a layered
+    // frame's cameras share one depth buffer. When set, the width, height, target and
+    // depthComparison above are not read: the attachments already answer all four.
+    std::optional<Resource<Fbo>> output{};
 };
 
 // What a scene's cascaded shadow map is made of. The defaults are the ones a scene of this size

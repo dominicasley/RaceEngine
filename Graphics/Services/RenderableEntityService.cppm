@@ -20,6 +20,7 @@ module;
 export module raceengine.graphics:RenderableEntityService;
 
 import :FrameDiagnostics;
+import :ShaderService;
 import raceengine.graphics.models;
 import raceengine.shared;
 
@@ -37,7 +38,13 @@ private:
 public:
     explicit RenderableEntityService(MemoryStorageService& memoryStorageService, FrameDiagnostics& diagnostics);
 
-    [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor) const;
+    // `shaderService` is taken as a parameter rather than held, and that is the composition root's
+    // doing rather than a preference: this service is constructed *before* the renderer, and the
+    // shader registry is constructed after it, so there is no reference to hold at the time this one
+    // is built. Passing it in at the one call site keeps the whole material-shader decision in one
+    // place instead of splitting it across two services to work around an ordering.
+    [[nodiscard]] RenderableModel createModel(const CreateRenderableModelDTO& entityDescriptor,
+                                              ShaderService& shaderService) const;
     [[nodiscard]] std::expected<void, std::string>
     setSkeleton(RenderableMesh& mesh, Resource<std::unique_ptr<ozz::animation::Skeleton>> skeleton) const;
     [[nodiscard]] std::expected<void, std::string>

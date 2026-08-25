@@ -50,6 +50,18 @@ export enum class Key : int {
     // The telemetry toggle. A driver flagging an interesting moment must not have to leave the seat
     // to do it, which is the whole of why it is a key and not a command line switch.
     T = GLFW_KEY_T,
+    // The free-camera toggle. A key rather than an environment variable for the telemetry key's
+    // reason: deciding to go and look at something from outside the car is a thing you decide while
+    // driving, and a knob that needs the process restarted is one nobody reaches for.
+    C = GLFW_KEY_C,
+    // Print where the camera is standing and which way it points. A key for the same reason again,
+    // and for one more: a view is the hardest thing in this project to describe in words, so what a
+    // driver saw can only be handed over by being reproduced, and this is what makes that possible.
+    P = GLFW_KEY_P,
+    // The wiper stalk, stepped one setting per press. A key for the reason the telemetry toggle is
+    // one: it is a control a driver reaches for *because* of what they are looking at, and a wiper
+    // setting chosen before the process started is a wiper setting chosen before the rain.
+    V = GLFW_KEY_V,
     Escape = GLFW_KEY_ESCAPE,
     Space = GLFW_KEY_SPACE,
     LeftShift = GLFW_KEY_LEFT_SHIFT,

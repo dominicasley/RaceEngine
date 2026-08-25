@@ -167,7 +167,9 @@ void startEngine(const DrivelineSetup& setup, DrivelineState& state)
 
 void placeDriveline(const DrivelineSetup& setup, DrivelineState& state, const double axleSpeed)
 {
-    state.shaftSpeed = axleSpeed * setup.gearbox.finalDrive;
+    // **The gear's own final drive**, which on a two-final transaxle is not one number. Placing a car
+    // in sixth with the first axle's ratio would wind the shaft against a speed it never turns at.
+    state.shaftSpeed = axleSpeed * setup.gearbox.finalFor(state.gear);
     state.windUp = 0.0;
 }
 
@@ -285,6 +287,20 @@ void advanceShift(const Gearbox& gearbox, DrivelineState& state, const std::int3
 
 } // namespace
 
+// What reaches the differential, given what the gearbox output is carrying. Declared in
+// Api/Driveline.cppm, where the reasoning lives.
+[[nodiscard]] double throughDrivelineLosses(const DrivelineLosses& losses, const double torque, const double speed)
+{
+    // A driveline that ate more than 95% of what went through it is a seized one, and the reciprocal
+    // below would turn a plausible number into an enormous one rather than failing visibly.
+    const auto efficiency = std::clamp(losses.efficiency, 0.05, 1.0);
+
+    // Torque and speed agreeing in sign is power flowing toward the wheels. At a standstill there is
+    // no power flowing either way and no loss to take, so the driving branch — which multiplies — is
+    // the safe one to fall into.
+    return torque * speed >= 0.0 ? torque * efficiency : torque / efficiency;
+}
+
 [[nodiscard]] std::expected<DrivelineTorques, std::string>
 stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::array<double, cornerCount>& wheelSpeeds,
               const std::array<double, cornerCount>& wheelInertias, const std::array<double, cornerCount>& roadTorques,
@@ -352,7 +368,13 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
     const auto connected = geared && drivenCount > 0 && state.shiftPhase == ShiftPhase::Engaged;
 
     const auto gearRatio = setup.gearbox.ratio(state.gear);
-    const auto finalDrive = setup.gearbox.finalDrive;
+
+    // **The final drive this gear runs through**, which is a property of the gear on a transaxle with
+    // two of them. The compliant shaft sits between the gearbox output and the final drive, so which
+    // axle is downstream of it changes with the gear — and so does the speed the shaft is wound
+    // against. Modelling that pair as one lumped shaft is an approximation and it is recorded at
+    // `DrivelineCompliance::stiffness`.
+    const auto finalDrive = setup.gearbox.finalFor(state.gear);
 
     // The differential input's speed, at the gearbox output — the reference the compliant shaft and
     // every number describing it is stated in, because that is where the shaft physically is.
@@ -434,7 +456,21 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
         advanceCreep(setup.autoClutch, state.creepCommand, input.brake, input.throttle, connected, running, deltaTime);
     result.creepCommand = state.creepCommand;
 
-    const auto commanded = std::min(automatic, creepPedal(setup.coupling, state.creepCommand));
+    // **Launch control owns the pedal outright while it is armed**, rather than voting with the others
+    // — which is what makes it a mode and the rest of the automation a set of rules. Creep and the
+    // catching-up term are both about a car that is trying to move; a launch is a car being
+    // deliberately held, and `min`-ing a regulator against them would let whichever wanted the clutch
+    // closer win at exactly the moment the regulator is trying to hold it open enough to keep the
+    // engine alive.
+    //
+    // The two things that still beat it are the two that must: the driver's own foot past the pedal's
+    // free play, inside `advanceClutchPedal`, and the anti-stall floor applied over the result.
+    state.launchArmed = launchControlArmed(setup.autoClutch.launch, state.launchArmed, input.brake, input.throttle,
+                                           axleSpeed, connected, running);
+
+    const auto commanded =
+        state.launchArmed ? launchControlPedal(setup.coupling, setup.autoClutch.launch, flywheel, state.engineSpeed)
+                          : std::min(automatic, creepPedal(setup.coupling, state.creepCommand));
 
     // **A dead engine gets a disengaged clutch, at any speed, and this is not the anti-stall.** The
     // anti-stall prevents a stall and lives only under the creep band; this is what to do once one has
@@ -576,7 +612,11 @@ stepDriveline(const DrivelineSetup& setup, DrivelineState& state, const std::arr
     // Through the final drive to the differential, and out to the wheels it decides between. This is
     // the *delivered* torque and not the reaction: they part company the moment the slot holds
     // anything with a member grounded to its own housing.
-    const auto axleTorque = shaftTorque * finalDrive;
+    // **The losses go here and nowhere else** — between the gearbox output and the differential, which
+    // is where the final drive, its bearings and the halfshaft joints physically are. See
+    // `DrivelineLosses` for why this is not a multiplier on the engine's curve, and for the sign rule
+    // that makes a lossy driveline coast down *harder* rather than more gently.
+    const auto axleTorque = throughDrivelineLosses(setup.losses, shaftTorque, state.shaftSpeed) * finalDrive;
 
     // One statement of what a differential is handed, rather than the same seven fields written out
     // three times with the indices changed.

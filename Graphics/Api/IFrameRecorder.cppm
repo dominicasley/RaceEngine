@@ -33,7 +33,12 @@ public:
     // Opens the frame. False means there is nothing to render into this step — a swapchain
     // that went out of date, or a minimised window — so the caller records nothing and does
     // not call endFrame.
-    [[nodiscard]] virtual bool beginFrame() = 0;
+    //
+    // `simulationTime` is the simulated instant this frame renders, in seconds — the engine's tick
+    // count times its fixed step, and the only clock anything temporal in a shader may read. Wall
+    // time would put a different image on disk every capture run; this is a function of the frame
+    // number, so frame N is the same instant on every machine.
+    [[nodiscard]] virtual bool beginFrame(double simulationTime) = 0;
 
     // One view: the camera's scene pass into that camera's own render target, followed by
     // that camera's post-process chain. Each pass establishes the state it reads, so views

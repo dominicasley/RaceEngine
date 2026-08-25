@@ -1,6 +1,7 @@
 module;
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <functional>
@@ -145,6 +146,10 @@ private:
     // level was built with rather than the state its first update produced.
     float accumulator = fixedTimeStep;
     float interpolationAlpha = 0.0f;
+    // Ticks simulated since the engine started, ever. The frame hands the renderer this times the
+    // fixed step as the simulated instant it renders — the one clock anything temporal in a shader
+    // may read, and under capture a function of the frame number rather than of the machine.
+    uint64_t simulatedTicks = 0;
     std::vector<std::function<void(float)>> updateCallbacks;
     // How the engine asks its own loop to stop, and what the process should say when it does.
     // The frame capture is the one thing that ends a run from below `main` today; it used to do
@@ -196,6 +201,16 @@ public:
     [[nodiscard]] float interpolation() const
     {
         return interpolationAlpha;
+    }
+
+    // The simulated instant, in seconds: ticks times the fixed step, and the same number the
+    // renderer hands every shader as the clock. Exposed so that a game animating something a
+    // shader also animates — a wiper blade, whose sweep the shader inverts to work out what it
+    // cleared — reads *that* clock rather than starting a second one beside it. Under a capture it
+    // is a function of the frame number, so anything driven by it reproduces.
+    [[nodiscard]] double simulatedSeconds() const
+    {
+        return static_cast<double>(simulatedTicks) * static_cast<double>(fixedTimeStep);
     }
 
     // The engine's own logger, so a game can say something into the same stream the engine does

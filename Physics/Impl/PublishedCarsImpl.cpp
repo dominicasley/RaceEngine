@@ -543,8 +543,47 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto steerRatio = -14.1;
     const auto roadWheelLock = std::abs(steerLock / steerRatio) * (3.14159265358979323846 / 180.0);
 
-    // suspensions.ini: rates at the wheel, dampers with a knee, and the anti-roll bars. The spring
-    // and damper are carried onto the shaft by the motion ratio the linkage reports at design.
+    // suspensions.ini: dampers with a knee and the anti-roll bars. The spring and damper are carried
+    // onto the shaft by the motion ratio the linkage reports at design.
+    //
+    // **The spring rates are the tenth and eleventh numbers taken away from the mod** (2026-08-24).
+    // `suspensions.ini` states `SPRING_RATE` 35000 front and 57000 rear, and this model read both as
+    // **wheel** rates. Against measured figures for the car — 3.5 kg/mm front and 4.5 kg/mm rear on
+    // motion ratios of 0.96 and 0.64 — the wheel rates are `spring x MR^2` = **31632 and 18076**.
+    //
+    // **The front being nearly right is what makes the rear credible as a defect.** At a front motion
+    // ratio of 0.96 a spring rate and a wheel rate are the same number to 8%, so AC's 35000 is correct
+    // whichever convention it is in — it lands within 11% of the wheel rate below. At the rear's 0.64
+    // they differ by 1/0.64^2 = 2.4x, and AC's 57000 read as a wheel rate is **3.15 times too stiff**.
+    // One end right and the other wrong is a bad number; both ends wrong the same way would have been
+    // our own misreading.
+    //
+    // What it was doing: the rear ride frequency came out at **2.47 Hz against the front's 1.49**, a
+    // 61% split where a road car runs the rear 10-20% above the front. These give 1.39 and 1.42 Hz.
+    //
+    // **Ride height is preserved and that is not luck**: `springFreeLengthForLoad` below solves the
+    // rest length from *this* rate and the corner's static load, so a rate change moves stiffness and
+    // not attitude. Scaling `springRate` on an already-built car does the opposite, which is how a
+    // probe briefly credited this change with fixing the rear wheel lift that it does not fix.
+    //
+    // **HELD, NOT ADOPTED — and the reason is the whole argument for holding it.** Fitting the wheel
+    // rates above breaks a criterion that was derived from the real car: the **skidpad falls to
+    // 0.883 g against a 0.90-0.95 band** taken from a Mk7 GTI on OEM tyres, which is the measurement
+    // this car's tyre grip was itself set against (`grip-set-without-circularity`).
+    //
+    // The mechanism is not grip, it is balance. Softening the rear by 68% while the anti-roll bars
+    // stay put moves the roll-stiffness distribution from **49.7% front to 67.2%**, and a
+    // front-drive car with two thirds of its roll couple on the front axle understeers into its
+    // limit. The bars are AC's numbers too and would have to be re-derived alongside — which is a
+    // second unverified figure to lean on, not a free move.
+    //
+    // **And the rear motion ratio is the number the whole thing turns on.** At the source's 0.64 the
+    // rear ride frequency comes to 1.39 Hz; at 0.78 it would be 1.70, which is a sporty hatchback
+    // and leaves the balance nearly alone. A 0.14 difference in an unverified motion ratio is the
+    // difference between a car that passes its own skidpad and one that does not.
+    //
+    // So this stays on AC's figures until the rear motion ratio is confirmed, and the ride-frequency
+    // anomaly is recorded rather than acted on. `docs/known-red.md`.
     const auto wheelRate = std::array{35000.0, 35000.0, 57000.0, 57000.0};
     const auto bumpRate = std::array{4600.0, 4600.0, 6200.0, 6200.0};
     const auto fastBumpRate = std::array{1834.0, 1834.0, 1842.0, 1842.0};
@@ -664,7 +703,7 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         //      model may set it.
         //   3. 0.87 puts criterion 5 at **0.9230 g**, mid-band.
         //   4. **0-100 is then checked independently** on the launch fixture against the published
-        //      6.4-6.7 s for a DSG without launch control — a different measurement against a
+        //      6.5-6.6 s measured (MOTOR Australia, amS) — a different measurement against a
         //      different external reference, with no shared parameter but this one.
         //
         // Steps 3 and 4 agreeing is the validation. Neither number was used to set the other.
@@ -714,6 +753,14 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         //
         // Swept in `[.tyre-shape]`; **driven and accepted 2026-08-22**, in the same session as the
         // grip correction below — the two went to the seat together and cannot be separated by it.
+        //
+        // **No longer merely fitted: corroborated against two external references, 2026-08-24**
+        // (`[.peak-to-tail]`, docs/tyre-peak-to-tail-brief.md). With the peak held, sweeping the
+        // tail 0.44-0.91 spans 6.31-7.37 s of electronics-on 0-100 and only this curve lands in
+        // the measured 6.5-6.6; its locked-to-peak ratio (0.804 through the chassis) sits inside
+        // the published 0.75-0.90 dry band. The same sweep proved the anti-lock recovery law is
+        // calibrated against this tail's shallowness — steep tails cost the car 4-6 m through the
+        // controller alone — so changing these three is a controller co-design, not a data edit.
         corner.tyre.longitudinalShape = 1.50;
         corner.tyre.longitudinalCurvature = 0.0;
         corner.tyre.longitudinalStiffness = 28.0;
@@ -721,8 +768,30 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         // Stated on the shaft, and sized inside the travel the linkage has. The bump stops AC states
         // do not carry across: its front BUMPSTOP_UP of 0.80 m is not a travel any suspension has and
         // its rear BUMPSTOP_DN of 0 would have the droop stop touching at rest.
+        //
+        // **The bump gap is confirmed and the droop gap was wrong** (2026-08-24). Measurements of a
+        // 2019 GTI Rabbit Edition DSG — same MQB platform — give a bare shock shaft of 73 mm at ride
+        // height with **18 mm to the bump stop**, so the 20 mm here is right to two millimetres.
+        //
+        // Droop is a different thing and was being modelled as if it were the same thing. **On a strut
+        // the rebound limit is the damper topping out**, not a bumper somebody specifies: the travel
+        // is whatever stroke is left once ride height has used some. Placing 20 mm there invented a
+        // constraint the car does not have, and it bound — measured, the rear reached its droop stop
+        // at 23 mm of extension against **-4965 N**, and a rear tyre carrying 80 N is 0.27 mm off the
+        // road. The wheel was leaving the ground under braking because its suspension had stopped
+        // extending, which is why nothing at the front ever moved it.
+        //
+        // 40 mm is placed against the **linkage's** own limit rather than invented: the geometry
+        // allows 49.5 mm of front shaft droop and 52.0 of rear, and the car only ever asks for 27.4.
+        // That leaves the stop real travel to work in before the geometric clamp behind it, which has
+        // no reaction force and is what `validateCornerSetup` exists to keep the car away from.
+        // Measured: lowest rear axle load **79.8 N -> 402.1 N**, and the stop is then never touched at
+        // all. It saturates by 30 mm, so this is not a number tuned to an outcome.
+        //
+        // Still placeholders, and still bounding everything behind them: `bumpAngle`/`droopAngle` give
+        // only 55 mm of front bump travel where the real car measures **73**.
         corner.bumpStop = TravelStop{.gap = 0.020, .rate = 900000.0, .progression = 3.0, .damping = 40000.0};
-        corner.droopStop = TravelStop{.gap = 0.020, .rate = 600000.0, .progression = 3.0, .damping = 30000.0};
+        corner.droopStop = TravelStop{.gap = 0.040, .rate = 600000.0, .progression = 3.0, .damping = 30000.0};
 
         const auto restLength = springFreeLengthForLoad(corner, sprungLoad[index]);
         if (!restLength)
@@ -772,12 +841,52 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         return glm::dvec2(rpm * rpmToRadiansPerSecond, torque);
     };
 
+    // Torque at a speed the manufacturer states as a *power*, which is the only honest way to write
+    // the top of the curve: 180 kW from 5000 to 6200 rpm is one statement about three points, and
+    // reading three torques off a dyno graph instead would be three inventions that happen to agree.
+    const auto atPower = [&atRpm](const double rpm, const double watts)
+    {
+        return atRpm(rpm, watts / (rpm * rpmToRadiansPerSecond));
+    };
+
+    // **The seventh number taken away from the mod** (2026-08-24), after the wheel radius, the
+    // unsprung mass, `CG_LOCATION`, the tyre peaks, `MAX_TORQUE` and `FRONT_SHARE`. Full account:
+    // `docs/engine-curve-brief.md`.
+    //
+    // **The import is faithful and that is gated — the source data is wrong.** AC's turbo is
+    // `boost = min(WASTEGATE, MAX_BOOST * (rpm/REFERENCE_RPM)^GAMMA)` and `[TURBO_0]` states 1.60,
+    // 1.20, 2200 and 2.5; recomputed from those four numbers the imported curve matched at all
+    // eighteen points, and the wastegate is on its stop at **1961 rpm**, so above two thousand revs
+    // the imported curve was `power.lut x 2.2` and no turbo behaviour was involved in the shortfall
+    // at all. It was entirely in `power.lut`, which would need a flat 168.2 N.m across the plateau
+    // and carries 124 / 144 / 154 / 152 / 156. The mod's engine is a weaker engine than the car it
+    // names, and `ui_car.json` claims a third figure again — 402 N.m, which is a Golf R's.
+    //
+    // **What is here is two published statements and nothing invented between them**: 370 N.m from
+    // 1600 to 4300 rpm and 180 kW from 5000 to 6200, which is the whole of what a manufacturer
+    // homologates and is exactly the shape a wastegated turbo makes. Torque between 4300 and 5000 is
+    // the straight line joining them. Above 6200 it tapers to the mod's own figure at the limiter,
+    // because nothing published says where it ends and the power up there was already right to 0.3%.
+    //
+    // **Below 1600 rpm nothing is published and the mod's own curve is kept.** That leaves a steeper
+    // spool from 1000 to 1600 than the mod had — 146.7 to 370 rather than to 208 — which is what a
+    // wastegated turbo physically does and is still not a measurement. It is the one stretch this
+    // change makes a claim about that no in-gear pull exercises, so `CreepTests`, `AntiStallTests`
+    // and `GradeTests` are what stand over it.
+    //
+    // **This model has no turbo, so the correction goes into the final curve.** AC's boost ramp is
+    // therefore not a constraint on it, which matters: that ramp cannot reach full boost before
+    // 1961 rpm and VW's plateau starts at 1600, so honouring the published figure means departing
+    // from the mod's turbo shape. Where the mod and the real car disagree, the real car wins.
+    //
+    // What it is worth is the **spread across gears** and not the offset — a wrong scalar moves
+    // three gears together and a wrong curve moves them apart. Measured through the reference car's
+    // own gearing in `[.in-gear]`, the mod's curve ran -15.9% / -11.1% / +0.8% in 4th / 5th / 6th
+    // against auto motor und sport's sheet, a spread of 16.7 points; this one runs flat.
     setup.engine.torque =
-        Curve{.points = {atRpm(0.0, 95.0), atRpm(500.0, 129.92491), atRpm(1000.0, 146.745119), atRpm(1500.0, 193.70088),
-                         atRpm(1768.0, 235.290486), atRpm(1904.0, 260.621688), atRpm(2000.0, 272.8),
-                         atRpm(2500.0, 316.8), atRpm(2650.0, 325.6), atRpm(3000.0, 338.8), atRpm(3500.0, 334.4),
-                         atRpm(4000.0, 334.4), atRpm(4500.0, 349.8), atRpm(5000.0, 343.2), atRpm(5500.0, 314.6),
-                         atRpm(6300.0, 272.8), atRpm(6500.0, 264.0), atRpm(6800.0, 248.16)}};
+        Curve{.points = {atRpm(0.0, 95.0), atRpm(500.0, 129.92491), atRpm(1000.0, 146.745119), atRpm(1600.0, 370.0),
+                         atRpm(4300.0, 370.0), atPower(5000.0, 180000.0), atPower(5500.0, 180000.0),
+                         atPower(6200.0, 180000.0), atRpm(6500.0, 264.0), atRpm(6800.0, 248.16)}};
 
     setup.engine.inertia = 0.150;
     setup.engine.idleSpeed = 850.0 * rpmToRadiansPerSecond;
@@ -785,11 +894,63 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // engine.ini [COAST_REF]: what it absorbs at the limiter with the throttle shut.
     setup.engine.coastTorque = 75.0;
 
-    // drivetrain.ini [GEARS]. Seven forward, and reverse as its magnitude — `reduction` puts the sign
-    // on for it, so carrying GEAR_R's own -2.9 through would give a reverse gear that drives forward.
-    setup.gearbox.ratios = {3.19, 2.08, 1.47, 1.20, 0.99, 0.80, 0.65};
-    setup.gearbox.finalDrive = 4.37;
-    setup.gearbox.reverseRatio = 2.9;
+    // **The eighth number taken away from the mod** (2026-08-24). `drivetrain.ini` states seven
+    // ratios and a **single** `FINAL` of 4.37; Volkswagen's own *2019 Golf GTI Technical
+    // Specifications* state the 7-speed DSG as the ratios below and **two** final drives, 4.17 and
+    // 3.13. Reverse as its magnitude — `reduction` puts the sign on for it, so carrying a negative
+    // through would give a reverse gear that drives forward.
+    //
+    // **First gear was within 1.7% and that is why this lasted**: applying the low final to the whole
+    // box left 2nd and 3rd 13-21% tall and 4th through 7th **35% to 47% short**, and nothing that
+    // checks a standing start can see it. The sanity check that settles it is a cruise — the mod put
+    // 7th at 2397 rpm at 100 km/h and 5912 at 250, which is near peak power in an overdrive; these
+    // give 1691 and 4170.
+    //
+    // Which gear runs through which axle is **not stated** by VW and is inferred — see
+    // `Gearbox::finalDrivePerGear` for the rule and for how it is validated against a box whose
+    // mapping *is* published. It comes out `I, II, II, I, I, II, II`: gears alternating between the
+    // two output shafts in pairs, which is what a dual-clutch box physically is and is not the
+    // contiguous "low gears on the low axle" arrangement it is tempting to assume.
+    //
+    // The resulting overall reductions are 14.178 / 8.607 / 5.540 / 3.878 / 2.961 / 2.379 / 2.003,
+    // whose steps rise all the way up the box — 0.607, 0.644, 0.700, 0.763, 0.803, 0.842 — which is
+    // the shape every real gearbox has and is how the arrangement was chosen.
+    // Full account: `docs/engine-curve-validation-brief.md`.
+    setup.gearbox.ratios = {3.40, 2.75, 1.77, 0.93, 0.71, 0.76, 0.64};
+    setup.gearbox.finalDrive = 4.17;
+    setup.gearbox.finalDrivePerGear = {4.17, 3.13, 3.13, 4.17, 4.17, 3.13, 3.13};
+    setup.gearbox.reverseRatio = 2.90;
+
+    // **Derived on a different car, which is what makes it evidence rather than a tune.** No road
+    // measurement can separate engine torque from driveline efficiency — they are a product in the
+    // tractive force — so this is solved on auto motor und sport's 230 PS Mk7, whose engine, mass,
+    // gearing, road load and in-gear times are every one of them separately published, leaving
+    // efficiency the only unknown left in it. Three gears sampling three different rpm bands agree on
+    // **0.879 to 0.945**, a spread of 7.3% of its own value, and this is the midpoint.
+    //
+    // It is emphatically **not** the 0.83 a first pass got by attributing the whole in-gear residual
+    // to it: that residual is also carrying a 7.2% mass error and the gearing above.
+    // `docs/engine-curve-validation-brief.md`, and `EngineCurveValidationProbe` re-derives it.
+    setup.losses.efficiency = 0.912;
+
+    // **Restated for this car's own final drive rather than inherited.** The default is derived
+    // through 4.37, which is what `placeholderSedan`'s driveline has and what this car had until the
+    // gearing was corrected; the same halfshafts through 4.17 are 25000/4.17^2 = 1438 N.m/rad at the
+    // gearbox output. Leaving it on the default was a silent 7% softening of this car's driveline —
+    // and it showed up as a *placeholder* car's shift test moving, because a default nobody restates
+    // belongs to whoever is still using it.
+    setup.compliance.stiffness = 1438.0;
+
+    // **The launch programme this car has, shipped OFF** — like ABS, traction control and XDS, and for
+    // the same reason: every measurement this project holds is of the car underneath its electronics,
+    // and a default that quietly launched every fixture would be a suite that could no longer see the
+    // car. A test or a setup sheet that wants it says so, once.
+    //
+    // What it reproduces is the procedure from the seat: brake and throttle together, the engine held
+    // near 3000 rpm on a slipping clutch, and the car released when the brake comes off. The second
+    // phase — what the controller does to the clutch *during* the take-up — is not modelled yet.
+    setup.autoClutch.launch.enabled = false;
+    setup.autoClutch.launch.targetSpeed = 3000.0 * rpmToRadiansPerSecond;
 
     setup.coupling.kind = DriveCouplingKind::FrictionClutch;
 

@@ -484,8 +484,9 @@ TEST_CASE("what a launch does with traction control", "[.assist-probe]")
         {
             const auto now = static_cast<double>(step) * tick;
 
-            const auto roadSideSpeed = std::abs(state.chassis.linearVelocity.z) / tyreRadius *
-                                       driveline.gearbox.finalDrive * driveline.gearbox.ratio(gear);
+            // `reduction`, not `ratio * finalDrive`: two final drives since 2026-08-24.
+            const auto roadSideSpeed =
+                std::abs(state.chassis.linearVelocity.z) / tyreRadius * driveline.gearbox.reduction(gear);
             if (roadSideSpeed > upshiftSpeed && gear < driveline.gearbox.topGear())
             {
                 gear++;
@@ -1072,8 +1073,8 @@ TEST_CASE("does the longitudinal peak have to answer to two references at once",
 
         for (auto step = 1; step <= 360 * 15; step++)
         {
-            const auto roadSide = std::abs(state.chassis.linearVelocity.z) / tyreRadius * driveline.gearbox.finalDrive *
-                                  driveline.gearbox.ratio(gear);
+            const auto roadSide =
+                std::abs(state.chassis.linearVelocity.z) / tyreRadius * driveline.gearbox.reduction(gear);
             if (roadSide > upshift && gear < driveline.gearbox.topGear())
             {
                 gear++;

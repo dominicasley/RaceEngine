@@ -69,6 +69,13 @@ void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
         { postProcess.inputs.push_back(PostProcessInput{.attachment = attachment, .level = level}); });
 }
 
+void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey, const Resource<Texture>& texture) const
+{
+    memoryStorageService.postProcesses.mutate(
+        postProcessKey,
+        [&](PostProcess& postProcess) { postProcess.inputs.push_back(PostProcessInput{.texture = texture}); });
+}
+
 void PostProcessService::setParameters(const Resource<PostProcess>& postProcessKey, const glm::vec4& parameters) const
 {
     memoryStorageService.postProcesses.mutate(postProcessKey,

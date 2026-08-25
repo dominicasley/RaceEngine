@@ -872,7 +872,14 @@ TEST_CASE("the first half second of a stop, tick by tick", "[.brake-model]")
         input.brake = pedal;
 
         std::printf("\n  %s, pedal %.2f\n", name, pedal);
-        std::printf("    t [s]   speed   front load   rear load   front w   rear w   pitch [deg]\n");
+        // **The two bump-stop columns were added 2026-08-24 and they are the point of this trace now.**
+        // The rear-load oscillation measures 3.48 Hz with a damping ratio of 0.10, and neither is what
+        // this car's springs and dampers give on their own — computed, the pitch mode is 2.09 Hz at
+        // zeta 0.24. Both come into line if the front stiffness is about ten times what its spring
+        // says, which is what a bump stop is. Inferring that from a frequency is not the same as
+        // seeing the force, so here is the force.
+        std::printf("    t [s]   speed   front load   rear load   front w   rear w   pitch [deg]   "
+                    "F bumpstop   R bumpstop   F travel\n");
 
         for (auto step = 1; step <= 360; step++)
         {
@@ -892,12 +899,15 @@ TEST_CASE("the first half second of a stop, tick by tick", "[.brake-model]")
                 continue;
             }
 
-            std::printf("   %6.3f  %6.2f  %10.1f  %10.1f  %8.2f %8.2f  %10.3f\n", static_cast<double>(step) * tick,
-                        state.chassis.linearVelocity.z,
+            std::printf("   %6.3f  %6.2f  %10.1f  %10.1f  %8.2f %8.2f  %10.3f  %10.1f  %10.1f  %8.4f\n",
+                        static_cast<double>(step) * tick, state.chassis.linearVelocity.z,
                         stepped->corners[0].forces.tireVertical + stepped->corners[1].forces.tireVertical,
                         stepped->corners[2].forces.tireVertical + stepped->corners[3].forces.tireVertical,
                         state.corners[0].wheelSpeed, state.corners[2].wheelSpeed,
-                        stepped->telemetry.pitch * 57.29577951308232);
+                        stepped->telemetry.pitch * 57.29577951308232,
+                        stepped->corners[0].forces.bumpStop + stepped->corners[1].forces.bumpStop,
+                        stepped->corners[2].forces.bumpStop + stepped->corners[3].forces.bumpStop,
+                        stepped->corners[0].suspension.wheelTravel);
         }
     };
 
@@ -910,4 +920,332 @@ TEST_CASE("the first half second of a stop, tick by tick", "[.brake-model]")
     std::printf("\n=== the transient the lock order is being read through ===\n");
     trace("one exponent", asShipped, 0.35);
     trace("two exponents", base.value(), 0.35);
+}
+
+TEST_CASE("what correcting the rear spring rate would do to the pitch transient", "[.brake-model]")
+{
+    // **Measured, not adopted.** The rear wheel rate is the prime suspect for a pitch mode that runs
+    // at 3.48 Hz with a damping ratio of 0.10 and throws the rear axle to 189 N mid-stop.
+    //
+    // The evidence: `suspensions.ini` states 35000 front and 57000 rear, and this model reads both as
+    // **wheel** rates. Against a published-but-unverified 3.5 kg/mm front and 4.5 kg/mm rear on motion
+    // ratios of 0.96 and 0.64, the wheel rates should be **31632 and 18076** — so the front is right
+    // to 11% and **the rear is 3.15 times too stiff**.
+    //
+    // That asymmetry is itself the argument. At a front motion ratio of 0.96 a spring rate and a wheel
+    // rate are the same number to 8%, so AC's front figure is correct whichever convention it is in.
+    // At the rear's 0.64 they differ by 1/0.64^2 = 2.4x, and a spring rate read as a wheel rate lands
+    // almost exactly where AC's 57000 is. **One end being right is what makes the other end credible
+    // as a defect rather than as our own misreading.**
+    //
+    // What this case does *not* assume is that fixing it fixes the transient. The front is on its bump
+    // stops through the whole stop, and a softer rear pitches the car further nose-down, which would
+    // push it *deeper* in. So the two corrections are measured together and apart.
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    // Scaling `springRate` scales the wheel rate by the same factor: the conversion the car was built
+    // with is `springRate = wheelRate / motionRatio^2`, and the geometry is untouched here.
+    const auto withRates = [&base](const double frontScale, const double rearScale)
+    {
+        auto car = base.value();
+        for (auto index = std::size_t{0}; index < cornerCount; index++)
+        {
+            car.corners[index].springRate *= index < 2 ? frontScale : rearScale;
+        }
+
+        return car;
+    };
+
+    struct Transient
+    {
+        double lowestRearAxle = 1e9;
+        double peakBumpStop = 0.0;
+        double stopDistance = 0.0;
+    };
+
+    const auto run = [&world](const VehicleSetup& car)
+    {
+        auto state = VehicleState{};
+        settle(car, state, world.value(), hundred);
+
+        auto result = Transient{};
+        const auto start = state.chassis.position.z;
+
+        auto input = VehicleInput{};
+        input.brake = 0.35;
+
+        for (auto step = 1; step <= 360 * 12; step++)
+        {
+            const auto stepped = stepVehicle(car, state, input, noDriveTorque, world.value(), tick);
+            REQUIRE(stepped.has_value());
+
+            const auto rear = stepped->corners[2].forces.tireVertical + stepped->corners[3].forces.tireVertical;
+            const auto stop = stepped->corners[0].forces.bumpStop + stepped->corners[1].forces.bumpStop;
+
+            result.lowestRearAxle = std::min(result.lowestRearAxle, rear);
+            result.peakBumpStop = std::max(result.peakBumpStop, stop);
+
+            if (state.chassis.linearVelocity.z <= 0.05)
+            {
+                result.stopDistance = state.chassis.position.z - start;
+                break;
+            }
+        }
+
+        return result;
+    };
+
+    std::printf("\n=== the rear spring rate against the pitch transient ===\n");
+    std::printf("  wheel rates the source implies: front 31632, rear 18076 N/m\n");
+    std::printf("  the car ships with:             front 35000, rear 57000 N/m\n\n");
+    std::printf("  front    rear     lowest rear axle    peak front bumpstop    100-0 m\n");
+
+    const auto cases =
+        std::array{std::tuple{"35000", "57000", 1.0, 1.0}, std::tuple{"35000", "18076", 1.0, 18076.0 / 57000.0},
+                   std::tuple{"31632", "57000", 31632.0 / 35000.0, 1.0},
+                   std::tuple{"31632", "18076", 31632.0 / 35000.0, 18076.0 / 57000.0}};
+
+    for (const auto& [frontName, rearName, frontScale, rearScale] : cases)
+    {
+        const auto measured = run(withRates(frontScale, rearScale));
+
+        std::printf("  %-7s  %-7s  %14.1f N  %18.1f N  %9.2f%s\n", frontName, rearName, measured.lowestRearAxle,
+                    measured.peakBumpStop, measured.stopDistance,
+                    frontScale == 1.0 && rearScale == 1.0 ? "   <- as shipped" : "");
+    }
+
+    std::printf("\n  A rear axle that stops reaching zero, and a front that stops hitting its stop, are two\n");
+    std::printf("  different fixes. This says whether either alone is enough.\n");
+}
+
+TEST_CASE("the front bump stop's rate, against the travel a real one has", "[.brake-model]")
+{
+    // **The gap is right and the rate is not.** Measurements of a 2019 GTI Rabbit Edition DSG — same
+    // MQB platform — give a bare shock shaft of 73 mm at ride height with **18 mm to the bump stop**
+    // and 73 mm of total bump travel. This model's `bumpStop.gap` is 20 mm, so the *travel before the
+    // stop* is right to two millimetres and "the front runs out of suspension" is the wrong diagnosis.
+    //
+    // What is wrong is what happens after it touches. The stop is a placeholder — AC's own
+    // `BUMP_STOP_RATE` of 55000 N/m was not carried across — and at the 12.9 mm the trace reaches it
+    // has a tangent stiffness of **1123 kN/m**: twenty times AC's stated rate and **thirty-two times
+    // the front spring**. That is what takes the pitch mode to 3.48 Hz and its damping ratio to 0.10.
+    //
+    // A real car does ride its bump stops under hard braking — at a 31632 N/m wheel rate the front
+    // needs about 45 mm of travel for the load a 0.94 g stop puts on it, against 18 mm to the stop —
+    // so the stop engaging is correct. Engaging like a wall is not.
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    const auto withStop = [&base](const double rate, const double damping, const double rearScale)
+    {
+        auto car = base.value();
+        for (auto index = std::size_t{0}; index < cornerCount; index++)
+        {
+            car.corners[index].bumpStop.rate = rate;
+            car.corners[index].bumpStop.damping = damping;
+            if (index >= 2)
+            {
+                car.corners[index].springRate *= rearScale;
+            }
+        }
+
+        return car;
+    };
+
+    const auto run = [&world](const VehicleSetup& car)
+    {
+        auto state = VehicleState{};
+        settle(car, state, world.value(), hundred);
+
+        auto lowestRear = 1e9;
+        auto peakStop = 0.0;
+        auto deepestTravel = 0.0;
+        auto deepestDroop = 0.0;
+        auto rearExtension = 0.0;
+        auto distance = 0.0;
+        const auto start = state.chassis.position.z;
+
+        auto input = VehicleInput{};
+        input.brake = 0.35;
+
+        for (auto step = 1; step <= 360 * 12; step++)
+        {
+            const auto stepped = stepVehicle(car, state, input, noDriveTorque, world.value(), tick);
+            REQUIRE(stepped.has_value());
+
+            lowestRear =
+                std::min(lowestRear, stepped->corners[2].forces.tireVertical + stepped->corners[3].forces.tireVertical);
+            peakStop = std::max(peakStop, stepped->corners[0].forces.bumpStop);
+            deepestTravel = std::max(deepestTravel, stepped->corners[0].suspension.wheelTravel);
+            // **The rear's DROOP stop**, which is where this trail ends. A rear tyre carrying 80 N is
+            // 0.27 mm from leaving the road, and a wheel can only follow the road as far as its own
+            // suspension lets it extend.
+            deepestDroop = std::min(deepestDroop, stepped->corners[2].forces.droopStop);
+            rearExtension = std::min(rearExtension, stepped->corners[2].suspension.wheelTravel);
+
+            if (state.chassis.linearVelocity.z <= 0.05)
+            {
+                distance = state.chassis.position.z - start;
+                break;
+            }
+        }
+
+        return std::array{lowestRear, peakStop, deepestTravel, distance, deepestDroop, rearExtension};
+    };
+
+    std::printf("\n=== the front bump stop's rate ===\n");
+    std::printf("  measured: 18 mm to the stop, 73 mm total bump travel. Model gap: 20 mm.\n");
+    std::printf("  AC states BUMP_STOP_RATE = 55000 N/m linear; the model places 900000 at cubic.\n\n");
+    // **Swept over the DAMPING and not the rate**, and that is a correction. Sweeping the rate first
+    // moved nothing at all — the peak "bump stop force" came back at 7210 N for every stiffness from
+    // 55000 to 900000, which is `40000 x 0.18 m/s` and therefore the stop's **damper**, not its
+    // spring. At 40000 N.s/m that term is five times the corner's own critical damping, so the stop
+    // does not so much stiffen the car as hit it.
+    std::printf("   rate     damping   rear spring   lowest rear axle   F travel   R droop force   R extension\n");
+
+    const auto cases = std::array{std::tuple{900000.0, 40000.0, 1.0, "shipped"},
+                                  std::tuple{900000.0, 10000.0, 1.0, ""},
+                                  std::tuple{900000.0, 4000.0, 1.0, ""},
+                                  std::tuple{900000.0, 0.0, 1.0, "no stop damping"},
+                                  std::tuple{55000.0, 4000.0, 1.0, "AC rate, sane damping"},
+                                  std::tuple{55000.0, 4000.0, 18076.0 / 57000.0, "...and the rear fix"}};
+
+    for (const auto& [rate, damping, rearScale, note] : cases)
+    {
+        const auto measured = run(withStop(rate, damping, rearScale));
+
+        std::printf("  %8.0f  %8.0f   %9.0f   %14.1f N  %7.1f mm  %11.1f N  %8.1f mm  %s\n", rate, damping,
+                    57000.0 * rearScale, measured[0], 1000.0 * measured[2], measured[4], 1000.0 * measured[5], note);
+    }
+
+    std::printf("\n  Watch the travel column: a stop soft enough to stop ringing the car is also a stop\n");
+    std::printf("  that lets the suspension run further, and the linkage has a hard limit behind it.\n");
+}
+
+TEST_CASE("how much travel the linkage actually has, against the stops placed in it", "[.brake-model]")
+{
+    // **Droop is set by the damper topping out, not by a separate bumper**, and that reframes the
+    // number. On a strut the rebound limit *is* the shock reaching its maximum length, so the travel
+    // available is the stroke left over once ride height has used some of it. Measurements of a 2019
+    // GTI Rabbit DSG give 73 mm of exposed shaft at ride height — that is the **bump** side — and the
+    // droop side is the rest of the stroke.
+    //
+    // This model expresses both ends as `TravelStop`s with placed 20 mm gaps. Before any of that is
+    // worth correcting, the question is whether the **linkage** would even allow more: a stop gap
+    // larger than the geometry's own range is a stop that never touches, and `validateCornerSetup`
+    // refuses exactly that. So this reports what the geometry has.
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    std::printf("\n=== travel the linkage allows, against the stops placed in it ===\n");
+    std::printf("  corner   shaft bump   shaft droop   wheel bump   wheel droop   bump gap   droop gap\n");
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        const auto& corner = setup->corners[index];
+
+        const auto design = solveCorner(corner.hardpoints, 0.0, 0.0);
+        const auto atBump = solveCorner(corner.hardpoints, corner.hardpoints.bumpAngle, 0.0);
+        const auto atDroop = solveCorner(corner.hardpoints, corner.hardpoints.droopAngle, 0.0);
+
+        REQUIRE(design.has_value());
+        REQUIRE(atBump.has_value());
+        REQUIRE(atDroop.has_value());
+
+        // Positive is compression on the shaft; the linkage's own limits either side of design.
+        const auto shaftBump = design->damperLength - atBump->damperLength;
+        const auto shaftDroop = atDroop->damperLength - design->damperLength;
+        const auto wheelBump = atBump->wheelTravel - design->wheelTravel;
+        const auto wheelDroop = design->wheelTravel - atDroop->wheelTravel;
+
+        std::printf("    %zu     %8.1f mm  %9.1f mm  %9.1f mm  %10.1f mm  %6.1f mm  %8.1f mm\n", index,
+                    1000.0 * shaftBump, 1000.0 * shaftDroop, 1000.0 * wheelBump, 1000.0 * wheelDroop,
+                    1000.0 * corner.bumpStop.gap, 1000.0 * corner.droopStop.gap);
+    }
+
+    std::printf("\n  Measured on the real car: 18 mm to the bump stop and 73 mm of total bump travel.\n");
+    std::printf("  If the linkage here has far less than 73 mm, the stops are not the whole problem —\n");
+    std::printf("  the droop and bump ANGLES are placed too, and they bound everything behind them.\n");
+}
+
+TEST_CASE("does giving the rear its droop travel back keep the wheel on the road", "[.brake-model]")
+{
+    // **The decisive test for the rear lifting.** Droop is the damper topping out, and the linkage
+    // here offers 52.6 mm of it at the rear while the placed `droopStop.gap` binds at 20. So the car
+    // is being stopped from extending by a placeholder with 32 mm of its own travel unused.
+    //
+    // Swept up to the linkage's own limit — beyond which `validateCornerSetup` rightly refuses,
+    // because a stop with no travel behind it is a clamp and a clamp has no reaction force.
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    std::printf("\n=== the rear's droop travel against the wheel staying down ===\n");
+    std::printf("  linkage allows 52.6 mm of rear droop; the placed stop binds at 20.\n\n");
+    std::printf("  droop gap   lowest rear axle   rear extension   droop force   100-0 m\n");
+
+    for (const auto gap : {0.020, 0.030, 0.040, 0.045})
+    {
+        auto car = base.value();
+        for (auto& corner : car.corners)
+        {
+            corner.droopStop.gap = gap;
+        }
+
+        // The car must still be a legal car at the new gap, or the number below means nothing.
+        for (const auto& corner : car.corners)
+        {
+            REQUIRE(validateCornerSetup(corner).has_value());
+        }
+
+        auto state = VehicleState{};
+        settle(car, state, world.value(), hundred);
+
+        auto lowestRear = 1e9;
+        auto extension = 0.0;
+        auto droopForce = 0.0;
+        auto distance = 0.0;
+        const auto start = state.chassis.position.z;
+
+        auto input = VehicleInput{};
+        input.brake = 0.35;
+
+        for (auto step = 1; step <= 360 * 12; step++)
+        {
+            const auto stepped = stepVehicle(car, state, input, noDriveTorque, world.value(), tick);
+            REQUIRE(stepped.has_value());
+
+            lowestRear =
+                std::min(lowestRear, stepped->corners[2].forces.tireVertical + stepped->corners[3].forces.tireVertical);
+            extension = std::min(extension, stepped->corners[2].suspension.wheelTravel);
+            droopForce = std::min(droopForce, stepped->corners[2].forces.droopStop);
+
+            if (state.chassis.linearVelocity.z <= 0.05)
+            {
+                distance = state.chassis.position.z - start;
+                break;
+            }
+        }
+
+        std::printf("   %6.1f mm  %14.1f N  %11.1f mm  %10.1f N  %8.2f%s\n", 1000.0 * gap, lowestRear,
+                    1000.0 * extension, droopForce, distance, gap == 0.020 ? "   <- shipped" : "");
+    }
+
+    std::printf("\n  If the rear load climbs with the gap, the placeholder was the constraint all along.\n");
+    std::printf("  If it does not, the wheel is leaving for a reason the suspension cannot reach.\n");
 }

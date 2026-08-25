@@ -277,8 +277,14 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
     // not move, and it does not — the sprung side is solved from it rather than stated beside it,
     // which is exactly what let the mod's figure hide for a milestone.
     REQUIRE(setup->unsprungMass() == Catch::Approx(184.0));
-    REQUIRE(properties->mass == Catch::Approx(1164.0));
-    REQUIRE(properties->mass + setup->unsprungMass() == Catch::Approx(1348.0));
+    // **1268 sprung and 1452 total since 2026-08-24**, where it was 1164 and 1348. The mod's
+    // `TOTALMASS` was not this car's mass: the manufacturer's tare figure is 1377 kg unoccupied and a
+    // car being driven has a 75 kg driver in it, so what accelerates is 1452 and the model was 7.2%
+    // light. The unsprung side is untouched — it is a component build-up and does not depend on the
+    // total — so the whole correction lands on the sprung ledger, which is where an occupant sits.
+    // `docs/engine-curve-validation-brief.md`.
+    REQUIRE(properties->mass == Catch::Approx(1268.0));
+    REQUIRE(properties->mass + setup->unsprungMass() == Catch::Approx(1452.0));
 
     SECTION("and the assembled car carries the inertia the file states, not the shell")
     {
@@ -296,7 +302,16 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
         const auto assembled = computeMassProperties(ledger);
         REQUIRE(assembled.has_value());
 
-        const auto twelfth = 1348.0 / 12.0;
+        // **Scaled with the corrected total mass** (1452 kg since 2026-08-24, was 1348). `car.ini`
+        // states the box's *dimensions*; the inertia is that box carrying the car's mass, so a mass
+        // correction moves it proportionally.
+        //
+        // Worth one caveat that is deliberately not modelled: the 104 kg is largely an occupant, who
+        // sits near the middle of the car and a little high, so a real driver adds rather less pitch
+        // and yaw inertia than distributing them like the whole shell does. Correcting that means
+        // stating the occupant as its own `MassComponent` with its own position, which the ledger
+        // already supports and no source gives a seating position for.
+        const auto twelfth = 1452.0 / 12.0;
         REQUIRE(assembled->inertia[0][0] == Catch::Approx(twelfth * (1.452 * 1.452 + 4.27 * 4.27)).epsilon(1e-9));
         REQUIRE(assembled->inertia[1][1] == Catch::Approx(twelfth * (1.54 * 1.54 + 4.27 * 4.27)).epsilon(1e-9));
         REQUIRE(assembled->inertia[2][2] == Catch::Approx(twelfth * (1.54 * 1.54 + 1.452 * 1.452)).epsilon(1e-9));
@@ -323,7 +338,7 @@ TEST_CASE("the imported car weighs what the data says and is distributed as it s
             // reasoning (both grip-independent — under 1.5% across a 20% grip cut), criterion 5's
             // threshold then set from the real car's 0.90-0.95 g skidpad, and grip moved to land it
             // mid-band at 0.9232 g. 0-100 then checked independently at 6.556 s against a published
-            // 6.4-6.7 for a DSG without launch control. The full account is on the assignment in
+            // a measured 6.5-6.6 s. The full account is on the assignment in
             // `PublishedCars.cppm`.
             REQUIRE(corner.tyre.lateralPeak == Catch::Approx(1.114));
             REQUIRE(corner.tyre.longitudinalPeak == Catch::Approx(1.131));
@@ -501,7 +516,8 @@ TEST_CASE("the imported car settles on its springs", "[physics][golf][settle]")
         const auto front = load(Corner::FrontLeft) + load(Corner::FrontRight);
         const auto rear = load(Corner::RearLeft) + load(Corner::RearRight);
 
-        REQUIRE(front + rear == Catch::Approx(1348.0 * gravity).epsilon(0.01));
+        // 1377 kg tare, unoccupied, plus the 75 kg driver every mass convention is written against.
+        REQUIRE(front + rear == Catch::Approx(1452.0 * gravity).epsilon(0.01));
         // The published weight distribution, read back off the car it was built into — the whole
         // chain from the mass ledger through the spring solve to four settled tyre loads.
         REQUIRE(front / (front + rear) == Catch::Approx(frontWeightFraction).epsilon(1e-3));
@@ -620,7 +636,7 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
         // have been circular.
         //
         // Reads 0.9232 g. The independent check is 0-100, which lands 6.556 s against a published
-        // 6.4-6.7 for a DSG without launch control — a different measurement against a different
+        // a measured 6.5-6.6 s — a different measurement against a different
         // external reference, sharing only the tyre peaks.
         REQUIRE(peak > 0.90);
         REQUIRE(peak < 0.95);
@@ -1263,37 +1279,46 @@ TEST_CASE("the imported car ticks purely and deterministically", "[physics][golf
     }
 }
 
-TEST_CASE("the imported driveline is the one the file states", "[physics][golf][driveline]")
+TEST_CASE("the driveline is the one the manufacturer states, not the one the file does", "[physics][golf][driveline]")
 {
     const auto driveline = golfGtiMk7Driveline();
 
-    SECTION("seven forward gears, a final drive, and a reverse that goes backwards")
+    SECTION("seven forward gears, two final drives, and a reverse that goes backwards")
     {
+        // **The mod's box is gone as of 2026-08-24.** It stated seven ratios and a *single* final
+        // drive of 4.37; VW's own 2019 Golf GTI Technical Specifications state the ratios below and
+        // **two** final drives, 4.17 and 3.13, which is what a transverse transaxle has. Applying one
+        // final to the whole box left 4th through 7th 35% to 47% short while 1st stayed within 1.7%.
         REQUIRE(driveline.gearbox.ratios.size() == 7);
-        REQUIRE(driveline.gearbox.ratios.back() == Catch::Approx(0.65));
-        REQUIRE(driveline.gearbox.finalDrive == Catch::Approx(4.37));
+        REQUIRE(driveline.gearbox.ratios.back() == Catch::Approx(0.64));
+        REQUIRE(driveline.gearbox.finalDrive == Catch::Approx(4.17));
 
-        REQUIRE(driveline.gearbox.reduction(7) == Catch::Approx(0.65 * 4.37));
-        // GEAR_R is stated as -2.9 and `reduction` puts the sign on itself, so carrying the file's own
-        // sign through would give a reverse gear that drives the car forwards.
-        REQUIRE(driveline.gearbox.reduction(-1) == Catch::Approx(-2.9 * 4.37));
+        // Seventh runs on the tall axle, which is the whole reason a cruising gear is a cruising gear.
+        REQUIRE(driveline.gearbox.finalFor(7) == Catch::Approx(3.13));
+        REQUIRE(driveline.gearbox.reduction(7) == Catch::Approx(0.64 * 3.13));
+
+        // Reverse takes the first axle, and `reduction` puts the sign on itself — carrying a negative
+        // ratio through would give a reverse gear that drives the car forwards.
+        REQUIRE(driveline.gearbox.reduction(-1) == Catch::Approx(-2.90 * 4.17));
         REQUIRE(driveline.gearbox.reduction(0) == 0.0);
     }
 
-    SECTION("an engine that makes what the *file* says, which is not what the car is quoted at")
+    SECTION("an engine that makes what the car is quoted at, which is no longer what the file says")
     {
-        // The peak of the *boosted* curve. power.lut alone is the naturally aspirated one, and reading
-        // it as final reports 159 N.m for a car that makes 350.
+        // **The name of this section has now been true twice and false once, so it is worth reading
+        // the history rather than the name.** It began as "what the car is quoted as making", which
+        // was a claim about a Volkswagen made by a test that was pinning a file; it was corrected on
+        // 2026-08-23 to say so; and on 2026-08-24 the car stopped carrying the file's curve, so the
+        // original name became true for the first time (`docs/engine-curve-brief.md`).
         //
-        // **This section pins the import, and its name was wrong until 2026-08-23.** It used to say
-        // "what the car is quoted as making", which is a claim about a Volkswagen and not about a
-        // file: VW quotes this car at 370 N.m from 1600 to 4300 rpm, and the curve below peaks at
-        // 349.8 at 4500 and is 26% under the stated plateau at 2000. What is faithful here is the
-        // *power* — matched to within 0.7% everywhere above 5000 rpm. The gap between those two
-        // sentences is a real defect and it has a test of its own below.
+        // What is pinned here is now the **published** engine: 370 N.m from 1600 to 4300 rpm and
+        // 180 kW from 5000 to 6200. The mod's own curve had no plateau at all — it peaked at 349.8
+        // at 4500 rpm and ran 26% under the stated figure at 2000 — and what was faithful about it
+        // was the *power*, which is why the top of this curve barely moved. That the import read the
+        // file correctly is a separate claim with a separate case below, and it is still gated,
+        // because "the file is wrong" and "we read the file wrong" have very different fixes.
         auto peakTorque = 0.0;
         auto peakPower = 0.0;
-        auto peakPowerSpeed = 0.0;
 
         for (auto rpm = 1000.0; rpm <= 6800.0; rpm += 10.0)
         {
@@ -1301,17 +1326,27 @@ TEST_CASE("the imported driveline is the one the file states", "[physics][golf][
             const auto torque = driveline.engine.torque.at(speed);
 
             peakTorque = std::max(peakTorque, torque);
-            if (torque * speed > peakPower)
-            {
-                peakPower = torque * speed;
-                peakPowerSpeed = rpm;
-            }
+            peakPower = std::max(peakPower, torque * speed);
         }
 
-        REQUIRE(peakTorque == Catch::Approx(349.8).margin(0.1));
-        // 243.5 bhp, in watts.
-        REQUIRE(peakPower == Catch::Approx(243.5 * 745.699872).epsilon(0.02));
-        REQUIRE(peakPowerSpeed == Catch::Approx(5780.0).epsilon(0.05));
+        // **VW's published plateau since 2026-08-24, not the mod's 349.8 peak**
+        // (`docs/engine-curve-brief.md`). The curve states 370 N.m from 1600 to 4300 rpm and 180 kW
+        // from 5000 to 6200, which is the whole of what the manufacturer homologates.
+        REQUIRE(peakTorque == Catch::Approx(370.0).margin(0.1));
+        REQUIRE(peakPower == Catch::Approx(180000.0).epsilon(0.02));
+
+        // **There is no single peak-power rpm any more, and that is the point of a plateau.** The
+        // mod's curve peaked at 5780 and this one is flat from 5000 to 6200, so asking where the
+        // maximum falls is asking which of a thousand equal samples the loop happened to see first —
+        // a number that would change with the sweep's step and mean nothing. What VW actually states
+        // is the flatness, so that is what is checked.
+        for (const auto rpm : {5000.0, 5500.0, 6000.0, 6200.0})
+        {
+            const auto speed = rpm * 0.10471975511965977;
+
+            CAPTURE(rpm);
+            REQUIRE(driveline.engine.torque.at(speed) * speed == Catch::Approx(180000.0).epsilon(0.01));
+        }
 
         REQUIRE(driveline.engine.limiterSpeed == Catch::Approx(6800.0 * 0.10471975511965977));
         REQUIRE(driveline.engine.idleSpeed == Catch::Approx(850.0 * 0.10471975511965977));
@@ -1377,8 +1412,9 @@ TEST_CASE("the imported engine curve is exactly what the file's turbo model make
     // crankshaft makes `power.lut(rpm) * (1 + boost)`. `[TURBO_0]` states MAX_BOOST 1.60, WASTEGATE
     // 1.20, REFERENCE_RPM 2200 and GAMMA 2.5, which puts the wastegate on its stop at **1961 rpm** —
     // so above two thousand revs the whole curve is simply `power.lut * 2.2`, and every newton metre
-    // the car is short of its published plateau is short in `power.lut` itself.
-    const auto driveline = golfGtiMk7Driveline();
+    // the car was short of its published plateau was short in `power.lut` itself.
+    //
+    // The car's own curve is deliberately **not** read here any more; see the loop below.
 
     // power.lut, verbatim, over the range the plateau question is asked in.
     const auto powerLut = std::vector<std::pair<double, double>>{
@@ -1391,56 +1427,85 @@ TEST_CASE("the imported engine curve is exactly what the file's turbo model make
         return std::min(1.20, 1.60 * std::pow(rpm / 2200.0, 2.5));
     };
 
+    // **What this loop compares against changed on 2026-08-24 and the claim did not.** The car no
+    // longer carries the imported curve — it carries VW's published one
+    // (`docs/engine-curve-brief.md`) — so comparing the turbo arithmetic against
+    // `driveline.engine.torque` would now be comparing it against the thing that replaced it, which
+    // would fail for the one reason that is not a defect.
+    //
+    // The claim worth keeping is the one that separates the two possible causes, and it does not need
+    // the car at all: **AC's own turbo model applied to AC's own power.lut cannot reach the published
+    // plateau anywhere in it.** If it could, the shortfall would have been our import and the fix
+    // would have been in `scripts/import-ac-car.py` rather than in the car's data. It could not, so
+    // the source is wrong and replacing it was the right move.
+    //
+    // The importer's fidelity itself was gated against the imported curve at all eighteen points
+    // before the replacement, and that curve is kept in `modEngineCurve()` in `InGearProbe.cpp` so
+    // the correction stays measurable rather than merely asserted.
     for (const auto& [rpm, naturallyAspirated] : powerLut)
     {
-        const auto expected = naturallyAspirated * (1.0 + boostAt(rpm));
-        const auto imported = driveline.engine.torque.at(rpm * 0.10471975511965977);
+        if (rpm < 1600.0 || rpm > 4300.0)
+        {
+            continue;
+        }
 
-        CAPTURE(rpm, naturallyAspirated, boostAt(rpm), expected, imported);
-        REQUIRE(imported == Catch::Approx(expected).margin(1e-6));
+        const auto boosted = naturallyAspirated * (1.0 + boostAt(rpm));
+
+        CAPTURE(rpm, naturallyAspirated, boostAt(rpm), boosted);
+        REQUIRE(boosted < 370.0);
     }
 
-    SECTION("and the wastegate is on its stop before two thousand revs, which is why the top end is right")
+    // And the worst of it, so the size of the gap is on the record rather than only its sign: at
+    // 2000 rpm the wastegate is already on its stop and the file still makes 124 x 2.2 = 272.8
+    // against a published 370, which is 26.3% short.
+    REQUIRE(124.0 * (1.0 + boostAt(2000.0)) == Catch::Approx(272.8).margin(0.05));
+
+    SECTION("and the wastegate is on its stop before two thousand revs, which is why the top end was right")
     {
         REQUIRE(boostAt(1960.0) < 1.20);
         REQUIRE(boostAt(1962.0) == Catch::Approx(1.20));
 
-        // Above the knee the curve is the naturally aspirated one scaled by a constant, so its
-        // *shape* is power.lut's shape and nothing the turbo does can change it.
-        REQUIRE(driveline.engine.torque.at(4500.0 * 0.10471975511965977) == Catch::Approx(159.0 * 2.2));
-        REQUIRE(driveline.engine.torque.at(2000.0 * 0.10471975511965977) == Catch::Approx(124.0 * 2.2));
+        // Above the knee the boost is a constant, so the curve the file produces is power.lut's own
+        // *shape* scaled by 2.2 and nothing the turbo does can change it. That is the whole reason
+        // the shortfall could be attributed to `power.lut` rather than to the turbo block: no choice
+        // of MAX_BOOST, REFERENCE_RPM or GAMMA reshapes a curve it only multiplies.
+        REQUIRE(159.0 * (1.0 + boostAt(4500.0)) == Catch::Approx(159.0 * 2.2));
+        REQUIRE(124.0 * (1.0 + boostAt(2000.0)) == Catch::Approx(124.0 * 2.2));
+
+        // And what a flat plateau would have required of it: 370 / 2.2 across the whole stretch,
+        // against a file carrying 124 to 159 there.
+        REQUIRE(370.0 / 2.2 == Catch::Approx(168.18).margin(0.01));
     }
 }
 
-TEST_CASE("the imported engine makes the torque the real car is quoted as making",
-          "[physics][golf][driveline][!shouldfail]")
+TEST_CASE("the engine makes the torque the real car is quoted as making", "[physics][golf][driveline]")
 {
-    // **It does not, and the account is in `docs/known-red.md`.** Found 2026-08-23 by the in-gear
-    // probe written for stage 3 of `docs/tyre-grip-ratio-brief.md`: run through a published test car's
-    // own gearing, this model's 80-120 km/h times come out 15.9% quick in fourth, 11.1% quick in fifth
-    // and 0.8% slow in sixth. A single wrong scale factor cannot produce a seventeen point spread
-    // across three consecutive gears; a wrong torque *curve* can, and does.
+    // **Red from 2026-08-23 to 2026-08-24, and closed by replacing the data rather than by tuning
+    // anything.** Kept as an ordinary passing case, because what it asserts is the thing the car is
+    // now built to and a `[!shouldfail]` that has been fixed is just a test nobody reads.
+    //
+    // It was found by the in-gear probe written for stage 3 of `docs/tyre-grip-ratio-brief.md`: run
+    // through a published test car's own gearing, the model's 80-120 km/h times came out 15.9% quick
+    // in fourth, 11.1% quick in fifth and 0.8% slow in sixth. **A single wrong scale factor cannot
+    // produce a seventeen point spread across three consecutive gears; a wrong torque *curve* can.**
+    // With VW's curve in place the same three rows read -24.7% / -23.6% / -23.5% — a spread of 1.2
+    // points, which is the shape error gone and a uniform offset left behind for the driveline
+    // efficiency this model still does not have.
     //
     // The source is Volkswagen's own homologated statement for the Golf GTI Performance, which is two
-    // numbers: **370 N.m from 1600 to 4300 rpm** and **180 kW from 5000 to 6200**. The second holds
-    // here to within 0.7%. The first is missed by 7% at 4300 rpm, 26% at 2000 and 44% at 1600, because
-    // the imported curve has no plateau at all — it climbs to its peak at 4500 rpm, which is where a
+    // numbers: **370 N.m from 1600 to 4300 rpm** and **180 kW from 5000 to 6200**. The mod's curve
+    // held the second to within 0.7% and missed the first by 7% at 4300 rpm, 26% at 2000 and 44% at
+    // 1600, because it had no plateau at all — it climbed to a peak at 4500 rpm, which is where a
     // naturally aspirated engine peaks and not where a wastegated turbo does.
     //
-    // **The cause is the mod's data and not the import, and that was checked rather than assumed** —
-    // the case above recomputes AC's turbo model from `engine.ini`'s own four numbers and the imported
-    // curve matches it to zero at every point. The wastegate is on its stop by 1961 rpm, so above two
-    // thousand revs the curve is `power.lut * 2.2` and the shortfall is entirely in `power.lut`: it
-    // carries 124 N.m at 2000 rpm where **168.2** would be needed to reach the published 370, and
-    // 144 / 154 / 152 / 156 across 2500-4300 against the same 168.2. Between 7% and 26% short, all of
-    // it in the naturally aspirated curve.
+    // **The cause was the mod's data and not the import, and that was checked rather than assumed** —
+    // the case above recomputes AC's turbo model from `engine.ini`'s own four numbers, the wastegate
+    // is on its stop by 1961 rpm, and no choice of turbo parameters reshapes a curve the turbo only
+    // multiplies. `power.lut` carries 124 N.m at 2000 rpm where 168.2 would be needed to reach the
+    // published 370, and 144 / 154 / 152 / 156 across 2500-4300 against the same 168.2.
     //
-    // **Who closes it.** Not this brief and not the tyre. It belongs to whoever authors a `power.lut`
-    // that reaches VW's published plateau — which is arithmetic once the transform above is pinned,
-    // because the plateau divided by 2.2 is a constant 168.2 from 1961 rpm to 4300 — and then
-    // re-derives everything downstream of it. **Not blocked on anything**: the whole of `data.acd` is
-    // unpacked in `~/dev/ac-car-data/out/vw_golf_gti_mk7.5_dsg.json` under `data['data']`, which is
-    // where all of the above was read.
+    // Full account, including what it was worth and what it deliberately did not fix:
+    // `docs/engine-curve-brief.md`.
     const auto driveline = golfGtiMk7Driveline();
 
     const auto atRpm = [&driveline](const double rpm)

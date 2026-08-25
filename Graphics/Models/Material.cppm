@@ -3,6 +3,7 @@ module;
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -100,6 +101,51 @@ export struct BlinnPhongShading
     float specularExponent = 1.0f;
 };
 
+// Car paint, as a property of **one car** rather than of a material.
+//
+// This is the whole reason it is here and not on `Material`: materials are shared storage owned by
+// the `Model`, so two renderables built from one `Resource<Model>` share them — which is stated as a
+// hazard in RenderableEntityService and is exactly what a grid of one car in twelve colours would
+// run into. Paint rides the *renderable* instead, reaches the shader through a binding of its own in
+// the per-draw set, and two cars from one model are then two colours with one model loaded.
+//
+// It also means a game changes a car's colour by writing a field on the car it already holds, rather
+// than by finding a material inside a model it did not author.
+//
+// Everything here is a number, and the maps that go with it — flake, scratch, dirt — stay on the
+// material, because those are what the *asset* is and do not vary between two cars built from it.
+export struct Paint
+{
+    // Off is the default and is a renderable drawn by whatever shader its materials asked for, with
+    // nothing here read at all. A car is painted by turning this on.
+    bool enabled = false;
+    // The base coat, under everything else. Linear, and low: a saturated road car is darker than
+    // people expect — 0.05 is a deep colour and 0.2 is already a bright one.
+    glm::vec3 colour{0.05f, 0.05f, 0.06f};
+    // The metallic flake suspended in it, and how much of the surface is flake rather than base.
+    // Density zero is a solid non-metallic paint, which is what a fleet car has.
+    glm::vec3 flakeColour{1.0f, 1.0f, 1.0f};
+    float flakeDensity = 0.0f;
+    // How fine the flake is, in repeats across the surface's own detail parametrisation. High: the
+    // effect is a sparkle that resolves into glitter as the camera closes, and too coarse a scale
+    // reads as noise on the paint rather than metal in it.
+    float flakeScale = 200.0f;
+    // The clear lacquer over the top, as a second specular lobe: its strength, and how polished it
+    // is. This is what separates paint from plastic — a sharp bright highlight riding on the broader
+    // one the base coat gives, which is a thing one lobe cannot produce.
+    float clearcoat = 1.0f;
+    float clearcoatRoughness = 0.04f;
+    // Orange peel: the slow ripple a sprayed and baked lacquer never quite loses. It perturbs the
+    // clearcoat's normal only, so it bends the reflection without touching the base coat, and needs
+    // no map — the whole point of it is that it is low frequency and unstructured.
+    float orangePeel = 0.0f;
+    float orangePeelScale = 30.0f;
+    // How much of the material's scratch and dirt maps to apply. On the paint rather than on the
+    // maps because it is the *car* that is scratched or filthy, not the asset.
+    float scratch = 0.0f;
+    float dirt = 0.0f;
+};
+
 export struct Material
 {
     glm::vec4 baseColour;
@@ -125,6 +171,29 @@ export struct Material
     // this surface's colour, which is every ordinary material.
     std::optional<MaterialBlend> blend{};
     std::optional<Resource<Shader>> shader{};
+    // The shader this material asked for **by name**, out of the asset's own `extras.shader`, and
+    // empty for the overwhelming majority of materials that ask for nothing.
+    //
+    // A name rather than a handle, because the importer has nothing to resolve one against: shaders
+    // are the *game's*, registered under names the game chose, and a model may be loaded before the
+    // rig that builds them has run. So the importer records what the asset said and the resolution
+    // happens where a renderable is built — the first point that has both the material and the
+    // registry. A name nothing was registered under is not a failed load; the material falls back to
+    // the shader its renderable was created with, and the miss is counted.
+    //
+    // This is what lets one material out of several hundred be drawn differently — a windscreen that
+    // wants rain and grime on it — without the engine having to know what a windscreen is, and
+    // without anything having to identify it by index into a list that changes on every re-export.
+    std::string declaredShader{};
+    // That name, once something resolved it against the shader registry.
+    //
+    // **Separate from `shader` above, and the separation is the whole of why this works.** `shader`
+    // is the *renderable's* choice written through as a default, and the draw path deliberately does
+    // not pick a pipeline from it: materials are shared storage, so one renderable choosing a shader
+    // would restyle every other renderable built from the same model. A *declared* shader has no
+    // such hazard — it comes from the asset, so every renderable built from that model wants it
+    // equally — which is why this one may drive the pipeline and that one may not.
+    std::optional<Resource<Shader>> declaredShaderHandle{};
     std::optional<Resource<Texture>> albedo;
     std::optional<Resource<Texture>> metallicRoughness;
     std::optional<Resource<Texture>> normal;

@@ -36,6 +36,12 @@ public:
                                                unsigned int outputLevel = 0, bool tracksWindowSize = false) const;
     void addInput(const Resource<PostProcess>& postProcess, const Resource<FboAttachment>& attachment,
                   unsigned int level = 0) const;
+    // An input this frame did not draw: a picture, uploaded once and sampled every frame after. The
+    // overload exists rather than a flag because the two cannot be confused at a call site — a pass
+    // reading the bloom chain and a pass reading a lens dirt plate are naming different kinds of
+    // thing, and the backend treats them differently (a texture has no layout to move and no level
+    // to choose). Order still decides the element of the shader's sampler array, exactly as above.
+    void addInput(const Resource<PostProcess>& postProcess, const Resource<Texture>& texture) const;
     // The four numbers this pass's shader reads out of the fullscreen push constant. See
     // PostProcess::parameters for why they belong to the pass.
     void setParameters(const Resource<PostProcess>& postProcess, const glm::vec4& parameters) const;

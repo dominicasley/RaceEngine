@@ -57,9 +57,12 @@ export enum class FrameDiagnostic : size_t {
     ExposureMeterSkipped,
     AmbientOcclusionSkipped,
     ColourGradeUnavailable,
+    MaterialShaderUnavailable,
+    PaintDataRingExhausted,
 };
 
-export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::ColourGradeUnavailable) + 1;
+export inline constexpr size_t frameDiagnosticCount =
+    static_cast<size_t>(FrameDiagnostic::PaintDataRingExhausted) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -124,6 +127,10 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "view(s) shaded without their occlusion, its buffer having no image to sample";
     case FrameDiagnostic::ColourGradeUnavailable:
         return "frame(s) presented ungraded, the presenter's lookup table having no image to sample";
+    case FrameDiagnostic::MaterialShaderUnavailable:
+        return "material(s) drawn with their renderable's shader, the one they named being registered nowhere";
+    case FrameDiagnostic::PaintDataRingExhausted:
+        return "painted draw(s) drawn unpainted, the paint ring having no slot left this frame";
     }
 
     return "skipped item(s) of an unnamed kind";

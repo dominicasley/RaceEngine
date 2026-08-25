@@ -386,18 +386,21 @@ TEST_CASE("the Golf's data, every field, against the real car or against arithme
     against("peak engine power [kW]", peakPower / 1000.0, 180.0, 25.0, "VW, 245 PS");
     against("idle speed [rpm]", driveline.engine.idleSpeed * 9.549296585513721, 800.0, 100.0, "Mk7 GTI idle");
     against("limiter [rpm]", driveline.engine.limiterSpeed * 9.549296585513721, 6800.0, 200.0, "engine.ini LIMITER");
-    against("final drive []", driveline.gearbox.finalDrive, 4.37, 0.01, "drivetrain.ini FINAL");
-    against("first gear []", driveline.gearbox.ratios[0], 3.19, 0.01, "drivetrain.ini GEAR_1");
-    against("top gear []", driveline.gearbox.ratios[6], 0.65, 0.01, "drivetrain.ini GEAR_7 (DSG, seven forward)");
+    // **Against VW's published sheet since 2026-08-24, not `drivetrain.ini`.** The mod stated seven
+    // ratios and a single final drive of 4.37; the car has two, 4.17 and 3.13, and ratios that match
+    // the file in not one place. `docs/engine-curve-validation-brief.md`.
+    against("final drive I []", driveline.gearbox.finalDrive, 4.17, 0.01, "VW 2019 Golf GTI tech specs");
+    against("final drive II []", driveline.gearbox.finalFor(7), 3.13, 0.01, "VW 2019 Golf GTI tech specs");
+    against("first gear []", driveline.gearbox.ratios[0], 3.40, 0.01, "VW 2019 Golf GTI tech specs");
+    against("top gear []", driveline.gearbox.ratios[6], 0.64, 0.01, "VW 2019 Golf GTI tech specs");
 
     // The gearing, in the units a driver reads. Top gear at the limiter must be *above* the car's
     // terminal speed or the car is gear-limited rather than drag-limited, which is what a 250 km/h
     // road car is not.
-    const auto topReduction = driveline.gearbox.ratios[6] * driveline.gearbox.finalDrive;
+    const auto topReduction = driveline.gearbox.reduction(driveline.gearbox.topGear());
     byHand("top gear at limiter [kph]", driveline.engine.limiterSpeed / topReduction * radius * 3.6, 290.0, 25.0,
            "must exceed the 250 kph the car is limited to");
-    byHand("first gear at limiter [kph]",
-           driveline.engine.limiterSpeed / (driveline.gearbox.ratios[0] * driveline.gearbox.finalDrive) * radius * 3.6,
+    byHand("first gear at limiter [kph]", driveline.engine.limiterSpeed / driveline.gearbox.reduction(1) * radius * 3.6,
            58.0, 10.0, "a hot hatch pulls about 60 kph in first");
 
     byHand("engine inertia [kg.m2]", driveline.engine.inertia, 0.15, 0.08, "a four-cylinder with a dual-mass flywheel");

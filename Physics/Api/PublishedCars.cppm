@@ -84,8 +84,27 @@ inline constexpr auto golfRearTrack = 1.516;
 // road is relative to it is what the tyre states.
 inline constexpr auto golfTyreRadius = 0.3186;
 
-// car.ini [BASIC] TOTALMASS.
-inline constexpr auto golfTotalMass = 1348.0;
+// **The ninth number taken away from the mod** (2026-08-24), and it is the mass of the whole car.
+//
+// `car.ini [BASIC] TOTALMASS` states **1348 kg**. The manufacturer's tare mass — the vehicle with
+// standard equipment and unoccupied — is **1377 kg**, and a car being driven has a driver in it. EC
+// 1230/2012's "weight in running order" is the convention that adds one and it adds exactly 75 kg, so
+// what is actually being accelerated is **1452 kg** and the model was **7.2% light**.
+//
+// **Whether AC's figure includes a driver could not be resolved and does not need to be.** The claim
+// that `TOTALMASS` carries one is community lore; the primary source for it says "speculated" in as
+// many words. Either reading gives the same shortfall in the total that accelerates: excluding a
+// driver the car is 29 kg under tare *and* has nobody in it, and including one the car itself is
+// 104 kg under tare. The number below is derived from the manufacturer's figure and the regulation's
+// occupant, so it does not depend on settling the mod's convention.
+//
+// It matters as much as the torque curve does and that is measured rather than asserted: elapsed time
+// in an in-gear pull moves **1.00% per 1% of mass** against 1.18% per 1% of `T·η`, which is why a
+// mass error hides so well behind an engine that looks about right.
+// `docs/engine-curve-validation-brief.md`.
+inline constexpr auto golfTareMass = 1377.0;
+inline constexpr auto golfDriverMass = 75.0;
+inline constexpr auto golfTotalMass = golfTareMass + golfDriverMass;
 
 // **Not suspensions.ini HUB_MASS, and this is the second number taken away from the mod.**
 //

@@ -6,6 +6,7 @@ export import :SphericalHarmonics;
 export import :ShadowCascades;
 export import :Frustum;
 export import :PostProcessing;
+export import :VolumetricFog;
 export import :LookupTable;
 export import :PhysicalCamera;
 export import :FrameDiagnostics;

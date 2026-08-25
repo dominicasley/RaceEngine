@@ -257,8 +257,8 @@ struct Tick
         // dumped another 480 N·m into a spinning tyre. Any signal taken off the driven wheels has
         // that fault; road speed through the gear does not.
         const auto roadSideSpeed = std::abs(state.chassis.linearVelocity.z) /
-                                   setup.corners.front().hardpoints.wheelRadius * driveline.gearbox.finalDrive *
-                                   driveline.gearbox.ratio(input.gear);
+                                   setup.corners.front().hardpoints.wheelRadius *
+                                   driveline.gearbox.reduction(input.gear);
 
         if (roadSideSpeed > upshiftSpeed && input.gear < driveline.gearbox.topGear())
         {

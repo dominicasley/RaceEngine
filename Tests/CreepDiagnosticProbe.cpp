@@ -380,8 +380,7 @@ struct Script
     const auto driveline = golfGtiMk7Driveline();
     const auto setup = golfGtiMk7().value();
 
-    return driveline.engine.idleSpeed / (driveline.gearbox.ratios.front() * driveline.gearbox.finalDrive) *
-           setup.corners.front().hardpoints.wheelRadius;
+    return driveline.engine.idleSpeed / driveline.gearbox.reduction(1) * setup.corners.front().hardpoints.wheelRadius;
 }
 
 [[nodiscard]] double gradeAngle(const double percent)
@@ -654,10 +653,10 @@ TEST_CASE("the sandbox launch's first third of a second", "[.creep-coldstart]")
 
     std::printf("\n  ticks with a negative clutch-side speed, of 130: %d\n", negatives);
     std::printf("  most negative it got: %.4f rad/s\n", worst);
-    std::printf("  `caught` would have read that as %.4f of the way to fully clamped.\n",
-                std::clamp((std::abs(worst) - 0.40 * driveline.engine.idleSpeed) /
-                               ((1.20 - 0.40) * driveline.engine.idleSpeed),
-                           0.0, 1.0));
+    std::printf(
+        "  `caught` would have read that as %.4f of the way to fully clamped.\n",
+        std::clamp((std::abs(worst) - 0.40 * driveline.engine.idleSpeed) / ((1.20 - 0.40) * driveline.engine.idleSpeed),
+                   0.0, 1.0));
 }
 
 // **Does a car on a slope roll down it?** Asked before any creep number taken on a grade is believed,

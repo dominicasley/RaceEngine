@@ -226,6 +226,19 @@ void advanceReferenceSpeed(const ReferenceSpeedSetup& setup, ReferenceSpeedState
     // `fallLimit`, which is already sourced to 1.3 g as the most any tyre gives a road car on any
     // surface, and that is true with the driver's foot anywhere at all.
     const auto ceiling = braking ? std::max(candidate, state.speed) : state.speed + setup.riseLimit * deltaTime;
+
+    // **The working floor is the 1.3 g cap, and a predictive floor was built here, measured, and
+    // taken out again** (2026-08-24, late). Falling along the learned rate instead of the cap did
+    // exactly what it promised for the estimate itself — the tracking error tightened from
+    // [−8%, +2%] to about ±3% — and made the *car* worse: 41.74 m to 44.33, with the rear axle at
+    // 0.45 of its capacity and a wheel off the ground. The mechanism is an interaction, not a bug:
+    // the estimate's upward anchors are biased high (the nominal-radius bias plus recovery
+    // overshoot), the cap-fall between anchors is what *washed that bias out*, and a prediction
+    // that preserves the anchors' level re-reads the whole stop 2-4% fast — which inflates every
+    // slip estimate, and the anti-lock recovery law's slip-anchored guards over-dump the rear on
+    // the phantom. The low bias of the cap-chasing floor turns out to be load-bearing for the
+    // controller calibrated on top of it. If a predictive floor is ever wanted again, the anchors'
+    // own bias has to be fixed first, and this paragraph is the measurement that says so.
     const auto floor = std::max(0.0, state.speed - setup.fallLimit * deltaTime);
 
     if (!supported)
@@ -265,6 +278,20 @@ void advanceReferenceSpeed(const ReferenceSpeedSetup& setup, ReferenceSpeedState
     // coarsely the input arrives.
     state.lagged += (state.speed - state.lagged) * blendOver(setup.rateSmoothing, deltaTime);
 
+    // **This differencer learns the limiter's slope whenever the estimate rides its own floor, and
+    // an honest replacement was built, measured and taken out** (2026-08-24, late). Measured: the
+    // rate reads the 12.749 cap through the cruise of a 9.5 m/s^2 stop, so every relative threshold
+    // in the anti-lock controller reads about 3 m/s^2 high through it. Learning the rate
+    // anchor-to-anchor instead — the slope between two wheel-confirmed points, which the carried
+    // stretches cannot pollute — made the number honest and the car worse (41.74 m to 45.32, the
+    // rear axle at 0.47 of its capacity in the high phase): honest `referenceAcceleration` lowers
+    // every wheel's `excess`, dumps then exit later and the stuck detector fires more, which is the
+    // over-dumping trade the recovery law's own rejected experiment already measured at three-to-one
+    // against. **The controller's thresholds are calibrated against this estimator's errors** — the
+    // estimator sibling of a controller calibrated in fractions of its actuator — so correcting
+    // either half of the estimate (this rate, or the cap-as-working-slope above) is inseparable from
+    // re-deriving the thresholds on top of it, and that is a co-design with its own acceptance
+    // evidence, not an increment.
     const auto measured = setup.rateSmoothing > 0.0 ? (state.speed - state.lagged) / setup.rateSmoothing : 0.0;
 
     state.rate = std::clamp(measured, -setup.fallLimit, braking ? 0.0 : setup.riseLimit);

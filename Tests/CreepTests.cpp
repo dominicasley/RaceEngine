@@ -300,8 +300,7 @@ struct Script
 // and there is no second statement of it anywhere to fall out of step.
 [[nodiscard]] double couplingPointSpeed(const VehicleSetup& setup, const DrivelineSetup& driveline)
 {
-    return driveline.engine.idleSpeed / (driveline.gearbox.ratios.front() * driveline.gearbox.finalDrive) *
-           setup.corners.front().hardpoints.wheelRadius;
+    return driveline.engine.idleSpeed / driveline.gearbox.reduction(1) * setup.corners.front().hardpoints.wheelRadius;
 }
 
 } // namespace
@@ -570,8 +569,29 @@ TEST_CASE("asking for torque closes the clutch, rather than letting the engine r
     // **And the engine has not run away first.** This is the assertion that would have caught the
     // launch regulator: it held the clutch open until the engine reached `launchSpeed` and then kept
     // it near there while slipping, so the revs before the bite were the *target* rather than an
-    // incidental. Bounded well under that target, so a rule reintroducing it cannot pass.
-    REQUIRE(worstBeforeBite < 0.85 * driveline.autoClutch.launchSpeed);
+    // incidental.
+    //
+    // **Stated as a shape rather than as a magnitude** (2026-08-24). It used to read
+    // `worstBeforeBite < 0.85 * launchSpeed`, and giving the engine VW's published torque
+    // (`docs/engine-curve-brief.md`) took it from 209 N.m to 370 at 1600 rpm — so the engine climbs
+    // faster while the pedal is coming off and reached 216.0 rad/s against a bound of 212.5. Nothing
+    // about the rule under test had changed. A magnitude bound on a flare is a bound on the engine's
+    // torque, which is not what this case is about, and raising it to fit would be the loosening
+    // `docs/known-red.md` exists to prevent.
+    //
+    // The two assertions below are what actually separate an incidental flare from a regulated one,
+    // and neither moves with the curve:
+    //
+    //   - it never reaches the old target at all — sourced to the thing being ruled out rather than
+    //     to a fraction of it;
+    //   - and it was **still climbing** when the clutch bit. A regulator holds the engine *at* its
+    //     target and then engages, so the worst before the bite would be at or above the revs at the
+    //     bite. Here it is below them, which is the signature of an engine that was simply on its way
+    //     up when the clutch closed on it. This is the stronger of the two: it would fail a regulator
+    //     targeting any speed whatever, including one well under `launchSpeed`, which the old bound
+    //     would have passed.
+    REQUIRE(worstBeforeBite < driveline.autoClutch.launchSpeed);
+    REQUIRE(worstBeforeBite < revsAtBite);
 
     SECTION("and the slip closes rather than being held open against the revs")
     {
@@ -661,7 +681,20 @@ TEST_CASE("a light brake holds the car against creep, and holds it quietly", "[p
         const auto crept = runCreep(setup, driveline, world.value(), 12.0, barely);
 
         CAPTURE(crept.back().station, crept.back().speed);
-        REQUIRE(crept.back().station - 20.0 > 5.0);
+
+        // **The bound is "not held", and it was a distance until 2026-08-24.** Five metres was what
+        // the old car happened to cover; correcting the mass to the manufacturer's 1377 kg tare plus a
+        // driver (+104 kg) and putting the driveline's losses where they belong took the same creep to
+        // 2.16 m over the same window, with nothing about the rule changed. Creep commands a *torque*
+        // and lets the speed fall out of whatever is loading the car — see `AutoClutch::creepTorque` —
+        // so a heavier car on a lossier driveline creeping more slowly is the design working, and a
+        // distance calibrated against one mass is not a statement about the cut-off at all.
+        //
+        // What this case is for is that the band below the cut-off is **not** one where the car is
+        // held with its clutch slipping into the brakes. So that is what it asserts: the car moves,
+        // and it is still moving at the end rather than having stalled against the pedal.
+        REQUIRE(crept.back().station - 20.0 > 1.0);
+        REQUIRE(crept.back().speed > 0.1);
     }
 }
 

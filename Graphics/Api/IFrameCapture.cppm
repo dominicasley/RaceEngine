@@ -29,6 +29,20 @@ public:
     // Reports rather than logging: a capture that silently produced nothing would let a
     // frame gate pass on a file that was never written.
     [[nodiscard]] virtual std::expected<void, std::string> captureFrame(const std::string& path) = 0;
+
+    // Every framebuffer colour attachment the backend holds, written beside `pathPrefix` as raw
+    // little-endian float32 with a one-line ASCII header, plus a manifest naming each one.
+    //
+    // **Raw, and that is the whole point of it.** `captureFrame` above is the presented picture,
+    // which has been through exposure, a filmic curve and a colour grade — so a number read out of
+    // it is not the number a pass wrote, and every intermediate buffer read that way has to be
+    // decoded through a curve nobody has calibrated. Diagnosing the occlusion chain that way cost a
+    // session and produced two confident wrong answers. This hands back what the pass actually
+    // stored.
+    //
+    // Colour only: a depth attachment needs its own aspect and its own conversion, and no question
+    // asked so far has wanted one. Level zero only, for the same reason.
+    [[nodiscard]] virtual std::expected<void, std::string> captureBuffers(const std::string& pathPrefix) = 0;
 };
 
 } // namespace raceengine

@@ -69,7 +69,11 @@ public:
     std::vector<std::pair<GpuResourceKind, unsigned int>> releasedResources;
     std::vector<Resource<Material>> releasedMaterials;
     std::vector<std::string> captureRequests;
+    std::vector<std::string> bufferCaptureRequests;
     unsigned int beginFrameCalls = 0;
+    // What the last beginFrame was told the simulated instant is, so a test can prove the engine
+    // hands its tick clock over rather than a wall reading.
+    double lastSimulationTime = 0.0;
     unsigned int endFrameCalls = 0;
     unsigned int recordViewCalls = 0;
     // Which probes the frame asked to capture, in order. A capture is a step rather than a whole
@@ -101,9 +105,10 @@ public:
         viewport = std::pair{width, height};
     }
 
-    [[nodiscard]] bool beginFrame() override
+    [[nodiscard]] bool beginFrame(const double simulationTime) override
     {
         beginFrameCalls++;
+        lastSimulationTime = simulationTime;
 
         return frameOpens;
     }
@@ -227,6 +232,16 @@ public:
         {
             return std::unexpected(captureFailure.value());
         }
+
+        return {};
+    }
+
+    // Recorded beside the frame captures rather than mixed in with them: the two are asked for
+    // separately and a test that means to assert one should not be able to satisfy itself with the
+    // other.
+    [[nodiscard]] std::expected<void, std::string> captureBuffers(const std::string& pathPrefix) override
+    {
+        bufferCaptureRequests.push_back(pathPrefix);
 
         return {};
     }

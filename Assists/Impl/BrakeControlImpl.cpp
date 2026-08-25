@@ -113,6 +113,13 @@ namespace raceengine
     const auto losing = state.acceleration < setup.lockDeceleration;
     const auto surging = excess > setup.recoverySurge;
 
+    // The one judgement the slip-aware recovery law adds, and it is a statement about the ECU's own
+    // belief rather than about the tyre: the estimated slip is past the calibrated band. Everything
+    // it gates degrades to the previous law when the reference is invalid — and, just as
+    // deliberately, when the estimator under-reads, which is what it does in exactly the case the
+    // acceleration-only loop exists to survive.
+    const auto pastBand = setup.slipAwareRecovery && referenceValid && slip > setup.slipEnter;
+
     switch (state.phase)
     {
     case ModulatorPhase::Passive:
@@ -135,6 +142,7 @@ namespace raceengine
             state.phase = ModulatorPhase::Dump;
             state.surged = false;
             state.cycles++;
+            state.departurePressure = state.pressure;
         }
         else if (!losing)
         {
@@ -153,7 +161,28 @@ namespace raceengine
         // pressure went to zero every cycle, which is a third of a second with no brake at all on
         // that corner while the re-apply crawls back, and the pressure cycle came out at 3.6 to
         // 4.8 Hz against a published 4 to 20.
-        if (excess > setup.recoveryAcceleration || !losing)
+        //
+        // **"No longer departing" is not enough on its own while the slip is still past the band**
+        // (the slip-aware recovery law, `AntilockSetup::slipAwareRecovery`). A lightly loaded wheel
+        // past the tyre's peak reaches an *equilibrium*: road torque nearly balances brake torque on
+        // the shallow far side of the curve, so the wheel tracks the decelerating car at a constant
+        // 0.4 slip — not departing, not recovering, just stuck — and a dump that ends there hands the
+        // pressure straight back to the equilibrium it was called to break. While the estimate says
+        // the wheel is still out there, only genuine re-acceleration ends the dump. A wheel actually
+        // coming back fires the threshold within milliseconds of the pressure getting low enough, so
+        // this does not empty the caliper the way the surge-waiting fault did.
+        //
+        // **Deeper dumps for deeper departures were built and rejected here, and the measurement is
+        // the reason this comment exists** (2026-08-24, late). Scaling the exit threshold from
+        // `recoveryAcceleration` at the band's edge to `recoverySurge` a band-width past it — "far
+        // past the peak, aggressive dump" in exit terms, no new constant — collapsed the rear axle
+        // to 0.47 of its capacity and took the stop from 41.74 m to 45.56: a lightly loaded wheel
+        // cannot surge however little brake it carries, so its dumps ran to empty and gave away the
+        // falling side of the curve wholesale. The Magic Formula's shallow far side means a wheel
+        // held just past its peak keeps delivering; a dump that insists on a convincing recovery
+        // trades that force for slip health at three-to-one against. The barely-creeping exit below
+        // is not a timidity to fix — it is where the force is.
+        if (excess > setup.recoveryAcceleration || (!losing && !pastBand))
         {
             state.phase = ModulatorPhase::Recover;
             state.surged = false;
@@ -190,6 +219,26 @@ namespace raceengine
         {
             state.phase = ModulatorPhase::Dump;
             state.cycles++;
+            state.departurePressure = state.pressure;
+        }
+        else if (pastBand && excess < setup.recoveryAcceleration)
+        {
+            // **Stuck: neither departing nor coming back, with the slip still past the band.** This
+            // is the equilibrium the utilisation instrument found the rear axle living in — the held
+            // pressure is the equilibrium pressure, so holding it holds the wheel at three times its
+            // peak slip indefinitely, and re-applying is worse. Only a further dump can break it.
+            //
+            // Not the ping-pong fault this file already made once: that one re-entered the dump on
+            // slip alone while the wheel was climbing back at 150 m/s^2, and the `excess` guard here
+            // is precisely what it lacked — a wheel genuinely re-accelerating is left alone whatever
+            // its slip says.
+            //
+            // The memory is overwritten with the *stuck* pressure, which is lower than the pressure
+            // the wheel originally departed at — conservative on purpose, because the stuck level is
+            // the freshest pressure known to be too much for this wheel at this load.
+            state.phase = ModulatorPhase::Dump;
+            state.cycles++;
+            state.departurePressure = state.pressure;
         }
         else if (!(state.surged && surging))
         {
@@ -197,13 +246,45 @@ namespace raceengine
             // anything below the exit threshold — otherwise a channel that settles in the band
             // between the two sits here holding a pressure nobody asked it to hold for the rest of
             // the stop, which is the same stagnation as the fault above wearing different clothes.
-            state.phase = ModulatorPhase::Reapply;
+            //
+            // **Past the band, hold instead** (slip-aware recovery): the wheel is on its way back —
+            // the stuck branch above did not fire, so it is re-accelerating — and pressure re-applied
+            // now meets it while it is still on the falling side of the curve and puts it straight
+            // back down. The road is winning at this pressure or the wheel would not be climbing, so
+            // holding cannot stagnate: the slip falls, crosses the band, and the branch below takes
+            // over.
+            if (!pastBand)
+            {
+                state.phase = ModulatorPhase::Reapply;
+            }
         }
 
         break;
 
     case ModulatorPhase::Reapply:
-        state.pressure = std::min(request, state.pressure + setup.modulator.reapplyGradient * deltaTime);
+    {
+        // **The re-apply is two stages** (slip-aware recovery), which is what a production unit does:
+        // the full gradient back up to the pressure the wheel last departed at, then a taper past it
+        // that eases to nothing as the estimated slip approaches the band. The first stage is the
+        // memory — below a level that provably held this wheel moments ago there is nothing to probe
+        // for, and the first cut of this law, which tapered the whole stage, was measured crawling
+        // back at 12 bar/s from the bottom of a dump and leaving the rear axle under-braked for
+        // tenths of a second per cycle. The second stage is the probe: the closer the estimate says
+        // the wheel is to the band, the more gently the pressure goes looking for the peak. Both
+        // stages are drawn against the controller's own calibrated band and its own remembered
+        // pressure rather than against any new number, and with the law off or the reference invalid
+        // the gradient is the previous law's to the bit.
+        //
+        // A wheel already past the band is never in the fast stage whatever the memory says — that
+        // is re-pinning, and it is the one thing the whole law exists to stop.
+        const auto proximity =
+            setup.slipAwareRecovery && referenceValid
+                ? std::clamp((setup.slipEnter - slip) / std::max(setup.slipEnter - setup.slipExit, 1e-9), 0.0, 1.0)
+                : 1.0;
+        const auto fast = state.pressure < state.departurePressure && !pastBand;
+
+        state.pressure =
+            std::min(request, state.pressure + setup.modulator.reapplyGradient * (fast ? 1.0 : proximity) * deltaTime);
 
         if (losing)
         {
@@ -218,6 +299,7 @@ namespace raceengine
         }
 
         break;
+    }
     }
 
     // The unit sits between the master cylinder and the caliper and cannot make pressure the driver

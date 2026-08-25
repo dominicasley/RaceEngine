@@ -408,17 +408,14 @@ TEST_CASE("this car's brakes exceed its grip, so the pedal has an optimum short 
 TEST_CASE("the imported car stops from 100 km/h in the distance the real one does",
           "[assists][antilock][braking][!shouldfail]")
 {
-    // **A data red, and it is here so that it announces itself the day the data is corrected.**
-    //
-    // Auto Bild Sportscars measured a Mk7 GTI Performance at 34.6 m and 35.1 m from 100 km/h in two
-    // separate tests. This car stops in about 40.8 m — **17% long** — and the case above says why:
-    // the 4200 N.m in `brakes.ini` caps the car at 0.997 g where the published figure needs 1.13 g
-    // (27.778^2 / (2 * 34.85) = 11.07 m/s^2). The tyre has that grip and the brakes cannot ask for it.
-    //
-    // Nothing in the assist work may fix this. Brake torque is vehicle data, the brief that
-    // commissioned this puts vehicle data out of scope, and the previous four corrections to this
-    // car's data were each verified against the source before being made. Whoever picks that up
-    // wants `brakes.ini`'s MAX_TORQUE and FRONT_SHARE and a reason to believe them.
+    // The published reference is auto motor und sport's Supertest: **35.5 m from 100 km/h, kalt**
+    // (1.108 g mean), verified at source on 2026-08-25. Auto Bild Sportscars' 34.6/35.1 m, which
+    // this case was originally written against, did not survive that verification. The car's ABS
+    // stop is 41.74 m — 17.6% long — and the gap's owners are measured, not guessed
+    // (`docs/braking-chain-brief.md`, the utilisation ledger): ~3.5 m of controller tracking gated
+    // on the estimator-and-controller co-design, <= 1.8 m of valve (real hardware), and ~1.4 m of
+    // capability whose candidates are the held chassis items. The tyre is exonerated by measurement
+    // (`docs/tyre-peak-to-tail-brief.md`). The bound below is the verified figure plus margin.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -435,12 +432,28 @@ TEST_CASE("the imported car stops from 100 km/h in the distance the real one doe
     REQUIRE(run.distance < 36.0);
 }
 
-TEST_CASE("anti-lock braking costs a few percent on dry tarmac and never beats a perfect driver",
+TEST_CASE("anti-lock braking stays inside the band a sensor-blind controller can reach on dry tarmac",
           "[assists][antilock][braking]")
 {
-    // **Criterion 2.** A real system loses a little to a driver braking perfectly on dry tarmac —
-    // it is hunting for a peak it cannot see, and the hunting costs mean pressure. A controller that
-    // beat one everywhere would be reading something it has no sensor for.
+    // **Criterion 2, restated 2026-08-24 late on Dominic's ruling that its first half was
+    // erroneous.** It used to assert the anti-lock stop *never beats* a perfect constant-pedal
+    // driver, on the premise that beating one means reading something the controller has no sensor
+    // for. The premise fails on this car: its optimum pedal is set by the **rear axle locking
+    // first**, so a single constant pressure is wrong at every other moment of the stop, and a
+    // per-channel modulating system legitimately beats any value of it. The transient decomposition
+    // proved it with the erroneous premise's own instrument (`docs/braking-chain-brief.md`,
+    // Progress): a controller with perfect knowledge forced through the modulator's own valve rates
+    // stops in 38.75 m — 3.4% *better* than the fine-swept driver — without seeing anything a
+    // sensor could not in principle deliver.
+    //
+    // **What the criterion was actually built to catch survives, as the band's far side.** Measured
+    // on this car: any controller working through this valve lands no better than −3.4% against the
+    // perfect driver, while perfect per-wheel knowledge with a free actuator lands at −8%. A
+    // two-sided 6% band therefore never blocks a legitimate controller and still fires on a
+    // model-peeker — beating the driver by more than the valve allows IS the signature the old
+    // assertion was groping for. **The −6% side is justified by that measurement and must be
+    // re-derived if the modulator's gradients ever change**, because the legitimate floor moves
+    // with the valve.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -459,7 +472,14 @@ TEST_CASE("anti-lock braking costs a few percent on dry tarmac and never beats a
     auto best = 1e9;
     auto bestPedal = 0.0;
 
-    for (const auto pedal : {0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0})
+    // **Finely where the optimum is, and that is not fastidiousness** (2026-08-24). At 0.05 steps this
+    // sweep put its best at 0.35 and the assisted stop came out 2.4% *shorter*, tripping the assertion
+    // below — for the second time, and for the same reason the paragraph above already records. The
+    // optimum pedal moves with everything: brake torque, grip, and now the car's corrected mass and
+    // gearing. A sweep whose resolution is coarser than the difference being argued about measures the
+    // sweep rather than the controller.
+    for (const auto pedal : {0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38,
+                             0.39, 0.40, 0.41, 0.42, 0.44, 0.46, 0.48, 0.50, 0.55, 0.60, 0.70, 0.80, 1.0})
     {
         const auto run = stop(setup.value(), world.value(), golfGtiMk7Assists(setup.value()), hundred, pedal);
         REQUIRE(run.stopped);
@@ -484,18 +504,23 @@ TEST_CASE("anti-lock braking costs a few percent on dry tarmac and never beats a
 
     CAPTURE(best, bestPedal, assisted.distance, penalty);
 
-    // Not better. This is the assertion that catches a controller which has learned to see the model.
-    REQUIRE(assisted.distance >= best);
+    // The cheating watch: better than the driver is allowed, better than the valve permits is not.
+    // Perfect knowledge through this valve measures −3.4%; a free actuator measures −8%; a controller
+    // past this bound is reading something its sensors cannot deliver.
+    REQUIRE(penalty > -0.06);
 
-    // **How much worse it is has its own case below**, because it does not hold and the two halves of
-    // this criterion should not fail together: "never beats a driver" is a statement about whether the
-    // controller is cheating and "costs only a few percent" is a statement about how well it hunts.
-    // The first is green.
-    REQUIRE(penalty > 0.0);
+    // **How much it costs the other way has its own case below**, so the two halves of this
+    // criterion cannot fail together: this side is a statement about whether the controller is
+    // cheating, the other about how well it hunts.
 }
 
 TEST_CASE("and the anti-lock stop costs only a few percent against that driver", "[assists][antilock][braking]")
 {
+    // **Criterion 2's second half — the hunting bound — and the half the 2026-08-24 restatement left
+    // untouched**: however legitimate beating the driver is, *losing* to one by more than a few
+    // percent still means the controller hunts badly, and that statement survives the premise the
+    // first half lost.
+    //
     // **Criterion 2's second half, and it holds again as of 2026-08-23 — closed by something that has
     // nothing to do with the anti-lock system.** It was opened the same day at 8.7% against a bound of
     // 6%, when brakes derived from this car's own calipers put 2.4 times a front wheel's lock pressure
@@ -644,10 +669,50 @@ TEST_CASE("the anti-lock system keeps the car straight on a split surface", "[as
     }
 }
 
-TEST_CASE("and on a split surface it stays inside a quarter turn", "[assists][antilock][braking][splitmu][!shouldfail]")
+TEST_CASE("and on a split surface it stays inside a quarter turn", "[assists][antilock][braking][splitmu]")
 {
-    // **Criterion 4's absolute half, and it does not hold: 53.7 degrees against a quarter turn.**
-    // `docs/known-red.md` carries the account.
+    // **Closed 2026-08-24 evening by the slip-aware recovery law, at 19.3 degrees against the
+    // 45 degree bound — and this closure is the controller's, not the car's.** The two before it were
+    // the car's (mass, then droop travel re-opening it), which is why the note below survives. The
+    // mechanism: the old recovery law left every wheel in anti-lock control at about three times its
+    // peak slip — `docs/braking-chain-brief.md`'s instrument measured it — and a tyre dragged that
+    // far past its longitudinal peak has little lateral force left to resist a yaw with. Held near
+    // the peak instead, the rear axle keeps its cornering stiffness and the same yaw moment builds a
+    // fifth of the heading error: 73.96 degrees to 19.27, with the unassisted run at 96.3.
+    //
+    // **Yaw-moment build-up limitation is still absent.** The account below stands: nothing ramps the
+    // high-grip front's pressure, so what bounds the heading error now is the rear axle's restored
+    // lateral authority rather than any moderation of the moment. A car with less rear axle — or a
+    // surface split the other way under a crest — has less of this margin.
+    //
+    // **Re-opened 2026-08-24 at 73.96 degrees, hours after being closed, and the closure note called
+    // it.** That note read: *"the margin here is the car's inertia rather than the controller doing
+    // anything about it. If a heavier car is what keeps this inside a quarter turn, a lighter one will
+    // put it back outside."* What put it back outside was not a lighter car but a rear axle that now
+    // stays on the road.
+    //
+    // Giving the rear its droop travel back — the stop was a placed 20 mm binding at 23 mm of
+    // extension, see `docs/known-red.md` — means the rear wheels follow the surface instead of
+    // hanging in the air. On a split-mu surface that is *more* asymmetry reaching the road, not less,
+    // because the high-grip side's rear tyre is now working. **The correctness fix un-masked this.**
+    //
+    // The mechanism below is still the mechanism, and it is still absent.
+    //
+    // **The history, so nobody re-derives it**: red at 53.7 degrees from 2026-08-23, closed by the
+    // mass correction on 2026-08-24, re-opened the same day by the droop correction at 73.96.
+    //
+    // Nothing about the anti-lock unit changed. What changed is that the car weighs what it weighs:
+    // the manufacturer's tare figure plus a driver is 1452 kg where the mod's `TOTALMASS` said 1348,
+    // so the model was 7.2% light (`docs/engine-curve-validation-brief.md`). A split surface makes a
+    // yaw *moment* out of the difference between the two sides, and that moment is set by the tyres;
+    // the yaw *inertia* resisting it scales with the mass that was missing. The heading error a given
+    // moment produces in a given time therefore falls, and it fell far enough.
+    //
+    // **That is a real closure and it is also a thin one to lean on.** The mechanism below is still
+    // absent — this system has no yaw-moment build-up limitation — so the margin here is the car's
+    // inertia rather than the controller doing anything about it. If a heavier car is what keeps this
+    // inside a quarter turn, a lighter one will put it back outside, and the account below is what to
+    // read when it does.
     //
     // A split surface makes a yaw moment whatever the electronics do, and this system has **no
     // yaw-moment build-up limitation** — the production feature that deliberately ramps the high-grip
@@ -727,20 +792,24 @@ TEST_CASE("the car still steers under full braking with the anti-lock system on"
 }
 
 TEST_CASE("and the steering it keeps puts the car somewhere else, not just at another angle",
-          "[assists][antilock][braking][!shouldfail]")
+          "[assists][antilock][braking]")
 {
-    // **Criterion 5's second half, and it does not hold: 1.33 times the locked run's lateral
-    // displacement against a bound of 3.** `docs/known-red.md` carries the account.
+    // **Criterion 5's second half, closed 2026-08-24 evening by the slip-aware recovery law: 4.14
+    // times the locked run's lateral displacement against the bound of 3**, at 2.2 times its yaw rate
+    // — which is the right shape as well as the right number, because 5.2 times the yaw rate for 1.3
+    // times the displacement was a car rotating about its own centre while it slid, and this is a car
+    // going where it is pointed.
+    //
+    // The paragraph that used to close this comment asked for "a two-stage re-apply, with a memory of
+    // the pressure it was holding when the wheel last departed" — and that is very nearly what closed
+    // it. `AntilockChannelState::departurePressure` is that memory and the re-apply is two-staged on
+    // it; what the prediction missed is that the memory alone is half the law, and the recovery
+    // phases also had to stop reading "not departing" as "recovered" (`AntilockSetup::
+    // slipAwareRecovery`, and the account in `docs/braking-chain-brief.md`'s Progress).
     //
     // The distinction the bound exists for is a real one. Yaw rate alone cannot tell a car that is
-    // being steered from a car that is rotating about its own centre while it slides, and the second
-    // is what this now measures: 5.2 times the yaw rate for 1.3 times the displacement. Before the
-    // brakes were derived from the hardware it was the other way round.
-    //
-    // Same cause as the split-mu case: the anti-lock unit is now driving an actuator that can put
-    // 2.4 times a wheel's lock pressure on it, it hunts across the whole of that range, and it has no
-    // memory of the pressure it was holding when the wheel last departed. What closes it is a
-    // two-stage re-apply, in `raceengine.assists`, with its own acceptance evidence.
+    // being steered from a car that is rotating about its own centre while it slides, which is why
+    // both halves of criterion 5 exist and are asserted separately.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -794,6 +863,15 @@ TEST_CASE("the cycling frequency falls out of the hydraulics rather than being p
     // What closes it is a modulator whose gradients are per *channel* — which is what a real unit's
     // rear outlet valve is — with a source for the rear one. Picking a number because it makes a
     // frequency come out is the prescribing this criterion exists to forbid.
+    //
+    // **It moved again on 2026-08-24 evening and by the right mechanism** — the slip-aware recovery
+    // law took the dry rear from 24.2 Hz to inside the band, because a channel that holds while a
+    // wheel climbs back and probes gently near the peak cycles at the wheel's pace rather than at its
+    // own valve's. **What fails now is the rear channel on the split surface at 3.48 Hz, below the
+    // band** — select-low means that channel follows the mu 0.35 wheel, whose road can only slowly
+    // spin it back up, and the law now waits for that. A real unit on that surface cycles slowly too;
+    // whether 3.5 Hz is *too* slow is a question for the per-channel gradients above, and the bound
+    // stays where the literature put it rather than moving to meet the measurement.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -1062,10 +1140,18 @@ TEST_CASE("the pedal pulsation is the modulator's own displacement", "[assists][
 }
 
 TEST_CASE("and on a split surface the anti-lock system takes off most of the heading error",
-          "[assists][antilock][braking][splitmu][!shouldfail]")
+          "[assists][antilock][braking][splitmu]")
 {
-    // **It takes off 16% where the bound is 30%, and it used to take off 36%.** Opened 2026-08-23 by
-    // the load-sensitivity split; `docs/known-red.md` carries the account.
+    // **Closed 2026-08-24 evening by the slip-aware recovery law, at 0.20 of the unassisted heading
+    // error against the 0.7 bound** — 19.27 degrees of 96.28 — by the mechanism the absolute case
+    // above records: wheels held near their peaks keep their lateral force, and the rear axle's
+    // restored cornering stiffness is what resists the moment. The moment itself is unmoderated;
+    // yaw-moment build-up limitation is still absent and the account below still says so.
+    //
+    // **Re-opened 2026-08-24 at 23% against a bound of 30%**, by the same droop correction and for the
+    // same reason as the absolute case above: a rear axle that stays on the road puts more of the
+    // surface's asymmetry into the car. Red at 16% on 2026-08-23, closed by the mass correction, and
+    // re-opened the same day. The mechanism described below is still missing.
     //
     // The mechanism is the one the absolute case above already names, arriving through a new door. A
     // split surface makes a yaw moment out of the difference between the two sides, and the assisted
@@ -1097,13 +1183,182 @@ TEST_CASE("and on a split surface the anti-lock system takes off most of the hea
     REQUIRE(std::abs(assisted.finalYaw) < 0.7 * std::abs(plain.finalYaw));
 }
 
-TEST_CASE("the car keeps all four wheels on the ground through a hard stop",
-          "[assists][antilock][braking][!shouldfail]")
+TEST_CASE("what the slip-aware recovery law is worth, measured against itself switched off",
+          "[assists][antilock][braking][recovery]")
 {
-    // **It does not, and the wheel that leaves is a rear one, 0.19 s into the stop.** Opened
-    // 2026-08-23 by the load-sensitivity split, which did not cause it so much as tip it over: the
-    // same measurement on the single-exponent car bottomed out at **11.3 N** of rear axle load, and
-    // eleven newtons is a wheel that is already off in every sense but the arithmetic.
+    // **The acceptance evidence for `AntilockSetup::slipAwareRecovery`, and every assertion is an
+    // A/B against the previous law rather than a target.** Dominic's rule for the braking chain —
+    // a diagnostic, not a calibration target — is why nothing here pins a utilisation figure as
+    // correct: what is asserted is that the law *moves* the channels it was built to move, in the
+    // direction the utilisation instrument said they were wrong, without giving back what the
+    // previous law had. Switching the law off must make every one of these fail, which is what makes
+    // this a regression gate for the law rather than a number pinned to a build.
+    //
+    // The defect it closes over, measured by `[.brake-utilisation]` on 2026-08-24: the rear axle
+    // spent a full-pedal ABS stop at ~3.0 times its own peak slip — an *equilibrium* past the peak,
+    // where road torque nearly balances brake torque, which the old recovery law read as "recovered"
+    // and re-applied into — delivering 0.74 of its capacity against the fronts' 0.85.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0, 1.0));
+    REQUIRE(world.has_value());
+
+    // One floored ABS stop, instrumented the way the utilisation probe is: per wheel per tick, the
+    // tyre's own capacity against what it delivered, and where it sat on its own curve. The runout
+    // below 5 m/s is excluded from the means for the probe's reason — the anti-lock unit drops out
+    // there by design, so a mean across it is a mean of two different experiments.
+    struct Measured
+    {
+        double rearSlipOverPeak = 0.0;
+        double frontUtilisation = 0.0;
+        double rearUtilisation = 0.0;
+        double carUtilisation = 0.0;
+        double distance = 0.0;
+        double minimumFrontSpeed = 1e9;
+    };
+
+    const auto measure = [&](const bool lawOn)
+    {
+        auto assists = withAntilock(setup.value());
+        assists.antilock.slipAwareRecovery = lawOn;
+
+        auto state = VehicleState{};
+        settle(setup.value(), state, world.value(), hundred);
+
+        auto assistState = AssistState{};
+        auto lastStep = VehicleStep{};
+
+        const auto sense = [&]
+        {
+            auto sensors = AssistSensors{};
+            for (auto index = std::size_t{0}; index < cornerCount; index++)
+            {
+                sensors.wheelSpeeds[index] = state.corners[index].wheelSpeed;
+            }
+            sensors.yawRate = lastStep.telemetry.yawRate;
+            sensors.lateralAcceleration = lastStep.telemetry.acceleration.x;
+
+            return sensors;
+        };
+
+        for (auto step = 0; step < 180; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {}, noBrakePressure, tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+        }
+
+        auto input = VehicleInput{};
+        input.brake = 1.0;
+
+        const auto start = state.chassis.position.z;
+        auto result = Measured{};
+        auto force = std::array<double, 2>{};
+        auto capacity = std::array<double, 2>{};
+        auto slipOverPeak = 0.0;
+        auto ticks = std::size_t{0};
+
+        for (auto step = 0; step < 360 * 30; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {.brake = 1.0, .throttle = 0.0},
+                                               brakeCircuitPressures(setup.value(), 1.0), tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+
+            if (state.chassis.linearVelocity.z > 5.0)
+            {
+                for (auto index = std::size_t{0}; index < cornerCount; index++)
+                {
+                    const auto& corner = lastStep.corners[index];
+                    const auto friction =
+                        raceengine::tyreFriction(setup->corners[index].tyre, raceengine::TyreAxis::Longitudinal,
+                                                 corner.forces.tireVertical, corner.patch.gripMultiplier);
+
+                    force[index / 2] += std::abs(corner.contact.tyre.longitudinal);
+                    capacity[index / 2] += friction * corner.forces.tireVertical;
+
+                    if (index >= 2)
+                    {
+                        const auto peak = corner.contact.tyre.longitudinalPeakSlip;
+                        slipOverPeak += peak > 1e-9 ? std::abs(corner.contact.slip.slipRatio) / peak : 0.0;
+                    }
+                    else
+                    {
+                        result.minimumFrontSpeed =
+                            std::min(result.minimumFrontSpeed, state.corners[index].wheelSpeed * tyreRadius);
+                    }
+                }
+
+                ticks++;
+            }
+
+            if (state.chassis.linearVelocity.z <= 0.0)
+            {
+                break;
+            }
+        }
+
+        result.distance = state.chassis.position.z - start;
+        result.rearSlipOverPeak = ticks > 0 ? slipOverPeak / (2.0 * static_cast<double>(ticks)) : 0.0;
+        result.frontUtilisation = capacity[0] > 1.0 ? force[0] / capacity[0] : 0.0;
+        result.rearUtilisation = capacity[1] > 1.0 ? force[1] / capacity[1] : 0.0;
+        result.carUtilisation =
+            capacity[0] + capacity[1] > 1.0 ? (force[0] + force[1]) / (capacity[0] + capacity[1]) : 0.0;
+
+        return result;
+    };
+
+    const auto off = measure(false);
+    const auto on = measure(true);
+
+    CAPTURE(off.rearSlipOverPeak, on.rearSlipOverPeak, off.rearUtilisation, on.rearUtilisation, off.frontUtilisation,
+            on.frontUtilisation, off.carUtilisation, on.carUtilisation, off.distance, on.distance);
+
+    // The precondition: with the law off, the equilibrium defect exists — the rear axle really is
+    // parked far past its peak. If this stops holding, the defect closed some other way and this
+    // whole case wants re-deriving rather than trimming.
+    REQUIRE(off.rearSlipOverPeak > 2.0);
+
+    // The law's own claim: the rear axle comes most of the way back to its peak...
+    REQUIRE(on.rearSlipOverPeak < 0.6 * off.rearSlipOverPeak);
+
+    // ...without giving back the force the old equilibrium was extracting from the falling side of
+    // the curve — the shallow far side of a Magic Formula is what made parking past the peak cheap
+    // in pure distance, so holding utilisation while halving the slip is the actual work.
+    REQUIRE(on.rearUtilisation > off.rearUtilisation - 0.01);
+
+    // The whole car uses more of what its tyres offer, and the stop that falls out is no longer —
+    // the distance is fallout here, not the criterion, which is the brief's rule.
+    REQUIRE(on.carUtilisation > off.carUtilisation);
+    REQUIRE(on.distance < off.distance + 0.05);
+
+    // And no front wheel locked in either arm while the car was moving: the law changed how pressure
+    // comes back, and lock prevention is the one thing a recovery law must not trade.
+    REQUIRE(off.minimumFrontSpeed > 0.5);
+    REQUIRE(on.minimumFrontSpeed > 0.5);
+}
+
+TEST_CASE("the car keeps all four wheels on the ground through a hard stop", "[assists][antilock][braking]")
+{
+    // **Closed 2026-08-24 by the mass correction**, having been red since 2026-08-23 with a rear wheel
+    // leaving the ground 0.19 s into the stop.
+    //
+    // This is the one of the three whose closure is least surprising and most fragile. The pitch
+    // transient described below is *unchanged* — it is a property of the suspension and the brake
+    // step, not of the mass — but it was swinging the rear axle down to about 11 N, and eleven newtons
+    // is a wheel that is already off in every sense but the arithmetic. Putting the car's missing
+    // 104 kg back raises the static rear load the transient swings *about*, so the same swing no
+    // longer reaches zero.
+    //
+    // **So the margin is small and the mechanism is still there.** Read the account below before
+    // concluding anything about the suspension from this case passing.
     //
     // **The cause is a pitch transient and not the brake balance**, which is why nothing about the
     // valve or the calipers will close it. Traced tick by tick in `[.brake-model]`, a step to the

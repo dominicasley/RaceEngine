@@ -26,6 +26,7 @@ module;
 module raceengine.graphics;
 
 import :RenderableEntityService;
+import :ShaderService;
 import :FrameDiagnostics;
 import raceengine.graphics.models;
 import raceengine.shared;
@@ -47,7 +48,8 @@ RenderableEntityService::RenderableEntityService(MemoryStorageService& memorySto
 {
 }
 
-RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor) const
+RenderableModel RenderableEntityService::createModel(const CreateRenderableModelDTO& entityDescriptor,
+                                                     ShaderService& shaderService) const
 {
     // Resolved once and read through: the model is the handle's element, and every list below
     // lives inside it. A model whose handle went stale between the load and here builds an
@@ -65,14 +67,45 @@ RenderableModel RenderableEntityService::createModel(const CreateRenderableModel
     // silently restyling the first. The instance's own choice travels on the RenderableModel.
     for (const auto& materialKey : model->materials)
     {
-        memoryStorageService.materials.mutate(materialKey,
-                                              [&](Material& material)
-                                              {
-                                                  if (!material.shader.has_value())
-                                                  {
-                                                      material.shader = entityDescriptor.shader;
-                                                  }
-                                              });
+        memoryStorageService.materials.mutate(
+            materialKey,
+            [&](Material& material)
+            {
+                if (material.shader.has_value())
+                {
+                    return;
+                }
+
+                // What the *asset* asked for comes first. `Material::declaredShader` is the name out
+                // of the asset's own `extras.shader`, recorded by the importer because the importer
+                // had no registry to resolve it against; this is the first point that has both, so
+                // this is where "later" is.
+                //
+                // A name nothing was registered under is not a failed load and not a silent one: the
+                // material falls back to its renderable's shader, exactly as one that asked for
+                // nothing does, and the miss is counted. That matters because the failure is
+                // otherwise invisible — a windscreen drawn with the ordinary shader looks like a
+                // windscreen whose special shader did nothing, which is indistinguishable from a
+                // special shader that ran and had no effect.
+                if (!material.declaredShader.empty())
+                {
+                    if (const auto declared = shaderService.getShaderByName(material.declaredShader);
+                        declared.has_value())
+                    {
+                        // Both: the handle the draw path picks its pipeline from, and `shader`, which
+                        // every other reader still expects to be set.
+                        material.declaredShaderHandle = declared.value();
+                        material.shader = declared.value();
+
+                        return;
+                    }
+
+                    diagnostics.record(FrameDiagnostic::MaterialShaderUnavailable,
+                                       [&] { return "material asked for shader '" + material.declaredShader + "'"; });
+                }
+
+                material.shader = entityDescriptor.shader;
+            });
     }
 
     auto meshes = std::vector<RenderableMesh>();

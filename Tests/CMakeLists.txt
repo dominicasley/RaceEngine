@@ -17,6 +17,7 @@ add_executable(EngineTests
         BackendParityTests.cpp
         BrakeHardwareTests.cpp
         BrakeModelProbe.cpp
+        BrakingUtilisationProbe.cpp
         CameraServiceTests.cpp
         CarAudioTests.cpp
         ClutchTests.cpp
@@ -29,6 +30,7 @@ add_executable(EngineTests
         CouplingTests.cpp
         DifferentialTests.cpp
         DrivelineTests.cpp
+        EngineCurveValidationProbe.cpp
         EngineLayerTests.cpp
         EnvelopeCandidateProbe.cpp
         EnvelopeResolutionProbe.cpp
@@ -74,7 +76,9 @@ add_executable(EngineTests
         TelemetryUnitsProbe.cpp
         TorqueConverterTests.cpp
         TractionControlTests.cpp
+        TyreGripRatioSweepProbe.cpp
         TyreLayerTests.cpp
+        TyrePeakToTailProbe.cpp
         TyreLoadSensitivityTests.cpp
         TyreShapeProbe.cpp
         TyreTests.cpp
@@ -84,7 +88,8 @@ add_executable(EngineTests
         VehicleTests.cpp
         WheelSpeedSensorTests.cpp
         SphericalHarmonicsTests.cpp
-        ShadowCascadesTests.cpp)
+        ShadowCascadesTests.cpp
+        VolumetricFogTests.cpp)
 
 # The recording fake is a module unit rather than a header because the seams it implements are
 # only reachable through `import`, and a header may not import.

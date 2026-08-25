@@ -93,7 +93,8 @@ std::expected<void, std::string> AutoExposureService::enable(Camera& camera, con
                                     level == 0 ? 0u : level - 1u);
         // Only the top of the chain weights anything: it is the one pass that sees the frame, and
         // every level below it is averaging numbers that already carry their weight with them.
-        postProcessService.setParameters(pass, glm::vec4(dto.meter.centreWeighting, 0.0f, 0.0f, 0.0f));
+        postProcessService.setParameters(
+            pass, glm::vec4(dto.meter.centreWeighting, dto.meter.coverageWeighting, 0.0f, 0.0f));
         cameraService.addPostProcess(camera, pass);
     }
 

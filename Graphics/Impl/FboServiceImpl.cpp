@@ -61,6 +61,23 @@ std::expected<Resource<Fbo>, std::string> FboService::create(const CreateFboDTO&
     return memoryStorageService.frameBuffers.add(fbo);
 }
 
+std::expected<Resource<Fbo>, std::string>
+FboService::compose(const std::vector<Resource<FboAttachment>>& attachments) const
+{
+    for (const auto& attachmentKey : attachments)
+    {
+        if (memoryStorageService.bufferAttachments.find(attachmentKey) == nullptr)
+        {
+            return std::unexpected("a composed framebuffer names an attachment that is not live");
+        }
+    }
+
+    // No factory call on purpose: createFbo creates an image for every attachment it is handed, and
+    // these attachments already carry the images their owners created. The record is the whole of
+    // what a composed framebuffer is.
+    return memoryStorageService.frameBuffers.add(Fbo{.type = FboType::Planar, .attachments = attachments});
+}
+
 std::expected<void, std::string> FboService::recreate(const Resource<Fbo>& fbo) const
 {
     const auto* stored = memoryStorageService.frameBuffers.find(fbo);

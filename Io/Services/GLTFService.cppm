@@ -51,6 +51,8 @@ public:
     // A glTF texture index out of an extras object, or -1 where the key is absent or not a number.
     // -1 is what `textureFor` already reads as "no texture", so the two compose without a branch.
     [[nodiscard]] int extrasTextureIndex(const tinygltf::Value& object, const std::string& key) const;
+    // A string out of an extras object, or empty where the key is absent or is not a string.
+    [[nodiscard]] std::string extrasString(const tinygltf::Value& object, const std::string& key) const;
     [[nodiscard]] std::expected<Texture, std::string> getImageFromIndex(const tinygltf::Model& model, int index,
                                                                         ColourSpace colourSpace) const;
     [[nodiscard]] std::optional<VertexIndicesType> toVertexIndicesType(int componentType) const;
@@ -525,6 +527,10 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
             .transform = toTextureTransform(tinyGltfMaterial.pbrMetallicRoughness.baseColorTexture),
             .blinnPhong = toBlinnPhongShading(tinyGltfMaterial.extras),
             .blend = blend,
+            // `extras.shader`: the asset naming the shader it wants to be drawn with. Recorded, not
+            // resolved — see Material::declaredShader. Its position here is its position in the
+            // struct: a designated initialiser must follow declaration order.
+            .declaredShader = extrasString(tinyGltfMaterial.extras, "shader"),
             .albedo = albedoTexturePtr,
             .metallicRoughness = metallicRoughnessTexturePtr,
             .normal = normalTexturePtr,
@@ -788,6 +794,21 @@ std::optional<BlinnPhongShading> GLTFService::toBlinnPhongShading(const tinygltf
                              // colour.
                              .specular = read("specular", defaults.specular),
                              .specularExponent = exponent < 1.0f ? 1.0f : exponent};
+}
+
+std::string GLTFService::extrasString(const tinygltf::Value& object, const std::string& key) const
+{
+    if (!object.IsObject() || !object.Has(key))
+    {
+        return {};
+    }
+
+    const auto& stated = object.Get(key);
+
+    // Empty for a key that is present but is not a string — a number or a bool here is an exporter
+    // saying something this does not understand, and guessing at it would be worse than not hearing
+    // it. The material then falls back exactly as one that stated nothing does.
+    return stated.IsString() ? stated.Get<std::string>() : std::string();
 }
 
 int GLTFService::extrasTextureIndex(const tinygltf::Value& object, const std::string& key) const

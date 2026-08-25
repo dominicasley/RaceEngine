@@ -27,6 +27,7 @@ export module raceengine.graphics.models:Scene;
 import raceengine.resource;
 import :Fbo;
 import :LightProbe;
+import :Material;
 import :Mesh;
 import :Shader;
 import :Texture;
@@ -111,6 +112,17 @@ export struct OrthographicVolume
 // and a second Camera a game had to keep in step would be a second answer to where the view is.
 export enum class CameraRole { Scene, ShadowCascade, ProbeFace, DepthNormalPrepass };
 
+// Which half of the opaque/blended partition a shading view records. All is every camera that ever
+// existed: opaque draws first, then the blended draws sorted back to front, in one view. The other
+// two are what a layered frame is made of — a layer camera records its layer's opaque draws and
+// nothing blended, and one final camera records every blended draw of every layer over the
+// composited result. The split axis is opaque/blended rather than per layer because blending is not
+// commutative *across* layers: the global back-to-front sort is the engine's own rule, and a
+// windscreen sorted only against its own layer would draw over a tree it is behind. Non-shading
+// views — cascades, probe faces, the occlusion prepass — ignore this; they have no blending to
+// partition.
+export enum class DrawPartition { All, OpaqueOnly, BlendedOnly };
+
 // The shape of the curve the post chain maps scene radiance through, once the camera's exposure
 // has said how much of it there is. All three leave black at black and white at white, so a change
 // here moves contrast rather than range, and all three are separable: contrast pivots at middle
@@ -168,6 +180,14 @@ export struct AutoExposure
     // camera the player is looking through has to have caught up by the time he has.
     float lightAdaptationSpeed = 6.0f;
     float darkAdaptationSpeed = 3.0f;
+    // How much a pixel's coverage weights the meter, zero to one. Zero is every meter before the
+    // layered frame existed: each pixel counts fully, which is right for a target the scene fills.
+    // A camera drawing one layer into a transparent buffer leaves alpha zero where nothing drew,
+    // and a meter counting those holes as black would drag a cabin's reading down by however much
+    // of the frame the world occupies. At one, a pixel meters exactly as much as something drew it
+    // — and a frame nothing drew keeps its previous reading, because the readback already holds
+    // through a zero total weight.
+    float coverageWeighting = 0.0f;
     // The range the meter may pick a shutter inside. A camera cannot hold the shutter open for
     // arbitrarily long, and that limit is the one place a slow lens or a low film speed can fail
     // to reach the exposure the meter asked for — which is what makes iso and aperture matter to
@@ -259,6 +279,106 @@ export struct Bloom
     std::vector<Resource<PostProcess>> passes{};
 };
 
+// The air, and what light does on its way through it.
+//
+// A property of the *scene* rather than of a camera, for the reason the shadow cascades are: it is
+// a fact about the world, and two cameras standing in the same world look through the same air.
+// Everything here describes the medium; nothing here describes its colour, because the colour is
+// not a decision. The shafts take the colour of the light that casts them and the haze takes the
+// mean of what the scene's global light probe photographed, so a scene re-lit for dusk fogs at dusk
+// with nothing restated — see docs/volumetric-fog-brief.md.
+//
+// The model is single scattering through a medium whose density falls off exponentially with
+// height. Extinction and the unshadowed half of the in-scattering are closed form and exact
+// (Graphics/Api/VolumetricFog.cppm states both, and the two scene shaders are the second
+// implementation); the sun's half is marched against the shadow cascades, which is where the god
+// rays come from.
+export struct Fog
+{
+    // Off is the default, and off is bit-for-bit the renderer that has no fog in it at all: every
+    // shader's fog is one branch on this, so a scene that states nothing is unchanged. It is also
+    // what makes the feature provable — both parity gates are byte-identical with it false.
+    bool enabled = false;
+    // Extinction at `baseHeight`, per world unit. A world unit is a tenth of a metre, so 1e-4 here
+    // is an optical depth of one over a kilometre — light haze — and 1e-3 is a bad morning.
+    float density = 0.0f;
+    // How far the density falls by 1/e, in world units. It is what makes fog a *layer*: a valley
+    // holding mist a few tens of metres deep and a ridge standing out of it are one number apart.
+    float scaleHeight = 300.0f;
+    // The height `density` is quoted at. Sea level for an open circuit; the floor of a valley if
+    // the fog is meant to pool in one.
+    float baseHeight = 0.0f;
+    // How far along a ray the medium is integrated. It bounds the horizon rather than the fog —
+    // the height profile already bounds a ray that climbs — and it is what a fragment at infinity
+    // (the sky) is fogged as though it were at. Without it a level ray to a 30,000-unit sky box
+    // integrates to fully opaque and the horizon is a flat wall of haze.
+    float maximumDistance = 20000.0f;
+    // Single-scatter albedo: the fraction of extinction that scatters rather than absorbs, per
+    // channel. This is IQ's separate extinction and in-scattering coefficients, said once — the
+    // extinction stays one number, so the transmittance and every marched weight stay one number,
+    // and what differs by channel is what the medium gives back.
+    glm::vec3 scatteringAlbedo{0.9f};
+    // Henyey-Greenstein's asymmetry, -1 fully backward to 1 fully forward. Positive is what makes a
+    // shaft bright when the camera looks towards the sun and faint when it looks away, and that
+    // asymmetry *is* the effect: at 0 the medium scatters the sun equally in every direction and
+    // the god rays flatten into a grey wash.
+    float anisotropy = 0.6f;
+    // A tint and a gain on the two halves, for a level that wants the haze warmer or the shafts
+    // stronger than the physics hands it. Both are 1 by default, which is the derived answer
+    // untouched.
+    glm::vec3 ambientTint{1.0f};
+    float sunIntensity = 1.0f;
+};
+
+// A pair of windscreen wipers, as the geometry of their arcs and the law their blade angle follows.
+//
+// **The blade angle is not stated — it is derived from the clock**, and that is what makes this
+// three vec4s instead of a stream of per-frame state. A wiper sweeps a fixed arc at a fixed rate, so
+// where the blade is at time t is a closed-form function of t, and so is the far more useful
+// question: when was a given point of the glass last swept? Both are answered in the shader from
+// these numbers alone, which is what lets rain be cleared analytically by a fragment that remembers
+// nothing (see WindshieldFragmentShader).
+//
+// The arcs are stated in the *pane's own texture coordinates*, because that is the only frame both
+// the game and the shader can name without the importer carrying node identity — the wiper pivots
+// exist in the asset as `WIPER_*` dummies whose names are flattened away at import. A pivot is
+// therefore a uv, and a radius is in units of u, with the v axis scaled to match u's world spacing
+// by the shader from its own Jacobian. Asset-specific numbers, so the *game* states them.
+export struct Wipers
+{
+    // Seconds for one full cycle: out, back, and any dwell parked before the next. Zero or less is
+    // "this car has no wipers running", and that is bit-for-bit the renderer that has none — the
+    // shader's whole wiper path is one branch on it, exactly as the fog and the rain are.
+    float cyclePeriod = 0.0f;
+    // How much of that period the blade spends moving. Equal to the period is a continuous wipe;
+    // less leaves the blade parked for the remainder, which is the intermittent setting.
+    float sweepSeconds = 0.0f;
+    // The simulated instant the current cycle began, in the same seconds the frame block carries.
+    // Stated rather than assumed zero so that switching the wipers on does not begin mid-stroke.
+    float cycleStart = 0.0f;
+    // Half the blade's width, in units of u. What the clearing is stated in is the *arc*; this is
+    // only how wide the blade draws.
+    float bladeHalfWidth = 0.0f;
+    // How many units of u one unit of v spans on the glass — the pane's own aspect, without which
+    // an arc stated in uv is an ellipse on the texture rather than a circle on the windscreen.
+    //
+    // **Stated rather than derived, and that is a correction** (2026-08-25): the shader first
+    // recovered this from the screen-space Jacobian of its own fragment, which made the clearing
+    // depend on the render resolution — measured, and the gates run at a different one from the
+    // game. It is a property of how the asset was unwrapped, the game already measures it there,
+    // and a number that never changes has no business being rebuilt per fragment per frame.
+    float paneAspect = 1.0f;
+    // Per blade: xy the pivot in uv, z the inner radius, w the outer. Two, because a tandem pair is
+    // what a road car has; a single-blade car states the second with a zero outer radius.
+    glm::vec4 bladeA{};
+    glm::vec4 bladeB{};
+    // Where each blade rests and how far it sweeps from there, in radians, measured in the pane's
+    // uv with u to the right and v up. Per blade rather than shared: a tandem pair is linked in
+    // *time* — one cycle, one phase — and not in geometry.
+    glm::vec2 parkAngle{};
+    glm::vec2 sweepAngle{};
+};
+
 export struct Camera
 {
     unsigned int iso;
@@ -304,6 +424,33 @@ export struct Camera
     glm::mat4 modelViewMatrix{};
     std::optional<Resource<Fbo>> output;
     std::vector<Resource<PostProcess>> postProcesses{};
+    // Which layers of the scene this view draws, tested against RenderableEntity::layers where the
+    // draw walk already tests castsShadow. Everything is born on layer 1 and the default mask draws
+    // every layer, so a scene that never states layers renders exactly as it always has. What the
+    // layers mean is the game's: the engine only ands the two words together.
+    unsigned int layerMask = ~0u;
+    // See DrawPartition. All for every camera that is not part of a layered frame.
+    DrawPartition partition = DrawPartition::All;
+    // A camera that continues a frame another camera began: its attachments begin as the previous
+    // view left them instead of being cleared. False is every camera that opens its own target.
+    bool loadColour = false;
+    bool loadDepth = false;
+    // Whether this view's depth survives the pass for a later camera to load. The backend's own
+    // policy stores depth only where a sampler proves something reads it; a layered frame's depth is
+    // read by the *next view's* rasteriser rather than by any sampler, which no attachment flag can
+    // say, so the camera says it.
+    bool keepDepth = false;
+    // What a cleared colour attachment holds, when this camera wants something other than the
+    // contract's clear colour. Transparent black is the layer-buffer case: a layer composites by its
+    // own alpha, so where nothing drew there must be nothing, not white.
+    std::optional<glm::vec4> clearColour{};
+    // How much of the scene's rain this view's *surfaces* shade under, multiplied into the rain the
+    // frame block carries for this view alone. One is every camera. Zero is a view of sheltered
+    // geometry: the cockpit's car camera draws a cabin with a roof over it, and a wet dashboard is
+    // wrong however hard it rains outside. Deliberately not applied to the fullscreen weather pass's
+    // own push constant — the rain falling in the world is visible through the windscreen whatever
+    // this view's surfaces shade as.
+    float rainScale = 1.0f;
 };
 
 export enum class RenderableEntityType {
@@ -333,6 +480,12 @@ export struct RenderableEntity
     // because the sky is the case that differs: it must not cast, and it is the single most
     // important thing a probe records.
     bool staticGeometry = true;
+    // Which layers of the scene this renderable belongs to, as a bitset a camera's layerMask is
+    // tested against. Layer 1 is where everything is born, and a camera's default mask draws every
+    // layer, so neither side has to be stated until a frame is split. A bitset rather than an index
+    // so one renderable can stand in several layers; what each bit means is the game's decision,
+    // exactly as it is for a camera's mask.
+    unsigned int layers = 1u;
 
     explicit RenderableEntity(RenderableEntityType type, SceneNode& node) :
         type(type),
@@ -368,6 +521,10 @@ export struct RenderableMesh
 export struct RenderableModel : public RenderableEntity
 {
     Resource<Model> model;
+    // What this car is painted with, if anything. Per renderable and not per material — see Paint —
+    // so a game recolours a car by writing this on the car it already holds, and two cars built from
+    // one model are two colours. Disabled by default, which is every renderable that is not a car.
+    Paint paint{};
     // The shader this instance was created with. Materials live in shared storage, so the
     // choice cannot be written through to them without one instance rewriting another's.
     Resource<Shader> shader;
@@ -443,6 +600,39 @@ export struct Scene
 
     std::optional<Resource<CubeMap>> environment{};
     ShadowCascades shadows{};
+    // The air every camera in this scene looks through. Disabled by default, which is the renderer
+    // that has no fog in it.
+    Fog fog{};
+    // The rain falling in it, 0..1-ish (above 1 is simply heavier). Weather like the fog is, and
+    // like it, zero is bit-for-bit the renderer that has no rain in it at all: the windshield
+    // shader — today's only reader — is one branch on this.
+    float rain = 0.0f;
+    // How the rain moves on the glass that carries it: x the ground speed in metres per second,
+    // y the airflow phase — the accumulated integral of speed *squared*, in m²/s, because the
+    // shear the airstream puts on a drop grows with the square of the speed and a drop's position
+    // is that shear *integrated*. The integral is accumulated by whoever calls setRainMotion
+    // rather than reconstructed in the shader, which is stateless and would otherwise teleport
+    // every drop the moment the speed changed. Frame state rather than per-renderable state
+    // because the one windshield this engine draws belongs to the one car the player sits in; the
+    // day a second car's glass rains, this moves to the per-draw set.
+    glm::vec2 rainMotion{0.0f, 0.0f};
+    // The car's own axes in world space, as full unit vectors: which way its body points and which
+    // way is up for it.
+    //
+    // **Both are body axes and neither is flattened, and that is load-bearing.** The shader turns
+    // them into the *model* space of whatever pane it is drawing, where they are then constant —
+    // and constant is the whole point, because they steer a displacement that has been accumulating
+    // since the session began. A pane's normal tilts with the body, so a world-space pull would
+    // change direction along the glass on every pitch and roll and the field would jitter over
+    // every kerb; a heading flattened to the horizontal has the same fault one axis down, since it
+    // leans against the body whenever the car pitches. Rotating both with the body makes the pane
+    // and the pull tilt together, so the projection between them — all the drift actually reads —
+    // does not move at all. The cost is that a sustained slope no longer leans the streaks, which
+    // is worth it and is not what anybody looks at.
+    glm::vec3 rainForward{0.0f, 0.0f, 1.0f};
+    glm::vec3 rainBodyUp{0.0f, 1.0f, 0.0f};
+    // The blades on that glass, off by default for the reason everything here is off by default.
+    Wipers wipers{};
 };
 
 } // namespace raceengine

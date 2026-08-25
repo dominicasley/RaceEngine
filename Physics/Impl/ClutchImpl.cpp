@@ -220,6 +220,45 @@ void idleDriveCoupling(const DriveCoupling& coupling, DriveCouplingState& state,
     return command + std::clamp(asked - command, -limit, limit);
 }
 
+[[nodiscard]] bool launchControlArmed(const LaunchControl& launch, const bool armed, const double brake,
+                                      const double throttle, const double wheelSpeed, const bool inGear,
+                                      const bool running)
+{
+    if (!launch.enabled || !inGear || !running)
+    {
+        return false;
+    }
+
+    // **Arming and staying armed are different thresholds, and that is deliberate.** Arming needs both
+    // pedals planted; staying armed only needs the brake, because the throttle is about to be the
+    // thing the driver is holding while the brake comes off. A single threshold for both would drop
+    // the launch on the tick the brake started moving, which is precisely the tick the clutch has to
+    // be loaded for.
+    if (armed)
+    {
+        return brake > launch.releaseBrake && throttle > launch.releaseBrake;
+    }
+
+    return std::abs(wheelSpeed) < launch.maximumWheelSpeed && brake > launch.armBrake && throttle > launch.armThrottle;
+}
+
+[[nodiscard]] double launchControlPedal(const DriveCoupling& coupling, const LaunchControl& launch,
+                                        const double engineTorque, const double engineSpeed)
+{
+    // A fluid coupling at stall already does this. See the declaration.
+    if (coupling.kind != DriveCouplingKind::FrictionClutch)
+    {
+        return 1.0;
+    }
+
+    // The capacity that holds the engine where it is asked to be: what it is making, plus a
+    // proportional correction on the speed error. Negative capacity is a released clutch rather than a
+    // clutch driving backwards, which `clutchPedalForCapacity` already answers correctly.
+    const auto capacity = engineTorque + launch.gain * (engineSpeed - launch.targetSpeed);
+
+    return clutchPedalForCapacity(coupling.clutch, capacity);
+}
+
 [[nodiscard]] double creepPedal(const DriveCoupling& coupling, const double command)
 {
     switch (coupling.kind)

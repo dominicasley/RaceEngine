@@ -186,6 +186,19 @@ export struct ReferenceSpeedSetup
     // into the threshold: 1.5 ms between pulses at 100 km/h, 30 ms at 5. A twentieth of a second is
     // a third of a cycle and thirty pulses at speed, which satisfies both.
     double rateSmoothing = 0.050;
+
+    // **Two corrections to this estimator were built, measured against the car, and taken out
+    // again on 2026-08-24** — a predictive floor (fall along the learned rate between anchors
+    // rather than at the cap) and anchor-to-anchor rate learning (so `rate` stops learning the
+    // limiter's own slope). Each fixed the error it named — the estimate's tracking tightened from
+    // [−8%, +2%] to ±3%, and the believed deceleration came off the 12.749 cap it sits pinned at —
+    // **and each made the car stop longer** (41.74 m to 44.33 and 45.32 respectively), because the
+    // anti-lock controller's thresholds and the slip-anchored recovery law are calibrated against
+    // this estimator's error signature: the low bias of the cap-chasing floor keeps the slip guards
+    // conservative, and the overstated deceleration makes dumps exit early. Correcting the
+    // estimator is therefore inseparable from re-deriving the controller on top of it. The
+    // measurements are at both sites in `WheelSensorsImpl.cpp`, and the instrument that took them
+    // is `how the reference speed estimate tracks the car` in `BrakingUtilisationProbe.cpp`.
 };
 
 export struct ReferenceSpeedState
