@@ -12,21 +12,21 @@
 
 import raceengine.physics;
 
+using raceengine::coaxialSpring;
 using raceengine::CornerHardpoints;
 using raceengine::CornerSetup;
-using raceengine::coaxialSpring;
 using raceengine::CornerSide;
 using raceengine::Curve;
 using raceengine::damperDampingCoefficient;
-using raceengine::damperShaftCompression;
 using raceengine::damperElementOf;
 using raceengine::DamperForceSolution;
 using raceengine::DamperKinematics;
+using raceengine::damperShaftCompression;
 using raceengine::golfGtiMk7;
-using raceengine::kneedDamper;
 using raceengine::golfMk7FrontCorner;
-using raceengine::linearDamper;
 using raceengine::golfMk7RearCorner;
+using raceengine::kneedDamper;
+using raceengine::linearDamper;
 using raceengine::outboardSign;
 using raceengine::solveCornerWithJacobian;
 using raceengine::solveDamperForce;
@@ -35,10 +35,10 @@ using raceengine::solveDamperKinematics;
 using raceengine::solveElement;
 using raceengine::solveSpringForce;
 using raceengine::solveSpringKinematics;
-using raceengine::springFreeLengthForLoad;
-using raceengine::SpringMount;
 using raceengine::springElementOf;
+using raceengine::springFreeLengthForLoad;
 using raceengine::SpringKinematics;
+using raceengine::SpringMount;
 using raceengine::SuspensionElement;
 using raceengine::SuspensionState;
 using raceengine::validateCornerSetup;
@@ -410,7 +410,8 @@ TEST_CASE("the migrated spring path is the old spring path, exactly", "[physics]
 
         // The free length, as the pre-migration formula wrote it, at an arbitrary load.
         const auto load = 3200.0;
-        const auto oldFreeLength = replicaLength(corner.hardpoints, element, 0.0) + load / (corner.springRate * oldRatio);
+        const auto oldFreeLength =
+            replicaLength(corner.hardpoints, element, 0.0) + load / (corner.springRate * oldRatio);
         const auto newFreeLength = springFreeLengthForLoad(corner, load);
         REQUIRE(newFreeLength.has_value());
         REQUIRE(newFreeLength.value() == oldFreeLength);
@@ -644,8 +645,21 @@ TEST_CASE("the migrated damper force is the old damper force, exactly", "[physic
     // on every Golf corner, across the travel and across rebound, rest and compression, it must be
     // the same bits the state-field arithmetic produced — force, velocity, and the generalised
     // contribution through the damper's own Jacobian.
-    const auto setup = golfGtiMk7();
-    REQUIRE(setup.has_value());
+    //
+    // **The car's seal friction is taken out of the fixture and not out of the claim** (2026-08-27).
+    // This case is about the *element migration* and asserts it to the bit; the Golf gained a
+    // 107 N Coulomb term on the shaft that day, which is a second thing the damper does and not a
+    // change to which geometry it reads. Isolating the variable is what this project has learned to
+    // do rather than widen a bound — and the friction is then asserted below, on the same corners, so
+    // the coverage grows instead of shrinking.
+    auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    auto setup = built;
+    for (auto& corner : setup->corners)
+    {
+        corner.damperFriction = 0.0;
+    }
 
     for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
     {
@@ -681,6 +695,20 @@ TEST_CASE("the migrated damper force is the old damper force, exactly", "[physic
             REQUIRE(compressing.force > 0.0);
             REQUIRE(rebounding.velocity < 0.0);
             REQUIRE(rebounding.force < 0.0);
+
+            // And what the shipped car adds on top of that, on the same corner at the same state:
+            // the whole of the stated seal friction, opposing the shaft, at a velocity well past the
+            // regularisation width. This is the claim the fixture above isolates, asserted rather
+            // than assumed away.
+            const auto& shipped = built->corners[index];
+            REQUIRE(shipped.damperFriction > 0.0);
+
+            const auto shippedCompression = solveDamperForce(shipped, state, 2.1);
+            REQUIRE(shippedCompression.force - compressing.force ==
+                    Catch::Approx(shipped.damperFriction).epsilon(1e-9));
+
+            const auto shippedRebound = solveDamperForce(shipped, state, -1.7);
+            REQUIRE(shippedRebound.force - rebounding.force == Catch::Approx(-shipped.damperFriction).epsilon(1e-9));
         }
     }
 }
@@ -729,24 +757,34 @@ TEST_CASE("the damper force follows the damper element through the production pa
     REQUIRE(std::abs(baseDamper.force * baseDamper.lengthPerAngle - baseDamper.force * spring.lengthPerAngle) > 1.0);
 }
 
-TEST_CASE("the migrated implicit damping coefficient is the old coefficient, exactly",
-          "[physics][suspension][element]")
+TEST_CASE("the migrated implicit damping coefficient is the old coefficient, exactly", "[physics][suspension][element]")
 {
     // Step 9's coaxial regression contract: the coefficient reads the damper element's Jacobian
     // and velocity now, and on every Golf corner — rebound, design, moderate bump and the edge of
     // the bump stop's entry — it must be the same bits the state-field expression produced. The
     // implicit divisor the integration solves against is checked with it, which is the stability
     // statement: identical coefficient, identical integrated response.
-    const auto setup = golfGtiMk7();
-    REQUIRE(setup.has_value());
+    //
+    // **The car's seal friction is taken out of the fixture and not out of the claim**, for the
+    // reason given on the force case above — and the friction's own contribution to this coefficient
+    // is asserted beside it, because a friction term that failed to reach the implicit divisor is
+    // exactly the defect that would make it chatter.
+    auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    auto setup = built;
+    for (auto& corner : setup->corners)
+    {
+        corner.damperFriction = 0.0;
+    }
 
     for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
     {
         const auto& corner = setup->corners[index];
         const auto& hardpoints = corner.hardpoints;
 
-        for (const auto through : {0.75 * hardpoints.droopAngle, 0.0, 0.4 * hardpoints.bumpAngle,
-                                   0.9 * hardpoints.bumpAngle})
+        for (const auto through :
+             {0.75 * hardpoints.droopAngle, 0.0, 0.4 * hardpoints.bumpAngle, 0.9 * hardpoints.bumpAngle})
         {
             const auto state = solveCornerWithJacobian(hardpoints, through, 0.0);
             REQUIRE(state.has_value());
@@ -755,18 +793,39 @@ TEST_CASE("the migrated implicit damping coefficient is the old coefficient, exa
             for (const auto wishboneRate : {-1.7, 0.0, 0.4, 2.1})
             {
                 const auto oldVelocity = -legacyJacobian * wishboneRate;
-                const auto oldCoefficient = legacyJacobian * legacyJacobian *
-                                            std::max(0.0, slopeAt(corner.damper, oldVelocity));
+                const auto oldCoefficient =
+                    legacyJacobian * legacyJacobian * std::max(0.0, slopeAt(corner.damper, oldVelocity));
 
                 const auto damper = solveDamperForce(corner, *state, wishboneRate);
                 const auto coefficient = damperDampingCoefficient(corner, damper);
                 REQUIRE(coefficient == oldCoefficient);
 
                 // The implicit update's divisor, both ways — the integration sees the same number.
-                const auto inertia = std::max(corner.unsprungMass * state->travelPerAngle * state->travelPerAngle,
-                                              1e-6);
+                const auto inertia =
+                    std::max(corner.unsprungMass * state->travelPerAngle * state->travelPerAngle, 1e-6);
                 const auto tick = 1.0 / 360.0;
                 REQUIRE(1.0 + (coefficient / inertia) * tick == 1.0 + (oldCoefficient / inertia) * tick);
+
+                // And the shipped car's friction does reach it, which is the whole reason its slope
+                // is written analytically: the curve's own differencing step is a hundred times the
+                // regularisation width and would read the term as flat.
+                //
+                // **Only where the shaft is inside that width**, which is the physical statement and
+                // a stronger one than "always larger": Coulomb friction is flat once it is developed,
+                // so past a few regularisation widths it must contribute *exactly nothing* to a
+                // slope. Both halves are asserted.
+                const auto& shipped = built->corners[index];
+                const auto shippedDamper = solveDamperForce(shipped, *state, wishboneRate);
+                const auto shippedCoefficient = damperDampingCoefficient(shipped, shippedDamper);
+
+                if (std::abs(shippedDamper.velocity) < shipped.damperFrictionSpeed)
+                {
+                    REQUIRE(shippedCoefficient > coefficient);
+                }
+                else if (std::abs(shippedDamper.velocity) > 20.0 * shipped.damperFrictionSpeed)
+                {
+                    REQUIRE(shippedCoefficient == coefficient);
+                }
             }
         }
     }
@@ -873,9 +932,8 @@ TEST_CASE("the migrated stop geometry is the old stop geometry, exactly", "[phys
         const auto droopEntry = angleForShaftCompression(hardpoints, -corner.droopStop.gap);
         const auto bumpEntry = angleForShaftCompression(hardpoints, corner.bumpStop.gap);
 
-        for (const auto angle :
-             {hardpoints.droopAngle, droopEntry, 0.5 * (hardpoints.droopAngle + droopEntry), 0.0,
-              0.4 * hardpoints.bumpAngle, bumpEntry, 0.95 * hardpoints.bumpAngle})
+        for (const auto angle : {hardpoints.droopAngle, droopEntry, 0.5 * (hardpoints.droopAngle + droopEntry), 0.0,
+                                 0.4 * hardpoints.bumpAngle, bumpEntry, 0.95 * hardpoints.bumpAngle})
         {
             const auto state = solveCornerWithJacobian(hardpoints, angle, 0.0);
             REQUIRE(state.has_value());
@@ -960,9 +1018,8 @@ TEST_CASE("stop kinematics follow the damper element, not the spring element", "
     REQUIRE(std::abs(damperMoved - baseCompression) > 1e-4);
 
     // And the spring axis's own displacement is not the stop's number on a split corner.
-    const auto springDisplacement =
-        solveElement(base.hardpoints, springElementOf(base.hardpoints), 0.0).length -
-        solveSpringForce(base, *state).length;
+    const auto springDisplacement = solveElement(base.hardpoints, springElementOf(base.hardpoints), 0.0).length -
+                                    solveSpringForce(base, *state).length;
     REQUIRE(std::abs(baseCompression - springDisplacement) > 0.001);
 }
 
@@ -984,9 +1041,8 @@ TEST_CASE("the stops' generalised contribution rides the damper element", "[phys
         const auto droopEntry = angleForShaftCompression(hardpoints, -corner.droopStop.gap);
         const auto bumpEntry = angleForShaftCompression(hardpoints, corner.bumpStop.gap);
 
-        for (const auto angle :
-             {hardpoints.droopAngle, droopEntry, 0.5 * (hardpoints.droopAngle + droopEntry), 0.0,
-              0.4 * hardpoints.bumpAngle, bumpEntry, 0.95 * hardpoints.bumpAngle})
+        for (const auto angle : {hardpoints.droopAngle, droopEntry, 0.5 * (hardpoints.droopAngle + droopEntry), 0.0,
+                                 0.4 * hardpoints.bumpAngle, bumpEntry, 0.95 * hardpoints.bumpAngle})
         {
             const auto state = solveCornerWithJacobian(hardpoints, angle, 0.0);
             REQUIRE(state.has_value());
@@ -1051,9 +1107,8 @@ TEST_CASE("the stops' generalised contribution follows the damper attachment onl
     {
         const auto damper = solveDamperForce(corner, state, 0.6);
         const auto compression = damperShaftCompression(corner, damper);
-        const auto stopAxisForce =
-            corner.bumpStop.force(compression - corner.bumpStop.gap, damper.velocity) +
-            -corner.droopStop.force(-compression - corner.droopStop.gap, -damper.velocity);
+        const auto stopAxisForce = corner.bumpStop.force(compression - corner.bumpStop.gap, damper.velocity) +
+                                   -corner.droopStop.force(-compression - corner.droopStop.gap, -damper.velocity);
 
         return std::pair{stopAxisForce, stopAxisForce * damper.lengthPerAngle};
     };

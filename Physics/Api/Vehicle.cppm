@@ -93,8 +93,8 @@ export [[nodiscard]] Curve linearDamper(const double bumpRate, const double rebo
 // signature says so: a spring's ratio converts a spring rate and nothing else, which is why the
 // cross-overload does not exist to call.
 export [[nodiscard]] Curve kneedDamper(const double bumpRate, const double fastBumpRate, const double bumpKnee,
-                                       const double reboundRate, const double fastReboundRate,
-                                       const double reboundKnee, const DamperKinematics& kinematics);
+                                       const double reboundRate, const double fastReboundRate, const double reboundKnee,
+                                       const DamperKinematics& kinematics);
 Curve kneedDamper(double, double, double, double, double, double, const SpringKinematics&) = delete;
 
 // A stop that comes in gradually and then very hard. `gap` is how much travel there is before it
@@ -141,6 +141,27 @@ export struct CornerSetup
 
     Curve damper = linearDamper(4200.0, 7600.0);
 
+    // Seal and rod friction on the damper shaft, newtons, opposing the shaft's motion at any
+    // non-zero velocity and not scaling with it. A `Curve` through the origin is a pure viscous
+    // damper and has none; a real one carries a Coulomb term that dominates exactly where the
+    // viscous term is smallest — small amplitudes and low velocities, which is straight-line running
+    // on coarse tarmac, the first millimetre of a steering input, and the settling after a kerb.
+    //
+    // **Zero here, and zero on every car in this project, because nobody has sourced one.** Published
+    // figures for a passenger car sit around 50 to 200 N at the shaft and a damper dynamometer plot
+    // shows it directly as the width of the hysteresis loop at zero velocity — but AC's data has no
+    // such number and none was found for this car (docs/suspension-fidelity-brief.md, item 5). The
+    // mechanism is here so that the day a plot turns up it is a data change; putting an invented
+    // number in would make it an architecture that asserts something nobody measured.
+    double damperFriction = 0.0;
+
+    // How fast the shaft has to be moving for the friction term to be fully developed, metres per
+    // second. **A numerical choice and not a physical one**: the term is regularised as
+    // `friction · tanh(velocity / this)` rather than `friction · sign(velocity)`, because a hard sign
+    // term at 360 Hz makes a limit cycle rather than a dead band. Small enough to look like friction,
+    // large enough that one tick cannot step across it.
+    double damperFrictionSpeed = 0.01;
+
     TravelStop bumpStop;
     TravelStop droopStop;
 
@@ -150,11 +171,34 @@ export struct CornerSetup
     double tireVerticalRate = 250000.0;
     double tireVerticalDamping = 1500.0;
 
+    // **Lateral-force compliance steer**: how far this corner's wheel is twisted about the chassis's
+    // up axis per newton of lateral force at its contact patch, radians per newton, **signed**.
+    //
+    // Every joint in `solveCorner` is an ideal pin or ball, so a rigid linkage takes no toe under
+    // load at all. A real one carries rubber, and the toe it takes is not an imperfection — it is
+    // *designed in*, because it puts the phase of the steering reaction force ahead of the steering
+    // angle and that is most of what the rack feels like. Production cars are set up for a slight
+    // **toe-out** under lateral force, which is a negative value here.
+    //
+    // Only the toe term is carried. A real bush also moves the upright sideways and rearward and
+    // takes camber with it, and those have no published figure behind them for this class of car —
+    // so the hub stays where the linkage put it. `applyComplianceSteer` is the seam and says why.
+    // docs/suspension-fidelity-brief.md, item 1.
+    double lateralForceSteer = 0.0;
+
     // Placeholder: a hub, upright, brake and wheel for a mid-size car.
     double unsprungMass = 38.0;
 
     // Torsional rate of this corner's half of the anti-roll bar, N·m per radian of *difference*
     // across the axle, expressed at the wheel as N/m of differential travel. Zero disables it.
+    //
+    // **The number keeps that meaning whether or not the corner states a drop link**, which is the
+    // whole of how the geometry was added without moving every car's roll stiffness. A corner with
+    // drop-link hardpoints refers this wheel rate onto the link through the link's own motion ratio
+    // *at design* — `k_link = k_wheel / ratio²`, the standard referral — so at the design position
+    // the bar is worth exactly what it was worth before, and what the geometry buys is that the
+    // ratio then varies across the travel and the force rides the link's own Jacobian instead of the
+    // wheel's. See `solveAntiRollBar`.
     double antiRollRate = 0.0;
 
     // Rolling resistance, as a fraction of the vertical load. Applied as a torque on the wheel
@@ -256,6 +300,42 @@ export struct VehicleSetup
     // angle, and turning one into the other needs a number only the steering box has.
     double steeringLockToLock = 13.194689145077131;
 
+    // Whether the tyre's in-plane forces reach the corner's degree of freedom through the linkage's
+    // own Jacobian — the geometric load path: roll centre, jacking, anti-dive, anti-squat and
+    // anti-lift, which are not four features but four readings of one dot product.
+    //
+    // Off is the model this project measured everything against: the tyre force reaches the corner
+    // as its vertical component times the wheel's vertical Jacobian, so **every newton of load
+    // transfer deflects a spring** and none of it travels through the wishbones. That is why the car
+    // leans about 12% more than its own springs and bars would make it lean, and why it has exactly
+    // zero anti-dive. Total load transfer and longitudinal balance are unaffected either way — those
+    // are fixed by the whole-car free body whatever path the force takes inside a corner — so this
+    // is an **attitude** switch with a balance side effect, which is the shape the seat reported.
+    //
+    // A switch rather than a rewrite because the old behaviour is what every measured figure in
+    // docs/ was taken under, and because it is the control: `docs/suspension-load-path-brief.md`
+    // stage 1 requires both parity gates byte-identical with this off.
+    bool geometricLoadPath = false;
+
+    // Whether the wheels' spin is allowed to react on the rest of the car — the driveline's own
+    // Newton's third law, in both the places it acts.
+    //
+    // On the **chassis**: a wheel being spun up or slowed down takes angular momentum from
+    // somewhere, and the model gives it none. The chassis receives the tyre force at the contact
+    // patch, which is exactly right whenever the wheel's spin is steady, and is short by the wheel's
+    // own `I·alpha` whenever it is not — a launch, a shift, a lock-up. Switched on, each corner puts
+    // `−I·alpha` back on the body about the wheel's spin axis, which is the term that makes the
+    // whole car's angular momentum balance close (docs/suspension-fidelity-brief.md, item 3A).
+    //
+    // In the **corner**: a chassis-mounted transaxle drives the hub, so the shaft torque does virtual
+    // work in the corner's own coordinate as the upright turns about the wheel's spin axis. That term
+    // is what converts an outboard brake's contact-patch force line into an inboard drive's
+    // wheel-centre line — the textbook distinction, and anti-lift under power on a driven axle. An
+    // outboard brake needs no counterpart: its couple is internal to the wheel assembly.
+    //
+    // Off by default, and off is the model every figure in docs/ was measured under.
+    bool drivelineReaction = false;
+
     [[nodiscard]] double unsprungMass() const
     {
         auto total = 0.0;
@@ -301,6 +381,19 @@ export struct CornerState
 
     // The carcass deflections, which are what make the tire transient rather than instantaneous.
     TyreState tyre;
+
+    // How far the bushes have twisted this corner about the chassis's up axis, radians. State rather
+    // than a derived quantity, because it is driven by the tyre force and the tyre force is driven by
+    // the toe: solving that inside one tick means an iteration, and this model's only iteration is
+    // the contact patch's.
+    //
+    // Carried from the previous tick instead, which is one tick of explicit lag at 360 Hz. **That was
+    // refused for the jacking force and is accepted here, and the difference is the sign of the
+    // loop**: more toe-out lowers the slip angle, which lowers the force, which lowers the toe-out,
+    // so the lag sits inside negative feedback and settles. Jacking is the other way round. A rubber
+    // bush also has a real relaxation of about this order, so what the lag models is not nothing —
+    // but nobody has sourced its time constant, so it is not claimed as one.
+    double complianceSteer = 0.0;
 };
 
 // The vehicle's own state and nothing else's. Engine speed lived here until the driveline was given
@@ -346,7 +439,20 @@ export struct CornerForces
     double damper = 0.0;
     double bumpStop = 0.0;
     double droopStop = 0.0;
+
+    // **Always the equivalent force at the wheel**, newtons, whichever bar model this corner is on —
+    // negative on the wheel that is further into bump, because the bar pushes it back out. A corner
+    // that states a drop link computes its force along the link and reports the wheel force that
+    // would do the same virtual work, so this field means one thing and telemetry reading it does
+    // not have to know which model a car is on.
     double antiRoll = 0.0;
+
+    // And the force along the drop link itself, newtons, zero on a corner that states none. The two
+    // corners of an axle carry this exactly equal and opposite — a torsion bar is one internal force
+    // — which is **not** true of `antiRoll` above once the link has a motion ratio, because the two
+    // corners sit at different points in their travel and so convert it differently.
+    double antiRollLink = 0.0;
+
     double tireVertical = 0.0;
 };
 
@@ -478,8 +584,7 @@ export struct DamperForceSolution
     double force = 0.0;
 };
 
-export [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& corner,
-                                                          const SuspensionState& suspension,
+export [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& corner, const SuspensionState& suspension,
                                                           const double wishboneRate);
 
 // The damper's contribution to the corner's implicit damping, as a coefficient rather than a
@@ -488,6 +593,35 @@ export [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& cor
 // the same expression the integration always solved against, now stated on `DamperForceSolution`
 // so the coefficient reads the damper's element and a test can hold it to the old bits.
 export [[nodiscard]] double damperDampingCoefficient(const CornerSetup& corner, const DamperForceSolution& damper);
+
+// The anti-roll bar at one corner: its force, and the Jacobian that force rides.
+//
+// Two models behind one function, chosen by the data (`dropLinkStated`). A corner with no drop-link
+// hardpoints gets the wheel-referred bar this model has always had — a rate times the difference in
+// *wheel travel*, on the wheel's own vertical Jacobian, arithmetic for arithmetic. A corner that
+// states one gets the bar on its own element: the rate referred to the link through the link's design
+// motion ratio, the force from the difference in *link* displacement, and the projection the link's
+// own. Both report a wheel-equivalent force so that `CornerForces::antiRoll` means one thing.
+//
+// The referral uses **both** corners' design ratios, so the pair's link forces are exactly equal and
+// opposite even if an axle is not mirrored — which is a stronger statement than the wheel-referred
+// model could make.
+export struct AntiRollBarSolution
+{
+    // Along the drop link, newtons, positive pushing its ends apart. Zero without a stated link.
+    double linkForce = 0.0;
+    // d(link length)/dWishboneAngle, the Jacobian `linkForce` acts through. Zero without one.
+    double lengthPerAngle = 0.0;
+    // The equivalent force at the wheel, which is what the corner's generalised force uses in the
+    // wheel-referred model and what both models report.
+    double wheelForce = 0.0;
+    // Which of the two models answered.
+    bool geometric = false;
+};
+
+export [[nodiscard]] AntiRollBarSolution solveAntiRollBar(const CornerSetup& corner, const SuspensionState& suspension,
+                                                          const CornerSetup& across,
+                                                          const SuspensionState& acrossSuspension);
 
 // The damper shaft's displacement from its design length, positive in bump — the whole of what
 // the bump and droop stops measure their gaps against, because a real stop lives on the shaft.

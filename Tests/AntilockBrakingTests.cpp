@@ -831,7 +831,7 @@ TEST_CASE("and the steering it keeps puts the car somewhere else, not just at an
 }
 
 TEST_CASE("the cycling frequency falls out of the hydraulics rather than being prescribed",
-          "[assists][antilock][braking][!shouldfail]")
+          "[assists][antilock][braking]")
 {
     // **Criterion 6.** Nothing in `AntilockSetup` states a frequency. What is stated is how fast the
     // modulator can dump and re-apply pressure, and the frequency is that working against how fast
@@ -867,11 +867,21 @@ TEST_CASE("the cycling frequency falls out of the hydraulics rather than being p
     // **It moved again on 2026-08-24 evening and by the right mechanism** — the slip-aware recovery
     // law took the dry rear from 24.2 Hz to inside the band, because a channel that holds while a
     // wheel climbs back and probes gently near the peak cycles at the wheel's pace rather than at its
-    // own valve's. **What fails now is the rear channel on the split surface at 3.48 Hz, below the
-    // band** — select-low means that channel follows the mu 0.35 wheel, whose road can only slowly
-    // spin it back up, and the law now waits for that. A real unit on that surface cycles slowly too;
-    // whether 3.5 Hz is *too* slow is a question for the per-channel gradients above, and the bound
-    // stays where the literature put it rather than moving to meet the measurement.
+    // own valve's. What failed after that was the rear channel on the split surface at 3.48 Hz, below
+    // the band — select-low means that channel follows the mu 0.35 wheel, whose road can only slowly
+    // spin it back up, and the law now waits for that.
+    //
+    // **CLOSED 2026-08-27, and the bound was never moved.** Every surface and every channel now lands
+    // inside 4 to 20 Hz. What closed it is **damper seal friction**, isolated by running this case
+    // with that one number zeroed and watching it fail again exactly as it used to: a shaft with a
+    // Coulomb dead band settles a dumping wheel differently, and the split surface's slow channel
+    // stopped being the slowest thing in the loop. The figure is sourced rather than picked —
+    // 107 N from a measured VW Passat B8 front strut, `PublishedCarsImpl.cpp` — which is the whole
+    // difference between this and the prescribing the criterion exists to forbid.
+    //
+    // **The modulator question above is NOT closed by this.** The rear circuit still runs the front's
+    // pressure gradients, and a real unit meters its rear outlet valve separately. This criterion
+    // stopped being the thing that shows it; that does not make it right.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();

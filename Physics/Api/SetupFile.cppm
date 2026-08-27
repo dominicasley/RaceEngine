@@ -48,6 +48,16 @@ export struct AxleTune
     std::optional<double> reboundRate;
     std::optional<double> antiRollRate;
     std::optional<double> brakeTorque;
+
+    // Seal and rod friction on the damper shaft, newtons. A damper setting, so it belongs on the
+    // sheet beside the bump and rebound rates it sits on top of.
+    std::optional<double> damperFriction;
+
+    // Lateral-force compliance steer, **degrees per kilonewton** — the unit a K&C rig reports it in
+    // and the unit the published figures behind it are quoted in, converted on the way in rather
+    // than making a human write radians per newton. Negative is toe-out, which is what a production
+    // car is set up for.
+    std::optional<double> complianceSteer;
 };
 
 export struct DifferentialTune

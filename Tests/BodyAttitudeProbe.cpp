@@ -85,27 +85,20 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
     }
 }
 
-} // namespace
-
-TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.body-attitude]")
+// The whole measurement, against a car handed in rather than built here, so the same table can be
+// printed for two load-path models and read side by side. `[.body-attitude]` measures the car as it
+// ships; `[.body-attitude-load-path]` prints the A/B `docs/suspension-load-path-brief.md` stage 3
+// asks for.
+void measure(const VehicleSetup& setup, const PhysicsWorld& world)
 {
-    const JoltGuard jolt;
-
-    const auto built = golfGtiMk7();
-    REQUIRE(built.has_value());
-    const auto& setup = built.value();
-
-    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
-    REQUIRE(world.has_value());
-
     // --- the static datum -----------------------------------------------------------------------
     auto state = VehicleState{};
-    settle(setup, state, world.value(), 25.0, 600.0);
+    settle(setup, state, world, 25.0, 600.0);
 
     auto restTravel = std::array<double, cornerCount>{};
     auto rollCentre = std::array<double, cornerCount>{};
     {
-        const auto stepped = stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world.value(), tick);
+        const auto stepped = stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world, tick);
         REQUIRE(stepped.has_value());
 
         WARN("=== static ===");
@@ -115,8 +108,8 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
             rollCentre[index] = stepped->corners[index].suspension.rollCentreHeight;
 
             WARN("corner " << index << ": travel " << restTravel[index] * 1000.0 << " mm, roll centre "
-                           << rollCentre[index] * 1000.0 << " mm, load "
-                           << stepped->corners[index].forces.tireVertical << " N");
+                           << rollCentre[index] * 1000.0 << " mm, load " << stepped->corners[index].forces.tireVertical
+                           << " N");
         }
         WARN("pitch " << stepped->telemetry.pitch * degrees << " deg, roll " << stepped->telemetry.roll * degrees
                       << " deg");
@@ -127,7 +120,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
     // Full pedal from 30 m/s with no electronics, sampled while the car is between 25 and 15 m/s so
     // that the initial pitch transient has passed and the wheels have not yet stopped.
     {
-        settle(setup, state, world.value(), 30.0, 900.0);
+        settle(setup, state, world, 30.0, 900.0);
 
         auto input = VehicleInput{};
         input.brake = 1.0;
@@ -141,7 +134,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
 
         for (auto step = 0; step < 3600; step++)
         {
-            const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world.value(), tick);
+            const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world, tick);
             REQUIRE(stepped.has_value());
 
             const auto speed = state.chassis.linearVelocity.z;
@@ -174,8 +167,8 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
         WARN("pitch " << meanPitch * degrees << " deg, i.e. "
                       << meanPitch * degrees / std::abs(meanLongitudinal / gravity) << " deg/g");
         WARN("peak pitch over the whole stop " << worstPitch * degrees << " deg");
-        WARN("front suspension " << (frontTravel / samples) * 1000.0 << " mm, rear "
-                                 << (rearTravel / samples) * 1000.0 << " mm (positive is bump)");
+        WARN("front suspension " << (frontTravel / samples) * 1000.0 << " mm, rear " << (rearTravel / samples) * 1000.0
+                                 << " mm (positive is bump)");
     }
 
     // --- cornering: how far the body leans ------------------------------------------------------
@@ -184,7 +177,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
     // HandlingTests uses, because a coasting car scrubs its speed away and measures a spiral.
     for (const auto steering : std::vector<double>{0.10, 0.20, 0.35, 0.60})
     {
-        settle(setup, state, world.value(), 20.0, 600.0);
+        settle(setup, state, world, 20.0, 600.0);
 
         auto input = VehicleInput{};
         input.steering = steering;
@@ -196,6 +189,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
         auto roll = 0.0;
         auto lateral = 0.0;
         auto travel = std::array<double, cornerCount>{};
+        auto load = std::array<double, cornerCount>{};
         auto supportedWorst = static_cast<int>(cornerCount);
 
         for (auto step = 0; step < 3600; step++)
@@ -206,7 +200,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
                                   setup.corners.front().hardpoints.wheelRadius / 2.0;
             drive = std::array<double, cornerCount>{perWheel, perWheel, 0.0, 0.0};
 
-            const auto stepped = stepVehicle(setup, state, input, drive, world.value(), tick);
+            const auto stepped = stepVehicle(setup, state, input, drive, world, tick);
             REQUIRE(stepped.has_value());
 
             if (step >= 3240)
@@ -225,6 +219,7 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
                 for (auto index = std::size_t{0}; index < cornerCount; index++)
                 {
                     travel[index] += stepped->corners[index].suspension.wheelTravel - restTravel[index];
+                    load[index] += stepped->corners[index].forces.tireVertical;
                 }
             }
         }
@@ -240,5 +235,61 @@ TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.bod
                      << std::abs(meanRoll * degrees) / std::max(std::abs(meanLateral / gravity), 1e-6) << " deg/g");
         WARN("travel FL " << (travel[0] / samples) * 1000.0 << " FR " << (travel[1] / samples) * 1000.0 << " RL "
                           << (travel[2] / samples) * 1000.0 << " RR " << (travel[3] / samples) * 1000.0 << " mm");
+
+        // How the lateral load transfer is split between the axles, which is the balance half of the
+        // load-path question and the one `docs/suspension-load-path-brief.md` section 7 puts a number
+        // on. Total transfer is `m·a·h/t` whatever the linkage does; **which axle carries it is a
+        // property of relative stiffness, and the geometric path adds the linkage's own stiffness to
+        // that sum**. More on the front is more understeer.
+        const auto frontTransfer = std::abs(load[0] - load[1]) / samples;
+        const auto rearTransfer = std::abs(load[2] - load[3]) / samples;
+        const auto total = frontTransfer + rearTransfer;
+
+        WARN("lateral load transfer front " << frontTransfer << " N, rear " << rearTransfer << " N, front share "
+                                            << (total > 1e-9 ? frontTransfer / total : 0.0));
     }
+}
+
+} // namespace
+
+TEST_CASE("body attitude: what the sprung mass does under load transfer", "[.body-attitude]")
+{
+    const JoltGuard jolt;
+
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
+    REQUIRE(world.has_value());
+
+    measure(built.value(), world.value());
+}
+
+// The same table twice, once for each load-path model, so the A/B is one command and one output.
+//
+// The two differ in one term: whether the tyre's in-plane forces reach the corner's degree of
+// freedom through the linkage's own Jacobian. Everything else — springs, bars, dampers, tyre, the
+// whole-car free body, the total load transfer — is identical, which is what makes this an attitude
+// measurement rather than a car change. `docs/suspension-load-path-brief.md`, stages 1 and 3.
+TEST_CASE("body attitude: the springs-only load path against the geometric one", "[.body-attitude-load-path]")
+{
+    const JoltGuard jolt;
+
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    const auto world = PhysicsWorld::create(generateProvingGround(plate(1200.0)).value());
+    REQUIRE(world.has_value());
+
+    auto springs = built.value();
+    springs.geometricLoadPath = false;
+
+    auto geometric = built.value();
+    geometric.geometricLoadPath = true;
+
+    WARN("################ springs only — every newton of load transfer deflects a spring ################");
+    measure(springs, world.value());
+
+    WARN("################ geometric — the tyre force through the patch's own Jacobian ################");
+    measure(geometric, world.value());
 }

@@ -122,8 +122,8 @@ namespace raceengine
 
 [[nodiscard]] SpringSolution solveSpringForce(const CornerSetup& corner, const SuspensionState& suspension)
 {
-    const auto evaluated = solveElement(corner.hardpoints, springElementOf(corner.hardpoints),
-                                        suspension.wishboneAngle);
+    const auto evaluated =
+        solveElement(corner.hardpoints, springElementOf(corner.hardpoints), suspension.wishboneAngle);
 
     return SpringSolution{.length = evaluated.length,
                           .lengthPerAngle = evaluated.lengthPerAngle,
@@ -132,8 +132,8 @@ namespace raceengine
 
 [[nodiscard]] DamperSolution solveDamperGeometry(const CornerSetup& corner, const SuspensionState& suspension)
 {
-    const auto evaluated = solveElement(corner.hardpoints, damperElementOf(corner.hardpoints),
-                                        suspension.wishboneAngle);
+    const auto evaluated =
+        solveElement(corner.hardpoints, damperElementOf(corner.hardpoints), suspension.wishboneAngle);
 
     return DamperSolution{.length = evaluated.length, .lengthPerAngle = evaluated.lengthPerAngle};
 }
@@ -143,11 +143,23 @@ namespace raceengine
 {
     const auto geometry = solveDamperGeometry(corner, suspension);
     const auto velocity = -geometry.lengthPerAngle * wishboneRate;
+    const auto viscous = corner.damper.at(velocity);
 
     return DamperForceSolution{.length = geometry.length,
                                .lengthPerAngle = geometry.lengthPerAngle,
                                .velocity = velocity,
-                               .force = corner.damper.at(velocity)};
+                               // Seal and rod friction on top of the curve, opposing the shaft at any non-zero velocity
+                               // and not scaling with it. `tanh` and not `sign` deliberately — a hard sign term at this
+                               // tick rate makes a limit cycle rather than a dead band, and the width is a numerical
+                               // choice stated as one (`CornerSetup::damperFrictionSpeed`).
+                               //
+                               // Branched rather than added, so a car with no friction stated runs the expression it
+                               // always ran and not one that happens to add a zero to it. Every car here states none.
+                               .force =
+                                   corner.damperFriction > 0.0
+                                       ? viscous + corner.damperFriction *
+                                                       std::tanh(velocity / std::max(corner.damperFrictionSpeed, 1e-9))
+                                       : viscous};
 }
 
 [[nodiscard]] double damperShaftCompression(const CornerSetup& corner, const DamperForceSolution& damper)
@@ -318,8 +330,7 @@ namespace raceengine
     const auto designLength = solveElement(corner.hardpoints, element, 0.0).length;
     const auto compression =
         designLength - solveElement(corner.hardpoints, element, corner.hardpoints.bumpAngle).length;
-    const auto extension =
-        solveElement(corner.hardpoints, element, corner.hardpoints.droopAngle).length - designLength;
+    const auto extension = solveElement(corner.hardpoints, element, corner.hardpoints.droopAngle).length - designLength;
 
     if (corner.bumpStop.gap >= compression)
     {
@@ -333,6 +344,31 @@ namespace raceengine
         return std::unexpected("the droop stop's gap of " + std::to_string(corner.droopStop.gap) +
                                " m never closes: the damper only extends " + std::to_string(extension) +
                                " m before the linkage reaches its limit");
+    }
+
+    // A drop link that is stated has to be a drop link. A corner that states none is not checked and
+    // is not a mistake — most cars here state none, because AC's data has no bar geometry at all —
+    // but one that states half of it, with the chassis end left on the origin, produces a link that
+    // sweeps most of a metre for a few millimetres of wheel and a bar rate referred through it that is
+    // nonsense. The force path falls back rather than dividing by it, so without this the mistake is
+    // silent.
+    if (dropLinkStated(corner.hardpoints))
+    {
+        const auto link = dropLinkElementOf(corner.hardpoints);
+        const auto kinematics = solveSpringKinematics(corner.hardpoints, link, 0.0, 0.0);
+        if (!kinematics)
+        {
+            return std::unexpected("the anti-roll bar's drop link cannot be evaluated: " + kinematics.error());
+        }
+
+        const auto ratio = std::abs(kinematics->motionRatio);
+        if (ratio < 0.05 || ratio > 2.0)
+        {
+            return std::unexpected("the anti-roll bar's drop link has a motion ratio of " +
+                                   std::to_string(kinematics->motionRatio) +
+                                   ", so it barely moves with the wheel or moves twice as far as it; its two "
+                                   "hardpoints are almost certainly not where the linkage thinks they are");
+        }
     }
 
     return {};
@@ -451,8 +487,95 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
     // The exact expression the force pass always used, with the Jacobian and the velocity now the
     // damper element's own. Same factors in the same order: the element's values are the state's
     // bit for bit, so the coefficient is too.
+    if (corner.damperFriction <= 0.0)
+    {
+        return damper.lengthPerAngle * damper.lengthPerAngle *
+               std::max(0.0, curveSlopeAt(corner.damper, damper.velocity));
+    }
+
+    // Friction has to reach here or the implicit integration fights it. Its slope is
+    // `d/dv [f · tanh(v/s)] = (f/s)·sech²(v/s)`, written analytically rather than differenced because
+    // the curve's own differencing step is a hundred times the smoothing width and would read the
+    // whole term as flat — and the slope at zero, which is `f/s`, is the largest number in this
+    // expression and the entire reason the term needs solving rather than stepping towards.
+    const auto smoothing = std::max(corner.damperFrictionSpeed, 1e-9);
+    const auto shaped = std::tanh(damper.velocity / smoothing);
+    const auto frictionSlope = (corner.damperFriction / smoothing) * (1.0 - shaped * shaped);
+
     return damper.lengthPerAngle * damper.lengthPerAngle *
-           std::max(0.0, curveSlopeAt(corner.damper, damper.velocity));
+           std::max(0.0, curveSlopeAt(corner.damper, damper.velocity) + frictionSlope);
+}
+
+namespace
+{
+
+// The drop link's motion ratio at the corner's design position, dLinkLength/dWheelTravel. A property
+// of the hardpoints alone, so it is the constant the authored wheel rate is referred through — and
+// evaluating it at design rather than at the tick's own travel is what keeps `antiRollRate` meaning
+// what it says. Zero where the corner does not move vertically, which the caller treats as "no bar".
+[[nodiscard]] double dropLinkDesignRatio(const CornerHardpoints& hardpoints)
+{
+    const auto design = solveCornerWithJacobian(hardpoints, 0.0, 0.0);
+    if (!design || std::abs(design->travelPerAngle) < 1e-9)
+    {
+        return 0.0;
+    }
+
+    return solveElement(hardpoints, dropLinkElementOf(hardpoints), 0.0).lengthPerAngle / design->travelPerAngle;
+}
+
+} // namespace
+
+[[nodiscard]] AntiRollBarSolution solveAntiRollBar(const CornerSetup& corner, const SuspensionState& suspension,
+                                                   const CornerSetup& across, const SuspensionState& acrossSuspension)
+{
+    // The wheel-referred bar: a rate times the difference in wheel travel across the axle. This is
+    // the model every car in this project has been on, and a corner that states no drop link stays on
+    // it — the expression below is the one that was inline in the force pass, factor for factor.
+    const auto wheelReferred = corner.antiRollRate * (acrossSuspension.wheelTravel - suspension.wheelTravel);
+
+    if (corner.antiRollRate == 0.0 || !dropLinkStated(corner.hardpoints) || !dropLinkStated(across.hardpoints))
+    {
+        return AntiRollBarSolution{.wheelForce = wheelReferred};
+    }
+
+    const auto selfRatio = dropLinkDesignRatio(corner.hardpoints);
+    const auto acrossRatio = dropLinkDesignRatio(across.hardpoints);
+
+    if (std::abs(selfRatio) < 1e-9 || std::abs(acrossRatio) < 1e-9 || std::abs(suspension.travelPerAngle) < 1e-9)
+    {
+        // A link that does not move with the wheel cannot carry a wheel rate onto itself. Falling
+        // back rather than dividing by it, because a degenerate drop link is an authoring mistake and
+        // the wheel-referred bar is still a bar.
+        return AntiRollBarSolution{.wheelForce = wheelReferred};
+    }
+
+    // `k_wheel = k_link · ratio²` is the standard referral of a rate through a motion ratio, and it is
+    // read backwards here because the wheel rate is what the data states. Taking one ratio from each
+    // end makes the referral a property of the axle: whatever the two corners' geometries are, the
+    // pair's link forces come out exactly equal and opposite, which a torsion bar's must be.
+    const auto linkRate = corner.antiRollRate / (selfRatio * acrossRatio);
+
+    const auto selfLink = dropLinkElementOf(corner.hardpoints);
+    const auto acrossLink = dropLinkElementOf(across.hardpoints);
+
+    const auto here = solveElement(corner.hardpoints, selfLink, suspension.wishboneAngle);
+    const auto there = solveElement(across.hardpoints, acrossLink, acrossSuspension.wishboneAngle);
+
+    // Displacement from design, positive as the link lengthens. The bar carries the *difference*, so
+    // an axle in pure heave — both links moving together — makes no force at all, whatever the two
+    // corners' ratios are.
+    const auto selfDisplacement = here.length - solveElement(corner.hardpoints, selfLink, 0.0).length;
+    const auto acrossDisplacement = there.length - solveElement(across.hardpoints, acrossLink, 0.0).length;
+
+    const auto linkForce = linkRate * (acrossDisplacement - selfDisplacement);
+
+    return AntiRollBarSolution{.linkForce = linkForce,
+                               .lengthPerAngle = here.lengthPerAngle,
+                               // What the same virtual work would take as a vertical force at the
+                               // wheel, so that the reported number means one thing in both models.
+                               .wheelForce = linkForce * here.lengthPerAngle / suspension.travelPerAngle,
+                               .geometric = true};
 }
 
 [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const VehicleSetup& setup, VehicleState& state,
@@ -530,6 +653,15 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         }
 
         result.corners[index].suspension = solved.value();
+
+        // And the twist the bushes are holding from the previous tick, which is the one force effect
+        // the kinematic solve is not told about. Branched rather than applied with a zero angle, so a
+        // car that states no compliance runs the solve it always ran, to the bit.
+        if (corner.lateralForceSteer != 0.0)
+        {
+            applyComplianceSteer(corner.hardpoints, result.corners[index].suspension,
+                                 state.corners[index].complianceSteer);
+        }
 
         // The wheel, in the world. The suspension solved it in chassis coordinates; the chassis
         // says where those are.
@@ -639,65 +771,14 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 
         // The anti-roll bar resists the difference across its axle and nothing else, so a car
         // hitting a kerb with one wheel feels it and a car on a level road does not.
-        const auto& other = result.corners[acrossAxle[index]];
-        solution.forces.antiRoll = corner.antiRollRate * (other.suspension.wheelTravel - suspension.wheelTravel);
-
-        // --- generalised force on the corner's one degree of freedom ---
-        const auto axisForce =
-            solution.forces.spring + solution.forces.damper + solution.forces.bumpStop + solution.forces.droopStop;
-
-        // The corner's one degree of freedom is the wheel travelling along the **body's** up axis, so
-        // what reaches it is the tyre load projected onto that axis rather than the load itself. On
-        // flat level ground the normal, the body's up and the world's up are one direction and this
-        // is the number it always was.
         //
-        // The unsprung weight beside it is deliberately left as `m·g`, not `m·g·(ŷ·bodyUp)`. That is
-        // a separate flat-world approximation with its own reason to exist, it is a second-order term
-        // against a 49 kg corner on a 1348 kg car, and folding it in here would move every cambered
-        // and rolling frame for something that has nothing to do with slopes.
-        const auto bodyUp = state.chassis.orientation * glm::dvec3(0.0, 1.0, 0.0);
-
-        const auto wheelUpForce = solution.forces.tireVertical * std::max(glm::dot(normal, bodyUp), 0.0) +
-                                  solution.forces.antiRoll - corner.unsprungMass * earthGravity;
-
-        // Each element's generalised contribution is its force times its **own** element's
-        // Jacobian — the spring's and, since step 8, the damper's; the stops still ride the
-        // state's Jacobian until their own migration. On a coaxial car every Jacobian here is the
-        // same bits — `solveElement` and the corner solve run identical arithmetic — and the fused
-        // pre-split sum is kept for exactly that case, because regrouping `s·x + d·x` as `(s+d)·x`
-        // moves the last ulp and thirty seconds of launch amplify an ulp into a parity failure.
-        // The branch is on bit equality, which is the condition under which the two expressions
-        // are the same value, not merely close.
-        // Since step 13 every projection here is the element's: the stops ride the damper
-        // element's Jacobian (the stop lives on the shaft), and the fused product does too. The
-        // branch is keyed on the authored coil-over condition (`coaxialSpring`) since step 14:
-        // when the spring's element IS the damper's element, every Jacobian in the sum is the
-        // same arithmetic on the same points — the same bits — and the fused pre-split grouping
-        // is kept, because regrouping `s·x + d·x` as `(s+d)·x` moves the last ulp and thirty
-        // seconds of launch amplify an ulp into a parity failure.
-        if (coaxialSpring(corner.hardpoints))
-        {
-            solution.generalisedForce =
-                axisForce * damper.lengthPerAngle + wheelUpForce * suspension.travelPerAngle;
-        }
-        else
-        {
-            const auto stopAxisForce = solution.forces.bumpStop + solution.forces.droopStop;
-
-            solution.generalisedForce = spring.force * spring.lengthPerAngle +
-                                        damper.force * damper.lengthPerAngle +
-                                        stopAxisForce * damper.lengthPerAngle +
-                                        wheelUpForce * suspension.travelPerAngle;
-        }
-
-        solution.generalisedInertia =
-            std::max(corner.unsprungMass * suspension.travelPerAngle * suspension.travelPerAngle, 1e-6);
-
-        // The damper's contribution to the corner's damping, as a coefficient rather than a force,
-        // so the integration below can solve it instead of stepping towards it. Damper rates are
-        // exactly where an explicit treatment falls over. Since step 9 the coefficient reads the
-        // damper element's own Jacobian and velocity — the same bits, through the same law.
-        cornerDamping[index] = damperDampingCoefficient(corner, damper);
+        // Two models behind one call, chosen by whether the corner states drop-link hardpoints —
+        // see `solveAntiRollBar`. A corner that states none reproduces the expression that was
+        // inline here, factor for factor, which is every car in this project today.
+        const auto& other = result.corners[acrossAxle[index]];
+        const auto bar = solveAntiRollBar(corner, suspension, setup.corners[acrossAxle[index]], other.suspension);
+        solution.forces.antiRoll = bar.wheelForce;
+        solution.forces.antiRollLink = bar.linkForce;
 
         // --- the tire ---
         //
@@ -753,6 +834,205 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
             solution.contact = WheelContact{};
         }
 
+        // What the bushes will be holding on the next tick. The lateral force is resolved into the
+        // **body's** own lateral axis rather than taken as the tyre's scalar, because compliance
+        // steer is an axle steering away from the turn and that is a direction in the car, not in the
+        // patch: on a banked road the two are not the same, and on a kerb they are nowhere near.
+        //
+        // A wheel in the air relaxes to nothing, which is the same statement the tyre's carcass makes
+        // one branch up.
+        if (corner.lateralForceSteer != 0.0)
+        {
+            const auto sideways = glm::dot(glm::inverse(state.chassis.orientation) *
+                                               (solution.contact.tyre.lateral * solution.contact.lateral),
+                                           glm::dvec3(1.0, 0.0, 0.0));
+
+            state.corners[index].complianceSteer = corner.lateralForceSteer * sideways;
+        }
+
+        // --- generalised force on the corner's one degree of freedom ---
+        //
+        // **Assembled after the tyre rather than before it**, which is the one ordering change the
+        // geometric load path needs: the in-plane tyre forces are inputs to it now, and reading last
+        // tick's would put a 360 Hz delay inside a feedback loop that carries the jacking force.
+        // Nothing between the two blocks reads either of them, so the move is arithmetic-neutral —
+        // and the parity gates were held to byte-identity across it.
+        const auto axisForce =
+            solution.forces.spring + solution.forces.damper + solution.forces.bumpStop + solution.forces.droopStop;
+
+        // Each element's generalised contribution is its force times its **own** element's
+        // Jacobian — the spring's and, since step 8, the damper's; the stops still ride the
+        // state's Jacobian until their own migration. On a coaxial car every Jacobian here is the
+        // same bits — `solveElement` and the corner solve run identical arithmetic — and the fused
+        // pre-split sum is kept for exactly that case, because regrouping `s·x + d·x` as `(s+d)·x`
+        // moves the last ulp and thirty seconds of launch amplify an ulp into a parity failure.
+        // The branch is on bit equality, which is the condition under which the two expressions
+        // are the same value, not merely close.
+        // Since step 13 every projection here is the element's: the stops ride the damper
+        // element's Jacobian (the stop lives on the shaft), and the fused product does too. The
+        // branch is keyed on the authored coil-over condition (`coaxialSpring`) since step 14:
+        // when the spring's element IS the damper's element, every Jacobian in the sum is the
+        // same arithmetic on the same points — the same bits — and the fused pre-split grouping
+        // is kept, because regrouping `s·x + d·x` as `(s+d)·x`
+        // moves the last ulp and thirty seconds of launch amplify an ulp into a parity failure.
+        if (setup.geometricLoadPath)
+        {
+            // **The road force through the derivative of the point it acts on** — the whole dot
+            // product rather than the vertical component of one term of it. A corner is one degree
+            // of freedom, so this is not a model of the load path, it is the definition of the
+            // generalised force; roll centre, jacking, anti-dive, anti-squat and anti-lift are
+            // readings of `patchPerAngle`'s three components and are not implemented separately
+            // anywhere.
+            //
+            // The tyre force is assembled in the world, where its three parts are stated, and
+            // rotated into the chassis frame the linkage is solved in.
+            const auto tyreInBody =
+                glm::inverse(state.chassis.orientation) *
+                (solution.forces.tireVertical * normal + solution.contact.tyre.longitudinal * solution.contact.forward +
+                 solution.contact.tyre.lateral * solution.contact.lateral);
+
+            // **The point the road pushes on is a material point of the wheel, and
+            // `SuspensionState::contactPatch` is not one.** That patch is reconstructed every solve
+            // from the world's own down direction projected into the wheel's plane, so it depends on
+            // the spin axis and on nothing else about how the upright is standing: turn the upright
+            // about the wheel's own axis and the constructed patch does not move, while the real one
+            // rolls forward or back by a radius times the angle.
+            //
+            // Measured, that omission is **the whole of the longitudinal channel and none of the
+            // lateral one** — `patchPerAngle - wheelCentrePerAngle` comes out exactly (lateral, 0, 0)
+            // on all four corners, which is why the load-path brief found the patch's side-view ratio
+            // and the wheel centre's agreeing to every digit it printed and read that as evidence the
+            // term was negligible. It is not evidence about the term at all. `[.driveline-path]`
+            // section 3 is the demonstration and asserts it.
+            //
+            // This model already treats the patch as a material point in the *other* coordinate,
+            // where the same force's moment about the wheel centre is `−Fx·r` and is applied to the
+            // wheel's spin every tick. Saying it here as well is one model written down consistently,
+            // not a second one — and it corrects the load-path brief's section 4, which held that
+            // applying the road force at the patch was already complete for an outboard brake. It was
+            // complete for an *inboard* one: the constructed patch's side-view line is the wheel
+            // centre's.
+            //
+            // The radius carried is the **loaded** one, which is item 6 of
+            // docs/suspension-fidelity-brief.md and comes free here rather than costing a term: the
+            // road is at the loaded radius, so that is where the force is applied. Same statement of
+            // the deflection as the effective rolling radius above uses, so the two cannot disagree.
+            const auto belowCentre = suspension.contactPatch - suspension.wheelCentre;
+            const auto freeRadius = std::max(glm::length(belowCentre), 1e-12);
+            const auto roadRadius = std::max(corner.hardpoints.wheelRadius - solution.patch.penetration, 1e-3);
+
+            const auto patchPerAngle =
+                suspension.wheelCentrePerAngle +
+                glm::cross(suspension.uprightRatePerAngle, belowCentre * (roadRadius / freeRadius));
+
+            // The bar and the unsprung weight keep the wheel's own vertical Jacobian, because that
+            // is where they act: the drop link pulls the wishbone, and the unsprung weight is a
+            // vertical force on a mass whose height is the wheel centre's. Neither has an in-plane
+            // component to lose. The unsprung weight stays `m·g` rather than `m·g·(ŷ·bodyUp)` for
+            // the reason it always did — a separate flat-world approximation, second order against
+            // a 49 kg corner, and nothing to do with the load path.
+            //
+            // The bar's is not an approximation any more even so: a corner that states a drop link
+            // reports the wheel force that does the same virtual work as its link force, so
+            // `wheelForce · travelPerAngle` *is* `linkForce · lengthPerAngle` and the bar rides its
+            // own element after all, through one multiplication instead of a second term.
+            const auto unsprungUpForce = solution.forces.antiRoll - corner.unsprungMass * earthGravity;
+
+            // And the shaft torque, which is the other half of the same statement. A chassis-mounted
+            // transaxle drives the hub, so its torque does virtual work in this coordinate as the
+            // upright turns about the wheel's spin axis; an outboard brake's couple is internal to
+            // the wheel assembly and does none, which is why braking needs no counterpart here.
+            //
+            // The two terms together collapse exactly onto the wheel-centre force line, which is the
+            // textbook statement of an inboard differential and is what `[.driveline-path]` section 5
+            // asserts to 1e-9. The axis is `upright · (+1, 0, 0)` on **every** corner and deliberately
+            // not the outboard-pointing axis the contact patch is posed with: both wheels of a car
+            // going forward turn the same way.
+            const auto shaftWork =
+                setup.drivelineReaction
+                    ? driveTorques[index] * glm::dot(suspension.uprightRatePerAngle,
+                                                     suspension.uprightOrientation * glm::dvec3(1.0, 0.0, 0.0))
+                    : 0.0;
+
+            if (coaxialSpring(corner.hardpoints))
+            {
+                solution.generalisedForce = axisForce * damper.lengthPerAngle + glm::dot(tyreInBody, patchPerAngle) +
+                                            unsprungUpForce * suspension.travelPerAngle + shaftWork;
+            }
+            else
+            {
+                const auto stopAxisForce = solution.forces.bumpStop + solution.forces.droopStop;
+
+                solution.generalisedForce =
+                    spring.force * spring.lengthPerAngle + damper.force * damper.lengthPerAngle +
+                    stopAxisForce * damper.lengthPerAngle + glm::dot(tyreInBody, patchPerAngle) +
+                    unsprungUpForce * suspension.travelPerAngle + shaftWork;
+            }
+        }
+        else
+        {
+            // The corner's one degree of freedom is the wheel travelling along the **body's** up
+            // axis, so what reaches it is the tyre load projected onto that axis rather than the
+            // load itself. On flat level ground the normal, the body's up and the world's up are one
+            // direction and this is the number it always was.
+            //
+            // The unsprung weight beside it is deliberately left as `m·g`, not `m·g·(ŷ·bodyUp)`.
+            // That is a separate flat-world approximation with its own reason to exist, it is a
+            // second-order term against a 49 kg corner on a 1348 kg car, and folding it in here
+            // would move every cambered and rolling frame for something that has nothing to do with
+            // slopes.
+            //
+            // **Every statement below is byte-for-byte the arithmetic this model has always run**,
+            // which is what makes `geometricLoadPath` a control rather than a rewrite: every figure
+            // in docs/ was measured here.
+            const auto bodyUp = state.chassis.orientation * glm::dvec3(0.0, 1.0, 0.0);
+
+            const auto wheelUpForce = solution.forces.tireVertical * std::max(glm::dot(normal, bodyUp), 0.0) +
+                                      solution.forces.antiRoll - corner.unsprungMass * earthGravity;
+
+            if (coaxialSpring(corner.hardpoints))
+            {
+                solution.generalisedForce =
+                    axisForce * damper.lengthPerAngle + wheelUpForce * suspension.travelPerAngle;
+            }
+            else
+            {
+                const auto stopAxisForce = solution.forces.bumpStop + solution.forces.droopStop;
+
+                solution.generalisedForce =
+                    spring.force * spring.lengthPerAngle + damper.force * damper.lengthPerAngle +
+                    stopAxisForce * damper.lengthPerAngle + wheelUpForce * suspension.travelPerAngle;
+            }
+        }
+
+        // The generalised inertia of a one-degree-of-freedom assembly is `m·|dC/dq|²`, and taking
+        // only the wheel centre's *vertical* rate drops the lateral and longitudinal parts of its
+        // motion — so the corner is modelled as lighter than it is, its natural frequency comes out
+        // too high, and it answers a kerb faster than it should.
+        //
+        // **Tied to the same switch as the force path, and that is the point rather than a
+        // convenience.** With the geometric path on, the two sides of `F = ma` were written in
+        // different models: the force used the whole vector and the inertia one component of it.
+        // With it off, the force path is vertical-only and a vertical-only inertia is the matching
+        // statement, which is also every figure this project has measured. So each position of the
+        // switch is now internally consistent, and `OSR_LOAD_PATH=springs` is still the control.
+        //
+        // The upright's own rotational term is deliberately absent and is where this stops: it needs
+        // an inertia tensor for the upright, which is data no car here carries.
+        // docs/suspension-fidelity-brief.md, item 4.
+        solution.generalisedInertia =
+            setup.geometricLoadPath
+                ? std::max(corner.unsprungMass *
+                               glm::dot(suspension.wheelCentrePerAngle, suspension.wheelCentrePerAngle),
+                           1e-6)
+                : std::max(corner.unsprungMass * suspension.travelPerAngle * suspension.travelPerAngle, 1e-6);
+
+        // The damper's contribution to the corner's damping, as a coefficient rather than a force,
+        // so the integration below can solve it instead of stepping towards it. Damper rates are
+        // exactly where an explicit treatment falls over. Since step 9 the coefficient reads the
+        // damper element's own Jacobian and velocity — the same bits, through the same law.
+        cornerDamping[index] = damperDampingCoefficient(corner, damper);
+
         // --- reaction on the chassis ---
         //
         // Newton's third law, taken over the whole corner rather than element by element. A corner
@@ -773,9 +1053,16 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         // wishbone's constraint forces solved as well; the resultant below is what is exact until
         // they are.
         //
-        // The tire force goes on at the **contact patch**, which is what the brief is really after:
-        // the moment it makes about the centre of gravity is where jacking and the lateral load
-        // path come from, and that is preserved here.
+        // The tire force goes on at the **contact patch**, and the free body above is why that is
+        // exact: with the caliper on the upright the brake couple is internal to the assembly, so
+        // moment balance puts the chassis reaction on the same line of action as the road force.
+        //
+        // **What it is not is the jacking force**, and the comment that said so was wrong in a way
+        // that took a brief to unpick. The moment this makes about the centre of gravity is the
+        // *total* roll couple, which is right in both load-path models and is fixed by the whole-car
+        // free body anyway. Jacking is a statement about how much of that couple the springs have to
+        // react, and that is decided on the corner's side of the linkage — `patchPerAngle` and
+        // `VehicleSetup::geometricLoadPath`, above. Do not "fix" this side; it is not broken.
         //
         // **And it goes on along the road's normal.** Applied along world up it balanced gravity
         // exactly on any slope and left the car nothing to roll down — see the load above.
@@ -784,17 +1071,37 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 
         // The unsprung mass's weight, which the chassis carries whenever the tire is not, and its
         // inertia, which is what a wheel snatched upward by a kerb kicks back into the body with.
-        const auto wheelAcceleration =
-            suspension.travelPerAngle * (solution.generalisedForce / solution.generalisedInertia);
-        // Only the *relative* acceleration now: the unsprung weight is already in the body's own
-        // gravity, since the body carries the whole car's mass. This term is the cross coupling —
-        // what a wheel snatched upward by a kerb kicks back into the body with.
-        chassisForces.addForceAtPoint(glm::dvec3(0.0, -corner.unsprungMass * wheelAcceleration, 0.0), wheelWorld,
-                                      worldCentreOfMass);
+        //
+        // Only the *relative* acceleration: the unsprung weight is already in the body's own gravity,
+        // since the body carries the whole car's mass. This term is the cross coupling.
+        //
+        // **Which way the kick points is the same question the inertia above asks**, so it is on the
+        // same switch. Vertical-only, a wheel snatched sideways by a kerb kicks the body straight up
+        // and the sideways part is thrown away — and it is thrown away along the *world's* vertical
+        // rather than the body's, which is a second flat-world approximation on top of the first. On
+        // the geometric path the wheel centre's own direction of travel carries it, rotated out of
+        // the chassis frame the linkage was solved in, and both approximations go together.
+        const auto acceleration = solution.generalisedForce / solution.generalisedInertia;
 
-        // And the tire's in-plane forces, at the contact patch — which is the whole of what the
-        // brief means by applying them where they act. Their moment about the centre of gravity is
-        // the roll couple and the jacking force, and neither is modelled anywhere else.
+        if (setup.geometricLoadPath)
+        {
+            chassisForces.addForceAtPoint(state.chassis.orientation *
+                                              (-corner.unsprungMass * acceleration * suspension.wheelCentrePerAngle),
+                                          wheelWorld, worldCentreOfMass);
+        }
+        else
+        {
+            const auto wheelAcceleration = suspension.travelPerAngle * acceleration;
+
+            chassisForces.addForceAtPoint(glm::dvec3(0.0, -corner.unsprungMass * wheelAcceleration, 0.0), wheelWorld,
+                                          worldCentreOfMass);
+        }
+
+        // And the tire's in-plane forces, at the contact patch, which is where they act. Their
+        // moment about the centre of gravity is the roll couple and the pitch couple — the *total*
+        // load transfer, which is `m·a·h/t` and `m·a·h/L` whatever the linkage does with it. The
+        // jacking force is not here and never was; it is the same forces read through
+        // `patchPerAngle` on the corner's side.
         chassisForces.addForceAtPoint(solution.contact.tyre.longitudinal * solution.contact.forward +
                                           solution.contact.tyre.lateral * solution.contact.lateral,
                                       solution.patch.centre, worldCentreOfMass);
@@ -937,11 +1244,45 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
                                               : setupCorner.brakeTorque * brakePedalResponse(setup, index, input.brake);
         const auto commanded = braking + rolling;
 
+        auto arrested = 0.0;
+
         if (commanded > 0.0 && std::abs(corner.wheelSpeed) > 0.0)
         {
+            // The sign is read before the wheel is slowed, because a brake that brings it exactly to
+            // rest leaves nothing to read it from afterwards.
+            const auto turning = corner.wheelSpeed;
             const auto arresting = std::abs(corner.wheelSpeed) * setupCorner.wheelInertia / deltaTime;
             const auto applied = std::min(commanded, arresting);
             corner.wheelSpeed -= std::copysign(applied / setupCorner.wheelInertia * deltaTime, corner.wheelSpeed);
+            arrested = std::copysign(applied, turning);
+        }
+
+        // --- what spinning the wheel up takes out of the body -----------------------------------
+        //
+        // A wheel gaining or losing angular momentum takes it from somewhere, and this model gives
+        // it nowhere to come from. The chassis receives the road force at the contact patch, which
+        // is exactly right while the wheel's spin is steady — an outboard brake's couple is internal
+        // to the wheel assembly, so moment balance puts the chassis reaction on the road force's own
+        // line, which is what the comment beside that call says and it is correct. What is missing is
+        // the case where the spin is *not* steady: the difference between the two treatments is
+        // precisely `I·alpha`, the torque that went into the wheel instead of into the body.
+        //
+        // Checked against the whole car rather than argued: for a car accelerating at `a`, angular
+        // momentum about the centre of gravity requires the load transfer to exceed `m·a·h/L` by
+        // `sum(I·a/r)` over the four wheels, and it is exactly this term that closes it. On this car
+        // that is about 1.8% of the transfer under acceleration, zero at a steady speed, and its
+        // moment is largest during a launch, a shift and a lock-up — which are the three places the
+        // wheels' speeds move fastest.
+        //
+        // The axis is `upright · (+1, 0, 0)` and not the outboard-pointing axis the wheel is posed
+        // with, because both wheels of a car going forward turn the same way.
+        if (setup.drivelineReaction)
+        {
+            const auto& suspension = solution.suspension;
+            const auto spinAxis =
+                state.chassis.orientation * (suspension.uprightOrientation * glm::dvec3(1.0, 0.0, 0.0));
+
+            chassisForces.torque -= (roadTorque + driveTorques[index] - arrested) * spinAxis;
         }
 
         // The linkage has no solutions past its own geometric limits, and the stops exist so this

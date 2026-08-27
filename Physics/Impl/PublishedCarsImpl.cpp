@@ -46,8 +46,8 @@ namespace raceengine
     // joint ever moved. Mechanical trail rises 26.7 -> 36.0 mm with it, which is the whole of the
     // steering-feel change and is awaiting its seat session.
     corner.strutTop = at(0.25366, 0.54933, 0.0);
-    corner.strutTop.z = corner.lower.ballJoint.z -
-                        (corner.strutTop.y - corner.lower.ballJoint.y) * std::tan(glm::radians(7.5));
+    corner.strutTop.z =
+        corner.lower.ballJoint.z - (corner.strutTop.y - corner.lower.ballJoint.y) * std::tan(glm::radians(7.5));
     corner.steeringRackOuter = at(0.31000, -0.06546, -0.22200);
     corner.steeringArm = at(0.05200, -0.06757, -0.12586);
     corner.wheelCentre = at(0.0, 0.0, 0.0);
@@ -518,6 +518,46 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // taken here — a placeholder in the same sense as every other number without a source.
     setup.rideHeightReference = 0.135;
 
+    // **This car carries its load transfer through its wishbones as well as through its springs.**
+    //
+    // Off is the model every measured figure in docs/ was taken under, and it is still the model
+    // default (`VehicleSetup::geometricLoadPath`), so a placeholder car is unchanged and this is the
+    // only car that has moved. On, the tyre's in-plane forces reach the corner's own degree of
+    // freedom through the linkage's Jacobian, which is roll centre, jacking, anti-dive, anti-squat
+    // and anti-lift at once — not five features but one dot product that used to be missing four of
+    // its terms. Roll falls about 12% and the roll gradient goes 2.77-2.95 to 2.40-2.59 deg/g, which
+    // is the seat report of 2026-08-27 ("the body seems to pitch and roll excessively, however the
+    // handling feels fine") addressed where it lives.
+    //
+    // **Dive rises, and that is this car's front geometry rather than a sign error.** The front
+    // hardpoints put the side-view instant centre below ground, so the axle carries about -27%
+    // anti-dive — it is pro-dive — and switching the path on lets that reach the springs. Measured,
+    // localised and left alone: `[.load-path]` prints it, and moving a hardpoint on that evidence is
+    // a separate decision with its own seat session. docs/suspension-load-path-brief.md.
+    setup.geometricLoadPath = true;
+
+    // **And the wheels' own spin reacts on the body.** On for this car since 2026-08-27, **driven and
+    // kept on Dominic's instruction** — it was built, measured and shipped off that morning
+    // precisely so the verdict could be his rather than a default's.
+    //
+    // The term is `chassis torque += -(net wheel spin torque)` about the spin axis, which is the
+    // wheel's own `I·alpha` and is therefore **exactly zero whenever the spin is steady**. It is not
+    // `-T_drive`, which would be wrong for braking and wrong at a constant speed, and it is not
+    // torque roll: a transverse engine puts its crank and its differential on the *lateral* axis, so
+    // the reaction is a **pitch** couple. Derived rather than argued — for a car accelerating at `a`,
+    // angular momentum about the centre of gravity needs the load transfer to exceed `m·a·h/L` by
+    // `sum(I·a/r)` over the four wheels, and this closes that balance. About 1.8% of the transfer.
+    //
+    // **What it costs, and it is knowingly paid.** 0-100 6.856 -> 6.889 s (+0.49%) and a full-pedal
+    // stop from 30 m/s 54.18 -> 55.09 m (+1.69%), on a car whose braking is the open defect
+    // (`docs/braking-chain-brief.md`: 41.74 m against a verified 35.5 m). What it buys is transient
+    // pitch — peak squat over a launch 0.831 -> 0.963 deg, peak dive over a stop 1.688 -> 2.255 deg.
+    // Those two are **mostly the fixture's step pedal**, where a real one takes a tenth of a second.
+    //
+    // `OSR_DRIVELINE_REACTION=off` is the way back and the control, and it is re-stamped on every
+    // setup-sheet reload. `docs/suspension-fidelity-brief.md`, item 3.
+    setup.drivelineReaction = true;
+
     // car.ini CONTROLS: the steering wheel's lock in degrees each way, and the ratio between it and
     // the road wheel. The travel that produces that angle is solved off the linkage below.
     //
@@ -579,6 +619,57 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto fastReboundRate = std::array{2589.0, 2589.0, 2700.0, 2700.0};
     const auto reboundKnee = std::array{0.140, 0.140, 0.140, 0.140};
     const auto antiRoll = std::array{34000.0, 34000.0, 15000.0, 15000.0};
+
+    // **The tenth and eleventh numbers this car has that AC's data does not carry**, and the first
+    // two that come out of published measurements of *other* cars rather than of this one. Both are
+    // stated here with their sources; `docs/suspension-fidelity-brief.md`, items 1 and 5, carry the
+    // full argument and the bands.
+    //
+    // **Damper seal and rod friction, newtons at the shaft.** A `Curve` through the origin is a pure
+    // viscous damper and has none; a real one carries a Coulomb term that dominates exactly where the
+    // viscous term is smallest — small amplitudes and low velocities, which is straight-line running
+    // on coarse tarmac, the first millimetre of a steering input and the settling after a kerb.
+    //
+    // Source: Deubel, Dittrich, Meinck and Prokop, *Experimental analysis and modelling of friction
+    // in automotive shock absorbers operating under side forces*, Tribology International, 2025. The
+    // specimen is a twin-tube damper from the **MacPherson front suspension of a VW Passat B8** —
+    // MQB, the Mk7 Golf's own platform, which is as close a match as this project has ever had for a
+    // borrowed number. Its pin-slider test reports approximately **117 N breakaway and 107 N
+    // sliding**, with breakaway 2-14% above sliding (7% taken as representative) and the force
+    // direction-independent to within 5% at moderate side force and velocity — which is what makes a
+    // single symmetric constant a fair reduction of it.
+    //
+    // **The rear is the front's figure standing in for an unsourced one**, and is the weaker half of
+    // this: that paper's whole point is that a MacPherson strut's friction is driven by the *side
+    // force* the layout puts through the rod, and a rear damper that stands nearly upright carries
+    // far less of it. So the rear is very likely lower and nobody has measured it. Marked here rather
+    // than hidden in an average.
+    const auto damperFriction = std::array{107.0, 107.0, 107.0, 107.0};
+
+    // **Lateral-force compliance steer, radians per newton at the contact patch.** Every joint in
+    // this model's linkage is an ideal pin or ball, so the rigid car takes no toe under load at all.
+    // A real one takes a little, and it is *designed in* rather than tolerated.
+    //
+    // Source: Kawata, *Research on lateral force compliance steer settings for automobile front
+    // suspensions*, Journal of the Institute of Industrial Applications Engineers 12(3), 2024,
+    // Table 3 — six production cars measured on an **AB Dynamics K&C rig**, toe change of the outer
+    // wheel per 1000 N applied laterally at both contact patches.
+    //
+    // **Which table applies is decided by this car's own hardpoints and not by assumption.** The
+    // paper splits its samples by whether the steering gearbox sits ahead of the front axle or
+    // behind it, and states that behind is the front-engine front-drive layout. The Golf's
+    // `steeringRackOuter` is authored **222 mm behind the wheel centre**, so it is that group:
+    // Table 3, whose four samples read **-0.004, -0.020, -0.022 and -0.032 deg/kN**. The **median,
+    // -0.021 deg/kN**, is what is taken.
+    //
+    // **This is a class figure and not this car's**, which is the honest limit of it — the spread
+    // across four production cars is eightfold, and the -0.004 sample is an outlier against a cluster
+    // at -0.020 to -0.032. Negative is toe-out, which every sample in both of the paper's tables is,
+    // because the purpose of the setting is to put the phase of the steering reaction force ahead of
+    // the steering angle. The rear axle is left at zero: the paper is about front suspensions, this
+    // car's rear is a multi-link stood in for by a double wishbone, and no figure was found.
+    const auto lateralForceSteer =
+        std::array{-0.021 * 0.017453292519943295 / 1000.0, -0.021 * 0.017453292519943295 / 1000.0, 0.0, 0.0};
 
     // The brakes, and **`brakes.ini` no longer appears in this line at all** (2026-08-23). Neither
     // `MAX_TORQUE` nor `FRONT_SHARE` is read: the peak is `peakBrakeTorque` on the hardware above and
@@ -647,6 +738,8 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         corner.antiRollRate = antiRoll[index];
         corner.brakeTorque = brakeTorque[index];
         corner.unsprungMass = hubMass(index);
+        corner.damperFriction = damperFriction[index];
+        corner.lateralForceSteer = lateralForceSteer[index];
 
         // tyres.ini, the Semislicks compound — AC's own default for this car, taken whole so the
         // grip and the carcass describe the same tyre: carcass rate and damping, angular inertia,

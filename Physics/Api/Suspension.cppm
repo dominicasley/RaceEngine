@@ -159,9 +159,15 @@ export struct SuspensionState
     glm::dvec3 wheelCentre{0.0};
     glm::dquat uprightOrientation{1.0, 0.0, 0.0, 0.0};
 
-    // Where the tire's forces are applied. Never the wheel centre — applying them there is what
-    // loses the jacking force and the lateral load path, which come out for free when the force
-    // acts where it actually acts.
+    // Where the tire's forces are applied. Never the wheel centre — that is the point the resultant
+    // a corner hands the chassis genuinely passes through, so the roll couple and the total load
+    // transfer come out right for free.
+    //
+    // **It does not on its own buy the jacking force or the geometric load path, and the comment
+    // that said so was half right about the half that does not matter.** Those live on the
+    // *corner's* side of the linkage — in `patchPerAngle` below — because what decides whether a
+    // spring has to deflect is virtual work in the corner's own coordinate, not where a force is
+    // applied to the body. See docs/suspension-load-path-brief.md, section 4.
     glm::dvec3 contactPatch{0.0};
 
     // Read off the wheel's orientation rather than stored beside it, so they cannot disagree with
@@ -178,6 +184,52 @@ export struct SuspensionState
     // (`solveElement`, `solveDamperKinematics`); the state stopped carrying its own copies when
     // the legacy damper path was retired (docs/suspension-geometry-audit.md, step 14).
     double travelPerAngle = 0.0;
+
+    // d(contactPatch)/dWishboneAngle, chassis frame, metres per radian — the **whole** velocity of
+    // the point the road pushes on, not just its vertical component.
+    //
+    // This is the geometric load path, and it is not a feature so much as the rest of one dot
+    // product. A corner is one degree of freedom, so what the spring has to carry is the tyre force
+    // dotted with the derivative of its point of application. `travelPerAngle` is that derivative's
+    // y component alone, so a model built on it takes only the vertical part of the vertical force
+    // and drops the in-plane parts entirely — which is exactly the same statement as "no roll
+    // centre, no anti-dive, no anti-squat, no jacking", because those *are* the in-plane terms.
+    //
+    // Two cross-checks tie it to things this file already computes. The lateral ratio is the roll
+    // centre: `patchPerAngle.x / patchPerAngle.y == rollCentreHeight / contactPatch.x`, because both
+    // are statements about the direction the patch scrubs as the wheel rises. And the longitudinal
+    // ratio is the side-view swing arm, which is anti-dive and anti-lift.
+    //
+    // Differenced from the same two neighbouring solves as `travelPerAngle`, at the same rack
+    // travel, so it costs nothing and cannot disagree with it by choice of method.
+    glm::dvec3 patchPerAngle{0.0};
+
+    // d(wheelCentre)/dWishboneAngle, chassis frame, metres per radian — the **whole** velocity of the
+    // wheel centre, of which `travelPerAngle` is the y component alone.
+    //
+    // Differenced from the same two neighbouring solves as everything else here, so it is free. Two
+    // things want it and neither is the tyre force. The corner's generalised inertia is
+    // `m·|dC/dq|²`, and taking only the vertical component models a corner as lighter than it is
+    // (docs/suspension-fidelity-brief.md, item 4). And the unsprung mass's reaction on the chassis
+    // acts along *this* direction rather than along the body's up, which is what a wheel snatched
+    // sideways by a kerb kicks the body with.
+    glm::dvec3 wheelCentrePerAngle{0.0};
+
+    // dTheta_upright/dWishboneAngle, chassis frame, radians per radian — the upright's whole angular
+    // velocity as the arm swings, differenced from the same two solves' orientations.
+    //
+    // **This is the term that separates an inboard drive from an outboard brake, and nothing else in
+    // this file can express it.** `contactPatch` above is reconstructed from the world's down
+    // direction each solve, so it is *not* a material point of the upright: a rotation of the upright
+    // about the wheel's own spin axis moves the real contact patch and leaves this one exactly where
+    // it was. Measured, and it is not a rounding effect — `patchPerAngle.z / patchPerAngle.y` and the
+    // wheel centre's own ratio agree to every digit printed, on all four corners, because the
+    // difference between them is precisely the spin-axis rotation the construction drops.
+    //
+    // So the honest patch Jacobian is the wheel centre's plus `uprightRatePerAngle × (R · down)`,
+    // which is what `SuspensionState` cannot state on its own because the loaded radius is a
+    // dynamic quantity. The consumer assembles it; see `VehicleImpl.cpp`.
+    glm::dvec3 uprightRatePerAngle{0.0};
 
     double wishboneAngle = 0.0;
 
@@ -212,6 +264,25 @@ solveCornerWithJacobian(const CornerHardpoints& hardpoints, const double wishbon
 // stated twice: a roll centre is a *consequence* of where the wishbones point, and a model that
 // feeds it back into a force is modelling its own output.
 export void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionState& state);
+
+// Steer the solved wheel by a small angle about the chassis's up axis, and re-read everything the
+// upright's orientation decides — camber, toe, the contact patch and the half track.
+//
+// **This is the seam bushing compliance arrives through, and it is deliberately outside
+// `solveCorner`.** That function is pure geometry: hardpoints and one travel parameter in, wheel
+// transform out, no forces and no time. Compliance is a *force* effect — a rubber bush deflecting
+// under the tyre's lateral load — so it cannot live inside a solve that is not told about forces,
+// and putting it there would also make the kinematic solve unrepeatable.
+//
+// What it is not: a translation. A real bush deflects the upright sideways and rearward as well as
+// twisting it, and only the toe term has a published figure behind it
+// (docs/suspension-fidelity-brief.md, item 1). So the hub stays exactly where the linkage put it and
+// the wheel turns about it, which is the part that is sourced and nothing else.
+//
+// The Jacobians are left alone for the same reason they are left alone by steering: they are the
+// linkage's, differenced from the linkage's own solves, and a hundredth of a degree of bush twist is
+// not a change to what the wishbones do.
+export void applyComplianceSteer(const CornerHardpoints& hardpoints, SuspensionState& state, const double steerAngle);
 
 // The load-time diagnostic the brief asks for, and the reason it is not optional: bump steer that
 // emerges from the geometry is correct and desirable, and bump steer that emerges from a typo in a
@@ -259,8 +330,8 @@ export struct SuspensionElementState
 // Evaluated with the same swing transform the solver applies to the damper and the drop link, and
 // differenced at the same step as the corner Jacobian, so the two derivatives cannot disagree by
 // choice of method.
-export [[nodiscard]] SuspensionElementState
-solveElement(const CornerHardpoints& hardpoints, const SuspensionElement& element, const double wishboneAngle);
+export [[nodiscard]] SuspensionElementState solveElement(const CornerHardpoints& hardpoints,
+                                                         const SuspensionElement& element, const double wishboneAngle);
 
 // The element each role is attached to today. The damper's is the authored pair — and a strut *is*
 // the damper, so a strut corner's element runs from the top bearing to the lower ball joint. The
@@ -269,6 +340,26 @@ solveElement(const CornerHardpoints& hardpoints, const SuspensionElement& elemen
 // seat changes what `springElementOf` answers and nothing else.
 export [[nodiscard]] SuspensionElement damperElementOf(const CornerHardpoints& hardpoints);
 export [[nodiscard]] SuspensionElement springElementOf(const CornerHardpoints& hardpoints);
+
+// The anti-roll bar's drop link, as an element like the other two — chassis end fixed, wishbone end
+// swinging with the lower arm.
+//
+// **A corner states a drop link or it does not, and most do not.** The two hardpoints default to the
+// origin, and a corner that leaves them there has no link geometry at all: the bar then stays on the
+// wheel-referred model it has always been on, which is what `dropLinkStated` decides. That is the
+// same shape as `SpringMount::CoaxialWithDamper` — the data says which model applies, and a car with
+// nothing authored gets the arithmetic it always got, to the bit.
+//
+// The Golf is one of the cars that does not state one, and that is a data fact rather than an
+// oversight: `suspensions.ini` gives `ARB FRONT 34000 / REAR 15000` and no coordinates whatever.
+// docs/suspension-fidelity-brief.md said the points were "authored on every corner"; they are
+// authored on the *placeholder* corner and on nothing else.
+export [[nodiscard]] SuspensionElement dropLinkElementOf(const CornerHardpoints& hardpoints);
+
+// Whether this corner authors a drop link. Exact inequality of the two points, deliberately and for
+// the same reason `coaxialSpring` uses exact equality: the condition is "somebody typed coordinates
+// here", not "the coordinates are nearly something".
+export [[nodiscard]] bool dropLinkStated(const CornerHardpoints& hardpoints);
 
 // Whether this corner's spring rides the damper's own element — the authored coil-over condition,
 // decided from the hardpoints alone: the two elements are the same attachment points, exactly.
@@ -305,11 +396,11 @@ export struct DamperKinematics
 // byte-identity, which survives no regrouping. Refused where the wheel does not move vertically,
 // exactly as the solver refuses its own motion ratio there.
 export [[nodiscard]] std::expected<SpringKinematics, std::string>
-solveSpringKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element,
-                      const double wishboneAngle, const double rackTravel = 0.0);
+solveSpringKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element, const double wishboneAngle,
+                      const double rackTravel = 0.0);
 
 export [[nodiscard]] std::expected<DamperKinematics, std::string>
-solveDamperKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element,
-                      const double wishboneAngle, const double rackTravel = 0.0);
+solveDamperKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element, const double wishboneAngle,
+                      const double rackTravel = 0.0);
 
 } // namespace raceengine

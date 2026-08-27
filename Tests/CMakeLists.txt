@@ -11,6 +11,7 @@ find_package(Catch2 3 CONFIG REQUIRED)
 
 add_executable(EngineTests
         AccessorUtilityTests.cpp
+        AntiRollBarSweepProbe.cpp
         AntiStallTests.cpp
         AntilockBrakingTests.cpp
         AssistDiagnosticProbe.cpp
@@ -29,7 +30,9 @@ add_executable(EngineTests
         CreepTests.cpp
         CriteriaGripSweepProbe.cpp
         CouplingTests.cpp
+        DamperFrictionProbe.cpp
         DifferentialTests.cpp
+        DrivelinePathProbe.cpp
         DrivelineTests.cpp
         EngineCurveValidationProbe.cpp
         EngineLayerTests.cpp
@@ -77,6 +80,9 @@ add_executable(EngineTests
         SteeringShimmyProbe.cpp
         SpringDamperKinematicsProbe.cpp
         SuspensionElementTests.cpp
+        SuspensionFidelityTests.cpp
+        SuspensionLoadPathProbe.cpp
+        SuspensionLoadPathTests.cpp
         SuspensionSweepProbe.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp

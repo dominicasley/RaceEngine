@@ -141,6 +141,30 @@ struct Circle
     return Circle{.centre = centre, .normal = axis, .radius = glm::length(radius)};
 }
 
+// Everything the upright's orientation decides, read off it rather than tracked beside it. One
+// statement of it, because two would be two places for camber and the patch to disagree — and since
+// compliance steer re-runs exactly this after twisting the upright, the two paths cannot drift.
+//
+// The arithmetic is untouched from where it was inline in `solveCorner`: same operations in the same
+// order, so the solve is byte-identical across the extraction.
+void readOffWheel(const CornerHardpoints& hardpoints, SuspensionState& state)
+{
+    // The wheel's spin axis, pointing away from the car. Everything about how the wheel is standing
+    // is read from this rather than tracked beside it.
+    const auto outboard = outboardSign(hardpoints.side);
+    const auto spinAxis = state.uprightOrientation * glm::dvec3(outboard, 0.0, 0.0);
+
+    state.camber = -std::asin(glm::clamp(spinAxis.y, -1.0, 1.0));
+    state.toe = std::asin(glm::clamp(spinAxis.z, -1.0, 1.0));
+
+    // The contact patch is directly below the wheel centre *in the wheel's own plane*, which for a
+    // cambered wheel is not directly below it in the world.
+    const auto down = glm::dvec3(0.0, -1.0, 0.0);
+    const auto inPlaneDown = down - glm::dot(down, spinAxis) * spinAxis;
+    state.contactPatch = state.wheelCentre + hardpoints.wheelRadius * glm::normalize(inPlaneDown);
+    state.halfTrack = std::abs(state.contactPatch.x);
+}
+
 [[nodiscard]] glm::dvec3 nearestTo(const SphereCircleIntersection& candidates, const glm::dvec3& reference)
 {
     if (candidates.count < 2)
@@ -271,20 +295,7 @@ struct Circle
     state.wheelCentre = place(hardpoints.wheelCentre);
     state.wheelTravel = state.wheelCentre.y - hardpoints.wheelCentre.y;
 
-    // The wheel's spin axis, pointing away from the car. Everything about how the wheel is standing
-    // is read from this rather than tracked beside it.
-    const auto outboard = outboardSign(hardpoints.side);
-    const auto spinAxis = upright * glm::dvec3(outboard, 0.0, 0.0);
-
-    state.camber = -std::asin(glm::clamp(spinAxis.y, -1.0, 1.0));
-    state.toe = std::asin(glm::clamp(spinAxis.z, -1.0, 1.0));
-
-    // The contact patch is directly below the wheel centre *in the wheel's own plane*, which for a
-    // cambered wheel is not directly below it in the world.
-    const auto down = glm::dvec3(0.0, -1.0, 0.0);
-    const auto inPlaneDown = down - glm::dot(down, spinAxis) * spinAxis;
-    state.contactPatch = state.wheelCentre + hardpoints.wheelRadius * glm::normalize(inPlaneDown);
-    state.halfTrack = std::abs(state.contactPatch.x);
+    readOffWheel(hardpoints, state);
 
     // Deliberately absent: the damper and the drop link. They are chassis-to-wishbone elements,
     // and every element quantity — length, Jacobian, motion ratio — is evaluated from the solved
@@ -322,6 +333,27 @@ struct Circle
 
     solved->travelPerAngle = travelChange / (2.0 * step);
 
+    // The whole patch velocity, from the two solves already paid for. Its y component is *not*
+    // `travelPerAngle`: that is the wheel *centre*'s, and the patch sits a radius below it in the
+    // wheel's own plane, so camber gain separates the two. Both are wanted — the corner's
+    // generalised force is the tyre force through this one, and the unsprung terms act at the
+    // centre.
+    solved->patchPerAngle = (ahead->contactPatch - behind->contactPatch) / (2.0 * step);
+
+    // The wheel centre's whole velocity, of which `travelPerAngle` above is the y component. Free
+    // from the same two solves, and the corner's generalised inertia and the unsprung reaction on
+    // the chassis both want the vector rather than the component.
+    solved->wheelCentrePerAngle = (ahead->wheelCentre - behind->wheelCentre) / (2.0 * step);
+
+    // And the upright's own angular velocity, from the same two orientations. The relative rotation
+    // across the interval is tiny, so its vector part is half the rotation vector and the scalar part
+    // is within an ulp of one — but the sign is still normalised, because a quaternion and its
+    // negative are the same rotation and reading the vector part of the wrong one silently inverts
+    // every axis.
+    const auto turned = ahead->uprightOrientation * glm::conjugate(behind->uprightOrientation);
+    const auto aligned = turned.w < 0.0 ? -turned : turned;
+    solved->uprightRatePerAngle = glm::dvec3(aligned.x, aligned.y, aligned.z) / step;
+
     // At a turning point of the wheel's travel every element's motion ratio is genuinely infinite
     // — the linkage is at the end of its useful range — and reporting zero there is a lie the
     // force calculation would silently believe.
@@ -332,6 +364,17 @@ struct Circle
     }
 
     return solved;
+}
+
+void applyComplianceSteer(const CornerHardpoints& hardpoints, SuspensionState& state, const double steerAngle)
+{
+    // About the chassis's own up axis, which is what a toe angle is measured about and what the
+    // published figure this is driven by was measured as (a K&C rig reads toe change against an
+    // applied lateral force at the contact patch). Not about the kingpin: that would be a steering
+    // input, and the bushes that deflect are the arm's and the tie rod's rather than the rack.
+    state.uprightOrientation = glm::angleAxis(steerAngle, glm::dvec3(0.0, 1.0, 0.0)) * state.uprightOrientation;
+
+    readOffWheel(hardpoints, state);
 }
 
 void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionState& state)
@@ -491,6 +534,19 @@ sweepCorner(const CornerHardpoints& hardpoints, const std::uint32_t samples, con
     }
 
     return damperElementOf(hardpoints);
+}
+
+[[nodiscard]] SuspensionElement dropLinkElementOf(const CornerHardpoints& hardpoints)
+{
+    return SuspensionElement{.chassis = hardpoints.antiRollBarChassis, .wishbone = hardpoints.antiRollBarWishbone};
+}
+
+[[nodiscard]] bool dropLinkStated(const CornerHardpoints& hardpoints)
+{
+    // Both default to the origin, so a car that says nothing about its bar's geometry says it here by
+    // leaving the two points equal. Exact inequality on purpose: the question is whether coordinates
+    // were typed, not whether they are nearly something.
+    return hardpoints.antiRollBarChassis != hardpoints.antiRollBarWishbone;
 }
 
 [[nodiscard]] bool coaxialSpring(const CornerHardpoints& hardpoints)

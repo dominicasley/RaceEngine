@@ -175,6 +175,14 @@ namespace
             {
                 axle.brakeTorque = *number;
             }
+            else if (field == "friction")
+            {
+                axle.damperFriction = *number;
+            }
+            else if (field == "compliancesteer")
+            {
+                axle.complianceSteer = *number;
+            }
             else
             {
                 return false;
@@ -267,7 +275,8 @@ namespace
 {
     const auto axle = [](const AxleTune& sheet)
     {
-        return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque;
+        return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque ||
+               sheet.damperFriction || sheet.complianceSteer;
     };
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
@@ -308,6 +317,19 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
         if (sheet.brakeTorque)
         {
             corner.brakeTorque = *sheet.brakeTorque;
+        }
+
+        if (sheet.damperFriction)
+        {
+            corner.damperFriction = *sheet.damperFriction;
+        }
+
+        if (sheet.complianceSteer)
+        {
+            // Degrees per kilonewton on the sheet, radians per newton in the model. One conversion,
+            // here, because a sheet a driver edits should carry the unit the measurement is published
+            // in and the model should carry the unit its arithmetic is in.
+            corner.lateralForceSteer = *sheet.complianceSteer * 0.017453292519943295 / 1000.0;
         }
     };
 

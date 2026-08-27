@@ -366,8 +366,8 @@ TEST_CASE("every corner of the imported car validates", "[physics][golf]")
         // own element. The conversion is the spring motion ratio squared, so multiplying back must
         // recover the file's own number exactly — this is the check that the conversion is a
         // conversion and not a guess.
-        const auto spring = raceengine::solveSpringKinematics(
-            corner.hardpoints, raceengine::springElementOf(corner.hardpoints), 0.0);
+        const auto spring =
+            raceengine::solveSpringKinematics(corner.hardpoints, raceengine::springElementOf(corner.hardpoints), 0.0);
         REQUIRE(spring.has_value());
 
         const auto wheelRate = corner.springRate * spring->motionRatio * spring->motionRatio;
@@ -582,7 +582,19 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
     // indefinitely" failed with the two sides exactly equal. A nose-heavy front-drive car understeers
     // more and needs more lock to reach its limit, which is the correct behaviour and not a lost
     // limit; what was wrong was a fixture whose range was cut to the old car.
-    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45, 0.60, 0.80, 1.00};
+    //
+    // **Refined a third time on 2026-08-27, and this one is about resolving the peak rather than
+    // reaching it — read the paragraph on the assertion below before changing it back.** The list was
+    // roughly geometric from 0.02 to 1.00, which is the right spacing for the *gradient* sections
+    // above and too coarse for the *maximum* the last section asserts: the peak sits at 0.37 and the
+    // sweep stepped 0.30 straight to 0.45, straddling it. `0.34, 0.36, 0.38, 0.40` are added at the
+    // **same 0.02 spacing the sweep already uses at its low end**, applied to the one step that
+    // contains the maximum — a lattice, deliberately, rather than angles picked to land on the peak.
+    //
+    // Every index the other sections walk is untouched: they compare `measured[1..6]`, which are the
+    // steerings from 0.04 to 0.22, and the additions all sit at index 8 and beyond.
+    const auto steerings = std::vector<double>{0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30,
+                                               0.34, 0.36, 0.38, 0.40, 0.45, 0.60, 0.80, 1.00};
     auto measured = std::vector<SteadyState>{};
 
     for (const auto steering : steerings)
@@ -640,6 +652,33 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
         // Reads 0.9232 g. The independent check is 0-100, which lands 6.556 s against a published
         // a measured 6.5-6.6 s — a different measurement against a different
         // external reference, sharing only the tyre peaks.
+        //
+        // **The bound has never been moved and is not moved here. The GRID was, on 2026-08-27, and
+        // this paragraph is the whole justification** — because refining a grid raises a measured
+        // maximum by construction, which is the direction that turns a red green, and
+        // `docs/known-red.md` exists to stop that happening quietly.
+        //
+        // The geometric load path took this from 0.9232 to a reported 0.8918 g and it was carried as
+        // a red for a day. It is not 0.8918. **A maximum taken over samples is an underestimate of a
+        // true maximum, always**, and this sweep stepped 0.30 straight to 0.45 while the peak sits at
+        // 0.37. Measured by `[.bar-sweep]` (`RaceEngine/Tests/AntiRollBarSweepProbe.cpp`), which
+        // prints every sample of a dense scan so the shape is on the record rather than the summary:
+        //
+        //     0.30 -> 0.8918   0.34 -> 0.8990   0.37 -> 0.9011   0.40 -> 0.8995
+        //     0.32 -> 0.8953   0.35 -> 0.9001   0.38 -> 0.9008   0.42 -> 0.8968
+        //     0.33 -> 0.8974   0.36 -> 0.9009   0.39 -> 0.9004   0.45 -> 0.8913
+        //
+        // So the car's peak is **0.9011 g** and the old list reported the value at 0.30 instead. On
+        // the 0.02 lattice now in the sweep it reads **0.9009**.
+        //
+        // **Read the margin before trusting this pass. It is 0.1%** — 0.9009 against a 0.90 floor.
+        // That is the honest state of the car and not a comfortable green: this car sits at the very
+        // bottom of the real Mk7's 0.90-0.95 range, and a physics change worth one part in a thousand
+        // puts it back in `docs/known-red.md`. The balance question is unchanged by any of this.
+        // What moves it is the front axle's share of lateral load transfer, which the load path took
+        // from 53.9% to 58.1%; the honest lever is the anti-roll bars, and **their real rates could
+        // not be sourced** — VW's bar is a tube whose rate is set by insert-plate length, so a
+        // published diameter does not give a rate. `docs/suspension-fidelity-brief.md`, Progress.
         REQUIRE(peak > 0.90);
         REQUIRE(peak < 0.95);
         REQUIRE(measured.back().lateralAcceleration < peak);

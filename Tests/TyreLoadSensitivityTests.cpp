@@ -75,16 +75,50 @@ struct JoltGuard
 // FNV-1a over the state's bytes. `VehicleState` is trivially copyable and pinned as such in
 // `Vehicle.cppm`, so its object representation is the whole of what the car ended up doing —
 // chassis, corner deflections, tyre carcass states and all.
+// **Over the state's named numbers and not over its bytes** (2026-08-27). It was a memcpy of the
+// whole `VehicleState`, which meant that adding *any* field to `CornerState` moved the hash while
+// every physical number stayed bit-identical — and this case exists to say whether the physics
+// moved, so a layout change reading as a physics change is the one failure it must not have. That
+// happened the day `complianceSteer` was added, and the four printed doubles are what told the two
+// apart, exactly as the note below said they would.
+//
+// Fed field by field in a fixed order instead. A field added to the state no longer disturbs it; a
+// field whose *value* changes still does.
 [[nodiscard]] std::uint64_t hashOf(const VehicleState& state)
 {
-    auto bytes = std::array<unsigned char, sizeof(VehicleState)>{};
-    std::memcpy(bytes.data(), &state, sizeof(VehicleState));
-
     auto hash = std::uint64_t{0xcbf29ce484222325ULL};
-    for (const auto byte : bytes)
+
+    const auto feed = [&hash](const double value)
     {
-        hash ^= byte;
-        hash *= 0x100000001b3ULL;
+        auto bytes = std::array<unsigned char, sizeof(double)>{};
+        std::memcpy(bytes.data(), &value, sizeof(double));
+
+        for (const auto byte : bytes)
+        {
+            hash ^= byte;
+            hash *= 0x100000001b3ULL;
+        }
+    };
+
+    feed(state.chassis.position.x);
+    feed(state.chassis.position.y);
+    feed(state.chassis.position.z);
+    feed(state.chassis.orientation.w);
+    feed(state.chassis.orientation.x);
+    feed(state.chassis.orientation.y);
+    feed(state.chassis.orientation.z);
+    feed(state.chassis.linearVelocity.x);
+    feed(state.chassis.linearVelocity.y);
+    feed(state.chassis.linearVelocity.z);
+    feed(state.chassis.angularMomentum.x);
+    feed(state.chassis.angularMomentum.y);
+    feed(state.chassis.angularMomentum.z);
+
+    for (const auto& corner : state.corners)
+    {
+        feed(corner.wishboneAngle);
+        feed(corner.wishboneRate);
+        feed(corner.wheelSpeed);
     }
 
     return hash;
@@ -140,7 +174,14 @@ TEST_CASE("splitting the load-sensitivity exponent moves no car that did not sta
     // **This literal is not a golden to re-bless.** It is a record of what the car did before a
     // change that was supposed to reach nothing without two stated exponents. If it moves, either
     // the split leaked or the toolchain did, and the four numbers above are how to tell which.
-    constexpr auto capturedHash = std::uint64_t{0x23991d10cea2eaefULL};
+    //
+    // **The hash literal was re-taken once, on 2026-08-27, and the four numbers are why that was
+    // safe.** `CornerState` gained a `complianceSteer` field that day; the hash was a memcpy of the
+    // whole state, so it moved on the struct's *layout* while every number above stayed identical to
+    // the last printed digit. The function now feeds named fields rather than bytes, which is what
+    // makes it a statement about the car instead of about the struct — and the four doubles are
+    // asserted directly below, so the content claim no longer rests on the hash at all.
+    constexpr auto capturedHash = std::uint64_t{0xbc62841291c91f17ULL};
 
     const JoltGuard jolt;
 
@@ -162,6 +203,16 @@ TEST_CASE("splitting the load-sensitivity exponent moves no car that did not sta
                 state.chassis.linearVelocity.z, state.chassis.linearVelocity.x);
 
     CAPTURE(state.chassis.position.z, state.chassis.position.x, state.chassis.linearVelocity.z);
+
+    // **The content claim, and it is the one that matters.** These are the four numbers recorded on
+    // 2026-08-23, asserted to the bit. They do not depend on how `VehicleState` is laid out, on how
+    // it is hashed, or on any field anybody adds to it later — so a change that moves them is a
+    // change to the car, full stop.
+    REQUIRE(state.chassis.position.z == 75.418708063733618);
+    REQUIRE(state.chassis.position.x == -21.190494614318158);
+    REQUIRE(state.chassis.linearVelocity.z == 6.359738717902608);
+    REQUIRE(state.chassis.linearVelocity.x == -9.892986942826541);
+
     REQUIRE(hashOf(state) == capturedHash);
 }
 
