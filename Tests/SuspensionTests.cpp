@@ -208,16 +208,22 @@ TEST_CASE("the motion ratio varies across the travel", "[physics][suspension]")
     const auto sweep = sweepCorner(corner, 41);
     REQUIRE(sweep.has_value());
 
+    // The ratio is the damper element's, read at the sweep's own angles — the state stopped
+    // carrying a copy when the legacy damper path was retired (step 14).
+    const auto element = raceengine::damperElementOf(corner);
     auto lowest = 1e30;
     auto highest = -1e30;
     for (const auto& sample : sweep->samples)
     {
-        // The damper moves less than the wheel, because it picks up inboard of the ball joint.
-        REQUIRE(std::abs(sample.motionRatio) > 0.1);
-        REQUIRE(std::abs(sample.motionRatio) < 1.0);
+        const auto kinematics = raceengine::solveDamperKinematics(corner, element, sample.wishboneAngle);
+        REQUIRE(kinematics.has_value());
 
-        lowest = std::min(lowest, std::abs(sample.motionRatio));
-        highest = std::max(highest, std::abs(sample.motionRatio));
+        // The damper moves less than the wheel, because it picks up inboard of the ball joint.
+        REQUIRE(std::abs(kinematics->motionRatio) > 0.1);
+        REQUIRE(std::abs(kinematics->motionRatio) < 1.0);
+
+        lowest = std::min(lowest, std::abs(kinematics->motionRatio));
+        highest = std::max(highest, std::abs(kinematics->motionRatio));
     }
 
     REQUIRE(highest - lowest > 0.01);
@@ -233,8 +239,15 @@ TEST_CASE("the motion ratio varies across the travel", "[physics][suspension]")
         const auto& before = sweep->samples[index - 1];
         const auto& after = sweep->samples[index];
 
-        const auto secant = (after.damperLength - before.damperLength) / (after.wheelTravel - before.wheelTravel);
-        const auto mean = 0.5 * (before.motionRatio + after.motionRatio);
+        const auto lengthBefore = raceengine::solveElement(corner, element, before.wishboneAngle).length;
+        const auto lengthAfter = raceengine::solveElement(corner, element, after.wishboneAngle).length;
+        const auto ratioBefore = raceengine::solveDamperKinematics(corner, element, before.wishboneAngle);
+        const auto ratioAfter = raceengine::solveDamperKinematics(corner, element, after.wishboneAngle);
+        REQUIRE(ratioBefore.has_value());
+        REQUIRE(ratioAfter.has_value());
+
+        const auto secant = (lengthAfter - lengthBefore) / (after.wheelTravel - before.wheelTravel);
+        const auto mean = 0.5 * (ratioBefore->motionRatio + ratioAfter->motionRatio);
 
         REQUIRE(secant == Catch::Approx(mean).epsilon(1e-4));
     }
@@ -307,7 +320,11 @@ TEST_CASE("the left corner is the mirror of the right", "[physics][suspension]")
         // the opposite.
         REQUIRE(onLeft->camber == Catch::Approx(onRight->camber).margin(1e-9));
         REQUIRE(onLeft->toe == Catch::Approx(onRight->toe).margin(1e-9));
-        REQUIRE(onLeft->damperLength == Catch::Approx(onRight->damperLength).margin(1e-12));
+
+        // The damper length mirrors too, read off each side's own element (step 14).
+        const auto leftLength = raceengine::solveElement(left, raceengine::damperElementOf(left), angle).length;
+        const auto rightLength = raceengine::solveElement(right, raceengine::damperElementOf(right), angle).length;
+        REQUIRE(leftLength == Catch::Approx(rightLength).margin(1e-12));
     }
 }
 
@@ -415,7 +432,13 @@ TEST_CASE("the solve is pure", "[physics][suspension][determinism]")
     REQUIRE(first->wheelCentre == second->wheelCentre);
     REQUIRE(first->camber == second->camber);
     REQUIRE(first->toe == second->toe);
-    REQUIRE(first->motionRatio == second->motionRatio);
+
+    const auto element = raceengine::damperElementOf(corner);
+    const auto once = raceengine::solveDamperKinematics(corner, element, 0.07, 0.012);
+    const auto again = raceengine::solveDamperKinematics(corner, element, 0.07, 0.012);
+    REQUIRE(once.has_value());
+    REQUIRE(again.has_value());
+    REQUIRE(once->motionRatio == again->motionRatio);
 }
 
 TEST_CASE("a strut is the same problem with one step replaced", "[physics][suspension][strut]")
@@ -473,24 +496,35 @@ TEST_CASE("a strut's motion ratio is near one, and a wishbone's is not", "[physi
     REQUIRE(strut.has_value());
     REQUIRE(wishbone.has_value());
 
+    const auto ratioAt = [](const CornerHardpoints& hardpoints, const double angle)
+    {
+        const auto kinematics =
+            raceengine::solveDamperKinematics(hardpoints, raceengine::damperElementOf(hardpoints), angle);
+        REQUIRE(kinematics.has_value());
+        return kinematics->motionRatio;
+    };
+
+    const auto strutHardpoints = strutCorner(CornerSide::Right);
     for (const auto& sample : strut->samples)
     {
-        REQUIRE(std::abs(sample.motionRatio) > 0.75);
-        REQUIRE(std::abs(sample.motionRatio) < 1.05);
+        const auto ratio = ratioAt(strutHardpoints, sample.wishboneAngle);
+        REQUIRE(std::abs(ratio) > 0.75);
+        REQUIRE(std::abs(ratio) < 1.05);
     }
 
+    const auto wishboneHardpoints = frontCorner(CornerSide::Right);
     for (const auto& sample : wishbone->samples)
     {
-        REQUIRE(std::abs(sample.motionRatio) < 0.70);
+        REQUIRE(std::abs(ratioAt(wishboneHardpoints, sample.wishboneAngle)) < 0.70);
     }
 
     // And neither reverses, which is what says the damper is attached to something real.
-    const auto sameSign = [](const auto& sweep)
+    const auto sameSign = [&ratioAt](const CornerHardpoints& hardpoints, const auto& sweep)
     {
         auto sign = 0.0;
         for (const auto& sample : sweep.samples)
         {
-            const auto here = sample.motionRatio < 0.0 ? -1.0 : 1.0;
+            const auto here = ratioAt(hardpoints, sample.wishboneAngle) < 0.0 ? -1.0 : 1.0;
             if (sign != 0.0 && here != sign)
             {
                 return false;
@@ -500,8 +534,8 @@ TEST_CASE("a strut's motion ratio is near one, and a wishbone's is not", "[physi
         return true;
     };
 
-    REQUIRE(sameSign(strut.value()));
-    REQUIRE(sameSign(wishbone.value()));
+    REQUIRE(sameSign(strutHardpoints, strut.value()));
+    REQUIRE(sameSign(wishboneHardpoints, wishbone.value()));
 }
 
 TEST_CASE("steering a strut changes its camber", "[physics][suspension][strut]")

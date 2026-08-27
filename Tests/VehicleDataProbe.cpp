@@ -236,10 +236,12 @@ TEST_CASE("the Golf's data, every field, against the real car or against arithme
 
     const auto designRatio = [&car](const std::size_t index)
     {
-        const auto design = raceengine::solveCornerWithJacobian(car.corners[index].hardpoints, 0.0, 0.0);
-        REQUIRE(design.has_value());
+        const auto& hardpoints = car.corners[index].hardpoints;
+        const auto spring =
+            raceengine::solveSpringKinematics(hardpoints, raceengine::springElementOf(hardpoints), 0.0);
+        REQUIRE(spring.has_value());
 
-        return std::abs(design->motionRatio);
+        return std::abs(spring->motionRatio);
     };
 
     const auto frontWheelRate = front.springRate * designRatio(0) * designRatio(0);
@@ -284,10 +286,10 @@ TEST_CASE("the Golf's data, every field, against the real car or against arithme
     // position. So the meaningful check is not the length, it is that the solve did what it claims:
     // the compression from free to installed, times the rate, must be the static load on the shaft.
     {
-        const auto design = raceengine::solveCornerWithJacobian(front.hardpoints, 0.0, 0.0);
-        REQUIRE(design.has_value());
+        const auto designSpringLength =
+            raceengine::solveElement(front.hardpoints, raceengine::springElementOf(front.hardpoints), 0.0).length;
 
-        const auto shaftLoad = front.springRate * (front.springFreeLength - design->damperLength);
+        const auto shaftLoad = front.springRate * (front.springFreeLength - designSpringLength);
         const auto wheelLoad = shaftLoad * designRatio(0);
 
         // **The springs carry the *sprung* mass, whose distribution is not the whole car's.** The

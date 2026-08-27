@@ -180,6 +180,14 @@ export inline constexpr uint32_t sceneBehindBinding = 2;
 // spreads a low sun over. Past that a level costs a blit and buys a blur wider than the pane.
 export inline constexpr uint32_t sceneBehindMipCount = 7;
 
+// The scene's cloud dome map, beside the occlusion and the behind copy on their exact terms: an
+// image a pass produced earlier — the cloud march at the end of the world camera's chain — read
+// only by a view that shades. The skybox composites it over the sky integral, and a probe face
+// binds the same image, which is how clouds reach the captures and become ambient light. A scene
+// with no cloud map binds the 1x1 white image; shaders guard the sample behind the frame block's
+// coverage, so the dummy's content is never read.
+export inline constexpr uint32_t cloudMapBinding = 3;
+
 // How the occlusion is gathered: directions through the pixel, and steps marched along each. Both
 // sides count them — the shader marches them and the engine reports them once at bring-up — so they
 // are contract numbers rather than literals in the shader. Three by four is the cheap end of GTAO
@@ -198,6 +206,15 @@ export inline constexpr uint32_t gtaoStepsPerSlice = 4;
 // feature costs. Sixteen is where the dither stops reading as banding on this scene.
 // docs/volumetric-fog-brief.md has the derivation.
 export inline constexpr uint32_t fogMarchSteps = 8;
+
+// How many steps the cloud dome march takes through the cloud shell. A quality knob on the fog's
+// terms — the march is envelope-bounded and early-exits on spent transmittance, so fewer steps move
+// where an edge falls rather than how much cloud there is — and it can afford to be larger than the
+// fog's because the dome map is marched once at map resolution, not per frame pixel.
+// 128 since the shell doubled for the cumulus towers (2026-08-26): the map is marched at the
+// midpoint with no dither, so the step length IS the terracing wavelength, and 64 steps through
+// an 18,000-unit slab printed the quantisation as onion-ring contours.
+export inline constexpr uint32_t cloudMarchSteps = 128;
 
 // How far a bloom chain is allowed to halve. Six levels from half of 1080p is a bottom level about
 // thirty texels across, which is a spill the width of the screen; past that the chain is buying
@@ -223,9 +240,20 @@ export inline constexpr uint32_t probeSpecularBinding = 1;
 // elements it wants and ignores the rest, but every element is written whatever the shader reads:
 // a descriptor a pipeline statically uses must be there, and an unwritten element of a descriptor
 // array is the same defect as an unbound sampler.
-export inline constexpr uint32_t postProcessDescriptorSet = 0;
+// One, not the zero it was: the fullscreen pipeline layout carries the frame block at set 0 now —
+// the same set, layout and dynamic offset the scene draws bind — because the fog pass reads the
+// sun, the cascades' matrices, the probes and the medium out of it, and a fullscreen pass that
+// could see none of that was the whole reason fog lived in three scene shaders. Every fullscreen
+// shader spells this through the macro, so the renumber cost no shader an edit.
+export inline constexpr uint32_t postProcessDescriptorSet = 1;
 export inline constexpr uint32_t postProcessInputBinding = 0;
 export inline constexpr uint32_t postProcessInputCount = 4;
+
+// The shadow set's index in the *fullscreen* layout — the same set layout and the same descriptor
+// the scene draws bind at set 3, at the slot the fullscreen layout has for it. It exists so the
+// fog pass can march the cascades for its god rays; every other fullscreen shader declares nothing
+// at it and never sees it.
+export inline constexpr uint32_t fullscreenShadowSet = 2;
 
 // The colour grade, beside the inputs in the same set: one three-dimensional combined sampler. It is
 // a binding of its own rather than an element of the array above because a descriptor array holds
@@ -237,6 +265,17 @@ export inline constexpr uint32_t lookupTableBinding = 1;
 // cube there is and interpolates to exactly the identity everywhere, so there is nothing to gain by
 // making it larger.
 export inline constexpr uint32_t neutralLookupTableSize = 2;
+
+// The baked cloud noise volumes, beside the grade in the fullscreen set and bindings of their own
+// for the grade's reason exactly: a sampler3D cannot be an element of the sampler2D input array.
+// Two — the base shape and the detail erosion — and every fullscreen pass is written both, the
+// neutral table standing in wherever a pass names no volume of its own, because a descriptor the
+// layout declares must be written whether or not the shader reads it.
+export inline constexpr uint32_t cloudBaseNoiseBinding = 2;
+export inline constexpr uint32_t cloudDetailNoiseBinding = 3;
+export inline constexpr uint32_t postProcessVolumeCount = 2;
+
+static_assert(cloudDetailNoiseBinding == cloudBaseNoiseBinding + 1);
 
 // Middle grey in the exposed scene-linear domain, and the point the tone curve's contrast term
 // pivots about: below it a contrast above one darkens and above it brightens, and at one it does
@@ -277,7 +316,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 50;
+export inline constexpr size_t shaderContractMacroCount = 55;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -341,10 +380,15 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"PROBE_SPECULAR_MIPS", probeSpecularMipCount},
         {"PROBE_CUBE_RESOLUTION", probeCubeResolution},
         {"SET_POST_PROCESS", postProcessDescriptorSet},
+        {"SET_FULLSCREEN_SHADOW", fullscreenShadowSet},
         {"POST_INPUT_BINDING", postProcessInputBinding},
         {"POST_INPUTS", postProcessInputCount},
         {"LUT_BINDING", lookupTableBinding},
         {"FOG_MARCH_STEPS", fogMarchSteps},
+        {"CLOUD_MAP_BINDING", cloudMapBinding},
+        {"CLOUD_BASE_NOISE_BINDING", cloudBaseNoiseBinding},
+        {"CLOUD_DETAIL_NOISE_BINDING", cloudDetailNoiseBinding},
+        {"CLOUD_MARCH_STEPS", cloudMarchSteps},
     }};
 }
 

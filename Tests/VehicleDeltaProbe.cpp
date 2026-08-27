@@ -237,11 +237,12 @@ TEST_CASE("what the corrected data did to the car", "[.vehicle-delta]")
     {
         const auto& corner = setup.corners[axle];
 
-        const auto design = raceengine::solveCornerWithJacobian(corner.hardpoints, 0.0, 0.0);
-        REQUIRE(design.has_value());
-
-        // Back to the wheel from the shaft, which is where `springRate` is stated.
-        const auto ratio = std::abs(design->motionRatio);
+        // Back to the wheel from the shaft, which is where `springRate` is stated — through the
+        // spring element's own ratio.
+        const auto spring =
+            raceengine::solveSpringKinematics(corner.hardpoints, raceengine::springElementOf(corner.hardpoints), 0.0);
+        REQUIRE(spring.has_value());
+        const auto ratio = std::abs(spring->motionRatio);
         const auto wheelRate = corner.springRate * ratio * ratio;
 
         // Sprung mass on this corner, by statics about the other axle.

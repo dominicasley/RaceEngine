@@ -17,6 +17,8 @@ module;
 #include <type_traits>
 #include <vector>
 
+#include <Profiling/RaceEngineProfile.hpp>
+
 module raceengine.physics;
 
 namespace raceengine
@@ -26,6 +28,26 @@ namespace raceengine
 {
     return Curve{
         .points = {glm::dvec2(-5.0, -5.0 * reboundRate), glm::dvec2(0.0, 0.0), glm::dvec2(5.0, 5.0 * bumpRate)}};
+}
+
+[[nodiscard]] Curve kneedDamper(const double bumpRate, const double fastBumpRate, const double bumpKnee,
+                                const double reboundRate, const double fastReboundRate, const double reboundKnee,
+                                const DamperKinematics& kinematics)
+{
+    const auto ratio = std::abs(kinematics.motionRatio);
+    const auto square = std::max(ratio * ratio, 1e-9);
+    const auto span = 5.0;
+
+    const auto bumpKneeSpeed = ratio * bumpKnee;
+    const auto bumpKneeForce = (bumpRate / square) * bumpKneeSpeed;
+    const auto bumpEnd = bumpKneeForce + (fastBumpRate / square) * (span - bumpKneeSpeed);
+
+    const auto reboundKneeSpeed = ratio * reboundKnee;
+    const auto reboundKneeForce = (reboundRate / square) * reboundKneeSpeed;
+    const auto reboundEnd = reboundKneeForce + (fastReboundRate / square) * (span - reboundKneeSpeed);
+
+    return Curve{.points = {glm::dvec2(-span, -reboundEnd), glm::dvec2(-reboundKneeSpeed, -reboundKneeForce),
+                            glm::dvec2(0.0, 0.0), glm::dvec2(bumpKneeSpeed, bumpKneeForce), glm::dvec2(span, bumpEnd)}};
 }
 
 [[nodiscard]] std::array<double, cornerCount> wheelInertias(const VehicleSetup& setup)
@@ -82,20 +104,57 @@ namespace raceengine
 [[nodiscard]] std::expected<double, std::string> springFreeLengthForLoad(const CornerSetup& corner,
                                                                          const double sprungLoad)
 {
-    const auto solved = solveCornerWithJacobian(corner.hardpoints, 0.0, 0.0);
-    if (!solved)
+    const auto spring = solveSpringKinematics(corner.hardpoints, springElementOf(corner.hardpoints), 0.0, 0.0);
+    if (!spring)
     {
-        return std::unexpected(solved.error());
+        return std::unexpected(spring.error());
     }
 
-    if (std::abs(solved->motionRatio) < 1e-9 || corner.springRate <= 0.0)
+    if (std::abs(spring->motionRatio) < 1e-9 || corner.springRate <= 0.0)
     {
         return std::unexpected("a corner with no motion ratio or no spring cannot be given a rest length");
     }
 
-    // At equilibrium the spring's force along the damper, resolved to the wheel by the motion
-    // ratio, carries the sprung corner load.
-    return solved->damperLength + sprungLoad / (corner.springRate * std::abs(solved->motionRatio));
+    // At equilibrium the spring's force along its own axis, resolved to the wheel by the spring's
+    // motion ratio, carries the sprung corner load.
+    return spring->length + sprungLoad / (corner.springRate * std::abs(spring->motionRatio));
+}
+
+[[nodiscard]] SpringSolution solveSpringForce(const CornerSetup& corner, const SuspensionState& suspension)
+{
+    const auto evaluated = solveElement(corner.hardpoints, springElementOf(corner.hardpoints),
+                                        suspension.wishboneAngle);
+
+    return SpringSolution{.length = evaluated.length,
+                          .lengthPerAngle = evaluated.lengthPerAngle,
+                          .force = corner.springRate * (corner.springFreeLength - evaluated.length)};
+}
+
+[[nodiscard]] DamperSolution solveDamperGeometry(const CornerSetup& corner, const SuspensionState& suspension)
+{
+    const auto evaluated = solveElement(corner.hardpoints, damperElementOf(corner.hardpoints),
+                                        suspension.wishboneAngle);
+
+    return DamperSolution{.length = evaluated.length, .lengthPerAngle = evaluated.lengthPerAngle};
+}
+
+[[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& corner, const SuspensionState& suspension,
+                                                   const double wishboneRate)
+{
+    const auto geometry = solveDamperGeometry(corner, suspension);
+    const auto velocity = -geometry.lengthPerAngle * wishboneRate;
+
+    return DamperForceSolution{.length = geometry.length,
+                               .lengthPerAngle = geometry.lengthPerAngle,
+                               .velocity = velocity,
+                               .force = corner.damper.at(velocity)};
+}
+
+[[nodiscard]] double damperShaftCompression(const CornerSetup& corner, const DamperForceSolution& damper)
+{
+    const auto design = solveElement(corner.hardpoints, damperElementOf(corner.hardpoints), 0.0);
+
+    return design.length - damper.length;
 }
 
 [[nodiscard]] SteeringLimitLoads steeringLimitLoad(const VehicleSetup& setup)
@@ -198,15 +257,6 @@ namespace raceengine
         return std::unexpected(geometry.error());
     }
 
-    const auto design = solveCorner(corner.hardpoints, 0.0, 0.0);
-    const auto atBump = solveCorner(corner.hardpoints, corner.hardpoints.bumpAngle, 0.0);
-    const auto atDroop = solveCorner(corner.hardpoints, corner.hardpoints.droopAngle, 0.0);
-
-    if (!design || !atBump || !atDroop)
-    {
-        return std::unexpected("the corner cannot be solved across its own travel");
-    }
-
     // A damper whose two ends coincide is not a damper, and the arithmetic downstream does not say
     // so: the "length" of a zero-length damper still varies as the wishbone swings its end about,
     // so a motion ratio comes out, and it is a plausible-looking number describing nothing.
@@ -222,21 +272,28 @@ namespace raceengine
     // monotonically as the wheel rises; one that reverses would have the spring pushing the wrong way
     // over half its range. This is what catches a damper attached to the wrong thing — the geometry
     // still solves, the curves still look like curves, and the ratio quietly passes through zero.
-    const auto swept = sweepCorner(corner.hardpoints, 41);
-    if (!swept)
-    {
-        return std::unexpected(swept.error());
-    }
-
+    // Since step 14 the ratio is the damper element's, read at the same forty-one positions the
+    // sweep used to supply — the same bits, so the refusals print the numbers they always did.
+    const auto damperElement = damperElementOf(corner.hardpoints);
     auto sign = 0.0;
-    for (const auto& sample : swept->samples)
+    for (auto index = 0; index < 41; index++)
     {
-        if (std::abs(sample.motionRatio) < 1e-9)
+        const auto through = static_cast<double>(index) / 40.0;
+        const auto angle =
+            corner.hardpoints.droopAngle + through * (corner.hardpoints.bumpAngle - corner.hardpoints.droopAngle);
+
+        const auto kinematics = solveDamperKinematics(corner.hardpoints, damperElement, angle, 0.0);
+        if (!kinematics)
+        {
+            return std::unexpected(kinematics.error());
+        }
+
+        if (std::abs(kinematics->motionRatio) < 1e-9)
         {
             continue;
         }
 
-        const auto here = sample.motionRatio < 0.0 ? -1.0 : 1.0;
+        const auto here = kinematics->motionRatio < 0.0 ? -1.0 : 1.0;
         if (sign != 0.0 && here != sign)
         {
             return std::unexpected("the motion ratio changes sign across the travel, so the damper "
@@ -246,15 +303,23 @@ namespace raceengine
 
         sign = here;
 
-        if (std::abs(sample.motionRatio) > 2.0)
+        if (std::abs(kinematics->motionRatio) > 2.0)
         {
-            return std::unexpected("the motion ratio reaches " + std::to_string(sample.motionRatio) +
+            return std::unexpected("the motion ratio reaches " + std::to_string(kinematics->motionRatio) +
                                    ", so the damper is being asked to move twice as far as the wheel");
         }
     }
 
-    const auto compression = design->damperLength - atBump->damperLength;
-    const auto extension = atDroop->damperLength - design->damperLength;
+    // The design and end lengths off the damper element — the same bits the full solves used to
+    // produce (step 14), and the subtraction order the messages were always built from. The travel
+    // itself is already proven solvable by `validateCorner` above, and element evaluation is
+    // closed form, so there is nothing left here that can fail to solve.
+    const auto element = damperElementOf(corner.hardpoints);
+    const auto designLength = solveElement(corner.hardpoints, element, 0.0).length;
+    const auto compression =
+        designLength - solveElement(corner.hardpoints, element, corner.hardpoints.bumpAngle).length;
+    const auto extension =
+        solveElement(corner.hardpoints, element, corner.hardpoints.droopAngle).length - designLength;
 
     if (corner.bumpStop.gap >= compression)
     {
@@ -381,12 +446,23 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 
 } // namespace
 
+[[nodiscard]] double damperDampingCoefficient(const CornerSetup& corner, const DamperForceSolution& damper)
+{
+    // The exact expression the force pass always used, with the Jacobian and the velocity now the
+    // damper element's own. Same factors in the same order: the element's values are the state's
+    // bit for bit, so the coefficient is too.
+    return damper.lengthPerAngle * damper.lengthPerAngle *
+           std::max(0.0, curveSlopeAt(corner.damper, damper.velocity));
+}
+
 [[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const VehicleSetup& setup, VehicleState& state,
                                                                   const VehicleInput& input,
                                                                   const std::array<double, cornerCount>& driveTorques,
                                                                   const PhysicsWorld& world, const double deltaTime,
                                                                   const BrakeCommand& brakes)
 {
+    RACEENGINE_ZONE_N("stepVehicle");
+
     auto result = VehicleStep{};
 
     // Recomputed every tick rather than cached, because burning fuel changes all of it and a cache
@@ -502,20 +578,25 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         auto& solution = result.corners[index];
         const auto& suspension = solution.suspension;
 
+        // The damper's velocity and force read the damper's own element (`solveDamperForce`): the
+        // same curve at the same compression-positive velocity, only the geometry source is the
+        // element evaluator, whose Jacobian is the state's `damperLengthPerAngle` bit for bit.
+        const auto damper = solveDamperForce(corner, suspension, state.corners[index].wishboneRate);
+        solution.damperVelocity = damper.velocity;
+
         // Compression of the damper against its design length, positive in bump. Everything on the
         // damper axis — spring, damper, and both stops — is measured here, because that is where a
-        // real bump stop lives: on the shaft, not at the wheel.
-        const auto designSolve = solveCorner(corner.hardpoints, 0.0, 0.0);
-        if (!designSolve)
-        {
-            return std::unexpected(designSolve.error());
-        }
+        // real bump stop lives: on the shaft, not at the wheel. Since step 12 both lengths are the
+        // damper element's (`damperShaftCompression`), the same bits the design solve produced;
+        // the stop force law below and the stops' generalised contribution are untouched.
+        const auto compression = damperShaftCompression(corner, damper);
 
-        const auto compression = designSolve->damperLength - suspension.damperLength;
-        solution.damperVelocity = -suspension.damperLengthPerAngle * state.corners[index].wishboneRate;
-
-        solution.forces.spring = corner.springRate * (corner.springFreeLength - suspension.damperLength);
-        solution.forces.damper = corner.damper.at(solution.damperVelocity);
+        // The spring reads its own element (`solveSpringForce`), which on every current car is the
+        // damper's element and the same numbers it always was. Both stops stay on the damper axis
+        // deliberately — the shaft is where a real bump stop lives.
+        const auto spring = solveSpringForce(corner, suspension);
+        solution.forces.spring = spring.force;
+        solution.forces.damper = damper.force;
         solution.forces.bumpStop = corner.bumpStop.force(compression - corner.bumpStop.gap, solution.damperVelocity);
         solution.forces.droopStop =
             -corner.droopStop.force(-compression - corner.droopStop.gap, -solution.damperVelocity);
@@ -579,17 +660,44 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
         const auto wheelUpForce = solution.forces.tireVertical * std::max(glm::dot(normal, bodyUp), 0.0) +
                                   solution.forces.antiRoll - corner.unsprungMass * earthGravity;
 
-        solution.generalisedForce =
-            axisForce * suspension.damperLengthPerAngle + wheelUpForce * suspension.travelPerAngle;
+        // Each element's generalised contribution is its force times its **own** element's
+        // Jacobian — the spring's and, since step 8, the damper's; the stops still ride the
+        // state's Jacobian until their own migration. On a coaxial car every Jacobian here is the
+        // same bits — `solveElement` and the corner solve run identical arithmetic — and the fused
+        // pre-split sum is kept for exactly that case, because regrouping `s·x + d·x` as `(s+d)·x`
+        // moves the last ulp and thirty seconds of launch amplify an ulp into a parity failure.
+        // The branch is on bit equality, which is the condition under which the two expressions
+        // are the same value, not merely close.
+        // Since step 13 every projection here is the element's: the stops ride the damper
+        // element's Jacobian (the stop lives on the shaft), and the fused product does too. The
+        // branch is keyed on the authored coil-over condition (`coaxialSpring`) since step 14:
+        // when the spring's element IS the damper's element, every Jacobian in the sum is the
+        // same arithmetic on the same points — the same bits — and the fused pre-split grouping
+        // is kept, because regrouping `s·x + d·x` as `(s+d)·x` moves the last ulp and thirty
+        // seconds of launch amplify an ulp into a parity failure.
+        if (coaxialSpring(corner.hardpoints))
+        {
+            solution.generalisedForce =
+                axisForce * damper.lengthPerAngle + wheelUpForce * suspension.travelPerAngle;
+        }
+        else
+        {
+            const auto stopAxisForce = solution.forces.bumpStop + solution.forces.droopStop;
+
+            solution.generalisedForce = spring.force * spring.lengthPerAngle +
+                                        damper.force * damper.lengthPerAngle +
+                                        stopAxisForce * damper.lengthPerAngle +
+                                        wheelUpForce * suspension.travelPerAngle;
+        }
 
         solution.generalisedInertia =
             std::max(corner.unsprungMass * suspension.travelPerAngle * suspension.travelPerAngle, 1e-6);
 
         // The damper's contribution to the corner's damping, as a coefficient rather than a force,
         // so the integration below can solve it instead of stepping towards it. Damper rates are
-        // exactly where an explicit treatment falls over.
-        cornerDamping[index] = suspension.damperLengthPerAngle * suspension.damperLengthPerAngle *
-                               std::max(0.0, curveSlopeAt(corner.damper, solution.damperVelocity));
+        // exactly where an explicit treatment falls over. Since step 9 the coefficient reads the
+        // damper element's own Jacobian and velocity — the same bits, through the same law.
+        cornerDamping[index] = damperDampingCoefficient(corner, damper);
 
         // --- the tire ---
         //

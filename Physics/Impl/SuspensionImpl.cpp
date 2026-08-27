@@ -286,22 +286,11 @@ struct Circle
     state.contactPatch = state.wheelCentre + hardpoints.wheelRadius * glm::normalize(inPlaneDown);
     state.halfTrack = std::abs(state.contactPatch.x);
 
-    // Where the spring and damper act. On a double wishbone that is a separate unit picking up on
-    // the lower arm, so its outboard end swings with the arm. On a strut there is no separate unit:
-    // the strut *is* the damper, running from its top bearing down to the lower ball joint, so its
-    // "outboard end" is that joint and its length is the kingpin's. That is also why a strut's
-    // motion ratio is near one where a wishbone car's is near a half.
-    const auto damperOutboard =
-        strut ? lower
-              : rotateAboutLine(hardpoints.damperWishbone, hardpoints.lower.frontPivot, lowerAxis, wishboneAngle);
-    const auto damperInboard = strut ? hardpoints.strutTop : hardpoints.damperChassis;
-    state.damperWishbone = damperOutboard;
-    state.damperLength = glm::distance(damperInboard, damperOutboard);
-
-    const auto dropLinkOutboard =
-        rotateAboutLine(hardpoints.antiRollBarWishbone, hardpoints.lower.frontPivot, lowerAxis, wishboneAngle);
-    state.dropLinkWishbone = dropLinkOutboard;
-    state.dropLinkLength = glm::distance(hardpoints.antiRollBarChassis, dropLinkOutboard);
+    // Deliberately absent: the damper and the drop link. They are chassis-to-wishbone elements,
+    // and every element quantity — length, Jacobian, motion ratio — is evaluated from the solved
+    // state through `solveElement` and the role-typed kinematics since the legacy damper path was
+    // retired (docs/suspension-geometry-audit.md, step 14). The state carries the linkage's own
+    // degrees of freedom and nothing an element can derive.
 
     return state;
 }
@@ -330,21 +319,17 @@ struct Circle
     }
 
     const auto travelChange = ahead->wheelCentre.y - behind->wheelCentre.y;
-    const auto damperChange = ahead->damperLength - behind->damperLength;
 
     solved->travelPerAngle = travelChange / (2.0 * step);
-    solved->damperLengthPerAngle = damperChange / (2.0 * step);
 
-    // At a turning point of the wheel's travel the ratio is genuinely infinite — the linkage is at
-    // the end of its useful range — and reporting zero there is a lie the force calculation would
-    // silently believe.
+    // At a turning point of the wheel's travel every element's motion ratio is genuinely infinite
+    // — the linkage is at the end of its useful range — and reporting zero there is a lie the
+    // force calculation would silently believe.
     if (std::abs(travelChange) < 1e-12)
     {
         return std::unexpected("the wheel does not move vertically at " + std::to_string(wishboneAngle) +
                                " rad, so the motion ratio is undefined; the travel range is too wide");
     }
-
-    solved->motionRatio = damperChange / travelChange;
 
     return solved;
 }
@@ -462,6 +447,133 @@ sweepCorner(const CornerHardpoints& hardpoints, const std::uint32_t samples, con
     }
 
     return sweep;
+}
+
+[[nodiscard]] SuspensionElementState solveElement(const CornerHardpoints& hardpoints, const SuspensionElement& element,
+                                                  const double wishboneAngle)
+{
+    // The same swing transform the solver applies to the damper and the drop link: the wishbone
+    // end rides the lower arm's circle, oriented so that a positive angle is bump.
+    const auto axis = swingOf(hardpoints.lower).normal;
+    const auto lengthAt = [&](const double angle)
+    {
+        return glm::distance(element.chassis,
+                             rotateAboutLine(element.wishbone, hardpoints.lower.frontPivot, axis, angle));
+    };
+
+    // The corner Jacobian's own step, so the two differencings cannot disagree by choice of step.
+    constexpr auto step = 1e-6;
+
+    return SuspensionElementState{.length = lengthAt(wishboneAngle),
+                                  .lengthPerAngle =
+                                      (lengthAt(wishboneAngle + step) - lengthAt(wishboneAngle - step)) / (2.0 * step)};
+}
+
+[[nodiscard]] SuspensionElement damperElementOf(const CornerHardpoints& hardpoints)
+{
+    if (hardpoints.kind == SuspensionKind::MacPhersonStrut)
+    {
+        return SuspensionElement{.chassis = hardpoints.strutTop, .wishbone = hardpoints.lower.ballJoint};
+    }
+
+    return SuspensionElement{.chassis = hardpoints.damperChassis, .wishbone = hardpoints.damperWishbone};
+}
+
+[[nodiscard]] SuspensionElement springElementOf(const CornerHardpoints& hardpoints)
+{
+    // The coil-over assumption, stated here and nowhere else: unless the corner mounts its spring
+    // separately, the spring rides the damper's axis. No production car sets `OnLowerWishbone` —
+    // the real Mk7 rear does mount its spring this way, and the seat coordinates are the unsourced
+    // data step 3 of the audit ends on.
+    if (hardpoints.springMount == SpringMount::OnLowerWishbone)
+    {
+        return SuspensionElement{.chassis = hardpoints.springChassis, .wishbone = hardpoints.springWishbone};
+    }
+
+    return damperElementOf(hardpoints);
+}
+
+[[nodiscard]] bool coaxialSpring(const CornerHardpoints& hardpoints)
+{
+    const auto spring = springElementOf(hardpoints);
+    const auto damper = damperElementOf(hardpoints);
+
+    return spring.chassis == damper.chassis && spring.wishbone == damper.wishbone;
+}
+
+namespace
+{
+
+// The ratio the role types carry, differenced exactly as `solveCornerWithJacobian` differences the
+// damper's: raw element change over raw travel change, from solves at the same step with the same
+// continuity seeding. On an element that IS the damper this reproduces the solver's `motionRatio`
+// bit for bit — load-bearing, because the spring free length divides by this ratio and the parity
+// gates hold the coaxial migration to byte-identity, which survives no regrouping.
+[[nodiscard]] std::expected<SuspensionElementState, std::string>
+elementWithRatio(const CornerHardpoints& hardpoints, const SuspensionElement& element, const double wishboneAngle,
+                 const double rackTravel, double& motionRatio)
+{
+    const auto centre = solveCorner(hardpoints, wishboneAngle, rackTravel);
+    if (!centre)
+    {
+        return std::unexpected(centre.error());
+    }
+
+    constexpr auto step = 1e-6;
+    const auto behind = solveCorner(hardpoints, wishboneAngle - step, rackTravel, &centre.value());
+    const auto ahead = solveCorner(hardpoints, wishboneAngle + step, rackTravel, &centre.value());
+    if (!behind || !ahead)
+    {
+        return std::unexpected("the linkage has no solution beside " + std::to_string(wishboneAngle) +
+                               " rad, so the element's motion ratio cannot be differenced");
+    }
+
+    const auto travelChange = ahead->wheelCentre.y - behind->wheelCentre.y;
+    if (std::abs(travelChange) < 1e-12)
+    {
+        return std::unexpected("the wheel does not move vertically at " + std::to_string(wishboneAngle) +
+                               " rad, so the element's motion ratio is undefined");
+    }
+
+    const auto lengthChange = solveElement(hardpoints, element, wishboneAngle + step).length -
+                              solveElement(hardpoints, element, wishboneAngle - step).length;
+    motionRatio = lengthChange / travelChange;
+
+    return solveElement(hardpoints, element, wishboneAngle);
+}
+
+} // namespace
+
+[[nodiscard]] std::expected<SpringKinematics, std::string> solveSpringKinematics(const CornerHardpoints& hardpoints,
+                                                                                 const SuspensionElement& element,
+                                                                                 const double wishboneAngle,
+                                                                                 const double rackTravel)
+{
+    auto motionRatio = 0.0;
+    const auto state = elementWithRatio(hardpoints, element, wishboneAngle, rackTravel, motionRatio);
+    if (!state)
+    {
+        return std::unexpected(state.error());
+    }
+
+    return SpringKinematics{
+        .length = state->length, .lengthPerAngle = state->lengthPerAngle, .motionRatio = motionRatio};
+}
+
+[[nodiscard]] std::expected<DamperKinematics, std::string> solveDamperKinematics(const CornerHardpoints& hardpoints,
+                                                                                 const SuspensionElement& element,
+                                                                                 const double wishboneAngle,
+                                                                                 const double rackTravel)
+{
+    auto motionRatio = 0.0;
+    const auto state = elementWithRatio(hardpoints, element, wishboneAngle, rackTravel, motionRatio);
+    if (!state)
+    {
+        return std::unexpected(state.error());
+    }
+
+    return DamperKinematics{
+        .length = state->length, .lengthPerAngle = state->lengthPerAngle, .motionRatio = motionRatio};
 }
 
 [[nodiscard]] std::expected<void, std::string> validateCorner(const CornerHardpoints& hardpoints)

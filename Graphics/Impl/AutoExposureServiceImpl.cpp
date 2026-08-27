@@ -84,7 +84,8 @@ std::expected<void, std::string> AutoExposureService::enable(Camera& camera, con
 
     for (auto level = 0u; level < levels; level++)
     {
-        const auto pass = postProcessService.create(dto.shader, reduction.value(), level);
+        const auto pass = postProcessService.create(dto.shader, reduction.value(), level, false,
+                                                    "meter reduce " + std::to_string(level));
 
         // Level zero reads the frame; every level below reads the one above it out of the image it
         // is itself writing a level of, which is what FboAttachment::levels and the backend's

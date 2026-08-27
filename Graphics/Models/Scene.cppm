@@ -5,6 +5,7 @@ module;
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -241,6 +242,14 @@ export struct AmbientOcclusion
     std::optional<Resource<Shader>> prepassShader{};
     Resource<FboAttachment> occlusion{};
     std::vector<Resource<PostProcess>> passes{};
+    // Whether the prepass's depth attachment outlives the prepass (2026-08-26, pre-Z). The prepass
+    // rasterises the whole view before anything shades it, so its depth is the frame's visibility
+    // already paid for; a game that composes a shading camera over it gets perfect early-z and says
+    // so here. This is `Camera::keepDepth` for a camera the game does not own — the prepass camera
+    // is a copy the backend makes — and it exists for the same reason: the consumer is the *next*
+    // view's rasteriser, which no sampler handle can prove. False leaves the depth DONT_CARE, which
+    // is what it was for as long as nothing but the prepass itself read it.
+    bool shareDepth = false;
 };
 
 // The light a bright thing spills onto everything around it — a lens and an eye both do it, and a
@@ -401,6 +410,9 @@ export struct Camera
     Bloom bloom{};
     float fieldOfView;
     CameraRole role = CameraRole::Scene;
+    // What this view is, in words, for debug labels and GPU profiler zones — "world", "cascade 2",
+    // "ao prepass". Empty is legal: the backend then labels the pass by its role alone.
+    std::string debugName{};
     // The shader every draw in this view uses instead of the entity's own. A cascade renders
     // depth and nothing else, and depth does not vary by material, so one shader serves the whole
     // pass; a camera without one shades each entity as that entity asked to be shaded.
@@ -435,6 +447,10 @@ export struct Camera
     // view left them instead of being cleared. False is every camera that opens its own target.
     bool loadColour = false;
     bool loadDepth = false;
+    // True when this view's target already holds the right picture and the frame may skip
+    // recording it — a cached far shadow cascade between refits. Written by whoever owns the
+    // caching decision; the engine's record loop only reads it.
+    bool contentsHeld = false;
     // Whether this view's depth survives the pass for a later camera to load. The backend's own
     // policy stores depth only where a sampler proves something reads it; a layered frame's depth is
     // read by the *next view's* rasteriser rather than by any sampler, which no attachment flag can
@@ -556,6 +572,17 @@ export struct ShadowCascade
     // The whole bias budget is expressed in these two, so no cascade needs tuning of its own.
     float texelWorldSize = 1.0f;
     float depthPerWorldUnit = 1.0f;
+    // This cascade's own map size. Cascades may differ — the far ones carry coarser texels
+    // anyway, and the 2048-to-4096 A/B measured the extra resolution paying only where a caster
+    // has sub-texel detail — so the texel arithmetic above must divide by this and never by one
+    // shared number.
+    unsigned int resolution = 0;
+    // The far-cascade cache's held state: where the accepted padded fit stands, and whether the
+    // map's contents still match it. While the ideal fit drifts inside the pad the camera is left
+    // exactly where it was and the frame skips re-rendering the map — the world is static and the
+    // sun is fixed per run, so the picture in it is still right. See ShadowService::update.
+    glm::vec3 heldPosition{};
+    bool mapValid = false;
 };
 
 // A scene's cascaded shadow map. Empty `cascades` means the scene casts no shadow, which is a
@@ -570,6 +597,9 @@ export struct ShadowCascades
     // Scene::lights, which is the order both backends upload them in.
     unsigned int lightIndex = 0;
     unsigned int resolution = 0;
+    // Whether the far cascades (index 2 and up) hold a padded fit and skip re-rendering while the
+    // ideal fit drifts inside the pad. See CreateShadowCascadesDTO::cacheFarCascades.
+    bool cacheFarCascades = false;
     // How far from the eye the cascades reach. Beyond it a fragment is lit: there is no map to
     // ask, and the alternative — treating "outside the map" as shadowed — paints the far half of
     // the world black.
@@ -579,6 +609,18 @@ export struct ShadowCascades
     float lambda = 0.5f;
     float casterExtent = 0.0f;
     std::vector<ShadowCascade> cascades{};
+};
+
+// The scene's cloud state: how much of the sky the clouds take and what kind they are. Two numbers
+// rather than anything drawn, because everything visible derives from them — the dome pass gates on
+// coverage, the skybox composites what it marched, the probes photograph the result.
+export struct Clouds
+{
+    // Cloud cover, 0..1-ish (above 1 is simply thicker). Zero is the clear sky, bit for bit.
+    float coverage = 0.0f;
+    // Stratus-to-cumulus blend, 0..1. Read by nothing until the march exists; carried now so the
+    // frame block's lane is stated once.
+    float type = 0.0f;
 };
 
 export struct Scene
@@ -633,6 +675,16 @@ export struct Scene
     glm::vec3 rainBodyUp{0.0f, 1.0f, 0.0f};
     // The blades on that glass, off by default for the reason everything here is off by default.
     Wipers wipers{};
+    // The clouds over it, weather like the rain is and zero-defaulted like it: coverage 0 is
+    // bit-for-bit the renderer that has no clouds in it at all — every shader's clouds are one
+    // branch on the frame block's coverage lane.
+    Clouds clouds{};
+    // The dome map those clouds are marched into — written at the end of the world camera's chain,
+    // composited by the skybox and photographed by the probes. Stated on the scene rather than
+    // found by the backend because which attachment is the cloud map is the game's to say, exactly
+    // as a camera's output is. Unset binds the 1x1 white dummy, which the coverage branch above
+    // keeps unread.
+    std::optional<Resource<FboAttachment>> cloudMap{};
 };
 
 } // namespace raceengine

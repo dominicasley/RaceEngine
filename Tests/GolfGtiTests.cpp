@@ -362,13 +362,15 @@ TEST_CASE("every corner of the imported car validates", "[physics][golf]")
         // and only running the geometry tests.
         REQUIRE(validateCornerSetup(corner).has_value());
 
-        const auto design = solveCornerWithJacobian(corner.hardpoints, 0.0, 0.0);
-        REQUIRE(design.has_value());
+        // AC states its spring rates *at the wheel*, and the model wants them along the spring's
+        // own element. The conversion is the spring motion ratio squared, so multiplying back must
+        // recover the file's own number exactly — this is the check that the conversion is a
+        // conversion and not a guess.
+        const auto spring = raceengine::solveSpringKinematics(
+            corner.hardpoints, raceengine::springElementOf(corner.hardpoints), 0.0);
+        REQUIRE(spring.has_value());
 
-        // AC states its spring rates *at the wheel*, and the model wants them along the damper. The
-        // conversion is the motion ratio squared, so multiplying back must recover the file's own
-        // number exactly — this is the check that the conversion is a conversion and not a guess.
-        const auto wheelRate = corner.springRate * design->motionRatio * design->motionRatio;
+        const auto wheelRate = corner.springRate * spring->motionRatio * spring->motionRatio;
         REQUIRE(wheelRate == Catch::Approx(index < 2 ? 35000.0 : 57000.0).epsilon(1e-9));
 
         // suspensions.ini [ARB], straight from the file.
@@ -1396,7 +1398,9 @@ TEST_CASE("the car's own data steers it correctly, with no help from a setup she
     REQUIRE(setup.has_value());
 
     REQUIRE(setup->rackTravelPerInput > 0.0);
-    REQUIRE(setup->rackTravelPerInput == Catch::Approx(0.0700).margin(5e-4));
+    // 0.0700 until 2026-08-26: the step-17 caster correction moved the kingpin's top rearward,
+    // and the rack travel that reaches the same stated lock re-solved to 0.0678. Same margin.
+    REQUIRE(setup->rackTravelPerInput == Catch::Approx(0.0678).margin(5e-4));
 }
 
 TEST_CASE("the imported engine curve is exactly what the file's turbo model makes of power.lut",

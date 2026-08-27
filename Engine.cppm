@@ -151,6 +151,11 @@ private:
     // may read, and under capture a function of the frame number rather than of the machine.
     uint64_t simulatedTicks = 0;
     std::vector<std::function<void(float)>> updateCallbacks;
+    // The game's per-frame subscribers, beside the per-tick ones above and destroyed with them.
+    // Separate because they answer a different question: a tick is a unit of simulated time and a
+    // frame is a unit of drawing, and a decision about *drawing* — how often a cached pass is
+    // re-rendered — cannot be made on a clock that runs at a different rate to the frame.
+    std::vector<std::function<void()>> frameCallbacks;
     // How the engine asks its own loop to stop, and what the process should say when it does.
     // The frame capture is the one thing that ends a run from below `main` today; it used to do
     // it with std::exit, which skipped every destructor between here and the process — the
@@ -195,6 +200,15 @@ public:
     // before entity behaviours and before the scene settles, and always before the frame
     // that renders its effects. Registration is add-only, like the rest of the engine.
     void onUpdate(std::function<void(float)> callback);
+    // Game logic on the *frame*, run in registration order once per `step()` — after that frame's
+    // ticks and before anything the frame records is chosen, so a callback may still write what a
+    // camera or a post-process pass is about to be recorded with. Registration is add-only, like
+    // the rest of the engine.
+    //
+    // It exists because a cadence stated in frames cannot be kept on the tick callback: at any
+    // frame rate other than 120 the two clocks slide against each other, and a frame may take two
+    // ticks or none. Anything paced by *simulated time* still belongs on `onUpdate`.
+    void onFrame(std::function<void()> callback);
 
     // Fraction of a fixed step that was left unsimulated when this frame was drawn, in
     // [0, 1): what a renderer interpolates by to draw between two ticks.

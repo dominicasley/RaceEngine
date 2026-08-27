@@ -42,7 +42,8 @@ std::expected<Resource<Fbo>, std::string> FboService::create(const CreateFboDTO&
                                                                          .captureFormat = attachment.captureFormat,
                                                                          .internalFormat = attachment.internalFormat,
                                                                          .depthComparison = attachment.depthComparison,
-                                                                         .levels = attachment.levels}));
+                                                                         .levels = attachment.levels,
+                                                                         .initialColour = attachment.initialColour}));
         }
 
         return attachments;

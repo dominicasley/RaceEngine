@@ -20,6 +20,8 @@ module;
 #include <spdlog/logger.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <Profiling/RaceEngineProfile.hpp>
+
 module raceengine;
 
 import raceengine.resource;
@@ -227,7 +229,13 @@ Engine::Engine() :
                             continue;
                         }
 
-                        if (const auto recreated = postProcessService.recreateOutputBuffer(postProcess, width, height);
+                        // A pass that follows the window at a fraction of it keeps that fraction
+                        // through the resize; see PostProcess::windowSizeDivisor.
+                        const auto divisor = static_cast<int>(pass->windowSizeDivisor);
+                        const auto passWidth = std::max(width / divisor, 1);
+                        const auto passHeight = std::max(height / divisor, 1);
+                        if (const auto recreated =
+                                postProcessService.recreateOutputBuffer(postProcess, passWidth, passHeight);
                             !recreated)
                         {
                             logger->error("Post-process output buffer was not rebuilt at {}x{}: {}", width, height,
@@ -287,11 +295,18 @@ void Engine::onUpdate(std::function<void(float)> callback)
     updateCallbacks.push_back(std::move(callback));
 }
 
+void Engine::onFrame(std::function<void()> callback)
+{
+    frameCallbacks.push_back(std::move(callback));
+}
+
 // One tick of simulation, always fixedTimeStep long. Order is writers before readers: the
 // game's own logic, then the behaviour each entity carries, then the scene settling what
 // both of them moved.
 void Engine::update(float delta)
 {
+    RACEENGINE_ZONE_N("Engine::update");
+
     for (const auto& callback : updateCallbacks)
     {
         callback(delta);
@@ -329,6 +344,8 @@ float Engine::frameDelta() const
 
 void Engine::step()
 {
+    RACEENGINE_ZONE_N("Engine::step");
+
     frameDiagnostics.beginFrame();
 
     // The keyboard, once, on the thread that owns the window. GLFW's key state only changes inside
@@ -350,34 +367,60 @@ void Engine::step()
     // an exposure adaptation driven by anything else would put a different image on disk.
     auto ticks = 0u;
 
-    while (accumulator >= fixedTimeStep)
     {
-        update(fixedTimeStep);
-        accumulator -= fixedTimeStep;
-        ticks++;
-        simulatedTicks++;
+        RACEENGINE_ZONE_N("fixed steps");
+
+        while (accumulator >= fixedTimeStep)
+        {
+            update(fixedTimeStep);
+            accumulator -= fixedTimeStep;
+            ticks++;
+            simulatedTicks++;
+        }
     }
+
+    // Plotted rather than only counted: a frame that took none and a frame that took the catch-up
+    // limit are the two ends of the spiral guard, and the shape of that channel is what says whether
+    // the guard is being reached at all.
+    RACEENGINE_PLOT("Fixed steps per frame", static_cast<double>(ticks));
 
     interpolationAlpha = accumulator / fixedTimeStep;
 
-    for (auto& scenePtr : sceneManagerService.getScenes())
     {
-        if (!scenePtr)
+        // The game's per-frame say, before anything this frame records is chosen: a callback here
+        // may still write a camera's pose or hold a post-process pass, and both are read below.
+        RACEENGINE_ZONE_N("frame callbacks");
+
+        for (const auto& callback : frameCallbacks)
         {
-            continue;
+            callback();
         }
+    }
 
-        // Before the matrices, not after: refitting a cascade *is* choosing the position,
-        // direction and orthographic volume its matrix is then built from.
-        shadowService.update(*scenePtr);
+    {
+        // No comma in the name, and that is not a style note: `tracy-csvexport` writes the zone name
+        // into an unquoted CSV field, so a comma splits one row into columns that no longer line up.
+        RACEENGINE_ZONE_N("cascade fit and camera matrices");
 
-        for (auto& camera : scenePtr->cameras)
+        for (auto& scenePtr : sceneManagerService.getScenes())
         {
-            // Before the frame, not after it: the exposure a view is recorded with is a push
-            // constant read while that view's post chain is being recorded, so a camera that
-            // adapted afterwards would always be showing the previous frame's number.
-            autoExposureService.update(camera, ticks, fixedTimeStep);
-            cameraService.updateModelViewProjectionMatrix(camera);
+            if (!scenePtr)
+            {
+                continue;
+            }
+
+            // Before the matrices, not after: refitting a cascade *is* choosing the position,
+            // direction and orthographic volume its matrix is then built from.
+            shadowService.update(*scenePtr);
+
+            for (auto& camera : scenePtr->cameras)
+            {
+                // Before the frame, not after it: the exposure a view is recorded with is a push
+                // constant read while that view's post chain is being recorded, so a camera that
+                // adapted afterwards would always be showing the previous frame's number.
+                autoExposureService.update(camera, ticks, fixedTimeStep);
+                cameraService.updateModelViewProjectionMatrix(camera);
+            }
         }
     }
 
@@ -389,24 +432,41 @@ void Engine::step()
     //
     // A backend that cannot open a frame — a swapchain gone out of date, a minimised window —
     // records nothing this step and skips the close, which is the one path with no present.
-    if (renderer->beginFrame(static_cast<double>(simulatedTicks) * static_cast<double>(fixedTimeStep)))
+    //
+    // Hoisted out of the `if` for one reason and it is the profiler's: `beginFrame` is where the CPU
+    // waits on the frame already in flight, so it is the first place to look when a frame is long,
+    // and a call inside a condition cannot carry a zone of its own.
+    auto frameOpened = false;
     {
-        // The cascades first: a shadow cascade produces the depth map everything downstream
-        // samples, and a producer recorded after its consumer is read before it is written (see
-        // CameraRole). Separate passes rather than a sort because the order is fixed groups, and a
-        // sort would allocate inside the frame to say so.
-        for (auto& scenePtr : sceneManagerService.getScenes())
-        {
-            if (!scenePtr)
-            {
-                continue;
-            }
+        RACEENGINE_ZONE_N("beginFrame (waits on the GPU)");
+        frameOpened = renderer->beginFrame(static_cast<double>(simulatedTicks) * static_cast<double>(fixedTimeStep));
+    }
 
-            for (auto& camera : scenePtr->cameras)
+    if (frameOpened)
+    {
+        {
+            // The cascades first: a shadow cascade produces the depth map everything downstream
+            // samples, and a producer recorded after its consumer is read before it is written (see
+            // CameraRole). Separate passes rather than a sort because the order is fixed groups, and
+            // a sort would allocate inside the frame to say so.
+            RACEENGINE_ZONE_N("record shadow cascades");
+
+            for (auto& scenePtr : sceneManagerService.getScenes())
             {
-                if (camera.role == CameraRole::ShadowCascade)
+                if (!scenePtr)
                 {
-                    renderer->recordView(*scenePtr, camera, delta);
+                    continue;
+                }
+
+                for (auto& camera : scenePtr->cameras)
+                {
+                    // A held cascade's map already shows the right picture — the shadow service
+                    // kept its fit exactly where the map was rendered — so the frame spends
+                    // nothing on it, which is most of what the far-cascade cache buys.
+                    if (camera.role == CameraRole::ShadowCascade && !camera.contentsHeld)
+                    {
+                        renderer->recordView(*scenePtr, camera, delta);
+                    }
                 }
             }
         }
@@ -415,35 +475,43 @@ void Engine::step()
         // recorded above, and the scene cameras below shade from the probe.
         recordProbeCaptures();
 
-        for (auto& scenePtr : sceneManagerService.getScenes())
         {
-            if (!scenePtr)
-            {
-                continue;
-            }
+            RACEENGINE_ZONE_N("record scene views");
 
-            for (auto& camera : scenePtr->cameras)
+            for (auto& scenePtr : sceneManagerService.getScenes())
             {
-                if (camera.role == CameraRole::Scene)
+                if (!scenePtr)
                 {
-                    // Immediately before the view that samples it, and inside the same frame: the
-                    // occlusion is gathered from this camera's own geometry, so it is neither a
-                    // group of its own above nor something a game could order for itself.
-                    renderer->recordAmbientOcclusion(*scenePtr, camera, delta);
-                    renderer->recordView(*scenePtr, camera, delta);
+                    continue;
+                }
 
-                    // Immediately after the view that filled it. The reduction this reads from is
-                    // the tail of that view's post-process chain, so the copy has to be a command
-                    // in the same frame and after those passes; what it copies reaches the CPU a
-                    // fixed number of submissions later, never this one.
-                    renderer->recordAutoExposure(camera);
+                for (auto& camera : scenePtr->cameras)
+                {
+                    if (camera.role == CameraRole::Scene)
+                    {
+                        // Immediately before the view that samples it, and inside the same frame:
+                        // the occlusion is gathered from this camera's own geometry, so it is
+                        // neither a group of its own above nor something a game could order for
+                        // itself.
+                        renderer->recordAmbientOcclusion(*scenePtr, camera, delta);
+                        renderer->recordView(*scenePtr, camera, delta);
+
+                        // Immediately after the view that filled it. The reduction this reads from
+                        // is the tail of that view's post-process chain, so the copy has to be a
+                        // command in the same frame and after those passes; what it copies reaches
+                        // the CPU a fixed number of submissions later, never this one.
+                        renderer->recordAutoExposure(camera);
+                    }
                 }
             }
         }
 
         presenterService.record();
 
-        renderer->endFrame();
+        {
+            RACEENGINE_ZONE_N("endFrame (submit and present)");
+            renderer->endFrame();
+        }
     }
 
     // The frame owns the report as it owns the frame: every recorder and the skinning path have
@@ -453,7 +521,14 @@ void Engine::step()
     // After the present and before the swap: the capture reads what this frame put on screen.
     dumpFrameIfRequested();
 
-    glfwWindow.swapBuffers();
+    {
+        RACEENGINE_ZONE_N("swapBuffers (polls events)");
+        glfwWindow.swapBuffers();
+    }
+
+    // The frame's own boundary, last of all and after the swap, so Tracy's frame time is the whole
+    // of `Engine::step` and matches what the window is actually showing.
+    RACEENGINE_FRAME;
 }
 
 // One probe's worth of capture per frame, over every scene.
@@ -468,6 +543,8 @@ void Engine::step()
 // time-of-day change costs six frames per probe until the scene has settled again.
 void Engine::recordProbeCaptures()
 {
+    RACEENGINE_ZONE_N("record probe capture");
+
     for (auto& scenePtr : sceneManagerService.getScenes())
     {
         if (!scenePtr)

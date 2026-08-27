@@ -136,6 +136,29 @@ std::expected<void, std::string> SceneService::setRain(Scene& scene, const float
     return {};
 }
 
+std::expected<void, std::string> SceneService::setClouds(Scene& scene, const float coverage, const float type) const
+{
+    if (coverage < 0.0f)
+    {
+        return std::unexpected("cloud coverage is an amount of sky and cannot be negative; zero is the clear sky");
+    }
+
+    // A blend, unlike coverage: past either end there is no cloud kind it names.
+    if (type < 0.0f || type > 1.0f)
+    {
+        return std::unexpected("cloud type is a stratus-to-cumulus blend and lies between 0 and 1");
+    }
+
+    scene.clouds = Clouds{coverage, type};
+
+    return {};
+}
+
+void SceneService::setCloudMap(Scene& scene, const Resource<FboAttachment>& cloudMap) const
+{
+    scene.cloudMap = cloudMap;
+}
+
 std::expected<void, std::string> SceneService::setRainMotion(Scene& scene, const float groundSpeed,
                                                              const float airflowPhase, const glm::vec3 forward,
                                                              const glm::vec3 bodyUp) const

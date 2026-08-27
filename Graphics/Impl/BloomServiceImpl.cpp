@@ -119,7 +119,8 @@ std::expected<void, std::string> BloomService::enable(Camera& camera, const Crea
     // reads the one above it out of the chain it is itself writing a level of.
     for (auto level = 0u; level < levels; level++)
     {
-        const auto pass = postProcessService.create(dto.downsampleShader, downsample.value(), level);
+        const auto pass = postProcessService.create(dto.downsampleShader, downsample.value(), level, false,
+                                                    "bloom down " + std::to_string(level));
         postProcessService.addInput(pass, level == 0 ? sceneColour.front() : downsampleColour.front(),
                                     level == 0 ? 0u : level - 1u);
         postProcessService.setParameters(pass, glm::vec4(dto.bloom.threshold, dto.bloom.knee, dto.bloom.maximum, 0.0f));
@@ -133,7 +134,8 @@ std::expected<void, std::string> BloomService::enable(Camera& camera, const Crea
     for (auto level = levels - 1; level > 0; level--)
     {
         const auto target = level - 1;
-        const auto pass = postProcessService.create(dto.upsampleShader, upsample.value(), target);
+        const auto pass = postProcessService.create(dto.upsampleShader, upsample.value(), target, false,
+                                                    "bloom up " + std::to_string(target));
         postProcessService.addInput(pass, level == levels - 1 ? downsampleColour.front() : upsampleColour.front(),
                                     level);
         postProcessService.addInput(pass, downsampleColour.front(), target);

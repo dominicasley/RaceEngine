@@ -14,6 +14,8 @@ module;
 
 #include <glm/glm.hpp>
 
+#include <Profiling/RaceEngineProfile.hpp>
+
 module raceengine.physics;
 
 // The bridge declarations these bodies call through. Repeated here rather than imported: they sit
@@ -91,6 +93,8 @@ const std::vector<SurfaceMaterial>& PhysicsWorld::materials() const
 void PhysicsWorld::castRays(const std::vector<glm::dvec3>& origins, const std::vector<glm::dvec3>& directions,
                             const double maxDistance, std::vector<SurfaceHit>& results) const
 {
+    RACEENGINE_ZONE_N("PhysicsWorld::castRays");
+
     const auto count = origins.size() < directions.size() ? origins.size() : directions.size();
     results.assign(count, SurfaceHit{});
 

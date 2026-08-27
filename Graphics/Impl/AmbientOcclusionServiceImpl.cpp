@@ -86,12 +86,19 @@ std::expected<void, std::string> AmbientOcclusionService::enable(Camera& camera,
         return std::unexpected("the occlusion prepass has no buffer: " + prepass.error());
     }
 
+    // The gather and its blur run at half resolution: occlusion is a low-frequency term, the
+    // horizon search is the frame's most expensive fullscreen pass, and the upsample below puts
+    // the result back at the view's size without letting it cross a depth edge. The prepass stays
+    // full resolution — it is the geometry every consumer measures against, including the upsample.
+    const auto halfWidth = std::max(width / 2u, 1u);
+    const auto halfHeight = std::max(height / 2u, 1u);
+
     // A visibility term is one number between zero and one, so one eight-bit channel states it
     // exactly as well as four float ones would.
     const auto gatherTarget =
         fboService.create(CreateFboDTO{.type = FboType::Planar,
-                                       .attachments = {CreateFboAttachmentDTO{.width = width,
-                                                                              .height = height,
+                                       .attachments = {CreateFboAttachmentDTO{.width = halfWidth,
+                                                                              .height = halfHeight,
                                                                               .type = FboAttachmentType::Color,
                                                                               .captureFormat = TextureFormat::R,
                                                                               .internalFormat = TextureFormat::R}}});
@@ -102,8 +109,8 @@ std::expected<void, std::string> AmbientOcclusionService::enable(Camera& camera,
 
     const auto blurTarget =
         fboService.create(CreateFboDTO{.type = FboType::Planar,
-                                       .attachments = {CreateFboAttachmentDTO{.width = width,
-                                                                              .height = height,
+                                       .attachments = {CreateFboAttachmentDTO{.width = halfWidth,
+                                                                              .height = halfHeight,
                                                                               .type = FboAttachmentType::Color,
                                                                               .captureFormat = TextureFormat::R,
                                                                               .internalFormat = TextureFormat::R}}});
@@ -112,18 +119,32 @@ std::expected<void, std::string> AmbientOcclusionService::enable(Camera& camera,
         return std::unexpected("the occlusion blur has no target: " + blurTarget.error());
     }
 
+    const auto upsampleTarget =
+        fboService.create(CreateFboDTO{.type = FboType::Planar,
+                                       .attachments = {CreateFboAttachmentDTO{.width = width,
+                                                                              .height = height,
+                                                                              .type = FboAttachmentType::Color,
+                                                                              .captureFormat = TextureFormat::R,
+                                                                              .internalFormat = TextureFormat::R}}});
+    if (!upsampleTarget)
+    {
+        return std::unexpected("the occlusion upsample has no target: " + upsampleTarget.error());
+    }
+
     const auto prepassColour = fboService.getAttachmentsOfType(memoryStorageService.frameBuffers.get(prepass.value()),
                                                                FboAttachmentType::Color);
     const auto gathered = fboService.getAttachmentsOfType(memoryStorageService.frameBuffers.get(gatherTarget.value()),
                                                           FboAttachmentType::Color);
     const auto blurred = fboService.getAttachmentsOfType(memoryStorageService.frameBuffers.get(blurTarget.value()),
                                                          FboAttachmentType::Color);
-    if (prepassColour.empty() || gathered.empty() || blurred.empty())
+    const auto upsampled = fboService.getAttachmentsOfType(
+        memoryStorageService.frameBuffers.get(upsampleTarget.value()), FboAttachmentType::Color);
+    if (prepassColour.empty() || gathered.empty() || blurred.empty() || upsampled.empty())
     {
         return std::unexpected("one of the occlusion buffers came back without a colour attachment");
     }
 
-    const auto gather = postProcessService.create(dto.gatherShader, gatherTarget.value());
+    const auto gather = postProcessService.create(dto.gatherShader, gatherTarget.value(), 0, false, "gtao gather");
     postProcessService.addInput(gather, prepassColour.front());
     // The gather is the only pass here with numbers of its own, and they are its rather than the
     // camera's: the buffers are sized once and the search is tuned once.
@@ -131,16 +152,23 @@ std::expected<void, std::string> AmbientOcclusionService::enable(Camera& camera,
 
     // Two inputs, which is the capability this step was waiting on: the term being smoothed, and the
     // geometry that says where smoothing it would cross an edge.
-    const auto blur = postProcessService.create(dto.blurShader, blurTarget.value());
+    const auto blur = postProcessService.create(dto.blurShader, blurTarget.value(), 0, false, "gtao blur");
     postProcessService.addInput(blur, gathered.front());
     postProcessService.addInput(blur, prepassColour.front());
+
+    // Back to the view's own size, against the geometry: the term being lifted, and the prepass
+    // that says which of the four half-resolution texels under a pixel share its surface.
+    const auto upsample =
+        postProcessService.create(dto.upsampleShader, upsampleTarget.value(), 0, false, "gtao upsample");
+    postProcessService.addInput(upsample, blurred.front());
+    postProcessService.addInput(upsample, prepassColour.front());
 
     camera.ambientOcclusion = dto.occlusion;
     camera.ambientOcclusion.enabled = true;
     camera.ambientOcclusion.prepass = prepass.value();
     camera.ambientOcclusion.prepassShader = dto.prepassShader;
-    camera.ambientOcclusion.occlusion = blurred.front();
-    camera.ambientOcclusion.passes = {gather, blur};
+    camera.ambientOcclusion.occlusion = upsampled.front();
+    camera.ambientOcclusion.passes = {gather, blur, upsample};
 
     logger.info("Ambient occlusion enabled: {}x{} prepass, {} slice(s) of {} step(s) over a {:.0f} unit radius, "
                 "strength {:.2f}",
@@ -169,16 +197,21 @@ std::expected<void, std::string> AmbientOcclusionService::resize(const Camera& c
     }
 
     // Through the passes rather than through handles held beside them: a pass names the buffer it
-    // writes, and a second list of the same buffers would be a second thing to keep in step.
-    for (const auto& passKey : occlusion.passes)
+    // writes, and a second list of the same buffers would be a second thing to keep in step. The
+    // list order is this service's own — gather, blur, upsample — and the first two run at half
+    // the view's size, which is the same split enable() built them with.
+    for (size_t index = 0; index < occlusion.passes.size(); index++)
     {
-        const auto* pass = memoryStorageService.postProcesses.find(passKey);
+        const auto* pass = memoryStorageService.postProcesses.find(occlusion.passes[index]);
         if (pass == nullptr || !pass->output.has_value())
         {
             return std::unexpected("an occlusion pass no longer names a buffer to rebuild");
         }
 
-        if (const auto resized = fboService.resize(pass->output.value(), newWidth, newHeight); !resized)
+        const auto halfSized = index < 2;
+        const auto passWidth = halfSized ? std::max(newWidth / 2u, 1u) : newWidth;
+        const auto passHeight = halfSized ? std::max(newHeight / 2u, 1u) : newHeight;
+        if (const auto resized = fboService.resize(pass->output.value(), passWidth, passHeight); !resized)
         {
             return std::unexpected("an occlusion buffer was not rebuilt: " + resized.error());
         }

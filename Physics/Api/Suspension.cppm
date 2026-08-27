@@ -67,6 +67,9 @@ export [[nodiscard]] constexpr double outboardSign(const CornerSide side)
 // that does not vary by type.
 export enum class SuspensionKind : std::uint32_t { DoubleWishbone, MacPhersonStrut };
 
+// Where a corner's spring is mounted; see the fields on `CornerHardpoints`.
+export enum class SpringMount : std::uint32_t { CoaxialWithDamper, OnLowerWishbone };
+
 // A wishbone is two inboard pivots and one outboard ball joint. The line through the pivots is the
 // axis it swings about, so the ball joint traces a circle in chassis space and the whole linkage
 // has one degree of freedom plus steering.
@@ -96,6 +99,16 @@ export struct CornerHardpoints
     // picks up, and why the motion ratio is not one.
     glm::dvec3 damperChassis{0.0};
     glm::dvec3 damperWishbone{0.0};
+
+    // Where the spring acts. `CoaxialWithDamper` is the coil-over: the spring rides the damper's
+    // own element and the two points below are ignored — which is every car here today, and the
+    // truth for a strut front. `OnLowerWishbone` is the Mk7's sourced rear topology — spring and
+    // damper on the same link at different stations (docs/suspension-geometry-audit.md, step 3) —
+    // and reads the two points. No production car sets it: the real seat coordinates are the
+    // unsourced data the audit's step 3 ends on.
+    SpringMount springMount = SpringMount::CoaxialWithDamper;
+    glm::dvec3 springChassis{0.0};
+    glm::dvec3 springWishbone{0.0};
 
     // The drop link, chassis end and wishbone end. The bar's torsion comes from the difference in
     // these across an axle, so a corner on its own reports only its end of it.
@@ -159,26 +172,14 @@ export struct SuspensionState
     double halfTrack = 0.0;
     double wheelTravel = 0.0;
 
-    double damperLength = 0.0;
-    // dDamperLength/dWheelTravel at this point in the travel, and it varies across it — which is
-    // the reason for solving the linkage rather than storing a number. The spring and damper force
-    // at the wheel is the force along the damper times this.
-    double motionRatio = 0.0;
-    // dWheelTravel/dWishboneAngle, and dDamperLength/dWishboneAngle. The corner's degree of freedom
-    // is the wishbone angle, so these are the two Jacobians its equation of motion is written in:
-    // the first turns a force at the contact patch into a generalised force, the second does the
-    // same for a force along the damper. Their ratio is the motion ratio above, which is why that
-    // one is the readable diagnostic and these two are what the dynamics actually use.
+    // dWheelTravel/dWishboneAngle: the corner's degree of freedom is the wishbone angle, so this
+    // is the Jacobian that turns a force at the contact patch into a generalised force. Every
+    // damper-side quantity — length, Jacobian, motion ratio — lives on the elements now
+    // (`solveElement`, `solveDamperKinematics`); the state stopped carrying its own copies when
+    // the legacy damper path was retired (docs/suspension-geometry-audit.md, step 14).
     double travelPerAngle = 0.0;
-    double damperLengthPerAngle = 0.0;
 
-    double dropLinkLength = 0.0;
     double wishboneAngle = 0.0;
-
-    // The outboard ends of the damper and the drop link, which swing with the lower wishbone. The
-    // vehicle needs them to apply forces along the real axes rather than along a guess at them.
-    glm::dvec3 damperWishbone{0.0};
-    glm::dvec3 dropLinkWishbone{0.0};
 
     // Diagnostics, and outputs of the geometry rather than inputs to anything. Nothing below may
     // read these to compute a force; they exist to be plotted and argued about.
@@ -230,5 +231,85 @@ sweepCorner(const CornerHardpoints& hardpoints, const std::uint32_t samples = 41
 // that produce a plausible car rather than an obvious failure: pivots ordered so that "bump"
 // droops, and a linkage that passes through a configuration where the wheel stops moving vertically.
 export [[nodiscard]] std::expected<void, std::string> validateCorner(const CornerHardpoints& hardpoints);
+
+// A force-bearing element between the chassis and the lower wishbone: a damper, a spring seated on
+// the arm, a drop link. Two points are its whole geometry — the chassis end is fixed, the wishbone
+// end swings with the arm — and length, Jacobian and motion ratio are evaluated from the solved
+// linkage rather than stored beside it.
+//
+// This exists because the real Mk7 rear carries its spring and its damper on the *same* link at
+// *different* stations (docs/suspension-geometry-audit.md, step 3), which one coaxial element
+// cannot express. **Nothing in the production force path reads it yet** — the coil-over model in
+// `CornerSetup` is unchanged; this is the geometry API a migration will consume, proven equivalent
+// to the existing damper geometry first.
+export struct SuspensionElement
+{
+    glm::dvec3 chassis{0.0};
+    glm::dvec3 wishbone{0.0};
+};
+
+// Length and its derivative against the corner's generalised coordinate. Closed form — the element
+// rides a known circle, so unlike the linkage solve this cannot fail.
+export struct SuspensionElementState
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+};
+
+// Evaluated with the same swing transform the solver applies to the damper and the drop link, and
+// differenced at the same step as the corner Jacobian, so the two derivatives cannot disagree by
+// choice of method.
+export [[nodiscard]] SuspensionElementState
+solveElement(const CornerHardpoints& hardpoints, const SuspensionElement& element, const double wishboneAngle);
+
+// The element each role is attached to today. The damper's is the authored pair — and a strut *is*
+// the damper, so a strut corner's element runs from the top bearing to the lower ball joint. The
+// spring's is the damper's own element, because no car here states a separate spring seat: that is
+// the coil-over assumption, stated in one place instead of implied everywhere. A car with a sourced
+// seat changes what `springElementOf` answers and nothing else.
+export [[nodiscard]] SuspensionElement damperElementOf(const CornerHardpoints& hardpoints);
+export [[nodiscard]] SuspensionElement springElementOf(const CornerHardpoints& hardpoints);
+
+// Whether this corner's spring rides the damper's own element — the authored coil-over condition,
+// decided from the hardpoints alone: the two elements are the same attachment points, exactly.
+// This keys the generalised assembly's fused branch, which exists to keep `(s+d+stops)·x` in the
+// pre-split arithmetic where all the Jacobians are one number; it is exact point equality and
+// deliberately not a tolerance, because the branch's correctness condition is "the same bits",
+// not "close". Derived at the point of use rather than stored, so a rebuilt setup cannot carry a
+// stale answer.
+export [[nodiscard]] bool coaxialSpring(const CornerHardpoints& hardpoints);
+
+// Role-distinct kinematics, deliberately two types with no conversion between them. A wheel rate
+// comes from the spring's ratio and a shaft speed from the damper's; after the rear split those are
+// different numbers, so handing one to the other's arithmetic should not compile. The convention is
+// the solver's own: motionRatio = dElementLength/dWheelTravel, **signed**, negative on a healthy
+// corner, and consumers take the magnitude where a magnitude is meant.
+export struct SpringKinematics
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+    double motionRatio = 0.0;
+};
+
+export struct DamperKinematics
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+    double motionRatio = 0.0;
+};
+
+// The ratio is differenced exactly as `solveCornerWithJacobian` differences its own — raw element
+// change over raw travel change, from the same solves at the same step — so on an element that IS
+// the damper the two ratios are the same bits, not merely close. That is load-bearing: the spring
+// free length divides by this ratio, and the parity gates hold the coaxial migration to
+// byte-identity, which survives no regrouping. Refused where the wheel does not move vertically,
+// exactly as the solver refuses its own motion ratio there.
+export [[nodiscard]] std::expected<SpringKinematics, std::string>
+solveSpringKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element,
+                      const double wishboneAngle, const double rackTravel = 0.0);
+
+export [[nodiscard]] std::expected<DamperKinematics, std::string>
+solveDamperKinematics(const CornerHardpoints& hardpoints, const SuspensionElement& element,
+                      const double wishboneAngle, const double rackTravel = 0.0);
 
 } // namespace raceengine

@@ -85,6 +85,18 @@ export struct Curve
 // rates differ on every real damper and are separate arguments here for that reason.
 export [[nodiscard]] Curve linearDamper(const double bumpRate, const double reboundRate);
 
+// A wheel-referred kneed damper carried onto the shaft, which is AC's statement turned into this
+// model's: `rate` up to `knee` metres per second of *wheel* velocity and `fastRate` above it. The
+// shaft moves `ratio` times as fast as the wheel while carrying `1/ratio` of its force, so a
+// wheel-referred coefficient divides by the ratio squared and the knee's speed multiplies by it —
+// both halves, or the knee lands at the wrong speed. The ratio is the **damper's** and the
+// signature says so: a spring's ratio converts a spring rate and nothing else, which is why the
+// cross-overload does not exist to call.
+export [[nodiscard]] Curve kneedDamper(const double bumpRate, const double fastBumpRate, const double bumpKnee,
+                                       const double reboundRate, const double fastReboundRate,
+                                       const double reboundKnee, const DamperKinematics& kinematics);
+Curve kneedDamper(double, double, double, double, double, double, const SpringKinematics&) = delete;
+
 // A stop that comes in gradually and then very hard. `gap` is how much travel there is before it
 // touches; past that the force rises as the deflection to `progression`, so it is soft where it
 // first bites and immovable at the end. A linear stop either lets the suspension through it or
@@ -421,9 +433,68 @@ export [[nodiscard]] std::array<double, cornerCount> roadTorques(const VehicleSt
 // The spring free length that puts a corner in equilibrium at its design position under a given
 // sprung load. Not required — a car settles wherever its springs put it — but a setup whose design
 // position is also its static position is the one whose camber and roll centre curves mean what
-// they say, and computing it beats guessing at it.
+// they say, and computing it beats guessing at it. Solved on the **spring's own element**
+// (`springElementOf`) since the spring migration; on a coaxial car that is the damper's element
+// and the answer is bit-identical to what it always was.
 export [[nodiscard]] std::expected<double, std::string> springFreeLengthForLoad(const CornerSetup& corner,
                                                                                 const double sprungLoad);
+
+// The spring's own solution at a solved suspension position: its element's length and Jacobian
+// beside the force that length produces. This is what the force pass consumes since the spring
+// migrated onto its own element — and the seam a test reaches the production spring arithmetic
+// through without standing up a whole vehicle. Closed form, cannot fail.
+export struct SpringSolution
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+    double force = 0.0;
+};
+
+export [[nodiscard]] SpringSolution solveSpringForce(const CornerSetup& corner, const SuspensionState& suspension);
+
+// The damper's own geometry at a solved position, from the element evaluator — the damper-side
+// counterpart of `SpringSolution`, and since step 7 the source of the production damper velocity.
+// Deliberately geometry only: the damper force, the stops and the implicit damping still read the
+// solver's state fields, and their migration is a later step's. On every current car the element
+// is the solver's own damper, so length and Jacobian are the state's values bit for bit.
+export struct DamperSolution
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+};
+
+export [[nodiscard]] DamperSolution solveDamperGeometry(const CornerSetup& corner, const SuspensionState& suspension);
+
+// The damper's force at a solved position and wishbone rate — the damper-side counterpart of
+// `SpringSolution`'s force, and since step 8 what the force pass consumes. The force law is
+// untouched: the same curve, the same compression-positive velocity `−lengthPerAngle · q̇`, the
+// same signs; only the geometry source is the damper's own element. The stops and the implicit
+// damping deliberately still read the solver's state fields.
+export struct DamperForceSolution
+{
+    double length = 0.0;
+    double lengthPerAngle = 0.0;
+    double velocity = 0.0;
+    double force = 0.0;
+};
+
+export [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& corner,
+                                                          const SuspensionState& suspension,
+                                                          const double wishboneRate);
+
+// The damper's contribution to the corner's implicit damping, as a coefficient rather than a
+// force: the damper's own Jacobian squared times the curve's local slope at the current shaft
+// velocity, floored at zero. The law is untouched since before the element migrations — this is
+// the same expression the integration always solved against, now stated on `DamperForceSolution`
+// so the coefficient reads the damper's element and a test can hold it to the old bits.
+export [[nodiscard]] double damperDampingCoefficient(const CornerSetup& corner, const DamperForceSolution& damper);
+
+// The damper shaft's displacement from its design length, positive in bump — the whole of what
+// the bump and droop stops measure their gaps against, because a real stop lives on the shaft.
+// Since step 12 both lengths are the damper element's: the design length evaluated at q = 0 and
+// the current length off the same element, so the stops' kinematics follow the damper wherever
+// its geometry goes. The stop force law and the stops' generalised contribution are untouched.
+export [[nodiscard]] double damperShaftCompression(const CornerSetup& corner, const DamperForceSolution& damper);
 
 // Standard gravity, and the only constant in this file that is not a placeholder.
 inline constexpr auto earthGravity = 9.80665;

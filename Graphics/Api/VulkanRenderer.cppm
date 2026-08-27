@@ -4,6 +4,12 @@ module;
 
 #include <vk_mem_alloc.h>
 
+// GPU profiler zones, profile builds only: the header needs the Vulkan types above it, and every
+// macro below compiles away without RACEENGINE_HAS_TRACY exactly as RaceEngineProfile.hpp's do.
+#if defined(RACEENGINE_HAS_TRACY)
+#include <tracy/TracyVulkan.hpp>
+#endif
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <shaderc/shaderc.hpp>
@@ -16,7 +22,10 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include <sys/stat.h>
 #include <expected>
 #include <limits>
 #include <optional>
@@ -197,13 +206,19 @@ struct FrameDataUbo
     // primitive being drawn, where they are constant, and hands the fragment stage a frame that
     // owes nothing to the camera, to the car's attitude, or to a screen-space derivative.
     glm::vec4 rainBody;
+    // The clouds, appended under the same prefix rule: x the effective coverage, y the
+    // stratus-to-cumulus type blend, z and w reserved and written zero. Zero coverage is the clear
+    // sky, and every shader's clouds are one branch on it — the contract the rain and the fog
+    // already honour. Unlike both of those, a probe capture keeps this field: the clouded sky is
+    // exactly what a probe must photograph, since the captures are how clouds become ambient light.
+    glm::vec4 cloudParams;
 };
 
 // Four split distances, four texel sizes and four depth scales ride in one vec4 each, which is
 // what bounds the cascade count rather than any GPU limit.
 static_assert(shadowCascadeCount <= 4);
 static_assert(sizeof(LightUbo) == 64);
-static_assert(sizeof(FrameDataUbo) == 2400);
+static_assert(sizeof(FrameDataUbo) == 2416);
 static_assert(offsetof(FrameDataUbo, lightCount) == 80);
 static_assert(offsetof(FrameDataUbo, lights) == 96);
 static_assert(offsetof(FrameDataUbo, shadowMatrices) == 352);
@@ -224,6 +239,7 @@ static_assert(offsetof(FrameDataUbo, wiperSweep) == 2336);
 static_assert(offsetof(FrameDataUbo, wiperTiming) == 2352);
 static_assert(offsetof(FrameDataUbo, wiperPane) == 2368);
 static_assert(offsetof(FrameDataUbo, rainBody) == 2384);
+static_assert(offsetof(FrameDataUbo, cloudParams) == 2400);
 
 // The scene's air, into the block a shading view is handed. Disabled leaves the three fields at the
 // zero the block was value-initialised to, which is the block this engine uploaded before they
@@ -989,6 +1005,76 @@ void transitionImage(const VkCommandBuffer commandBuffer, const VkImage image, c
                     VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
 }
 
+// Where compiled artefacts live between runs: XDG_CACHE_HOME (or ~/.cache) /raceengine/. Empty
+// when neither variable resolves, in which case every cache is in-memory only for the run.
+std::string engineCacheDirectory()
+{
+    const char* xdgCache = std::getenv("XDG_CACHE_HOME");
+    std::string base = xdgCache != nullptr && *xdgCache != '\0' ? std::string(xdgCache) : std::string();
+    if (base.empty())
+    {
+        const char* home = std::getenv("HOME");
+        if (home == nullptr || *home == '\0')
+        {
+            return {};
+        }
+        base = std::string(home) + "/.cache";
+    }
+
+    const auto directory = base + "/raceengine";
+    static_cast<void>(mkdir(base.c_str(), 0755));
+    static_cast<void>(mkdir(directory.c_str(), 0755));
+
+    return directory;
+}
+
+std::string pipelineCacheFilePath()
+{
+    const auto directory = engineCacheDirectory();
+    return directory.empty() ? directory : directory + "/vulkan-pipeline.cache";
+}
+
+uint64_t fnv1a64(const std::string_view text)
+{
+    auto hash = 14695981039346656037ull;
+    for (const auto character : text)
+    {
+        hash ^= static_cast<unsigned char>(character);
+        hash *= 1099511628211ull;
+    }
+
+    return hash;
+}
+
+// The fallback name a view labels its pass with when its camera carries no debugName.
+constexpr const char* describeCameraRole(const CameraRole role)
+{
+    switch (role)
+    {
+    case CameraRole::ShadowCascade:
+        return "cascade";
+    case CameraRole::ProbeFace:
+        return "probe face";
+    case CameraRole::DepthNormalPrepass:
+        return "prepass";
+    case CameraRole::Scene:
+        break;
+    }
+
+    return "scene";
+}
+
+// A GPU profiler zone over the commands recorded in the enclosing scope, named at run time.
+// Contained in this file on purpose: macros do not cross an import, and no other unit records.
+#if defined(RACEENGINE_HAS_TRACY)
+#define RACEENGINE_GPU_ZONE(varname, commandBufferArg, nameArg)                                                        \
+    TracyVkZoneTransient(tracyGpuContext, varname, commandBufferArg, nameArg, true)
+#define RACEENGINE_GPU_COLLECT(commandBufferArg) TracyVkCollect(tracyGpuContext, commandBufferArg)
+#else
+#define RACEENGINE_GPU_ZONE(varname, commandBufferArg, nameArg) static_cast<void>(nameArg)
+#define RACEENGINE_GPU_COLLECT(commandBufferArg) static_cast<void>(commandBufferArg)
+#endif
+
 // The prefilter's own shaders, as source. Engine-owned rather than game assets: a game authors
 // what the world looks like, and how a captured environment is reduced to a roughness chain is no
 // more its business than the layout of the draw-data ring is. They go through the same shaderc
@@ -1132,6 +1218,18 @@ void main()
 )GLSL";
 
 } // namespace
+
+// How a fullscreen pass mixes with what is already in its target. Three states rather than the
+// bool this replaces, because a pass whose alpha is carrying *data* still has a reason to blend:
+// the cloud dome's alpha is a transmittance and its accumulation weight cannot ride in it, so the
+// weight becomes the pipeline's blend constant instead. `SourceAlpha` is every pass that ever
+// existed and `None` is the fog march's straight overwrite.
+enum class FullscreenBlend : uint8_t
+{
+    None,
+    SourceAlpha,
+    Constant
+};
 
 class VulkanRenderer : public IRenderBackend
 {
@@ -1340,6 +1438,49 @@ private:
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     VkQueue presentQueue = VK_NULL_HANDLE;
     VmaAllocator allocator = nullptr;
+    // Every vkCreateGraphicsPipelines call goes through this cache, and the cache is persisted
+    // across runs — which is what turns the first frame's several seconds of driver compilation
+    // into a warm start. VK_NULL_HANDLE only if creation itself failed; pipelines still build.
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    // Pass labels for captures and profilers. Loaded whenever the loader offers debug utils —
+    // which is independent of the validation layer — and null otherwise, so labelling is a no-op
+    // on a machine without it rather than a branch every call site carries.
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmdBeginDebugUtilsLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT cmdEndDebugUtilsLabel = nullptr;
+#if defined(RACEENGINE_HAS_TRACY)
+    TracyVkCtx tracyGpuContext = nullptr;
+#endif
+
+    // Opens a debug label over the commands recorded in its scope and closes it on every exit
+    // path. Inert when the extension is absent: `end` is captured only if `begin` fired.
+    class GpuPassLabel
+    {
+        VkCommandBuffer commandBuffer;
+        PFN_vkCmdEndDebugUtilsLabelEXT end;
+
+    public:
+        GpuPassLabel(const VulkanRenderer& renderer, const VkCommandBuffer commandBuffer, const char* name) :
+            commandBuffer(commandBuffer),
+            end(renderer.cmdBeginDebugUtilsLabel != nullptr ? renderer.cmdEndDebugUtilsLabel : nullptr)
+        {
+            if (renderer.cmdBeginDebugUtilsLabel != nullptr)
+            {
+                VkDebugUtilsLabelEXT label{};
+                label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+                label.pLabelName = name;
+                renderer.cmdBeginDebugUtilsLabel(commandBuffer, &label);
+            }
+        }
+        GpuPassLabel(const GpuPassLabel&) = delete;
+        GpuPassLabel& operator=(const GpuPassLabel&) = delete;
+        ~GpuPassLabel()
+        {
+            if (end != nullptr)
+            {
+                end(commandBuffer);
+            }
+        }
+    };
     VkDescriptorSetLayout frameDataSetLayout = VK_NULL_HANDLE;  // scene set 0
     VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;   // scene set 1
     VkDescriptorSetLayout drawDataSetLayout = VK_NULL_HANDLE;   // scene set 2, dynamic
@@ -1349,7 +1490,19 @@ private:
     VkPipelineLayout fullscreenPipelineLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkCommandPool uploadCommandPool = VK_NULL_HANDLE;
+    // The open upload batch. Every beginUploadCommands returns this one command buffer and
+    // finishUploadCommands leaves it open; flushUploadCommands submits it once — from endFrame,
+    // ahead of the frame's own submit, which is the same execution order the old per-upload fence
+    // gave without the hundreds of blocking round trips docs/renderer.md measured as most of the
+    // circuit's load. Staging buffers retire into the list beside it because they must outlive
+    // the copies they feed. Mutable because the upload path is const and the batch is bookkeeping.
+    mutable VkCommandBuffer uploadBatchCommands = VK_NULL_HANDLE;
+    mutable std::vector<std::pair<VkBuffer, VmaAllocation>> uploadBatchStaging;
     VkSampler attachmentSampler = VK_NULL_HANDLE;
+    // The cloud dome map's own sampler: the map is lat-long, so its u axis is an azimuth that
+    // wraps at 360 degrees and must REPEAT or the sky seams at due +z — the shared sampler above
+    // clamps, which every other attachment read wants. v stays clamped: the poles do not wrap.
+    VkSampler cloudMapSampler = VK_NULL_HANDLE;
     VkDeviceSize drawDataStride = 0;
     VkDeviceSize jointDataStride = 0;
     VkDeviceSize paintDataStride = 0;
@@ -1386,18 +1539,25 @@ private:
     // The key has to be something stable, because the pool never frees a set that is still cached:
     // a pass's inputs are fixed when the scene is built, so the number of distinct keys is the
     // number of passes and not the number of frames.
-    mutable std::vector<
-        std::pair<std::pair<std::array<PostProcessBinding, postProcessInputCount>, unsigned int>, VkDescriptorSet>>
-        attachmentSets;
-    // Cascade sets, keyed by the whole tuple of depth image ids and the two images bound beside
-    // them — the occlusion and the behind copy. A vector rather than a map because there are two
-    // live entries in practice — the shading view's and the fallback — and `<map>` in a second
-    // global module fragment breaks the sandbox link on clang-19 (see CLAUDE.md).
+    struct FullscreenSetKey
+    {
+        std::array<PostProcessBinding, postProcessInputCount> inputs;
+        unsigned int lookupTable;
+        std::array<unsigned int, postProcessVolumeCount> volumes;
+
+        [[nodiscard]] bool operator==(const FullscreenSetKey&) const = default;
+    };
+    mutable std::vector<std::pair<FullscreenSetKey, VkDescriptorSet>> attachmentSets;
+    // Cascade sets, keyed by the whole tuple of depth image ids and the three images bound beside
+    // them — the occlusion, the behind copy and the cloud map. A vector rather than a map because
+    // there are two live entries in practice — the shading view's and the fallback — and `<map>` in
+    // a second global module fragment breaks the sandbox link on clang-19 (see CLAUDE.md).
     struct ShadowSetKey
     {
         std::array<unsigned int, shadowCascadeCount> cascades;
         unsigned int occlusion;
         unsigned int behind;
+        unsigned int cloudMap;
 
         [[nodiscard]] bool operator==(const ShadowSetKey&) const = default;
     };
@@ -1532,6 +1692,8 @@ private:
     void selectPhysicalDevice();
     void createDevice();
     void createAllocator();
+    void createPipelineCache();
+    void writePipelineCache() const;
     void createSwapchain();
     void destroySwapchain();
     void createFrameResources();
@@ -1627,9 +1789,24 @@ private:
     // written and must not be moved wholesale.
     // `lookupTableImageId` is the colour grade this pass binds — the neutral identity for every
     // pass but the last one, which is the only pass whose input is a display-referred image.
+    // `shadowDescriptors` is the shadow set the pass binds at the fullscreen layout's third slot —
+    // the view's own for a pass recorded inside a view's chain, so the fog pass marches the same
+    // cascades the view shaded with, and the fallback set for a caller that has none.
+    // `volumeImageIds` are the two sampler3D slots beside the grade — the pass's own volumes, or
+    // neutralVolumes() for every pass that names none, because the layout declares both bindings
+    // whatever the shader reads.
+    // `loadColour` is PostProcess::loadColour: true makes the target begin the pass holding what it
+    // last held, which is what a pass that blends against its destination — or writes only part of
+    // it — needs. `blendWeight` is the constant the `FullscreenBlend::Constant` pipelines mix at;
+    // it is dynamic state, so one pipeline serves every weight. `slice`/`sliceCount` are
+    // PostProcess's: the vertical strip of the target this recording writes, of how many. The
+    // viewport stays the whole target whatever they say — see the definition.
     bool recordFullScreenPass(std::span<const PostProcessBinding> inputs, unsigned int lookupTableImageId,
+                              const std::array<unsigned int, postProcessVolumeCount>& volumeImageIds,
                               VkImageView targetView, VkExtent2D targetExtent, VkPipeline pipeline,
-                              const FullscreenPushConstants& parameters);
+                              const FullscreenPushConstants& parameters,
+                              VkDescriptorSet shadowDescriptors = VK_NULL_HANDLE, bool loadColour = false,
+                              float blendWeight = 1.0f, unsigned int slice = 0, unsigned int sliceCount = 1);
     bool recordPresentPass(unsigned int shaderId, unsigned int attachmentImageId, const glm::vec4& parameters,
                            unsigned int lookupTableImageId);
     // Moves the whole image to one layout, emitting one barrier per run of levels that share a
@@ -1652,16 +1829,26 @@ private:
     // exactly as a view with no cascades still binds a 1x1 depth image — because the shader
     // declares the array whole and a pipeline that statically uses a descriptor must find one.
     [[nodiscard]] VkDescriptorSet attachmentSet(std::span<const PostProcessBinding> inputs,
-                                                unsigned int lookupTableImageId);
+                                                unsigned int lookupTableImageId,
+                                                const std::array<unsigned int, postProcessVolumeCount>& volumeImageIds);
+    // The two volume slots filled with the neutral table: what every pass that names no volumes
+    // binds, the grade's own fallback applied one binding over.
+    [[nodiscard]] std::array<unsigned int, postProcessVolumeCount> neutralVolumes();
     // The set 3 the scene pipelines bind. Given the cascades' depth images it caches one set per
     // tuple; given none it hands back the fallback, because a sampler2DShadow the pipeline
     // statically uses must have a descriptor whether or not the shader's cascade count says to
     // read it.
     [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
-                                            unsigned int occlusionImageId, unsigned int behindImageId);
+                                            unsigned int occlusionImageId, unsigned int behindImageId,
+                                            unsigned int cloudMapImageId);
     // The image a shading view samples its occlusion from, or the 1x1 white one when it gathers
     // none. Not const: the fallback is created on first use, as every other dummy here is.
     [[nodiscard]] unsigned int ambientOcclusionImage(const Camera& camera);
+    // The image the scene's cloud map attachment carries, or the 1x1 white one when the scene
+    // states none. Resolved per view, and by the probe faces too — the captures are how clouds
+    // become ambient light, so a probe binding the dummy while the scene has a real map would
+    // photograph a clear sky under a clouded one.
+    [[nodiscard]] unsigned int cloudMapImage(const Scene& scene);
     [[nodiscard]] VkDescriptorSet fallbackShadowSet();
     [[nodiscard]] unsigned int dummyShadowMap();
     // The cascades' depth images in cascade order, or nothing if any of them is missing: a
@@ -1676,7 +1863,7 @@ private:
     [[nodiscard]] const ResolvedPipeline* scenePipeline(unsigned int shaderId, PrimitiveBinding& binding,
                                                         VkCullModeFlags cullMode, VkFormat colorFormat,
                                                         VkFormat depthFormat, bool blend, bool depthWrite);
-    [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat);
+    [[nodiscard]] VkPipeline offscreenPipeline(unsigned int shaderId, VkFormat colorFormat, FullscreenBlend blend);
     [[nodiscard]] unsigned int dummyTexture();
     [[nodiscard]] unsigned int dummyCubeMap();
     // Reports shaderc's own message rather than logging it: createShaderObject already has an
@@ -1686,15 +1873,19 @@ private:
     compileToSpirv(const std::string& source, shaderc_shader_kind kind, const char* stageName);
     [[nodiscard]] VkShaderModule createShaderModule(const std::vector<uint32_t>& spirv) const;
     [[nodiscard]] VkPipeline buildFullscreenPipeline(VkShaderModule vertexModule, VkShaderModule fragmentModule,
-                                                     VkFormat colorFormat) const;
+                                                     FullscreenBlend blend, VkFormat colorFormat) const;
     void createHostVisibleUniformBuffer(VkDeviceSize size, VkBuffer& buffer, VmaAllocation& allocation,
                                         void*& mapped) const;
     [[nodiscard]] VkCommandBuffer beginUploadCommands() const;
     void finishUploadCommands(VkCommandBuffer commandBuffer) const;
+    void retireUploadStaging(VkBuffer buffer, VmaAllocation allocation) const;
+    void flushUploadCommands() const;
     [[nodiscard]] unsigned int createSampledImage(std::span<const Texture* const> faces, bool cube) const;
-    // A three-dimensional sampled image: one mip, clamped, linearly filtered. Only a colour grade
-    // is one of these, and the whole of what it needs is different enough from a picture's upload
-    // that sharing the path above would be two functions in a trench coat.
+    // A three-dimensional sampled image: one mip, linearly filtered, and different enough from a
+    // picture's upload that sharing the path above would be two functions in a trench coat. The
+    // format follows the payload — float is the colour grade, expanded to RGBA32F and clamped as
+    // it always was; byte is baked volumetric noise, uploaded at its own channel count and
+    // repeating, because noise tiles where a grade's edges are black and white.
     [[nodiscard]] unsigned int createVolumeImage(const Texture& texture) const;
     // The grade that changes nothing, built once and bound by every pass that has none of its own.
     [[nodiscard]] unsigned int neutralLookupTable();
@@ -1740,6 +1931,27 @@ VulkanRenderer::~VulkanRenderer()
     {
         vkDeviceWaitIdle(device);
     }
+
+#if defined(RACEENGINE_HAS_TRACY)
+    if (tracyGpuContext != nullptr)
+    {
+        TracyVkDestroy(tracyGpuContext);
+        tracyGpuContext = nullptr;
+    }
+#endif
+
+    // An upload batch still open at teardown was never named by any submitted frame, so its
+    // commands are abandoned rather than run; the staging it holds goes with it.
+    if (uploadBatchCommands != VK_NULL_HANDLE)
+    {
+        vkFreeCommandBuffers(device, uploadCommandPool, 1, &uploadBatchCommands);
+        uploadBatchCommands = VK_NULL_HANDLE;
+    }
+    for (const auto& [buffer, allocation] : uploadBatchStaging)
+    {
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    }
+    uploadBatchStaging.clear();
 
     // The queue holds objects whose readyAt has not arrived and never will, because no further
     // frame will be submitted. The device idle above is the stronger guarantee they were waiting
@@ -1898,6 +2110,10 @@ VulkanRenderer::~VulkanRenderer()
     {
         vkDestroySampler(device, attachmentSampler, nullptr);
     }
+    if (cloudMapSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(device, cloudMapSampler, nullptr);
+    }
     if (descriptorPool != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
@@ -1929,6 +2145,12 @@ VulkanRenderer::~VulkanRenderer()
     }
 
     destroySwapchain();
+
+    if (pipelineCache != VK_NULL_HANDLE)
+    {
+        writePipelineCache();
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+    }
 
     if (device != VK_NULL_HANDLE)
     {
@@ -1966,11 +2188,17 @@ std::expected<void, std::string> VulkanRenderer::init()
         selectPhysicalDevice();
         createDevice();
         createAllocator();
+        createPipelineCache();
         createSwapchain();
         createFrameResources();
         createDescriptorInfrastructure();
         createProbeResources();
         createExposureResources();
+#if defined(RACEENGINE_HAS_TRACY)
+        // The context's constructor records its own calibration into this buffer, submits it and
+        // waits; the pool is reset before the first frame records, so borrowing it here is safe.
+        tracyGpuContext = TracyVkContext(physicalDevice, device, graphicsQueue, frames.front().commandBuffer);
+#endif
         return {};
     }
     catch (const std::exception& exception)
@@ -1998,9 +2226,29 @@ void VulkanRenderer::createInstance()
     std::vector<const char*> extensions(requiredWindowExtensions.extensions,
                                         requiredWindowExtensions.extensions + requiredWindowExtensions.count);
     std::vector<const char*> layers;
-    if (validationLayerEnabled)
+
+    // Debug utils rides whenever the loader offers it, not only under validation: it is what
+    // names the passes in a capture, and a capture is most wanted on exactly the runs that do
+    // not carry the validation layer.
+    uint32_t instanceExtensionCount = 0;
+    ensure(vkEnumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, nullptr),
+           "vkEnumerateInstanceExtensionProperties");
+    std::vector<VkExtensionProperties> instanceExtensions(instanceExtensionCount);
+    if (instanceExtensionCount > 0)
+    {
+        ensure(vkEnumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, instanceExtensions.data()),
+               "vkEnumerateInstanceExtensionProperties");
+    }
+    const auto debugUtilsAvailable =
+        std::ranges::any_of(instanceExtensions, [](const VkExtensionProperties& extension)
+                            { return std::strcmp(extension.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+
+    if (debugUtilsAvailable)
     {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    if (validationLayerEnabled)
+    {
         layers.push_back(validationLayerName);
     }
 
@@ -2033,16 +2281,28 @@ void VulkanRenderer::createInstance()
         // without LD_LIBRARY_PATH covering its .so); run without validation instead.
         logger.warn("Vulkan validation layer would not load; continuing without it");
         validationLayerEnabled = false;
-        extensions.pop_back();
         layers.pop_back();
         instanceCreateInfo.pNext = nullptr;
         instanceCreateInfo.enabledLayerCount = 0;
-        instanceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         ensure(vkCreateInstance(&instanceCreateInfo, nullptr, &instance), "vkCreateInstance");
     }
     else
     {
         ensure(createResult, "vkCreateInstance");
+    }
+
+    if (debugUtilsAvailable)
+    {
+        cmdBeginDebugUtilsLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+            vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT"));
+        cmdEndDebugUtilsLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+            vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT"));
+        // Both or neither: a label opened by one function pointer must be closable by the other.
+        if (cmdBeginDebugUtilsLabel == nullptr || cmdEndDebugUtilsLabel == nullptr)
+        {
+            cmdBeginDebugUtilsLabel = nullptr;
+            cmdEndDebugUtilsLabel = nullptr;
+        }
     }
 
     logger.info("Vulkan instance created (api 1.3, validation layer {})",
@@ -2268,6 +2528,107 @@ void VulkanRenderer::createAllocator()
     ensure(vmaCreateAllocator(&allocatorInfo, &allocator), "vmaCreateAllocator");
 }
 
+void VulkanRenderer::createPipelineCache()
+{
+    std::vector<char> initialData;
+    const auto path = pipelineCacheFilePath();
+    if (!path.empty())
+    {
+        if (std::FILE* file = std::fopen(path.c_str(), "rb"); file != nullptr)
+        {
+            std::fseek(file, 0, SEEK_END);
+            if (const auto size = std::ftell(file); size > 0)
+            {
+                initialData.resize(static_cast<size_t>(size));
+                std::fseek(file, 0, SEEK_SET);
+                if (std::fread(initialData.data(), 1, initialData.size(), file) != initialData.size())
+                {
+                    initialData.clear();
+                }
+            }
+            std::fclose(file);
+        }
+    }
+
+    // The blob's own header states which device wrote it. A foreign blob is dropped here rather
+    // than handed over: the spec leaves a driver's validation of initial data open, and a stale
+    // cache must cost a cold start, never a crash.
+    constexpr size_t headerSize = 32;
+    if (initialData.size() >= headerSize)
+    {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        uint32_t headerVendor = 0;
+        uint32_t headerDevice = 0;
+        std::memcpy(&headerVendor, initialData.data() + 8, sizeof(headerVendor));
+        std::memcpy(&headerDevice, initialData.data() + 12, sizeof(headerDevice));
+        if (headerVendor != properties.vendorID || headerDevice != properties.deviceID ||
+            std::memcmp(initialData.data() + 16, properties.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+        {
+            initialData.clear();
+        }
+    }
+    else
+    {
+        initialData.clear();
+    }
+
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cacheInfo.initialDataSize = initialData.size();
+    cacheInfo.pInitialData = initialData.empty() ? nullptr : initialData.data();
+
+    if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS)
+    {
+        cacheInfo.initialDataSize = 0;
+        cacheInfo.pInitialData = nullptr;
+        ensure(vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache), "vkCreatePipelineCache");
+    }
+
+    logger.info("Vulkan pipeline cache ready ({} bytes primed from {})", initialData.size(),
+                path.empty() ? "nowhere - no cache directory" : path);
+}
+
+void VulkanRenderer::writePipelineCache() const
+{
+    if (pipelineCache == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const auto path = pipelineCacheFilePath();
+    if (path.empty())
+    {
+        return;
+    }
+
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) != VK_SUCCESS || size == 0)
+    {
+        return;
+    }
+
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS)
+    {
+        return;
+    }
+
+    if (std::FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr)
+    {
+        if (std::fwrite(data.data(), 1, size, file) != size)
+        {
+            // A truncated cache would fail the header check next run and cost one cold start;
+            // removing it now keeps even that from happening.
+            std::fclose(file);
+            std::remove(path.c_str());
+
+            return;
+        }
+        std::fclose(file);
+    }
+}
+
 void VulkanRenderer::createSwapchain()
 {
     VkSurfaceCapabilitiesKHR capabilities;
@@ -2341,8 +2702,66 @@ void VulkanRenderer::createSwapchain()
     swapchainInfo.compositeAlpha = (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0
                                        ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                                        : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-    // FIFO for vsync parity with the GL path's glfwSwapInterval(1).
-    swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    // No vsync by default: MAILBOX presents the newest complete frame uncapped and without
+    // tearing, IMMEDIATE is the raw uncapped mode, and FIFO is the spec-guaranteed fallback and
+    // the old vsynced behaviour. RACEENGINE_PRESENT_MODE=immediate|mailbox|fifo forces one;
+    // a forced mode the surface does not offer falls back to FIFO with a warning.
+    uint32_t presentModeCount = 0;
+    ensure(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, nullptr),
+           "vkGetPhysicalDeviceSurfacePresentModesKHR");
+    std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+    ensure(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, presentModes.data()),
+           "vkGetPhysicalDeviceSurfacePresentModesKHR");
+
+    const auto presentModeOffered = [&](const VkPresentModeKHR candidate)
+    { return std::ranges::find(presentModes, candidate) != presentModes.end(); };
+
+    std::optional<VkPresentModeKHR> forced;
+    if (const char* requested = std::getenv("RACEENGINE_PRESENT_MODE"); requested != nullptr && *requested != '\0')
+    {
+        const std::string_view name(requested);
+        if (name == "immediate")
+        {
+            forced = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        else if (name == "mailbox")
+        {
+            forced = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        else if (name == "fifo")
+        {
+            forced = VK_PRESENT_MODE_FIFO_KHR;
+        }
+        else
+        {
+            logger.warn("RACEENGINE_PRESENT_MODE '{}' is not immediate, mailbox or fifo; using the default order",
+                        name);
+        }
+
+        if (forced.has_value() && !presentModeOffered(forced.value()))
+        {
+            logger.warn("RACEENGINE_PRESENT_MODE '{}' is not offered by this surface; using FIFO", name);
+            forced = VK_PRESENT_MODE_FIFO_KHR;
+        }
+    }
+
+    auto presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (forced.has_value())
+    {
+        presentMode = forced.value();
+    }
+    else
+    {
+        for (const auto candidate : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
+        {
+            if (presentModeOffered(candidate))
+            {
+                presentMode = candidate;
+                break;
+            }
+        }
+    }
+    swapchainInfo.presentMode = presentMode;
     swapchainInfo.clipped = VK_FALSE; // captureFrame reads rendered images back
 
     ensure(vkCreateSwapchainKHR(device, &swapchainInfo, nullptr, &swapchain), "vkCreateSwapchainKHR");
@@ -2373,9 +2792,12 @@ void VulkanRenderer::createSwapchain()
 
     requestedExtent = extent;
 
-    logger.info("Vulkan swapchain created: {}x{}, {} images, format {}, colour space {}, present mode FIFO",
+    logger.info("Vulkan swapchain created: {}x{}, {} images, format {}, colour space {}, present mode {}",
                 extent.width, extent.height, actualImageCount, describeFormat(surfaceFormat.format),
-                describeColorSpace(surfaceFormat.colorSpace));
+                describeColorSpace(surfaceFormat.colorSpace),
+                presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE"
+                : presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                                                             : "FIFO");
 }
 
 void VulkanRenderer::destroySwapchain()
@@ -2526,6 +2948,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
         // started — and it lives here for the occlusion image's reason word for word: per camera
         // pass, produced earlier in this frame, readable only by a view that shades.
         VkDescriptorSetLayoutBinding{sceneBehindBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // Binding 3 is the cloud dome map, here on the same terms once more: produced by a pass —
+        // the previous frame's cloud march — and read only by a view that shades, the skybox
+        // compositing it and the probe faces photographing it. A scene with none binds the 1x1
+        // white dummy behind the frame block's coverage branch.
+        VkDescriptorSetLayoutBinding{cloudMapBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     shadowSetLayout = makeSetLayout(shadowBindings);
 
@@ -2542,6 +2970,14 @@ void VulkanRenderer::createDescriptorInfrastructure()
         // when the pass has no grade — because the pipeline's static use of it does not care which
         // pass this is.
         VkDescriptorSetLayoutBinding{lookupTableBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // The baked cloud noise volumes, beside the grade and each a binding of its own for the
+        // grade's reason: a sampler3D cannot be an element of the sampler2D array. Written for
+        // every pass — the neutral table where a pass names no volume — because the pipeline's
+        // static use of them does not care which pass this is.
+        VkDescriptorSetLayoutBinding{cloudBaseNoiseBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{cloudDetailNoiseBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     fullscreenSetLayout = makeSetLayout(fullscreenBindings);
 
@@ -2567,10 +3003,15 @@ void VulkanRenderer::createDescriptorInfrastructure()
     // nothing — the range belongs to the layout, and writing it is valid whether or not the
     // pipeline reads it.
     const VkPushConstantRange fullscreenPushConstants{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(FullscreenPushConstants)};
+    // Three sets, not the one this was: the frame block first — the same layout, set and dynamic
+    // offset the scene draws bind — then the pass's own inputs, then the shadow set, so a
+    // fullscreen pass can read the sun, the probes and the medium and march the cascades. The fog
+    // pass is why; every other fullscreen shader declares only the middle set and pays nothing.
+    const std::array fullscreenSetLayouts = {frameDataSetLayout, fullscreenSetLayout, shadowSetLayout};
     VkPipelineLayoutCreateInfo fullscreenLayoutInfo{};
     fullscreenLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    fullscreenLayoutInfo.setLayoutCount = 1;
-    fullscreenLayoutInfo.pSetLayouts = &fullscreenSetLayout;
+    fullscreenLayoutInfo.setLayoutCount = static_cast<uint32_t>(fullscreenSetLayouts.size());
+    fullscreenLayoutInfo.pSetLayouts = fullscreenSetLayouts.data();
     fullscreenLayoutInfo.pushConstantRangeCount = 1;
     fullscreenLayoutInfo.pPushConstantRanges = &fullscreenPushConstants;
     ensure(vkCreatePipelineLayout(device, &fullscreenLayoutInfo, nullptr, &fullscreenPipelineLayout),
@@ -2613,6 +3054,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &attachmentSampler), "vkCreateSampler");
+
+    // The cloud dome map's sampler: identical but repeating in u, because the map's u is a
+    // lat-long azimuth that wraps at 360 degrees and a clamp would seam the sky where the mapping
+    // rejoins itself. See the member's own comment.
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    ensure(vkCreateSampler(device, &samplerInfo, nullptr, &cloudMapSampler), "vkCreateSampler");
 
     const auto alignment = std::max<VkDeviceSize>(deviceLimits.minUniformBufferOffsetAlignment, 1);
     drawDataStride = (sizeof(DrawDataUbo) + alignment - 1) / alignment * alignment;
@@ -2847,7 +3294,13 @@ bool VulkanRenderer::submitAndPresent(const VkBuffer captureBuffer)
                         VK_ACCESS_2_NONE);
     }
 
+    RACEENGINE_GPU_COLLECT(frame.commandBuffer);
     ensure(vkEndCommandBuffer(frame.commandBuffer), "vkEndCommandBuffer");
+
+    // The frame's uploads go first: the frame command buffer samples what they wrote, and queue
+    // submission order plus the batch's own barriers is exactly the ordering the per-upload
+    // fence used to provide.
+    flushUploadCommands();
 
     // No-ops on the coherent memory VMA picks here, but the uniform writes this frame made
     // must be flushed before the submit on any host-cached heap.
@@ -3042,8 +3495,10 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
 
     // Resolved before the swapchain image is touched: a pass that cannot bind its source
     // must leave the image untouched so the clear fallback can still take it.
+    RACEENGINE_GPU_ZONE(presenterZone, frames[frameIndex].commandBuffer, "presenter");
+    const GpuPassLabel presenterLabel(*this, frames[frameIndex].commandBuffer, "presenter");
     const std::array presentInputs = {PostProcessBinding{.gpuResourceId = attachmentImageId, .level = 0}};
-    if (attachmentSet(presentInputs, lookupTableImageId) == VK_NULL_HANDLE)
+    if (attachmentSet(presentInputs, lookupTableImageId, neutralVolumes()) == VK_NULL_HANDLE)
     {
         diagnostics.record(
             FrameDiagnostic::PresentPassSkipped,
@@ -3074,8 +3529,8 @@ bool VulkanRenderer::recordPresentPass(const unsigned int shaderId, const unsign
                                                 .viewUp = glm::vec4(0.0f),
                                                 .viewBack = glm::vec4(0.0f),
                                                 .weather = glm::vec4(0.0f)};
-    recordFullScreenPass(presentInputs, lookupTableImageId, swapchainImageViews[currentImageIndex], swapchainExtent,
-                         shader->second.swapchainTargetPipeline, pushConstants);
+    recordFullScreenPass(presentInputs, lookupTableImageId, neutralVolumes(), swapchainImageViews[currentImageIndex],
+                         swapchainExtent, shader->second.swapchainTargetPipeline, pushConstants);
 
     swapchainPassRecorded = true;
     lastPresentPass = PresentPass{shaderId, attachmentImageId, parameters, lookupTableImageId};
@@ -3212,6 +3667,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         return;
     }
 
+    // The view's name over everything it records — the scene draws and the post chain both — so a
+    // capture and a GPU profile read "world" or "cascade 2" rather than an anonymous run of draws.
+    const auto passName = camera.debugName.empty() ? std::string(describeCameraRole(camera.role)) : camera.debugName;
+    RACEENGINE_GPU_ZONE(scenePassZone, frame.commandBuffer, passName.c_str());
+    const GpuPassLabel passLabel(*this, frame.commandBuffer, passName.c_str());
+
     FrameDataUbo frameData{};
     frameData.viewMatrix = camera.modelViewMatrix;
     frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
@@ -3253,6 +3714,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     frameData.wiperTiming = glm::vec4(scene.wipers.cyclePeriod, scene.wipers.sweepSeconds, scene.wipers.cycleStart,
                                       scene.wipers.bladeHalfWidth);
     frameData.wiperPane = glm::vec4(scene.wipers.paneAspect, 0.0f, 0.0f, 0.0f);
+    frameData.cloudParams = glm::vec4(scene.clouds.coverage, scene.clouds.type, 0.0f, 0.0f);
 
     // A cascade is a producer and samples nothing; only the views that shade read the maps, and a
     // cascade sampling its own attachment while rendering into it would be a feedback loop.
@@ -3274,8 +3736,13 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // colour attachment could not be resolved shades over the white dummy exactly as a view with
     // no occlusion does.
     const auto splitForBehind = shading && hasColor && hasDepth && behindImage != dummyTexture();
-    auto shadowDescriptors =
-        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), occlusionImage, behindImage) : VK_NULL_HANDLE;
+    // The cloud map rides the same set and resolves with the same shape: the scene's own image for
+    // a view that shades, the dummy otherwise. It needs no transition here — the pass that wrote
+    // it left it SHADER_READ_ONLY, and the initial clear puts a never-written one there too.
+    const auto cloudImage = shading ? cloudMapImage(scene) : dummyTexture();
+    auto shadowDescriptors = cascadeImages.has_value()
+                                 ? shadowSet(cascadeImages.value(), occlusionImage, behindImage, cloudImage)
+                                 : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -3502,6 +3969,16 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             continue;
         }
 
+        // A held pass's target already holds the right picture, so the frame spends nothing on it —
+        // no descriptor set, no barrier, no draw. The target keeps the layout the last pass over it
+        // left, which is SHADER_READ_ONLY, so everything that samples it this frame still can; a
+        // target no pass has ever written is in that layout too, because the only kind that is read
+        // before it is written states an `initialColour` and the clear leaves it there.
+        if (postProcess->contentsHeld)
+        {
+            continue;
+        }
+
         // Every input the pass declared, in order, resolved to the image and level a descriptor
         // names. GL bound these to texture units 0..n and this backend used to bind only the first
         // of them; the fullscreen set is postProcessInputCount samplers wide now, and a shader
@@ -3554,6 +4031,34 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                                });
         }
 
+        // The pass's volumes, into the two sampler3D slots beside the grade. Neutral in any slot
+        // the pass leaves empty — the layout declares both bindings whatever the shader reads —
+        // and uploaded on first use exactly as the grade is.
+        auto volumes = neutralVolumes();
+        const auto boundVolumes = std::min<size_t>(postProcess->volumes.size(), postProcessVolumeCount);
+        for (size_t slot = 0; slot < boundVolumes; slot++)
+        {
+            if (const auto volumeId = uploadTexture(postProcess->volumes[slot]); volumeId.has_value())
+            {
+                volumes[slot] = volumeId.value();
+            }
+            else
+            {
+                diagnostics.record(FrameDiagnostic::VolumeInputUnavailable,
+                                   [&] { return "volume slot " + std::to_string(slot) + " names no live texture"; });
+            }
+        }
+
+        if (postProcess->volumes.size() > postProcessVolumeCount)
+        {
+            diagnostics.record(FrameDiagnostic::PostProcessVolumesExceeded,
+                               [&]
+                               {
+                                   return "the fullscreen set carries " + std::to_string(postProcessVolumeCount) +
+                                          " of the " + std::to_string(postProcess->volumes.size()) + " declared";
+                               });
+        }
+
         std::optional<unsigned int> targetImageId;
         if (postProcess->output.has_value())
         {
@@ -3574,14 +4079,19 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
         }
 
         const auto shader = shaderObjects.find(postProcessShader->gpuResourceId);
-        const auto usable = !inputs.empty() && targetImageId.has_value() &&
+        // A pass fed only by volume textures has no 2D input to name — the cloud dome marches
+        // 3D noise and reads no attachment — so volumes satisfy the has-something-to-read test.
+        const auto usable = (!inputs.empty() || !postProcess->volumes.empty()) && targetImageId.has_value() &&
                             imageResources.contains(targetImageId.value()) && shader != shaderObjects.end() &&
                             shader->second.fullscreen;
         // The pipeline is built against the target attachment's own format, so a post-process
         // buffer created with any FboAttachment::internalFormat renders rather than mismatching
         // a hardcoded one.
+        const auto blendMode = !postProcess->blend                    ? FullscreenBlend::None
+                               : postProcess->blendWeight.has_value() ? FullscreenBlend::Constant
+                                                                      : FullscreenBlend::SourceAlpha;
         const auto pipeline = usable ? offscreenPipeline(postProcessShader->gpuResourceId,
-                                                         imageResources.at(targetImageId.value()).format)
+                                                         imageResources.at(targetImageId.value()).format, blendMode)
                                      : VK_NULL_HANDLE;
         if (pipeline == VK_NULL_HANDLE)
         {
@@ -3645,7 +4155,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                 glm::vec4(static_cast<float>(frameSimulationTime), scene.rain, cameraVelocity.x, cameraVelocity.z)};
 
         // Every pass before the present works in radiance, where a grade has no meaning.
-        recordFullScreenPass(inputs, neutralLookupTable(), targetView, targetExtent, pipeline, parameters);
+        const auto postName = postProcess->debugName.empty() ? std::string("post-process") : postProcess->debugName;
+        RACEENGINE_GPU_ZONE(postPassZone, frame.commandBuffer, postName.c_str());
+        const GpuPassLabel postLabel(*this, frame.commandBuffer, postName.c_str());
+        recordFullScreenPass(inputs, neutralLookupTable(), volumes, targetView, targetExtent, pipeline, parameters,
+                             shadowDescriptors, postProcess->loadColour, postProcess->blendWeight.value_or(1.0f),
+                             postProcess->slice, postProcess->sliceCount);
 
         transitionTrackedLevel(frame.commandBuffer, targetImageId.value(), targetLevel,
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -4017,6 +4532,9 @@ void VulkanRenderer::recordSceneBehindCopy(const SceneBehindCopy& copy)
     {
         return;
     }
+
+    RACEENGINE_GPU_ZONE(behindCopyZone, frame.commandBuffer, "behind copy");
+    const GpuPassLabel behindCopyLabel(*this, frame.commandBuffer, "behind copy");
 
     // Everything opaque is in the attachment; seal the block so the copy may read it.
     vkCmdEndRendering(frame.commandBuffer);
@@ -4570,7 +5088,7 @@ void VulkanRenderer::createProbeResources()
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = probePrefilterPipelineLayout;
 
-    ensure(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &probePrefilterPipeline),
+    ensure(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &probePrefilterPipeline),
            "vkCreateGraphicsPipelines");
 
     // The set the prefilter reads the scratch cube through. One, for the process: the cube is one
@@ -4702,6 +5220,26 @@ unsigned int VulkanRenderer::ambientOcclusionImage(const Camera& camera)
     return attachment->gpuResourceId.value();
 }
 
+unsigned int VulkanRenderer::cloudMapImage(const Scene& scene)
+{
+    if (!scene.cloudMap.has_value())
+    {
+        return dummyTexture();
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(scene.cloudMap.value());
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value() ||
+        !imageResources.contains(attachment->gpuResourceId.value()))
+    {
+        diagnostics.record(FrameDiagnostic::CloudMapUnavailable,
+                           [] { return std::string("the scene's cloud map attachment is no longer loaded"); });
+
+        return dummyTexture();
+    }
+
+    return attachment->gpuResourceId.value();
+}
+
 // The view drawn a second time, for what its own geometry hides.
 //
 // A Camera on the stack rather than one the game keeps: every field of it except the target and the
@@ -4721,6 +5259,7 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
 
     Camera prepass = camera;
     prepass.role = CameraRole::DepthNormalPrepass;
+    prepass.debugName = camera.debugName.empty() ? std::string("ao prepass") : camera.debugName + " prepass";
     prepass.output = occlusion.prepass.value();
     prepass.overrideShader = occlusion.prepassShader.value();
     // The gather and the blur, and not the tone map or the meter's reduction: those belong to the
@@ -4739,7 +5278,12 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
     prepass.partition = DrawPartition::All;
     prepass.loadColour = false;
     prepass.loadDepth = false;
-    prepass.keepDepth = false;
+    // The one continuity field the prepass does not reset to false: `shareDepth` says the views
+    // recorded after this one load the depth it is about to write and test against it, which is
+    // pre-Z out of geometry the frame has already rasterised. The game states it because the game
+    // is what composed a shading camera over this buffer; the prepass camera itself is a copy
+    // nobody outside this function holds.
+    prepass.keepDepth = occlusion.shareDepth;
     prepass.clearColour.reset();
 
     recordScenePass(scene, prepass, delta);
@@ -4969,6 +5513,11 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
+    // The clouds, alone among the weather, are kept in a capture: the fog and the rain are effects
+    // between a surface and the eye, which a photograph must not bake in, but the clouded sky *is*
+    // the thing being photographed — the captures are how clouds become the world's ambient light.
+    frameData.cloudParams = glm::vec4(scene.clouds.coverage, scene.clouds.type, 0.0f, 0.0f);
+
     // No `uploadFog` here, and the omission is the rule rather than an oversight. A probe photographs
     // the world so that a surface can be given the light it cannot see directly; fog baked into that
     // photograph comes back as the surface's ambient light, and the surface then fogs a second time
@@ -4981,11 +5530,13 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     // put the sun's full radiance into the very shadow the direct term just removed, which is the
     // defect this whole path exists to fix, reintroduced one level down.
     // White for the occlusion beside them: a probe records the world's indirect light, and screen
-    // space has no answer for a face pointing somewhere the screen never looked.
+    // space has no answer for a face pointing somewhere the screen never looked. The cloud map is
+    // the scene's real one, not the dummy — the skybox this face draws composites it, and a probe
+    // that photographed a clear sky under a clouded one would light the world for the wrong day.
     const auto cascadeImages = shadowCascadeImages(scene);
-    auto shadowDescriptors =
-        cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture(), dummyTexture())
-                                  : VK_NULL_HANDLE;
+    auto shadowDescriptors = cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture(),
+                                                                   dummyTexture(), cloudMapImage(scene))
+                                                       : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -5268,11 +5819,15 @@ void VulkanRenderer::uploadProbes(const Scene& scene, FrameDataUbo& frameData) c
 }
 
 bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBinding> inputs,
-                                          const unsigned int lookupTableImageId, const VkImageView targetView,
-                                          const VkExtent2D targetExtent, const VkPipeline pipeline,
-                                          const FullscreenPushConstants& parameters)
+                                          const unsigned int lookupTableImageId,
+                                          const std::array<unsigned int, postProcessVolumeCount>& volumeImageIds,
+                                          const VkImageView targetView, const VkExtent2D targetExtent,
+                                          const VkPipeline pipeline, const FullscreenPushConstants& parameters,
+                                          const VkDescriptorSet shadowDescriptors, const bool loadColour,
+                                          const float blendWeight, const unsigned int slice,
+                                          const unsigned int sliceCount)
 {
-    const auto set = attachmentSet(inputs, lookupTableImageId);
+    const auto set = attachmentSet(inputs, lookupTableImageId, volumeImageIds);
     if (set == VK_NULL_HANDLE)
     {
         // attachmentSet counted the pool exhaustion if that is what it was; an unknown image id
@@ -5291,17 +5846,35 @@ bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBindi
     // a CLEAR because GL's drawFullScreenQuad cleared first, and the comment that stood here
     // conceded the point — "the quad covers the target anyway". Twenty-five of these run per frame.
     //
-    // The one thing that could make the old contents observable is the blend, which is
-    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA on this layout: a pass writing alpha below one would read the
-    // destination. Every fullscreen shader writes 1.0, and the R8 targets have no alpha component
-    // at all — which Vulkan reads as 1.0 — so the destination factor is zero everywhere and the
-    // load is genuinely dead.
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    // The one thing that makes the old contents observable is the blend, which is
+    // SRC_ALPHA/ONE_MINUS_SRC_ALPHA on this layout: a pass writing alpha below one reads the
+    // destination. Every fullscreen shader *but the cloud dome* writes 1.0, and the R8 targets have
+    // no alpha component at all — which Vulkan reads as 1.0 — so for those the destination factor
+    // is zero everywhere and the load is genuinely dead.
+    //
+    // The dome writes its transmittance there, so for years it blended against memory Vulkan says
+    // is undefined and got away with it on a driver that leaves the image alone (2026-08-27; it is
+    // the leading suspect for the recorded run-to-run sky flake). `loadColour` is that pass — and
+    // any later one that reads its destination on purpose — saying so, which is the whole
+    // difference between an accident and a contract.
+    colorAttachment.loadOp = loadColour ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    // The strip this recording writes, in whole texels and tiling exactly: the boundaries are
+    // `count * s / n`, so a width the count does not divide leaves no column unwritten and no
+    // column written twice. A count of one is the whole target and is every pass but the sliced
+    // one. A degenerate strip — a target narrower than its own slice count — is widened to a
+    // single column rather than refused, because a render area of zero width is not a legal pass.
+    const auto strips = std::max(sliceCount, 1u);
+    const auto index = std::min(slice, strips - 1u);
+    const auto left = static_cast<uint32_t>((static_cast<uint64_t>(targetExtent.width) * index) / strips);
+    const auto right = static_cast<uint32_t>((static_cast<uint64_t>(targetExtent.width) * (index + 1u)) / strips);
+    const VkRect2D strip{VkOffset2D{static_cast<int32_t>(left), 0},
+                         VkExtent2D{std::max(right - left, 1u), targetExtent.height}};
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, targetExtent};
+    renderingInfo.renderArea = strip;
     renderingInfo.layerCount = 1;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachments = &colorAttachment;
@@ -5311,6 +5884,12 @@ bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBindi
     // Positive height here: the fullscreen shaders derive their texture coordinates from
     // gl_VertexIndex in Vulkan's own y-down clip space, so the scene attachment (already
     // stored the GL way up) maps through one-to-one.
+    //
+    // **The whole target, even when only a strip of it is being written.** The viewport is what
+    // maps clip space onto the framebuffer, so shrinking it would squeeze the oversized triangle
+    // into the strip and hand every fragment the coordinates of a different texel. The strip is the
+    // render area and the scissor, which discard fragments outside it and leave what those texels
+    // held alone — which is exactly the statement a sliced pass is making.
     VkViewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
@@ -5320,12 +5899,27 @@ bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBindi
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
 
-    const VkRect2D scissor{VkOffset2D{0, 0}, targetExtent};
-    vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+    vkCmdSetScissor(frame.commandBuffer, 0, 1, &strip);
+
+    // Only a FullscreenBlend::Constant pipeline reads these, and every fullscreen pipeline declares
+    // them dynamic, so setting them unconditionally costs one command and removes a way to forget.
+    // The alpha component is the one the constant factors name; the other three are written to
+    // match so a future constant-colour factor cannot pick up a stale number.
+    const std::array blendConstants = {blendWeight, blendWeight, blendWeight, blendWeight};
+    vkCmdSetBlendConstants(frame.commandBuffer, blendConstants.data());
 
     vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullscreenPipelineLayout, 0, 1, &set,
-                            0, nullptr);
+
+    // All three of the layout's sets, every pass: the frame block at the view's own dynamic offset
+    // — recordScenePass wrote it before this chain began, so a chain pass reads the view it rides —
+    // the pass's inputs, and the shadow set (the caller's, or the fallback whose empty cascades
+    // shade lit). A shader that declares only its inputs sees only its inputs; the binding is the
+    // layout's to satisfy.
+    const auto shadowSet = shadowDescriptors != VK_NULL_HANDLE ? shadowDescriptors : fallbackShadowSet();
+    const std::array descriptorSets = {frame.frameDataSet, set, shadowSet};
+    const auto frameOffset = static_cast<uint32_t>(frame.frameDataOffset);
+    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullscreenPipelineLayout, 0,
+                            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 1, &frameOffset);
 
     // Pushed for every fullscreen pass, read by the ones that tone map or walk a chain. A shader
     // that does not declare the block simply does not see it; the range belongs to the layout, not
@@ -5409,7 +6003,7 @@ VulkanRenderer::BufferResource VulkanRenderer::createDeviceLocalBuffer(const voi
     vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
 
     finishUploadCommands(commandBuffer);
-    vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
+    retireUploadStaging(stagingBuffer, stagingAllocation);
 
     return resource;
 }
@@ -5721,6 +6315,13 @@ unsigned int VulkanRenderer::neutralLookupTable()
     return neutralLookupTableId;
 }
 
+std::array<unsigned int, postProcessVolumeCount> VulkanRenderer::neutralVolumes()
+{
+    std::array<unsigned int, postProcessVolumeCount> volumes{};
+    volumes.fill(neutralLookupTable());
+    return volumes;
+}
+
 unsigned int VulkanRenderer::dummyCubeMap()
 {
     if (dummyCubeMapId != 0)
@@ -5824,19 +6425,20 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 
     std::array<unsigned int, shadowCascadeCount> images{};
     images.fill(dummyShadowMap());
-    dummyShadowSet = shadowSet(images, dummyTexture(), dummyTexture());
+    dummyShadowSet = shadowSet(images, dummyTexture(), dummyTexture(), dummyTexture());
 
     return dummyShadowSet;
 }
 
-// Keyed by the whole tuple of depth image ids and the occlusion image beside them, so a rebuilt
+// Keyed by the whole tuple of depth image ids and the three images beside them, so a rebuilt
 // cascade target — or a view that gathers occlusion sharing the frame with one that does not — gets
 // a set of its own rather than a stale view. Linear scan over a list that holds one entry per view
 // in a running game, and the one the fallback added.
 VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
-                                          const unsigned int occlusionImageId, const unsigned int behindImageId)
+                                          const unsigned int occlusionImageId, const unsigned int behindImageId,
+                                          const unsigned int cloudMapImageId)
 {
-    const ShadowSetKey wanted{imageIds, occlusionImageId, behindImageId};
+    const ShadowSetKey wanted{imageIds, occlusionImageId, behindImageId, cloudMapImageId};
     for (const auto& [key, set] : shadowSets)
     {
         if (key == wanted)
@@ -5902,10 +6504,25 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
         behindImage->second.sampler != VK_NULL_HANDLE ? behindImage->second.sampler : attachmentSampler,
         behindImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
+    // The cloud map beside them, on the one sampler that repeats in u: the map is lat-long, its
+    // u an azimuth that wraps at 360 degrees, and the shared attachment sampler's clamp would
+    // seam the sky at due +z. A scene with none arrives here with the 1x1 white one, which keeps
+    // its own sampler.
+    const auto cloudImage = imageResources.find(cloudMapImageId);
+    if (cloudImage == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const VkDescriptorImageInfo cloudInfo{
+        cloudImage->second.sampler != VK_NULL_HANDLE ? cloudImage->second.sampler : cloudMapSampler,
+        cloudImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
     // One write covering the cascade binding's whole array: they are consecutive elements of a
     // single binding, so imageInfos is handed over in one go rather than a write per cascade. The
-    // occlusion and the behind copy are bindings of their own and therefore writes of their own.
-    std::array<VkWriteDescriptorSet, 3> writes{};
+    // occlusion, the behind copy and the cloud map are bindings of their own and therefore writes
+    // of their own.
+    std::array<VkWriteDescriptorSet, 4> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = shadowMapBinding;
@@ -5929,6 +6546,14 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[2].pImageInfo = &behindInfo;
+
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set;
+    writes[3].dstBinding = cloudMapBinding;
+    writes[3].dstArrayElement = 0;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].pImageInfo = &cloudInfo;
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -6118,16 +6743,18 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
 }
 
 VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessBinding> inputs,
-                                              const unsigned int lookupTableImageId)
+                                              const unsigned int lookupTableImageId,
+                                              const std::array<unsigned int, postProcessVolumeCount>& volumeImageIds)
 {
     // Resolved before any reference into imageResources is taken: creating the fallback inserts
     // into that map, and the padding below names it.
     const auto fallback = PostProcessBinding{.gpuResourceId = dummyTexture(), .level = 0};
     const auto bindings = postProcessBindings(inputs, fallback);
+    const FullscreenSetKey wanted{bindings, lookupTableImageId, volumeImageIds};
 
     for (const auto& [key, set] : attachmentSets)
     {
-        if (key.first == bindings && key.second == lookupTableImageId)
+        if (key == wanted)
         {
             return set;
         }
@@ -6174,10 +6801,25 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessB
     const VkDescriptorImageInfo gradeInfo{grade->second.sampler, grade->second.view,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
+    // The volumes beside it, each with the sampler its own image was created with — a volume image
+    // always carries one. The caller filled unused slots with the neutral table already.
+    std::array<VkDescriptorImageInfo, postProcessVolumeCount> volumeInfos{};
+    for (auto slot = 0u; slot < postProcessVolumeCount; slot++)
+    {
+        const auto volume = imageResources.find(volumeImageIds[slot]);
+        if (volume == imageResources.end())
+        {
+            return VK_NULL_HANDLE;
+        }
+
+        volumeInfos[slot] = VkDescriptorImageInfo{volume->second.sampler, volume->second.view,
+                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    }
+
     // One write covering the input binding's whole array, as the cascades are written: the inputs
-    // are consecutive elements of a single binding. The grade is a second binding and a second
-    // write.
-    std::array<VkWriteDescriptorSet, 2> writes{};
+    // are consecutive elements of a single binding. The grade and the two volumes are bindings of
+    // their own and therefore writes of their own.
+    std::array<VkWriteDescriptorSet, 2 + postProcessVolumeCount> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = postProcessInputBinding;
@@ -6194,9 +6836,20 @@ VkDescriptorSet VulkanRenderer::attachmentSet(const std::span<const PostProcessB
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[1].pImageInfo = &gradeInfo;
 
+    for (auto slot = 0u; slot < postProcessVolumeCount; slot++)
+    {
+        writes[2 + slot].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2 + slot].dstSet = set;
+        writes[2 + slot].dstBinding = cloudBaseNoiseBinding + slot;
+        writes[2 + slot].dstArrayElement = 0;
+        writes[2 + slot].descriptorCount = 1;
+        writes[2 + slot].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2 + slot].pImageInfo = &volumeInfos[slot];
+    }
+
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-    attachmentSets.emplace_back(std::pair{bindings, lookupTableImageId}, set);
+    attachmentSets.emplace_back(wanted, set);
     return set;
 }
 
@@ -6348,8 +7001,17 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    // GL enables GL_DEPTH_TEST globally and never touches the func or the write mask, so this is
+    // GL enables GL_DEPTH_TEST globally and never touches the func or the write mask, so this was
     // GL's default LESS — with the write mask now a property of the draw rather than of the API.
+    //
+    // **LESS_OR_EQUAL since 2026-08-26, and pre-Z is what needs it.** A view that loads a depth
+    // buffer another view already filled with its own geometry re-rasterises that geometry at
+    // *exactly* the depth already stored — the prepass and the shading pair compute `gl_Position`
+    // from the same expression over the same `localToScreen`, so the ties are exact rather than
+    // near — and LESS rejects every one of them. The symptom is not subtle: a black world. What the
+    // relaxation costs elsewhere is that two coplanar opaque surfaces at identical depth now let the
+    // *later* draw win instead of the earlier, which is the ordinary convention and is measured by
+    // both gates rather than argued about here.
     //
     // **A transparent surface tests depth and does not write it.** Writing is a claim that nothing
     // behind this fragment is visible, which is the one thing a pane of glass does not say. Two
@@ -6363,7 +7025,7 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_TRUE;
     depthStencil.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     depthStencil.maxDepthBounds = 1.0f;
 
     // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled.
@@ -6429,7 +7091,7 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     pipelineInfo.layout = scenePipelineLayout;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    const auto createResult = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+    const auto createResult = vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
     if (createResult != VK_SUCCESS)
     {
         diagnostics.record(FrameDiagnostic::ScenePipelineUnavailable,
@@ -6452,9 +7114,15 @@ VulkanRenderer::scenePipeline(const unsigned int shaderId, PrimitiveBinding& bin
     return &binding.pipelines.back();
 }
 
-VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const VkFormat colorFormat)
+VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const VkFormat colorFormat,
+                                             const FullscreenBlend blend)
 {
-    const auto key = (static_cast<uint64_t>(shaderId) << 32u) | static_cast<uint32_t>(colorFormat);
+    // Shader ids are a small counter, so the top two bits above them are free to carry the blend
+    // mode. The weight a constant-blend pipeline mixes at is dynamic state and deliberately not in
+    // the key: one pipeline serves every weight, and a knob that moved between two runs would
+    // otherwise build a pipeline per setting.
+    const auto key = (static_cast<uint64_t>(blend) << 62u) | (static_cast<uint64_t>(shaderId) << 32u) |
+                     static_cast<uint32_t>(colorFormat);
     const auto cached = offscreenPipelines.find(key);
     if (cached != offscreenPipelines.end())
     {
@@ -6468,7 +7136,7 @@ VkPipeline VulkanRenderer::offscreenPipeline(const unsigned int shaderId, const 
     }
 
     const auto pipeline =
-        buildFullscreenPipeline(shader->second.vertexModule, shader->second.fragmentModule, colorFormat);
+        buildFullscreenPipeline(shader->second.vertexModule, shader->second.fragmentModule, blend, colorFormat);
     if (pipeline != VK_NULL_HANDLE)
     {
         offscreenPipelines.emplace(key, pipeline);
@@ -6613,17 +7281,69 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
     // Every source is compiled with the contract macros predefined, so no shader spells a set
-    // index, a binding, an attribute location or an array bound that C++ also holds.
+    // index, a binding, an attribute location or an array bound that C++ also holds. The macro
+    // values join the cache key below for the same reason they exist: a contract change must
+    // recompile every shader that read it.
+    std::string cacheKeyMaterial;
+    cacheKeyMaterial.reserve(source.size() + 1024);
+    cacheKeyMaterial += stageName;
+    cacheKeyMaterial += '\x1f';
+    cacheKeyMaterial += std::to_string(static_cast<int>(kind));
+    cacheKeyMaterial += '\x1f';
     for (const auto& macro : shaderContractMacros())
     {
-        options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
+        auto value = std::to_string(macro.value);
+        options.AddMacroDefinition(std::string(macro.name), value);
+        cacheKeyMaterial += macro.name;
+        cacheKeyMaterial += '=';
+        cacheKeyMaterial += value;
+        cacheKeyMaterial += ';';
     }
 
     // The same list for the contract's non-integer numbers. std::to_string writes six decimal
     // places, which is more than enough for a decimal literal to round back to the same float.
     for (const auto& macro : shaderContractFloatMacros())
     {
-        options.AddMacroDefinition(std::string(macro.name), std::to_string(macro.value));
+        auto value = std::to_string(macro.value);
+        options.AddMacroDefinition(std::string(macro.name), value);
+        cacheKeyMaterial += macro.name;
+        cacheKeyMaterial += '=';
+        cacheKeyMaterial += value;
+        cacheKeyMaterial += ';';
+    }
+    cacheKeyMaterial += '\x1f';
+    cacheKeyMaterial += source;
+
+    // The compiled words, cached on disk keyed by everything the compilation depends on. The
+    // measured first frame spent 3.8 s in shaderc across the shader set, and the driver's own
+    // disk cache cannot reach any of it — it only sees the SPIR-V this cache is of.
+    std::string cachePath;
+    if (const auto directory = engineCacheDirectory(); !directory.empty())
+    {
+        std::array<char, 32> hashText{};
+        std::snprintf(hashText.data(), hashText.size(), "%016llx",
+                      static_cast<unsigned long long>(fnv1a64(cacheKeyMaterial)));
+        cachePath = directory + "/spirv-" + hashText.data() + ".spv";
+
+        if (std::FILE* file = std::fopen(cachePath.c_str(), "rb"); file != nullptr)
+        {
+            std::fseek(file, 0, SEEK_END);
+            const auto size = std::ftell(file);
+            std::fseek(file, 0, SEEK_SET);
+            std::vector<uint32_t> words;
+            auto usable = size > 0 && size % static_cast<long>(sizeof(uint32_t)) == 0;
+            if (usable)
+            {
+                words.resize(static_cast<size_t>(size) / sizeof(uint32_t));
+                usable = std::fread(words.data(), sizeof(uint32_t), words.size(), file) == words.size() &&
+                         words.front() == 0x07230203u;
+            }
+            std::fclose(file);
+            if (usable)
+            {
+                return words;
+            }
+        }
     }
 
     const auto result = compiler.CompileGlslToSpv(source, kind, stageName, options);
@@ -6640,7 +7360,27 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
         logger.warn("Vulkan {} shader compiled with {} warning(s)", stageName, result.GetNumWarnings());
     }
 
-    return std::vector<uint32_t>(result.cbegin(), result.cend());
+    std::vector<uint32_t> words(result.cbegin(), result.cend());
+
+    if (!cachePath.empty() && !words.empty())
+    {
+        if (std::FILE* file = std::fopen(cachePath.c_str(), "wb"); file != nullptr)
+        {
+            if (std::fwrite(words.data(), sizeof(uint32_t), words.size(), file) != words.size())
+            {
+                // A truncated blob would fail the magic-and-size check next run, but removing it
+                // now keeps even that cold start from happening.
+                std::fclose(file);
+                std::remove(cachePath.c_str());
+            }
+            else
+            {
+                std::fclose(file);
+            }
+        }
+    }
+
+    return words;
 }
 
 VkShaderModule VulkanRenderer::createShaderModule(const std::vector<uint32_t>& spirv) const
@@ -6656,7 +7396,7 @@ VkShaderModule VulkanRenderer::createShaderModule(const std::vector<uint32_t>& s
 }
 
 VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexModule,
-                                                   const VkShaderModule fragmentModule,
+                                                   const VkShaderModule fragmentModule, const FullscreenBlend blend,
                                                    const VkFormat colorFormat) const
 {
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
@@ -6701,14 +7441,28 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     // GL runs with glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) globally enabled. Straight
     // alpha, not the premultiplied form the scene pass uses: a fullscreen pass writes a whole
     // image over a target it does not read through, so there is no coverage here to split a
-    // fragment's terms by.
+    // fragment's terms by. A pass whose alpha channel is data rather than coverage — the fog
+    // march's transmittance — turns blending off instead.
+    //
+    // The third state is the constant pair, and it exists for the pass that is *both*: the cloud
+    // dome's alpha is a transmittance the skybox reads, and the dome also accumulates over frames,
+    // so the mix has to be stated somewhere other than in the fragment's alpha. It is set per pass
+    // through vkCmdSetBlendConstants rather than baked here, so one pipeline serves every weight.
+    //
+    // Blending of either kind reads the destination, which means the pass must also load its
+    // target — see PostProcess::loadColour, and note that the source-alpha arm ran for years over
+    // a DONT_CARE load op without noticing, because every shader but this one writes alpha 1.0.
     VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.blendEnable = VK_TRUE;
-    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.blendEnable = blend == FullscreenBlend::None ? VK_FALSE : VK_TRUE;
+    const auto sourceFactor =
+        blend == FullscreenBlend::Constant ? VK_BLEND_FACTOR_CONSTANT_ALPHA : VK_BLEND_FACTOR_SRC_ALPHA;
+    const auto destinationFactor = blend == FullscreenBlend::Constant ? VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA
+                                                                      : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.srcColorBlendFactor = sourceFactor;
+    blendAttachment.dstColorBlendFactor = destinationFactor;
     blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.srcAlphaBlendFactor = sourceFactor;
+    blendAttachment.dstAlphaBlendFactor = destinationFactor;
     blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
     blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -6718,7 +7472,11 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &blendAttachment;
 
-    const std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // Blend constants are declared dynamic on every fullscreen pipeline and set on every fullscreen
+    // pass, whether or not the factors above name them: a state nothing reads costs one command,
+    // and one that is sometimes declared and sometimes not is a state somebody forgets to set.
+    const std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
     VkPipelineDynamicStateCreateInfo dynamicState{};
     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
@@ -6745,7 +7503,7 @@ VkPipeline VulkanRenderer::buildFullscreenPipeline(const VkShaderModule vertexMo
     pipelineInfo.layout = fullscreenPipelineLayout;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    ensure(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline),
+    ensure(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline),
            "vkCreateGraphicsPipelines");
     return pipeline;
 }
@@ -6783,7 +7541,8 @@ std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(cons
         if (shaderObject.fullscreen)
         {
             shaderObject.swapchainTargetPipeline =
-                buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule, surfaceFormat.format);
+                buildFullscreenPipeline(shaderObject.vertexModule, shaderObject.fragmentModule,
+                                        FullscreenBlend::SourceAlpha, surfaceFormat.format);
         }
 
         const auto id = nextResourceId++;
@@ -6804,29 +7563,53 @@ std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(cons
 
 VkCommandBuffer VulkanRenderer::beginUploadCommands() const
 {
+    if (uploadBatchCommands != VK_NULL_HANDLE)
+    {
+        return uploadBatchCommands;
+    }
+
     VkCommandBufferAllocateInfo allocateInfo{};
     allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocateInfo.commandPool = uploadCommandPool;
     allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocateInfo.commandBufferCount = 1;
 
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    ensure(vkAllocateCommandBuffers(device, &allocateInfo, &commandBuffer), "vkAllocateCommandBuffers");
+    ensure(vkAllocateCommandBuffers(device, &allocateInfo, &uploadBatchCommands), "vkAllocateCommandBuffers");
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    ensure(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
-    return commandBuffer;
+    ensure(vkBeginCommandBuffer(uploadBatchCommands, &beginInfo), "vkBeginCommandBuffer");
+    return uploadBatchCommands;
 }
 
 void VulkanRenderer::finishUploadCommands(const VkCommandBuffer commandBuffer) const
 {
-    ensure(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    // The batch stays open: recording is complete for this upload, submission is
+    // flushUploadCommands' — once per frame from endFrame, or on the spot for a reader that
+    // needs the GPU's answer now. Execution order against the frame is unchanged, because the
+    // flush submits ahead of the frame's own command buffer exactly as each fence-waited upload
+    // used to complete ahead of it.
+    static_cast<void>(commandBuffer);
+}
+
+void VulkanRenderer::retireUploadStaging(const VkBuffer buffer, const VmaAllocation allocation) const
+{
+    uploadBatchStaging.emplace_back(buffer, allocation);
+}
+
+void VulkanRenderer::flushUploadCommands() const
+{
+    if (uploadBatchCommands == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    ensure(vkEndCommandBuffer(uploadBatchCommands), "vkEndCommandBuffer");
 
     VkCommandBufferSubmitInfo commandBufferInfo{};
     commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    commandBufferInfo.commandBuffer = commandBuffer;
+    commandBufferInfo.commandBuffer = uploadBatchCommands;
 
     VkSubmitInfo2 submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
@@ -6842,32 +7625,51 @@ void VulkanRenderer::finishUploadCommands(const VkCommandBuffer commandBuffer) c
     ensure(vkWaitForFences(device, 1, &uploadFence, VK_TRUE, waitForever), "vkWaitForFences");
 
     vkDestroyFence(device, uploadFence, nullptr);
-    vkFreeCommandBuffers(device, uploadCommandPool, 1, &commandBuffer);
+    vkFreeCommandBuffers(device, uploadCommandPool, 1, &uploadBatchCommands);
+    uploadBatchCommands = VK_NULL_HANDLE;
+
+    for (const auto& [buffer, allocation] : uploadBatchStaging)
+    {
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    }
+    uploadBatchStaging.clear();
 }
 
-// A colour grade's image. Three dimensions, one mip and a clamping sampler, and the three of those
-// are the whole reason it is not the function below: a grade is sampled at one level forever (a
-// minified grade is a different grade), and its edges hold black and white, where a repeating
-// address mode would fetch the opposite corner of the cube and put white in the shadows.
+// A three-dimensional image: one mip (a minified grade is a different grade, and a noise volume's
+// filtering is the march's own business), linearly filtered, and a format the payload decides.
+// Float data is the colour grade, expanded to four float channels under GL's padding rule and
+// clamped, because the table's edges hold black and white and a repeat would fetch the opposite
+// corner of the cube. Byte data is baked volumetric noise, uploaded at its own channel count —
+// sixteen bytes a texel would put 33 MB where 8 belong — and repeating, because the noise tiles
+// and a clamp would freeze its last texel across every repeat. Three byte channels pad to four
+// with an opaque alpha: R8G8B8_UNORM has no guaranteed sampled-image support.
 unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
 {
-    // Four channels, float, because the table is authored in float and the padding rule is GL's:
-    // a source with three components gets zero in the fourth and this one gets one, which nothing
-    // reads.
     const auto texelCount = static_cast<size_t>(texture.width) * texture.height * texture.depth;
     const auto sourceChannels = static_cast<size_t>(channelCount(texture.format));
-    constexpr auto componentBytes = sizeof(float);
-    const auto uploadBytes = static_cast<VkDeviceSize>(texelCount * 4 * componentBytes);
+    const auto componentBytes = static_cast<size_t>(pixelComponentBytes(texture.pixelDataType));
 
     if (sourceChannels == 0 || texture.data.size() < texelCount * sourceChannels * componentBytes)
     {
-        throw std::runtime_error("colour grade source has no usable payload");
+        throw std::runtime_error("volume texture source has no usable payload");
     }
+
+    const auto byteTexels = texture.pixelDataType == PixelDataType::UnsignedByte;
+    if (!byteTexels && texture.pixelDataType != PixelDataType::Float)
+    {
+        throw std::runtime_error("a volume texture carries byte or float texels; nothing uploads the third kind");
+    }
+
+    const auto uploadChannels = byteTexels && sourceChannels != 3 ? sourceChannels : size_t{4};
+    constexpr std::array<VkFormat, 4> byteFormats = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED,
+                                                     VK_FORMAT_R8G8B8A8_UNORM};
+    const auto format = byteTexels ? byteFormats[uploadChannels - 1] : VK_FORMAT_R32G32B32A32_SFLOAT;
+    const auto uploadBytes = static_cast<VkDeviceSize>(texelCount * uploadChannels * componentBytes);
 
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_3D;
-    imageInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imageInfo.format = format;
     imageInfo.extent = VkExtent3D{texture.width, texture.height, texture.depth};
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
@@ -6903,17 +7705,41 @@ unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
                            &stagingAllocationInfo),
            "vmaCreateBuffer");
 
-    auto* destination = static_cast<float*>(stagingAllocationInfo.pMappedData);
-    const auto* source = reinterpret_cast<const float*>(texture.data.data());
-    for (size_t texel = 0; texel < texelCount; texel++)
+    if (uploadChannels == sourceChannels)
     {
-        for (size_t channel = 0; channel < 3; channel++)
+        // The straight copy every compact noise volume takes: the format above matches the payload
+        // texel for texel.
+        std::memcpy(stagingAllocationInfo.pMappedData, texture.data.data(), uploadBytes);
+    }
+    else if (byteTexels)
+    {
+        // Three byte channels into four, alpha opaque and read by nothing.
+        auto* destination = static_cast<unsigned char*>(stagingAllocationInfo.pMappedData);
+        const auto* source = texture.data.data();
+        for (size_t texel = 0; texel < texelCount; texel++)
         {
-            destination[texel * 4 + channel] =
-                channel < sourceChannels ? source[texel * sourceChannels + channel] : 0.0f;
+            destination[texel * 4 + 0] = source[texel * 3 + 0];
+            destination[texel * 4 + 1] = source[texel * 3 + 1];
+            destination[texel * 4 + 2] = source[texel * 3 + 2];
+            destination[texel * 4 + 3] = 255;
         }
+    }
+    else
+    {
+        // The grade's expansion, exactly as it always ran: a source with three components gets
+        // zero in the fourth and this one gets one, which nothing reads.
+        auto* destination = static_cast<float*>(stagingAllocationInfo.pMappedData);
+        const auto* source = reinterpret_cast<const float*>(texture.data.data());
+        for (size_t texel = 0; texel < texelCount; texel++)
+        {
+            for (size_t channel = 0; channel < 3; channel++)
+            {
+                destination[texel * 4 + channel] =
+                    channel < sourceChannels ? source[texel * sourceChannels + channel] : 0.0f;
+            }
 
-        destination[texel * 4 + 3] = 1.0f;
+            destination[texel * 4 + 3] = 1.0f;
+        }
     }
     ensure(vmaFlushAllocation(allocator, stagingAllocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
@@ -6935,7 +7761,7 @@ unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
                     VK_ACCESS_2_SHADER_READ_BIT, whole);
 
     finishUploadCommands(commandBuffer);
-    vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
+    retireUploadStaging(stagingBuffer, stagingAllocation);
 
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -6947,14 +7773,18 @@ unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
     VkImageView view = VK_NULL_HANDLE;
     ensure(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView");
 
+    // The grade clamps because its edges are black and white; a noise volume repeats because it
+    // tiles, and a clamp would smear its last texel across every repeat.
+    const auto addressMode = byteTexels ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeU = addressMode;
+    samplerInfo.addressModeV = addressMode;
+    samplerInfo.addressModeW = addressMode;
     samplerInfo.maxLod = 0.0f;
 
     VkSampler sampler = VK_NULL_HANDLE;
@@ -6972,7 +7802,7 @@ unsigned int VulkanRenderer::createVolumeImage(const Texture& texture) const
                                              .layouts = {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                              .levelViews = {}});
 
-    logger.info("Vulkan colour grade {} uploaded: {} cube", id, texture.width);
+    logger.info("Vulkan volume texture {} uploaded: {}x{}x{}", id, texture.width, texture.height, texture.depth);
 
     return id;
 }
@@ -7175,7 +8005,7 @@ unsigned int VulkanRenderer::createSampledImage(const std::span<const Texture* c
     }
 
     finishUploadCommands(commandBuffer);
-    vmaDestroyBuffer(allocator, stagingBuffer, stagingAllocation);
+    retireUploadStaging(stagingBuffer, stagingAllocation);
 
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -7300,9 +8130,10 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
     std::erase_if(attachmentSets,
                   [&](const auto& cached)
                   {
-                      const auto names = std::ranges::any_of(cached.first.first, [&](const PostProcessBinding& binding)
+                      const auto names = std::ranges::any_of(cached.first.inputs, [&](const PostProcessBinding& binding)
                                                              { return binding.gpuResourceId == id; }) ||
-                                         cached.first.second == id;
+                                         cached.first.lookupTable == id ||
+                                         std::ranges::find(cached.first.volumes, id) != cached.first.volumes.end();
                       if (!names)
                       {
                           return false;
@@ -7314,15 +8145,15 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
                       return true;
                   });
 
-    // A cascade set names up to shadowCascadeCount views and the two images beside them — the
-    // occlusion and the behind copy — so one destroyed image invalidates every set that mentions
-    // it, on the same schedule and for the same reason as the fullscreen set above. The next frame
-    // that asks for a set with a live tuple builds a new one.
+    // A cascade set names up to shadowCascadeCount views and the three images beside them — the
+    // occlusion, the behind copy and the cloud map — so one destroyed image invalidates every set
+    // that mentions it, on the same schedule and for the same reason as the fullscreen set above.
+    // The next frame that asks for a set with a live tuple builds a new one.
     std::erase_if(shadowSets,
                   [&](const auto& entry)
                   {
                       if (std::ranges::find(entry.first.cascades, id) == entry.first.cascades.end() &&
-                          entry.first.occlusion != id && entry.first.behind != id)
+                          entry.first.occlusion != id && entry.first.behind != id && entry.first.cloudMap != id)
                       {
                           return false;
                       }
@@ -7415,6 +8246,12 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
                                          "FboAttachmentType::Stencil has no equivalent here");
             }
 
+            // The initial clear below is a transfer write, which the usage has to declare.
+            if (attachment.type == FboAttachmentType::Color && attachment.initialColour.has_value())
+            {
+                usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            }
+
             // GL honours FboAttachment::internalFormat; so does this. An internalFormat with no
             // Vulkan equivalent is a model the backend cannot serve, not a runtime condition.
             const auto requestedFormat = attachmentFormat(attachment.internalFormat);
@@ -7505,6 +8342,32 @@ std::expected<unsigned int, std::string> VulkanRenderer::createFbo(const Fbo& fb
                 {
                     resource.levelViews.push_back(createLevelView(attachmentId, level, 0));
                 }
+            }
+
+            // The opt-in first fill (FboAttachment::initialColour): cleared through the synchronous
+            // upload path because the image must be defined before any frame is — frame 0's probe
+            // captures run before the chain that will write this, and would otherwise sample it in
+            // UNDEFINED layout. Left in SHADER_READ_ONLY, and the tracked layouts say so, which is
+            // what makes the first real pass's transition out of it truthful. A resize re-runs this
+            // whole function over the same record, so a rebuilt attachment is re-cleared for free.
+            if (attachment.type == FboAttachmentType::Color && attachment.initialColour.has_value())
+            {
+                const auto& colour = attachment.initialColour.value();
+                const VkImageSubresourceRange whole{aspect, 0, levels, 0, 1};
+                const auto commandBuffer = beginUploadCommands();
+                transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COPY_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT, whole);
+                const VkClearColorValue clearValue{{colour.x, colour.y, colour.z, colour.w}};
+                vkCmdClearColorImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1,
+                                     &whole);
+                transitionImage(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT, whole);
+                finishUploadCommands(commandBuffer);
+
+                imageResources.at(attachmentId).layouts.assign(levels, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
 
             fboResource.attachmentIds.push_back(attachmentId);
@@ -7919,6 +8782,8 @@ std::expected<void, std::string> VulkanRenderer::captureBuffers(const std::strin
                 }
 
                 finishUploadCommands(commandBuffer);
+                // A readback: the CPU reads the mapping next, so the batch cannot stay lazy here.
+                flushUploadCommands();
                 ensure(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE), "vmaInvalidateAllocation");
 
                 auto values = std::vector<float>(texelCount * layout.components);

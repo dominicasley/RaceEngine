@@ -131,6 +131,7 @@ std::expected<Camera, std::string> CameraService::createCamera(const CreateCamer
                   .exposure = exposure,
                   .fieldOfView = 75.f,
                   .role = createCameraDTO.role,
+                  .debugName = createCameraDTO.debugName,
                   .overrideShader = createCameraDTO.overrideShader,
                   .tracksWindowSize = false,
                   .nearClippingPlane = 1.0f,

@@ -1,7 +1,10 @@
 module;
 
 #include <optional>
+#include <string>
 #include <vector>
+
+#include <glm/glm.hpp>
 
 export module raceengine.graphics.models:Dto;
 
@@ -25,6 +28,8 @@ export struct CreateFboAttachmentDTO
     DepthComparison depthComparison = DepthComparison::None;
     // See FboAttachment::levels. One is a plain render target.
     unsigned int levels = 1;
+    // See FboAttachment::initialColour. Unset is every render target that ever existed.
+    std::optional<glm::vec4> initialColour{};
 };
 
 export struct CreateFboDTO
@@ -55,6 +60,8 @@ export struct CreateCameraDTO
     DepthComparison depthComparison = DepthComparison::None;
     // See CameraRole and Camera::overrideShader.
     CameraRole role = CameraRole::Scene;
+    // See Camera::debugName. Empty is legal and labels the view by its role.
+    std::string debugName{};
     std::optional<Resource<Shader>> overrideShader{};
     // A render target this camera draws into instead of owning one — typically an Fbo composed over
     // attachments other framebuffers already own (FboService::compose), which is how a layered
@@ -74,6 +81,18 @@ export struct CreateShadowCascadesDTO
     Resource<Shader> depthShader;
     // Square, and unrelated to the window: a cascade target does not resize with it.
     unsigned int resolution = 2048;
+    // The size the far half of the cascades (index 2 and up) render at; zero means every cascade
+    // takes `resolution`. The near cascades are where a texel is small enough for caster detail
+    // to survive the PCF — measured on the 2048-to-4096 change, which sharpened the chain-link
+    // fence 1.28x and moved nothing else — so the far ones may run coarser for most of the fill.
+    unsigned int farResolution = 0;
+    // Whether the far cascades hold a padded fit across frames and skip re-rendering until the
+    // view drifts out of the pad. Sound exactly when what they contain is static under a fixed
+    // sun — this project's scenes — and measured worth most of the cascade GPU time, which is
+    // draw-bound rather than fill-bound. The pad coarsens far texels ~15%, inside what the PCF
+    // and distance softness already hide. The refit cadence is a pure function of the camera's
+    // ticks, so captures stay deterministic.
+    bool cacheFarCascades = false;
     // The practical split scheme's blend. 0 is uniform, 1 is logarithmic. See
     // cascadeSplitDistances.
     float lambda = 0.5f;
@@ -114,6 +133,11 @@ export struct CreateAmbientOcclusionDTO
     // again to tell the two apart. Fullscreen, and separate from the gather because a blur that ran
     // inside it would be sampling a buffer it was still writing.
     Resource<Shader> blurShader;
+    // Lifts the half-resolution blurred term back to the view's own size, joint-bilateral against
+    // the full-resolution prepass so the term never bleeds across a depth edge. The gather and the
+    // blur run at half resolution because occlusion is low-frequency and the gather's horizon
+    // search is the most expensive fullscreen pass in the frame.
+    Resource<Shader> upsampleShader;
     // Strength and radius, defaulted by AmbientOcclusion itself; the state fields are overwritten
     // when it is enabled.
     AmbientOcclusion occlusion{};

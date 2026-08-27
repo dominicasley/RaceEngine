@@ -15,6 +15,7 @@ add_executable(EngineTests
         AntilockBrakingTests.cpp
         AssistDiagnosticProbe.cpp
         BackendParityTests.cpp
+        BodyAttitudeProbe.cpp
         BrakeHardwareTests.cpp
         BrakeModelProbe.cpp
         BrakingUtilisationProbe.cpp
@@ -37,6 +38,8 @@ add_executable(EngineTests
         EnvelopeSolverProbe.cpp
         ForceFeedbackTests.cpp
         FrameDiagnosticsTests.cpp
+        FrontCamberValidationProbe.cpp
+        FrontHardpointStudyProbe.cpp
         FrameInvarianceTests.cpp
         FrustumTests.cpp
         GradeTests.cpp
@@ -46,6 +49,7 @@ add_executable(EngineTests
         HandlingTests.cpp
         InGearProbe.cpp
         InputDeviceProbeTests.cpp
+        InstantAxisCheckProbe.cpp
         InputServiceTests.cpp
         InputTests.cpp
         KerbDiscontinuityProbe.cpp
@@ -71,6 +75,9 @@ add_executable(EngineTests
         StalledChatterProbe.cpp
         SteeringGeometryProbe.cpp
         SteeringShimmyProbe.cpp
+        SpringDamperKinematicsProbe.cpp
+        SuspensionElementTests.cpp
+        SuspensionSweepProbe.cpp
         SuspensionTests.cpp
         TelemetryTests.cpp
         TelemetryUnitsProbe.cpp

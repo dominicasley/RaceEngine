@@ -232,6 +232,12 @@ target_include_directories(Engine SYSTEM PUBLIC
         ${TINYGLTF_INCLUDE_DIRS}
         ${ozz_animation_SOURCE_DIR}/include)
 
+# Not SYSTEM, and this is the one first-party include path in the tree: `Profiling/RaceEngineProfile.hpp`
+# holds the profiler's zone macros, which cannot live in a module because macros do not cross an
+# `import`. It is on the *public* path because the sandbox's simulation thread is instrumented too.
+# The header is inert unless RACEENGINE_WITH_TRACY is ON, so this costs an unprofiled build nothing.
+target_include_directories(Engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # No precompiled header on this target, and that is a finding rather than an omission.
 #
 # A PCH is worth an enormous amount here in principle — a std header textually included in a global
@@ -293,6 +299,62 @@ if(RACEENGINE_WITH_FMOD)
     target_compile_definitions(Engine PRIVATE RACEENGINE_HAS_FMOD)
 
     message(STATUS "FMOD: ${FMOD_LIBRARY}")
+endif()
+
+# Tracy, when a build asks for it. Off by default, and off is what every measurement this project
+# has is taken under: the client instruments a thread the moment it is linked, so a profiled binary
+# is not the binary the goldens were blessed from and must not be the one a gate runs. Both parity
+# gates run out of `build/dev`, which never sees this.
+#
+# `cmake --preset profile` is the whole switch — it turns this on and asks the vcpkg manifest for the
+# `profiling` feature in one step, so the client, the GUI and the capture tools arrive together.
+# Full account: docs/profiling.md.
+option(RACEENGINE_WITH_TRACY "Link the Tracy profiler client and compile the zone markers" OFF)
+
+# The version is pinned here and it is pinned to what the *viewer* speaks. Tracy's wire protocol
+# carries a version and a server refuses a client that does not match it, so "which Tracy" is one
+# decision covering both halves — scripts/install-tracy.sh unpacks the prebuilt tools of this exact
+# tag into ~/opt/tracy. Bump the two together or the profiler connects to nothing.
+set(RACEENGINE_TRACY_VERSION "0.14.1" CACHE STRING "Tracy version, client and viewer alike")
+
+if(RACEENGINE_WITH_TRACY)
+    # FetchContent rather than the vcpkg port, and the reason is the pin above: the port is at
+    # 0.13.1 at this manifest's baseline, and the only prebuilt Linux viewer is 0.14.1 — a mismatch
+    # that presents as a profiler that connects and then disconnects. The port's `gui-tools` feature
+    # would build a matching viewer from source, but it drags dbus, libsystemd and libxcrypt in with
+    # it, and libxcrypt does not configure on this machine without `sudo apt install autoconf-archive`.
+    # Downloading the viewer costs nothing and needs no root.
+    include(FetchContent)
+    # **Stated, not assumed.** Tracy 0.14 flipped `TRACY_ENABLE` to default OFF, and an OFF client is
+    # not a link error or a warning — `Tracy.hpp` simply expands every marker to nothing, the binary
+    # opens no listening socket, and the profiler sits on "Connecting..." forever. That is what
+    # happened here on the first run, and it is why this line is a `FORCE` rather than a default.
+    set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+    set(TRACY_STATIC ON CACHE BOOL "" FORCE)
+    # On demand, so a session records from the moment the profiler attaches rather than from process
+    # start. Without it the client queues everything from the first instruction and holds it in memory
+    # until somebody connects, which on a lap of Bathurst is a great deal of memory for data nobody
+    # asked for.
+    set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+            tracy
+            GIT_REPOSITORY https://github.com/wolfpld/tracy
+            GIT_TAG v${RACEENGINE_TRACY_VERSION}
+            GIT_SHALLOW TRUE
+            # SYSTEM, on the same rule FMOD's headers are held to: the zero-suppressions policy is
+            # first-party only, and Tracy's headers are expanded into first-party units by every
+            # marker, so -Werror over them would be -Werror over somebody else's code.
+            SYSTEM
+            EXCLUDE_FROM_ALL)
+    FetchContent_MakeAvailable(tracy)
+
+    # PUBLIC on both counts: the markers are macros, so every unit that carries one expands Tracy's
+    # own code into itself and needs the headers, the TRACY_ENABLE the target propagates, and the
+    # client to link against — including the sandbox's, which the engine cannot reach.
+    target_link_libraries(Engine PUBLIC Tracy::TracyClient)
+    target_compile_definitions(Engine PUBLIC RACEENGINE_HAS_TRACY)
+
+    message(STATUS "Tracy: client ${RACEENGINE_TRACY_VERSION} linked, zone markers live")
 endif()
 
 # The calibration tool. A console program, no window and no Vulkan: it talks to the input backend

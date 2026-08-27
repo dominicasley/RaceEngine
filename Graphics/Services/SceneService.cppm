@@ -54,6 +54,14 @@ public:
     // them live in Graphics/Api/VolumetricFog.cppm and in the scene shaders.
     [[nodiscard]] std::expected<void, std::string> setFog(Scene& scene, const Fog& fog) const;
     [[nodiscard]] std::expected<void, std::string> setRain(Scene& scene, float rain) const;
+    // The clouds over the scene, a per-scene statement exactly as the rain is. Zero coverage is the
+    // clear sky the renderer has always drawn; type is the stratus-to-cumulus blend and means
+    // nothing without coverage. See Scene::clouds.
+    [[nodiscard]] std::expected<void, std::string> setClouds(Scene& scene, float coverage, float type) const;
+    // Which attachment carries the marched cloud dome map. Stated by whoever built the world
+    // camera's chain, because which pass's output is the cloud map is a fact about that chain; the
+    // backend binds it to every shading view and to every probe face. See Scene::cloudMap.
+    void setCloudMap(Scene& scene, const Resource<FboAttachment>& cloudMap) const;
     // Where the rain's glass is going: the ground speed in metres per second, the airflow phase —
     // the integral of speed squared, accumulated by the caller a tick at a time — and the car's own
     // two axes in world space, which must be the body's and not the ground's. A per-tick setter

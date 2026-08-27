@@ -59,10 +59,12 @@ export enum class FrameDiagnostic : size_t {
     ColourGradeUnavailable,
     MaterialShaderUnavailable,
     PaintDataRingExhausted,
+    PostProcessVolumesExceeded,
+    VolumeInputUnavailable,
+    CloudMapUnavailable,
 };
 
-export inline constexpr size_t frameDiagnosticCount =
-    static_cast<size_t>(FrameDiagnostic::PaintDataRingExhausted) + 1;
+export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::CloudMapUnavailable) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -131,6 +133,12 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "material(s) drawn with their renderable's shader, the one they named being registered nowhere";
     case FrameDiagnostic::PaintDataRingExhausted:
         return "painted draw(s) drawn unpainted, the paint ring having no slot left this frame";
+    case FrameDiagnostic::PostProcessVolumesExceeded:
+        return "post-process pass(es) declaring more volumes than the fullscreen set carries";
+    case FrameDiagnostic::VolumeInputUnavailable:
+        return "volume slot(s) bound as the neutral table, the texture they name being unloaded";
+    case FrameDiagnostic::CloudMapUnavailable:
+        return "view(s) shaded under a white cloud map, the scene's attachment having no image to sample";
     }
 
     return "skipped item(s) of an unnamed kind";

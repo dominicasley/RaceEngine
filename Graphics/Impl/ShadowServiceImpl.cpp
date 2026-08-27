@@ -77,15 +77,21 @@ std::expected<void, std::string> ShadowService::enable(Scene& scene, Light& ligh
 
     for (auto index = 0u; index < shadowCascadeCount; index++)
     {
+        // The far half of the map may run coarser — see CreateShadowCascadesDTO::farResolution.
+        const auto resolution = index >= 2 && createShadowCascadesDTO.farResolution != 0
+                                    ? createShadowCascadesDTO.farResolution
+                                    : createShadowCascadesDTO.resolution;
+
         // Depth only, at its own resolution, with the comparison sampler percentage-closer
         // filtering needs — and marked as a producer, which is what makes the frame record it
         // before the camera that samples it.
         auto camera =
-            cameraService.createCamera(CreateCameraDTO{.width = createShadowCascadesDTO.resolution,
-                                                       .height = createShadowCascadesDTO.resolution,
+            cameraService.createCamera(CreateCameraDTO{.width = resolution,
+                                                       .height = resolution,
                                                        .target = CameraTarget::DepthOnly,
                                                        .depthComparison = DepthComparison::LessOrEqual,
                                                        .role = CameraRole::ShadowCascade,
+                                                       .debugName = "cascade " + std::to_string(index),
                                                        .overrideShader = createShadowCascadesDTO.depthShader});
         if (!camera)
         {
@@ -96,14 +102,15 @@ std::expected<void, std::string> ShadowService::enable(Scene& scene, Light& ligh
             return std::unexpected("cascade " + std::to_string(index) + " has no depth target: " + camera.error());
         }
 
-        scene.shadows.cascades.push_back(
-            ShadowCascade{.camera = &scene.cameras.emplace_back(std::move(camera).value())});
+        scene.shadows.cascades.push_back(ShadowCascade{
+            .camera = &scene.cameras.emplace_back(std::move(camera).value()), .resolution = resolution});
     }
 
     scene.shadows.light = &light;
     scene.shadows.viewCamera = &viewCamera;
     scene.shadows.lightIndex = lightIndex;
     scene.shadows.resolution = createShadowCascadesDTO.resolution;
+    scene.shadows.cacheFarCascades = createShadowCascadesDTO.cacheFarCascades;
     scene.shadows.distance = createShadowCascadesDTO.distance;
     scene.shadows.lambda = createShadowCascadesDTO.lambda;
     scene.shadows.casterExtent = createShadowCascadesDTO.casterExtent;
@@ -134,11 +141,36 @@ void ShadowService::update(Scene& scene) const
             continue;
         }
 
-        const auto fit = fitCascade(
-            viewCamera.position, viewCamera.direction, viewCamera.fieldOfView, viewCamera.aspectRatio, splits[index],
-            splits[index + 1], scene.shadows.light->direction, scene.shadows.resolution, scene.shadows.casterExtent);
+        // A cached far cascade pads its fit so the picture in it survives the camera drifting,
+        // and refits — re-rendering with it — only when the ideal fit leaves the pad. The pad is
+        // a fraction of the slice's own radius, so every cascade's hold budget scales with what
+        // it covers; the safety margin under it is what keeps the original slice inside the
+        // padded square right up to the refit.
+        constexpr auto farCascadePadFraction = 0.15f;
+        constexpr auto refitSafety = 0.9f;
+        const auto cached = scene.shadows.cacheFarCascades && index >= 2;
+        const auto pad = cached ? farCascadePadFraction *
+                                      cascadeSliceSphere(viewCamera.fieldOfView, viewCamera.aspectRatio,
+                                                         splits[index], splits[index + 1])
+                                          .radius
+                                : 0.0f;
+
+        // The cascade's own size, never the shared one: the texel arithmetic the bias budget is
+        // stated in has to divide by the map actually being rendered.
+        const auto resolution = cascade.resolution != 0 ? cascade.resolution : scene.shadows.resolution;
+        const auto fit = fitCascade(viewCamera.position, viewCamera.direction, viewCamera.fieldOfView,
+                                    viewCamera.aspectRatio, splits[index], splits[index + 1],
+                                    scene.shadows.light->direction, resolution, scene.shadows.casterExtent, pad);
 
         auto& camera = *cascade.camera;
+
+        if (cached && cascade.mapValid && glm::length(fit.position - cascade.heldPosition) < pad * refitSafety)
+        {
+            camera.contentsHeld = true;
+
+            continue;
+        }
+
         cameraService.setPosition(camera, fit.position.x, fit.position.y, fit.position.z);
         cameraService.setDirection(camera, fit.direction.x, fit.direction.y, fit.direction.z);
         cameraService.setRoll(camera, fit.roll.x, fit.roll.y, fit.roll.z);
@@ -148,6 +180,9 @@ void ShadowService::update(Scene& scene) const
         cascade.splitDistance = splits[index + 1];
         cascade.texelWorldSize = fit.texelWorldSize;
         cascade.depthPerWorldUnit = fit.depthPerWorldUnit;
+        cascade.heldPosition = fit.position;
+        cascade.mapValid = cached;
+        camera.contentsHeld = false;
     }
 }
 

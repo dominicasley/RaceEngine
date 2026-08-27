@@ -119,13 +119,19 @@ export struct CascadeFit
 // `casterExtent` is how far behind the slice the volume still catches geometry: a caster between
 // the light and the slice is outside the sphere and must still be in the depth map, or a building
 // stops casting the moment the camera looks past its base.
+// `padWorld` inflates the fitted square by that many world units on every side, so a held fit
+// stays valid while the ideal centre drifts up to the pad — the currency of the far-cascade
+// cache. Everything below derives from the padded radius, including the snap lattice, so a
+// padded fit is exactly the fit of a larger slice rather than a patched one. Zero is the
+// un-padded fit every existing caller gets.
 export [[nodiscard]] inline CascadeFit fitCascade(const glm::vec3& viewPosition, const glm::vec3& viewDirection,
                                                   const float verticalFieldOfViewDegrees, const float aspectRatio,
                                                   const float nearDistance, const float farDistance,
                                                   const glm::vec3& lightDirection, const uint32_t resolution,
-                                                  const float casterExtent)
+                                                  const float casterExtent, const float padWorld = 0.0f)
 {
-    const auto sphere = cascadeSliceSphere(verticalFieldOfViewDegrees, aspectRatio, nearDistance, farDistance);
+    auto sphere = cascadeSliceSphere(verticalFieldOfViewDegrees, aspectRatio, nearDistance, farDistance);
+    sphere.radius += padWorld;
     const auto centre = viewPosition + glm::normalize(viewDirection) * sphere.centreDistance;
     const auto light = glm::normalize(lightDirection);
 

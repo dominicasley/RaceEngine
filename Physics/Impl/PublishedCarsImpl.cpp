@@ -35,7 +35,19 @@ namespace raceengine
     corner.lower = Wishbone{.frontPivot = at(0.40769, -0.10955, 0.01423),
                             .rearPivot = at(0.40944, -0.12017, -0.27373),
                             .ballJoint = at(0.07174, -0.13710, 0.01213)};
-    corner.strutTop = at(0.25366, 0.54933, -0.04296);
+
+    // **The ninth number taken away from the mod** (2026-08-26): the strut top's longitudinal
+    // position. As imported (`-0.04296`) the kingpin leans back only 4.59 deg where a Mk7 is
+    // published near 7.5 deg of caster — the discrepancy step 1 of the suspension audit recorded
+    // and step 15 sized (docs/suspension-geometry-audit.md). The lateral and vertical positions
+    // are the file's own, so KPI and scrub are untouched; the longitudinal position is **solved**
+    // from the held ball joint and the published caster rather than typed, which is why the z
+    // lands in chassis space below instead of carrying a literal that would go stale if the ball
+    // joint ever moved. Mechanical trail rises 26.7 -> 36.0 mm with it, which is the whole of the
+    // steering-feel change and is awaiting its seat session.
+    corner.strutTop = at(0.25366, 0.54933, 0.0);
+    corner.strutTop.z = corner.lower.ballJoint.z -
+                        (corner.strutTop.y - corner.lower.ballJoint.y) * std::tan(glm::radians(7.5));
     corner.steeringRackOuter = at(0.31000, -0.06546, -0.22200);
     corner.steeringArm = at(0.05200, -0.06757, -0.12586);
     corner.wheelCentre = at(0.0, 0.0, 0.0);
@@ -95,31 +107,6 @@ namespace
 
 inline constexpr auto standardGravity = 9.80665;
 inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
-
-// AC states its damper as a rate with a knee: `rate` up to `knee` metres per second of *wheel*
-// velocity and `fastRate` above it. The model evaluates the damper at the shaft, and the shaft moves
-// `ratio` times as fast as the wheel while carrying `1/ratio` of its force — so a wheel-referred
-// coefficient becomes a shaft one divided by the square of the ratio, and the speed the knee sits at
-// is multiplied by it. Both halves of that have to be done or the knee lands at the wrong speed.
-[[nodiscard]] Curve kneedDamper(const double bumpRate, const double fastBumpRate, const double bumpKnee,
-                                const double reboundRate, const double fastReboundRate, const double reboundKnee,
-                                const double motionRatio)
-{
-    const auto ratio = std::abs(motionRatio);
-    const auto square = std::max(ratio * ratio, 1e-9);
-    const auto span = 5.0;
-
-    const auto bumpKneeSpeed = ratio * bumpKnee;
-    const auto bumpKneeForce = (bumpRate / square) * bumpKneeSpeed;
-    const auto bumpEnd = bumpKneeForce + (fastBumpRate / square) * (span - bumpKneeSpeed);
-
-    const auto reboundKneeSpeed = ratio * reboundKnee;
-    const auto reboundKneeForce = (reboundRate / square) * reboundKneeSpeed;
-    const auto reboundEnd = reboundKneeForce + (fastReboundRate / square) * (span - reboundKneeSpeed);
-
-    return Curve{.points = {glm::dvec2(-span, -reboundEnd), glm::dvec2(-reboundKneeSpeed, -reboundKneeForce),
-                            glm::dvec2(0.0, 0.0), glm::dvec2(bumpKneeSpeed, bumpKneeForce), glm::dvec2(span, bumpEnd)}};
-}
 
 // The rack travel that steers the front wheels to the lock the car states, **signed**. AC gives the
 // steering wheel's own lock and the ratio between the two, so the road wheel's angle is data; the
@@ -640,17 +627,23 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     {
         auto& corner = setup.corners[index];
 
-        const auto design = solveCornerWithJacobian(corner.hardpoints, 0.0, 0.0);
-        if (!design)
+        // Each role's rate converts through its own ratio: the spring's through `SpringKinematics`
+        // and the damper's through `DamperKinematics` — role-typed all the way into `kneedDamper`,
+        // whose spring overload is deleted. On this car the spring is coaxial, so the two ratios
+        // are the same bits and both conversions are the numbers they always were — the split is
+        // the seam, not a change.
+        const auto spring = solveSpringKinematics(corner.hardpoints, springElementOf(corner.hardpoints), 0.0, 0.0);
+        const auto damper = solveDamperKinematics(corner.hardpoints, damperElementOf(corner.hardpoints), 0.0, 0.0);
+        if (!spring || !damper)
         {
             return std::unexpected("corner " + std::string(cornerAbbreviation(static_cast<Corner>(index))) + ": " +
-                                   design.error());
+                                   (spring ? damper.error() : spring.error()));
         }
 
-        const auto ratio = std::abs(design->motionRatio);
-        corner.springRate = wheelRate[index] / (ratio * ratio);
+        const auto springRatio = std::abs(spring->motionRatio);
+        corner.springRate = wheelRate[index] / (springRatio * springRatio);
         corner.damper = kneedDamper(bumpRate[index], fastBumpRate[index], bumpKnee[index], reboundRate[index],
-                                    fastReboundRate[index], reboundKnee[index], ratio);
+                                    fastReboundRate[index], reboundKnee[index], *damper);
         corner.antiRollRate = antiRoll[index];
         corner.brakeTorque = brakeTorque[index];
         corner.unsprungMass = hubMass(index);

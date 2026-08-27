@@ -7,6 +7,7 @@
 module;
 
 #include <expected>
+#include <optional>
 #include <string>
 
 #include <glm/glm.hpp>
@@ -51,14 +52,64 @@ PostProcessService::create(const std::string& id, const Resource<Shader>& shader
         return std::unexpected("post process '" + id + "' has no output buffer: " + output.error());
     }
 
-    return memoryStorageService.postProcesses.add(PostProcess{.shader = shader, .output = output.value()});
+    return memoryStorageService.postProcesses.add(
+        PostProcess{.shader = shader, .output = output.value(), .debugName = id});
 }
 
 Resource<PostProcess> PostProcessService::create(const Resource<Shader>& shader, const Resource<Fbo>& output,
-                                                 const unsigned int outputLevel, const bool tracksWindowSize) const
+                                                 const unsigned int outputLevel, const bool tracksWindowSize,
+                                                 const std::string& id) const
 {
-    return memoryStorageService.postProcesses.add(PostProcess{
-        .shader = shader, .output = output, .outputLevel = outputLevel, .tracksWindowSize = tracksWindowSize});
+    return memoryStorageService.postProcesses.add(PostProcess{.shader = shader,
+                                                              .output = output,
+                                                              .debugName = id,
+                                                              .outputLevel = outputLevel,
+                                                              .tracksWindowSize = tracksWindowSize});
+}
+
+void PostProcessService::setBlend(const Resource<PostProcess>& postProcessKey, const bool blend) const
+{
+    memoryStorageService.postProcesses.mutate(postProcessKey,
+                                              [&](PostProcess& postProcess) { postProcess.blend = blend; });
+}
+
+void PostProcessService::setBlendWeight(const Resource<PostProcess>& postProcessKey,
+                                        const std::optional<float> weight) const
+{
+    memoryStorageService.postProcesses.mutate(postProcessKey,
+                                              [&](PostProcess& postProcess) { postProcess.blendWeight = weight; });
+}
+
+void PostProcessService::setLoadColour(const Resource<PostProcess>& postProcessKey, const bool loadColour) const
+{
+    memoryStorageService.postProcesses.mutate(postProcessKey,
+                                              [&](PostProcess& postProcess) { postProcess.loadColour = loadColour; });
+}
+
+void PostProcessService::setContentsHeld(const Resource<PostProcess>& postProcessKey, const bool held) const
+{
+    memoryStorageService.postProcesses.mutate(postProcessKey,
+                                              [&](PostProcess& postProcess) { postProcess.contentsHeld = held; });
+}
+
+void PostProcessService::setSlice(const Resource<PostProcess>& postProcessKey, const unsigned int slice,
+                                  const unsigned int sliceCount) const
+{
+    const auto count = sliceCount == 0 ? 1u : sliceCount;
+
+    memoryStorageService.postProcesses.mutate(postProcessKey,
+                                              [&](PostProcess& postProcess)
+                                              {
+                                                  postProcess.sliceCount = count;
+                                                  postProcess.slice = slice % count;
+                                              });
+}
+
+void PostProcessService::setWindowSizeDivisor(const Resource<PostProcess>& postProcessKey,
+                                              const unsigned int divisor) const
+{
+    memoryStorageService.postProcesses.mutate(
+        postProcessKey, [&](PostProcess& postProcess) { postProcess.windowSizeDivisor = divisor == 0 ? 1u : divisor; });
 }
 
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
@@ -71,9 +122,33 @@ void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey,
 
 void PostProcessService::addInput(const Resource<PostProcess>& postProcessKey, const Resource<Texture>& texture) const
 {
+    // The input array is sampler2D the whole way across, and a 3D image bound to a 2D slot is
+    // undefined with no validation to report it — the descriptor is written, the sample just reads
+    // garbage. Refused here, where the mistake is a one-line fix, rather than rendered as a wrong
+    // picture three passes downstream.
+    if (const auto* stored = memoryStorageService.textures.find(texture); stored != nullptr && stored->depth > 1)
+    {
+        fail("a texture with depth above one is a volume and cannot ride the fullscreen input array; "
+             "use addVolumeInput");
+    }
+
     memoryStorageService.postProcesses.mutate(
         postProcessKey,
         [&](PostProcess& postProcess) { postProcess.inputs.push_back(PostProcessInput{.texture = texture}); });
+}
+
+void PostProcessService::addVolumeInput(const Resource<PostProcess>& postProcessKey,
+                                        const Resource<Texture>& texture) const
+{
+    // The inverse of addInput's guard: a flat image where the shader declares a sampler3D is the
+    // same undefined bind from the other side.
+    if (const auto* stored = memoryStorageService.textures.find(texture); stored != nullptr && stored->depth <= 1)
+    {
+        fail("addVolumeInput takes a texture with depth above one; use addInput for a picture");
+    }
+
+    memoryStorageService.postProcesses.mutate(postProcessKey, [&](PostProcess& postProcess)
+                                              { postProcess.volumes.push_back(texture); });
 }
 
 void PostProcessService::setParameters(const Resource<PostProcess>& postProcessKey, const glm::vec4& parameters) const

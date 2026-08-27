@@ -1164,8 +1164,14 @@ TEST_CASE("how much travel the linkage actually has, against the stops placed in
         REQUIRE(atDroop.has_value());
 
         // Positive is compression on the shaft; the linkage's own limits either side of design.
-        const auto shaftBump = design->damperLength - atBump->damperLength;
-        const auto shaftDroop = atDroop->damperLength - design->damperLength;
+        // Shaft lengths off the damper element, which is the sole source of damper geometry since
+        // the legacy state fields were retired (step 14) — the same bits the solver used to carry.
+        const auto element = raceengine::damperElementOf(corner.hardpoints);
+        const auto designLength = raceengine::solveElement(corner.hardpoints, element, 0.0).length;
+        const auto shaftBump =
+            designLength - raceengine::solveElement(corner.hardpoints, element, corner.hardpoints.bumpAngle).length;
+        const auto shaftDroop =
+            raceengine::solveElement(corner.hardpoints, element, corner.hardpoints.droopAngle).length - designLength;
         const auto wheelBump = atBump->wheelTravel - design->wheelTravel;
         const auto wheelDroop = design->wheelTravel - atDroop->wheelTravel;
 
