@@ -88,11 +88,19 @@ namespace raceengine
     // the refusal.
     //
     // So this is the one piece of geometry here that is not from the file, and it is placed rather
-    // than fitted: the Mk7's rear damper picks up on the wheel carrier and stands very nearly
-    // upright, so the lower eye goes on the ball joint and the upper mount directly above it. That
-    // arrangement has a motion ratio of about one, which is what makes AC's at-the-wheel rates pass
+    // than fitted: the lower eye goes on the ball joint and the upper mount directly above it, an
+    // arrangement whose motion ratio is about one, which is what makes AC's at-the-wheel rates pass
     // through the conversion below essentially unchanged — the least the choice can be made to
     // matter. Only the *length* is free, and nothing reads it but the spring's rest length.
+    //
+    // **The wheel-carrier rationale this placement originally carried is the Mk6's, not this
+    // car's** — VW's own SSP 515 (p. 9) puts the Mk7's rear damper on the *spring link*, so the
+    // real ratio is strictly below one (reasoned 0.8–0.95, and nothing publishes a number; the
+    // 2026-08-29 entry in docs/suspension-fidelity-brief.md is the search record). The placement
+    // survives because the at-the-wheel rate convention is ratio-invariant for the spring and the
+    // viscous damper; what a true ratio would move is damper friction (one power) and the
+    // shaft-side travel stops. Re-placing the eye outboard on the link wants a measured offset,
+    // not a guess.
     corner.damperWishbone = corner.lower.ballJoint;
     corner.damperChassis = corner.lower.ballJoint + glm::dvec3(0.0, 0.40, 0.0);
 
