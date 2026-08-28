@@ -446,7 +446,18 @@ void stepTyreThermal(const TyreThermal& thermal, TyreState& state, const TyreThe
         const auto resisted =
             interfaceConductance > 0.0 && contact > 0.0 ? 1.0 / (1.0 / contact + 1.0 / interfaceConductance) : contact;
 
-        roadConductance = resisted * patchArea;
+        // Only the rubber conducts: `patchArea` is the geometric chord times the section width and
+        // the grooves are part of it, so a stated fraction takes them out. **The groove is a hole in
+        // the conducting area and not a second path in parallel** — still air across a 7.5 mm groove
+        // is about 3.5 W/(m²·K), a thousandth of the rubber's path, so what the groove carries is
+        // arithmetic noise and modelling it as nothing is exact to that part. It scales the whole
+        // series composition above, since both the semi-infinite term and the interface act only
+        // over the area that touches. **One is the gross patch and is the expression above
+        // unchanged**, which is what keeps this addition inert to the bit too.
+        const auto conductingArea =
+            thermal.roadAreaFraction < 1.0 ? patchArea * std::clamp(thermal.roadAreaFraction, 0.0, 1.0) : patchArea;
+
+        roadConductance = resisted * conductingArea;
     }
 
     // --- and the three nodes, all reading the same start-of-tick temperatures ---

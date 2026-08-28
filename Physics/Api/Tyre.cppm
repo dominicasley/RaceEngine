@@ -131,6 +131,18 @@ export struct TyreThermal
     // resolves uncertainty in. `TyreThermalTests` pins the gap so it cannot grow unnoticed.
     double roadContactConductance = 0.0;
 
+    // What fraction of the geometric contact patch is rubber on road rather than groove over road.
+    // **One is the gross patch**, which is what the model has always multiplied its road conductance
+    // by and is bit-identical to it; the honest figure for this tread is `1 − voidFraction` = 0.72,
+    // and it is deliberately a second field rather than a read of `voidFraction`, because that
+    // number is already spent on the tread's *mass* and a stated area fraction must be able to move
+    // without re-deriving the tyre's heat capacity.
+    //
+    // It is a different mechanism from `roadContactConductance` above and the two do not overlap:
+    // Miller's conductance is measured on a smooth-tread tyre, so it is a full-rubber figure for the
+    // area that touches, and this says how much area touches at all.
+    double roadAreaFraction = 1.0;
+
     // Still-air convection from a cylinder, W/(m²·K). A floor under the forced-convection
     // correlation rather than a term of its own: the Hilpert relation is a *forced* correlation and
     // goes to zero with speed, and a parked car still cools. The textbook band for free convection in

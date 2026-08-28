@@ -526,6 +526,20 @@ struct Launch
     return setup;
 }
 
+// And with a stated road-conducting fraction of the patch. One is the gross patch and is what the
+// shipped tyre states; 0.72 is `1 - voidFraction` and is what this tread's grooves leave touching.
+[[nodiscard]] VehicleSetup golfWithArea(const double fraction)
+{
+    auto setup = golfWith(true, -1.0);
+
+    for (auto& corner : setup.corners)
+    {
+        corner.tyre.thermal.roadAreaFraction = fraction;
+    }
+
+    return setup;
+}
+
 } // namespace
 
 TEST_CASE("where the tread's heat goes, and how much of it there is to move", "[.tyre-thermal]")
@@ -867,6 +881,91 @@ TEST_CASE("what the tread-road interface resistance is worth", "[.tyre-thermal]"
         }
 
         std::printf("\n");
+    }
+}
+
+TEST_CASE("what the groove's share of the patch is worth on the road path", "[.tyre-thermal]")
+{
+    // `TyreThermal::roadAreaFraction`. The road term multiplies the *gross* patch area and 28% of
+    // this tread is groove; grooves do not touch the road, so the conducting area is 0.72 of the
+    // geometric patch. A hole in the area rather than a second path — still air across a 7.5 mm
+    // groove is about 3.5 W/(m2.K), a thousandth of the rubber's — and a different mechanism from
+    // the interface conductance above, whose figure is measured on a smooth-tread tyre.
+    const auto guard = JoltGuard{};
+    const auto conditions = weather();
+
+    constexpr auto grooved = 0.72;
+    constexpr auto interface_ = 25200.0;
+
+    SECTION("what it does to the road path, at the speed every figure here is quoted at")
+    {
+        const auto setup = golfWith(true, -1.0);
+        const auto& thermal = setup.corners.front().tyre.thermal;
+        const auto world = plate(600.0, 60.0, 4.0);
+
+        auto state = VehicleState{};
+        settle(setup, state, world, hundred, 20.0);
+
+        auto last = VehicleStep{};
+        for (auto step = 0; step < 180; step++)
+        {
+            const auto stepped = stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world, tick, {}, weather());
+            REQUIRE(stepped.has_value());
+            last = stepped.value();
+        }
+
+        const auto& front = last.corners.front();
+        const auto penetration = front.patch.penetration;
+        const auto chord = 2.0 * std::sqrt(std::max(2.0 * tyreRadius * penetration - penetration * penetration, 0.0));
+        const auto patchArea = chord * setup.sampling.width;
+        const auto residence =
+            std::clamp(chord / std::max(std::abs(front.contact.longitudinalVelocity), 1e-3), 1e-3, 1.0);
+        const auto effusivity = std::sqrt(thermal.conductivity * thermal.density * thermal.specificHeat);
+        const auto perfect = 2.0 * effusivity / std::sqrt(3.141592653589793 * residence) * thermal.roadEffusivity /
+                             (effusivity + thermal.roadEffusivity);
+        const auto series = 1.0 / (1.0 / perfect + 1.0 / interface_);
+
+        std::printf("\n  Rolling at 100 km/h, residence %.4f s, gross patch %.4f m2.\n\n", residence, patchArea);
+        std::printf("    area fraction                        road path      of gross\n");
+        std::printf("    1.00 gross (shipped)                 %7.2f W/K      100.0%%\n", perfect * patchArea);
+        std::printf("    %.2f rubber only                     %7.2f W/K      %5.1f%%\n", grooved,
+                    perfect * patchArea * grooved, 100.0 * grooved);
+        std::printf("    and stacked with the interface's %.0f W/(m2.K):\n", interface_);
+        std::printf("    1.00 with the interface              %7.2f W/K      %5.1f%%\n", series * patchArea,
+                    100.0 * series / perfect);
+        std::printf("    %.2f with the interface              %7.2f W/K      %5.1f%%\n\n", grooved,
+                    series * patchArea * grooved, 100.0 * grooved * series / perfect);
+    }
+
+    SECTION("and what it is worth on the tread, driven")
+    {
+        const auto straightWorld = plate(8000.0, 100.0, 8.0);
+        const auto circleWorld = plate(1400.0, 900.0, 8.0);
+        const auto marks = std::vector<double>{};
+
+        std::printf("\n  Air %.1f C, track %.1f C, seeded at the track's temperature and driven four minutes.\n\n",
+                    conditions.airTemperature, conditions.trackTemperature);
+        std::printf("    fixture                    gross patch          %.2f of it       gain\n", grooved);
+
+        const auto row = [&](const char* label, const PhysicsWorld& world, const double steering, const double speed,
+                             const bool hottest) {
+            const auto gross =
+                hold(golfWithArea(1.0), world, steering, speed, 260.0, conditions.trackTemperature, marks);
+            const auto rubber =
+                hold(golfWithArea(grooved), world, steering, speed, 260.0, conditions.trackTemperature, marks);
+
+            const auto before = hottest ? gross.temperatures.hottestCore : gross.temperatures.core;
+            const auto after = hottest ? rubber.temperatures.hottestCore : rubber.temperatures.core;
+
+            std::printf("    %-26s %8.1f C            %8.1f C      %+5.2f\n", label, before, after, after - before);
+        };
+
+        row("straight 100 km/h, core", straightWorld, 0.0, hundred, false);
+        row("corner 20 m/s, hottest core", circleWorld, 0.37, 20.0, true);
+        row("corner 40 m/s, hottest core", circleWorld, 0.20, 40.0, true);
+
+        std::printf("\n    The hardest fixture here is the 40 m/s corner's hottest core, which is where the\n"
+                    "    +2.8 C estimate in docs/tyre-state-brief.md was made.\n\n");
     }
 }
 

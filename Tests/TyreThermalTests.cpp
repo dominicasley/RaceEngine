@@ -473,6 +473,152 @@ TEST_CASE("the tread-road interface resists heat, and the shipped tyre says it d
     }
 }
 
+TEST_CASE("the road path conducts through the rubber and not the grooves", "[physics][tyre][thermal][golf]")
+{
+    // `TyreThermal::roadAreaFraction`. The road term is multiplied by the geometric patch area and
+    // 28% of this tread is groove; grooves do not touch the road, so a stated fraction takes them
+    // out of the conducting area. The cases recover the road conductance the code actually used, on
+    // the same inversion the interface cases above stand on: with air, track and core at one
+    // temperature, one step of the closed form inverts to the sum of the paths leaving the surface,
+    // and the air and core paths cancel in a difference.
+    const auto thermal = golfThermal();
+    const auto nodes = tyreThermalNodes(thermal);
+
+    constexpr auto sink = 20.0;
+    constexpr auto hot = 100.0;
+    constexpr auto speed = 27.7778; // 100 km/h, which is where every road-path figure is quoted.
+    constexpr auto patchLength = 0.1910;
+    constexpr auto patchWidth = 0.235;
+
+    const auto surfaceConductance = [&](const double fraction, const double contact) {
+        auto tyre = thermal;
+        tyre.roadAreaFraction = fraction;
+        tyre.roadContactConductance = contact;
+
+        auto state = TyreState{};
+        seedTyreTemperature(state, sink);
+        state.surfaceTemperature = hot;
+
+        stepTyreThermal(tyre, state,
+                        TyreThermalInput{.roadSpeed = speed,
+                                         .airSpeed = speed,
+                                         .patchLength = patchLength,
+                                         .patchWidth = patchWidth,
+                                         .ambient = AmbientConditions{.airTemperature = sink,
+                                                                     .trackTemperature = sink}},
+                        tick);
+
+        return -nodes.surfaceCapacity / tick * std::log((state.surfaceTemperature - sink) / (hot - sink));
+    };
+
+    // The perfect-contact coefficient, recomputed from the tyre's own material figures as the
+    // interface cases above do.
+    const auto residence = patchLength / speed;
+    const auto effusivity = std::sqrt(thermal.conductivity * thermal.density * thermal.specificHeat);
+    const auto perfect = 2.0 * effusivity / std::sqrt(std::numbers::pi * residence) * thermal.roadEffusivity /
+                         (effusivity + thermal.roadEffusivity);
+    const auto patchArea = patchLength * patchWidth;
+
+    SECTION("the shipped Golf states the gross patch, which is the model as it has always been")
+    {
+        REQUIRE(thermal.roadAreaFraction == 1.0);
+    }
+
+    SECTION("and a tyre that states 1.0 is bit-identical to one that never heard of the field")
+    {
+        // Not "close to": at one the branch takes the gross patch, so the expression is character
+        // for character the one that shipped. Stepped under work rather than compared at rest, so
+        // the claim covers the whole path and not just the field's default.
+        const auto worked = [&](const TyreThermal& tyre) {
+            auto state = TyreState{};
+            seedTyreTemperature(state, 31.5);
+
+            const auto input = TyreThermalInput{.slipPower = 6000.0,
+                                                .verticalLoad = 4000.0,
+                                                .rollingResistance = 0.012,
+                                                .roadSpeed = speed,
+                                                .airSpeed = speed,
+                                                .patchLength = patchLength,
+                                                .patchWidth = patchWidth,
+                                                .ambient = AmbientConditions{.airTemperature = 20.0,
+                                                                             .trackTemperature = 31.5}};
+
+            for (auto step = 0; step < 360 * 30; step++)
+            {
+                stepTyreThermal(tyre, state, input, tick);
+            }
+
+            return state;
+        };
+
+        auto stated = thermal;
+        stated.roadAreaFraction = 1.0;
+
+        const auto unstated = worked(thermal);
+        const auto gross = worked(stated);
+
+        REQUIRE(unstated.surfaceTemperature == gross.surfaceTemperature);
+        REQUIRE(unstated.coreTemperature == gross.coreTemperature);
+        REQUIRE(unstated.carcassTemperature == gross.carcassTemperature);
+    }
+
+    SECTION("a stated 0.72 takes exactly its 28 per cent off the road path")
+    {
+        REQUIRE(surfaceConductance(1.0, 0.0) - surfaceConductance(0.72, 0.0) ==
+                Catch::Approx(0.28 * perfect * patchArea).epsilon(1e-9));
+    }
+
+    SECTION("and it scales the whole series composition rather than the perfect term alone")
+    {
+        // The interface conductance is per unit of area that touches, so the fraction multiplies
+        // *after* the series composition — a groove is a hole in the conducting area, not a change
+        // to how well the rubber that does touch conducts. Air across a 7.5 mm groove is worth about
+        // 3.5 W/(m²·K), a thousandth of the rubber's path, which is why the hole carries nothing.
+        constexpr auto measured = 25200.0; // NASA TN D-8161, rubber on asphalt.
+        const auto series = 1.0 / (1.0 / perfect + 1.0 / measured);
+
+        REQUIRE(surfaceConductance(1.0, measured) - surfaceConductance(0.72, measured) ==
+                Catch::Approx(0.28 * series * patchArea).epsilon(1e-9));
+    }
+
+    SECTION("a grooved patch leaves the tread hotter, which is what the term is for")
+    {
+        const auto worked = [&](const double fraction) {
+            auto tyre = thermal;
+            tyre.roadAreaFraction = fraction;
+
+            auto state = TyreState{};
+            seedTyreTemperature(state, 31.5);
+
+            const auto input = TyreThermalInput{.slipPower = 6000.0,
+                                                .verticalLoad = 4000.0,
+                                                .rollingResistance = 0.012,
+                                                .roadSpeed = speed,
+                                                .airSpeed = speed,
+                                                .patchLength = patchLength,
+                                                .patchWidth = patchWidth,
+                                                .ambient = AmbientConditions{.airTemperature = 20.0,
+                                                                             .trackTemperature = 31.5}};
+
+            for (auto step = 0; step < 360 * 240; step++)
+            {
+                stepTyreThermal(tyre, state, input, tick);
+            }
+
+            return state;
+        };
+
+        const auto gross = worked(1.0);
+        const auto grooved = worked(0.72);
+
+        REQUIRE(grooved.surfaceTemperature > gross.surfaceTemperature);
+        REQUIRE(grooved.coreTemperature > gross.coreTemperature);
+        // A band rather than a figure, so a future change that makes this large has to say so.
+        // Fitting it to close the window gap is the move `docs/tyre-state-brief.md` forbids.
+        REQUIRE(grooved.coreTemperature - gross.coreTemperature < 8.0);
+    }
+}
+
 TEST_CASE("a tyre warms when it is worked and cools when it is not", "[physics][tyre][thermal][golf]")
 {
     const auto thermal = golfThermal();
