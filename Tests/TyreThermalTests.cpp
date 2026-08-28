@@ -323,7 +323,7 @@ TEST_CASE("the tread's nodes come out of the tyre's own size", "[physics][tyre][
     }
 }
 
-TEST_CASE("the tread-road interface resists heat, and the shipped tyre says it does not",
+TEST_CASE("the tread-road interface resists heat and the shipped tyre states it",
           "[physics][tyre][thermal][golf]")
 {
     // `TyreThermal::roadContactConductance`, in series with the semi-infinite solution. The cases
@@ -369,9 +369,11 @@ TEST_CASE("the tread-road interface resists heat, and the shipped tyre says it d
                          (effusivity + thermal.roadEffusivity);
     const auto patchArea = patchLength * patchWidth;
 
-    SECTION("the shipped Golf states none, which is perfect contact")
+    SECTION("the shipped Golf states the measured conductance")
     {
-        REQUIRE(thermal.roadContactConductance == 0.0);
+        // NASA TN D-8161 (Miller, 1976), rubber on asphalt, a lower limit — stated 2026-08-29; the
+        // car had shipped it unstated, which was perfect contact.
+        REQUIRE(thermal.roadContactConductance == 25200.0);
     }
 
     SECTION("and a tyre that states none is the model that had no such term at all")

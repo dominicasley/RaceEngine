@@ -512,8 +512,8 @@ struct Launch
     return setup;
 }
 
-// The same car with a stated tread-road contact conductance, W/(m2.K). Zero is perfect contact and
-// is what the shipped tyre states.
+// The same car with a stated tread-road contact conductance, W/(m2.K). Zero is perfect contact,
+// which is the control; the shipped tyre states the measured 25200 since 2026-08-29.
 [[nodiscard]] VehicleSetup golfWithContact(const double conductance)
 {
     auto setup = golfWith(true, -1.0);
@@ -585,17 +585,25 @@ TEST_CASE("where the tread's heat goes, and how much of it there is to move", "[
     const auto patchArea = chord * setup.sampling.width;
     const auto residence = std::clamp(chord / std::max(std::abs(front.contact.longitudinalVelocity), 1e-3), 1e-3, 1.0);
     const auto effusivity = std::sqrt(thermal.conductivity * thermal.density * thermal.specificHeat);
-    const auto contact = 2.0 * effusivity / std::sqrt(3.141592653589793 * residence) * thermal.roadEffusivity /
+    const auto perfect = 2.0 * effusivity / std::sqrt(3.141592653589793 * residence) * thermal.roadEffusivity /
                          (effusivity + thermal.roadEffusivity);
+
+    // The car states an interface conductance since 2026-08-29, so the road path printed here is the
+    // one `stepTyreThermal` actually uses: the series composition, times the conducting fraction.
+    const auto contact = thermal.roadContactConductance > 0.0
+                             ? 1.0 / (1.0 / perfect + 1.0 / thermal.roadContactConductance)
+                             : perfect;
+    const auto roadPath = contact * patchArea * thermal.roadAreaFraction;
 
     std::printf("  Rolling at 100 km/h, front left, off the tick's own patch.\n\n");
     std::printf("    penetration %.4f m   chord %.4f m   patch %.4f m2   residence %.4f s\n", penetration, chord,
                 patchArea, residence);
-    std::printf("    tread effusivity %.0f J/(m2.K.s^0.5)   contact coefficient %.0f W/(m2.K)\n", effusivity, contact);
-    std::printf("    surface -> road  %7.2f W/K\n", contact * patchArea);
+    std::printf("    tread effusivity %.0f J/(m2.K.s^0.5)   contact coefficient %.0f W/(m2.K) perfect, %.0f stated\n",
+                effusivity, perfect, contact);
+    std::printf("    surface -> road  %7.2f W/K\n", roadPath);
     std::printf("    surface -> core  %7.2f W/K\n", nodes.surfaceToCore);
     std::printf("    surface time constant, every path together  %.2f s\n\n",
-                nodes.surfaceCapacity / (contact * patchArea + nodes.surfaceToCore));
+                nodes.surfaceCapacity / (roadPath + nodes.surfaceToCore));
 }
 
 TEST_CASE("what the tread warms up to, driven, and what the fitted number is worth", "[.tyre-thermal]")
@@ -776,7 +784,7 @@ TEST_CASE("what the tread-road interface resistance is worth", "[.tyre-thermal]"
 
         std::printf("\n  Rolling at 100 km/h, residence %.4f s, patch %.4f m2.\n\n", residence, patchArea);
         std::printf("    contact conductance      h_total        road path      of perfect\n");
-        std::printf("    perfect (shipped)      %8.0f W/(m2.K)  %7.2f W/K      100.0%%\n", perfect,
+        std::printf("    perfect (control)      %8.0f W/(m2.K)  %7.2f W/K      100.0%%\n", perfect,
                     perfect * patchArea);
 
         for (const auto stated : {low, measured, high})

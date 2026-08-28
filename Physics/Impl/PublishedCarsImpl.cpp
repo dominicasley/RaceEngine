@@ -980,13 +980,15 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         // depth and still-air convection — each a textbook or construction band rather than a value
         // chosen to make an output land somewhere. `docs/tyre-state-brief.md`, section 4.
 
-        // **This tyre states no contact conductance, so its road path assumes perfect contact.** That
-        // is not because the number is unknown — it is measured, at 2.52 × 10⁴ W/(m²·K) for rubber on
-        // asphalt, and `TyreThermal::roadContactConductance` carries the source. It is because what it
-        // buys is **a fifth of the road path and one to two degrees on the tread core**, which is
-        // below anything a seat can resolve and is not worth a driving-golden re-bless on a car nobody
-        // has driven since its defaults changed. `OSR_TYRE_CONTACT=25200` is the A/B, and stating it
-        // here is a one-line decision for whoever wants it. `docs/tyre-state-brief.md`.
+        // **The tread-road interface resists heat, and the figure is measured on this exact
+        // interface**: 2.52 × 10⁴ W/(m²·K) for rubber on asphalt, NASA TN D-8161 (Miller, 1976),
+        // stated as a lower limit — `TyreThermal::roadContactConductance` carries the source and the
+        // series composition. Stated since 2026-08-29. What it buys is a fifth of the road path
+        // (283.6 → 226.8 W/K at 100 km/h) and one to two degrees of tread core, below anything a
+        // seat can resolve; both gates are 0 of 32400 with it stated and unstated, so stating it
+        // moved no golden. `OSR_TYRE_CONTACT=perfect` is the control and the way back.
+        // `docs/tyre-state-brief.md`.
+        corner.tyre.thermal.roadContactConductance = 25200.0;
 
         // **AC's `tcurve_semis.lut`, slid 20 °C down its temperature axis on 2026-08-28 because the
         // window it came with belongs to a different tyre from the one this car wears.** The shape is
