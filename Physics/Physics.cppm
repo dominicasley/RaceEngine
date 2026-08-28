@@ -6,6 +6,7 @@ export module raceengine.physics;
 // naming a car gets the electronics fitted to it in the same import.
 export import raceengine.assists;
 
+export import :Ambient;
 export import :RigidBody;
 export import :JoltRuntime;
 export import :ProvingGround;

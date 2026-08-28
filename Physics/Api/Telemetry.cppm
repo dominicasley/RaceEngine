@@ -123,6 +123,27 @@ export struct WheelTelemetry
     // against `Speed` it is the estimator's error made visible, which is the channel to read first
     // when the electronics do something inexplicable.
     double sensedWheelSpeed = 0.0;
+
+    // The tread's three temperatures, degrees Celsius. All three, because the whole finding this
+    // model rests on is that they are **not** the same number and that grip follows the middle one:
+    // the surface moves within a corner, the core within a lap, the carcass within a stint. A single
+    // "tyre temperature" column would hide exactly the thing worth plotting.
+    //
+    // They read the seed temperature on a car with `tyreThermal` off, which is what a channel should
+    // say about a quantity that is not being simulated: the value the rest of the model is assuming.
+    double tyreSurfaceTemperature = 0.0;
+    double tyreCoreTemperature = 0.0;
+    double tyreCarcassTemperature = 0.0;
+
+    // The brake disc's temperature, degrees Celsius. One channel and not three: a disc is one lump of
+    // iron in this model, and what a plot of it answers is "did the brakes fade", which is a question
+    // about one number.
+    double discTemperature = 0.0;
+
+    // The wheel's, the same way — the node between the disc and the tyre since stage 3. It is worth
+    // its own column rather than being inferred, because the whole question stage 3 answers is how
+    // much of the disc's heat gets past it, and the answer is a temperature between two others.
+    double wheelTemperature = 0.0;
 };
 
 export struct TelemetryFrame

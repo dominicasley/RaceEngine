@@ -128,6 +128,11 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         wheel.antilockCycles = static_cast<std::uint32_t>(31 + corner);
         // Pascals in, bar out.
         wheel.brakePressure = sentinel(corner, 9) * 1.0e5;
+        // Celsius in, Celsius out — the one channel in this block that is written in the unit it is
+        // carried in, because every source this tyre is calibrated against states it that way.
+        wheel.treadCoreTemperature = sentinel(corner, 10);
+        wheel.discTemperature = sentinel(corner, 11);
+        wheel.wheelTemperature = sentinel(corner, 12);
     }
 
     const auto rows = lines(rackTorqueToCsv({frame}));
@@ -138,7 +143,7 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
 
     REQUIRE(header.size() == values.size());
     // Thirteen that were always there, then nine chassis channels, five driver ones, **seven for the
-    // electronics** and **thirteen** per corner — eighty-six in total.
+    // electronics** and **sixteen** per corner.
     //
     // The history, because the count has been wrong in a brief before: it was nine per corner and
     // sixty-three until `Patch Depth Spread` joined the block for the enveloping work, then ten and
@@ -152,7 +157,14 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // `XDS Fitted` joined the electronics group later the same day, taking it from six to seven: the
     // other two assists each had a *fitted* column and XDS had only an *active* one, so a lap with it
     // switched on and never triggered was indistinguishable from a lap without it.
-    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 13 * tracedCornerCount);
+    //
+    // `Tyre Temp Core` joined the per-corner block on 2026-08-28 with the thermal tyre, taking it
+    // from thirteen to fourteen. One column and not three: this file is the seat's artefact and the
+    // core is the layer grip reads. `Disc Temp` joined it the same day with the fade model, taking
+    // it to fifteen, and `Wheel Temp` joined with stage 3, taking it to sixteen — the rim is the
+    // *answer* to that stage rather than an input to it, and a trace showing a disc at 500 C, a rim
+    // at 90 and a tread at 50 says in three numbers how much a wheel lets past.
+    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 16 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -181,6 +193,9 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         REQUIRE(named("ABS Active", "[]") == Catch::Approx(corner % 2 == 0 ? 1.0 : 0.0).margin(1e-9));
         REQUIRE(named("ABS Cycles", "[]") == Catch::Approx(static_cast<double>(31 + corner)).margin(1e-9));
         REQUIRE(named("Brake Pressure", "[bar]") == Catch::Approx(sentinel(corner, 9)).epsilon(1e-9));
+        REQUIRE(named("Tyre Temp Core", "[C]") == Catch::Approx(sentinel(corner, 10)).epsilon(1e-9));
+        REQUIRE(named("Disc Temp", "[C]") == Catch::Approx(sentinel(corner, 11)).epsilon(1e-9));
+        REQUIRE(named("Wheel Temp", "[C]") == Catch::Approx(sentinel(corner, 12)).epsilon(1e-9));
     }
 }
 

@@ -16,6 +16,7 @@ export module raceengine.physics:Vehicle;
 
 import raceengine.assists;
 
+import :Ambient;
 import :Brakes;
 import :Contact;
 import :ContactPatch;
@@ -220,6 +221,21 @@ export struct CornerSetup
     // is what took `brakes.ini`'s `MAX_TORQUE` and `FRONT_SHARE` out of the Golf on 2026-08-23; the
     // setup sheet can still override it, because a pad change is a setup change.
     double brakeTorque = 1400.0;
+
+    // The disc as a lump of iron and the pad's fade curve with it — `brakeThermalOf` derives the
+    // whole thing from the same `BrakeHardware` that derived the torque above, so nothing here is a
+    // second statement of a part. Inert unless `VehicleSetup::brakeThermal` switches it on, and inert
+    // whatever that says on a brake whose couple states no fade curve.
+    BrakeThermal disc{};
+
+    // The wheel the disc is bolted inside — the third node, and the only path this model has from a
+    // brake at 500 °C to a tread at 50. `wheelThermalOf` derives it from a `WheelHardware` and the
+    // same `BrakeHardware` the disc came from, so the hat that joins them is stated once.
+    //
+    // **A default-constructed one has no heat capacity, which means no wheel.** Every step treats
+    // that as absent, so a car that does not state a wheel heats exactly as it did before stage 3
+    // existed. docs/brake-thermal-brief.md, section 7.
+    WheelThermal wheel{};
 };
 
 // One aerodynamic surface: a body, a wing, a splitter. Its coefficients are constants this
@@ -336,6 +352,33 @@ export struct VehicleSetup
     // Off by default, and off is the model every figure in docs/ was measured under.
     bool drivelineReaction = false;
 
+    // Whether the tyres carry a temperature — the tread's own heat balance, and grip following the
+    // tread **core** through the compound's own curve (`TyreThermal`).
+    //
+    // Off is the tyre this project measured everything against: friction, vertical rate and rolling
+    // resistance all constant from the moment the car is built to the end of the session, and a tyre
+    // that is therefore always exactly at its best. **Every performance figure in docs/ was taken
+    // under that assumption**, and the moment temperature is a state every fixture acquires a
+    // precondition it does not state — which is why the default seeds at
+    // `tyreDefaultTemperature`, the middle of the curve's flat plateau, so that switching this on
+    // changes nothing until something heats or cools a tyre.
+    //
+    // A switch rather than a rewrite for `geometricLoadPath`'s reason exactly: off is the control,
+    // and `OSR_TYRE_THERMAL=off` is the way back from the seat without a rebuild.
+    // docs/tyre-state-brief.md.
+    bool tyreThermal = false;
+
+    // Whether the brake discs carry a temperature, and the pads' friction follows it — which is fade.
+    //
+    // Off is the brake every figure in docs/ was measured on: a coefficient that is the same on the
+    // first stop of the day and the tenth in a row. **The inertness proof comes from the opposite end
+    // of the curve to the tyre's** and that is worth noticing rather than copying blindly — a pad's
+    // rated friction is flat *cold*, so seeding a disc at ambient is both the physical seed and the
+    // one that changes nothing, where the tyre had to be seeded warm to sit on its plateau.
+    //
+    // `OSR_BRAKE_THERMAL=off` is the control and the way back. docs/brake-thermal-brief.md.
+    bool brakeThermal = false;
+
     [[nodiscard]] double unsprungMass() const
     {
         auto total = 0.0;
@@ -394,6 +437,17 @@ export struct CornerState
     // bush also has a real relaxation of about this order, so what the lag models is not nothing —
     // but nobody has sourced its time constant, so it is not claimed as one.
     double complianceSteer = 0.0;
+
+    // The brake disc's temperature, degrees Celsius. Seeded at `brakeDefaultTemperature`, which is
+    // cold — see `VehicleSetup::brakeThermal` for why cold is the inert seed here and warm was the
+    // inert seed for the tyre.
+    double discTemperature = brakeDefaultTemperature;
+
+    // The wheel's, the same way. **A disc temperature without its wheel is not a state**, which is
+    // why `seedDiscTemperatures` sets both: a fixture measuring a first stop of the day is asserting
+    // that the whole corner is cold, and a wheel left at whatever the last run finished on would
+    // carry a stint's worth of heat into it.
+    double wheelTemperature = brakeDefaultTemperature;
 };
 
 // The vehicle's own state and nothing else's. Engine speed lived here until the driveline was given
@@ -406,6 +460,16 @@ export struct VehicleState
     RigidBodyState chassis;
     std::array<CornerState, cornerCount> corners{};
 };
+
+// Put every one of a car's brake discs at a stated temperature. A fixture measuring a tenth stop in a
+// row starts where the ninth left off; one measuring a first stop of the day says so with this.
+export void seedDiscTemperatures(VehicleState& state, const double celsius);
+
+// Put every one of a car's tyres at a stated temperature. What a fixture calls when it wants a cold
+// car — and the reason it is spelled at the call rather than defaulted is that a starting temperature
+// is part of a measurement: a stop from 20 °C and a stop from 85 °C are different experiments, and a
+// fixture that does not say which one it is running has not stated its own preconditions.
+export void seedTyreTemperatures(VehicleState& state, const double celsius);
 
 // `raceengine.assists` restates its own wheel count rather than importing this one, because it must
 // not be able to import anything from this module — see the head of `Assists/Api/WheelSensors.cppm`.
@@ -709,9 +773,14 @@ export [[nodiscard]] std::expected<VehicleSetup, std::string> placeholderSedan()
 // layer existed. That is what lets every fixture in the suite go on calling this with six arguments
 // and get an answer identical to the bit rather than merely close, which is the only kind of
 // regression evidence worth having for a car underneath a controller.
+//
+// `ambient` is the weather, and it follows the same rule for the same reason: it is a property of
+// the *scene* rather than of the car, it is read by exactly one thing — the tread's heat balance —
+// and it is defaulted so that every fixture that does not care goes on calling this with six or
+// seven arguments. A car with `tyreThermal` off never reads it at all.
 export [[nodiscard]] std::expected<VehicleStep, std::string>
 stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& input,
             const std::array<double, cornerCount>& driveTorques, const PhysicsWorld& world, const double deltaTime,
-            const BrakeCommand& brakes = {});
+            const BrakeCommand& brakes = {}, const AmbientConditions& ambient = {});
 
 } // namespace raceengine

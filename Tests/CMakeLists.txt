@@ -19,6 +19,8 @@ add_executable(EngineTests
         BodyAttitudeProbe.cpp
         BrakeHardwareTests.cpp
         BrakeModelProbe.cpp
+        BrakeThermalProbe.cpp
+        BrakeThermalTests.cpp
         BrakingUtilisationProbe.cpp
         CameraServiceTests.cpp
         CarAudioTests.cpp
@@ -95,11 +97,14 @@ add_executable(EngineTests
         TyreLoadSensitivityTests.cpp
         TyreShapeProbe.cpp
         TyreTests.cpp
+        TyreThermalProbe.cpp
+        TyreThermalTests.cpp
         VehicleDataProbe.cpp
         AssistPlacementProbe.cpp
         VehicleDeltaProbe.cpp
         VehicleTests.cpp
         WheelSpeedSensorTests.cpp
+        WheelThermalTests.cpp
         SphericalHarmonicsTests.cpp
         ShadowCascadesTests.cpp
         VolumetricFogTests.cpp)

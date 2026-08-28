@@ -174,8 +174,13 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
         // 32 chassis, driver and driveline channels, then fourteen per corner. Was 29 and twelve
         // until the two axle ride heights, the clutch pedal and the per-corner contact-sample count
         // were added for the telemetry expansion, and thirteen until `Patch Depth Spread` joined the
-        // per-corner block for the enveloping work.
-        REQUIRE(header.size() == 34 + 19 * cornerCount);
+        // per-corner block for the enveloping work. Nineteen until the tread's three temperatures
+        // joined it for the thermal tyre — three and not one, because grip follows the middle of
+        // them and a single column would hide exactly the thing worth plotting — twenty-two
+        // until the brake disc's one joined them, and twenty-three until the **wheel's** did with
+        // stage 3. The rim gets its own column because it is the answer to that stage rather than an
+        // input to it: what a reader wants is the disc, the rim and the tread side by side.
+        REQUIRE(header.size() == 34 + 24 * cornerCount);
     }
 
     SECTION("the steering column is the rim's angle, and the demand is beside it")
@@ -227,7 +232,10 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
             // Nineteen since the assist layer added five per corner — the hydraulic pressure, what
             // each of the three brake-based systems asked of the caliper, and what the wheel speed
             // sensor reported. Fourteen before that, thirteen before `Patch Depth Spread`.
-            REQUIRE(count == 19);
+            // Twenty-two since the tread's surface, core and carcass temperatures joined them,
+            // twenty-three since the brake disc's did, and twenty-four since the wheel's did with
+            // stage 3.
+            REQUIRE(count == 24);
         }
     }
 

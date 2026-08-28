@@ -7,6 +7,8 @@ module;
 
 export module raceengine.physics:Tyre;
 
+import :Ambient;
+
 namespace raceengine
 {
 // The tire, as a Magic Formula with the two things that decide whether a car feels like a car:
@@ -19,6 +21,156 @@ namespace raceengine
 // the load-sensitivity exponent — of which there are now two apiece — can only ever be read as a
 // matched pair.
 export enum class TyreAxis : std::uint32_t { Lateral, Longitudinal };
+
+// The tread's heat balance, stated so that **every constant carries a unit** and can be sourced,
+// derived from the tyre's own geometry, or bounded. That is the whole design rule here, and it is
+// the reason AC's own thermal gains are not used: `FRICTION_K = 0.0619` and its four companions
+// carry no unit, no timestep, no area and no mass, so they are numbers without a convention and a
+// number without a convention is not a measurement. docs/tyre-state-brief.md, section 2.
+//
+// **Three nodes and one direction of travel.** Heat arrives at the *surface* from sliding at the
+// patch and in the *tread core* and *carcass* from the carcass's own hysteresis; it leaves by
+// convection to the air and by conduction into the road. The grip curve reads the **core**, not the
+// surface, and that is sourced rather than assumed — Farroni, Russo, Sakhnevych and Timpone,
+// *TRT EVO*, Proc IMechE Part D 233(1) 2019: "the tire frictional behavior can be more realistically
+// associated with the tread core layer temperature", because friction is set by the bulk
+// viscoelastic state of the tread block and a thin skin cannot change it fast enough to matter.
+export struct TyreThermal
+{
+    // --- geometry, which is this tyre's own size and nothing else ---
+    //
+    // The tread band's outer radius and the rim's, metres. For a 225/40 R18 those are 0.2286 (an 18
+    // inch rim) plus 0.090 of section height (40% of 225 mm) and the rim radius itself, which is
+    // where `golfTyreRadius = 0.3186` comes from independently.
+    double outerRadius = 0.33;
+    double rimRadius = 0.2286;
+    // The tread band's width, metres.
+    double treadWidth = 0.20;
+
+    // New-tyre groove depth and the undertread below it, metres. The first is a published figure per
+    // tyre; the second is the rubber between the groove floor and the belt, which no manufacturer
+    // publishes and which is 1.5 to 3 mm on a passenger radial.
+    double grooveDepth = 0.0075;
+    double underTread = 0.002;
+
+    // What fraction of the grooved band is groove rather than rubber. A performance summer tread
+    // runs about 25-30% void; it is bounded rather than sourced per pattern.
+    double voidFraction = 0.28;
+
+    // The whole tyre's mass, kilograms. **This is what makes the carcass node's heat capacity a
+    // derived quantity rather than a guess**: the tread's mass follows from the geometry above, and
+    // what is left of a published tyre mass is everything else — belt, plies, liner, sidewalls and
+    // beads. Manufacturers publish it per size.
+    double tyreMass = 10.0;
+
+    // How thick the surface node is, metres. **A discretisation and not a physical constant**, and
+    // it is chosen from the material: the thermal diffusion length in tread rubber over the couple of
+    // seconds a corner lasts is `sqrt(alpha·t)` = 0.45 mm at this diffusivity, so half a millimetre
+    // is the depth that genuinely responds inside one corner. Making it thicker slows the surface
+    // channel and does not move the core, which is what grip reads.
+    double surfaceThickness = 0.0005;
+
+    // Half the belt-and-ply package's depth, metres — how far below the tread the carcass node's
+    // centroid sits. A construction estimate in the 4 to 8 mm band for a passenger radial's belt
+    // package, and it sets one conductance and nothing else.
+    double carcassHalfDepth = 0.003;
+
+    // --- material, sourced ---
+    //
+    // Tread rubber, from Clark, *Heat Generation in Aircraft Tires*, NASA 1983, whose three figures
+    // are mutually consistent: they give a diffusivity of 1.0e-7 m²/s, which is the textbook value
+    // for rubber and is the check that the trio belongs together.
+    //
+    // **Conductivity is the loosely constrained one and it matters least.** An independent NR/SBR
+    // tread compound measures 0.56 W/(m·K) against Clark's 0.209 — a factor of 2.7 — while the two
+    // densities agree to 5%. Volumetric heat capacity `density · specificHeat` is what turns watts
+    // into a rate of temperature change and therefore sets the warm-up; conductivity only sets how
+    // fast the nodes equalise with each other. **The stated range is 0.21 to 0.56** and Clark's value
+    // is taken because his three numbers are self-consistent.
+    double conductivity = 0.209;
+    double density = 1000.0;
+    double specificHeat = 2092.0;
+
+    // The road's thermal effusivity, `sqrt(k·rho·c)`, J/(m²·K·s^0.5). Asphalt concrete's textbook
+    // trio — 1.2 W/(m·K), 2300 kg/m³, 900 J/(kg·K) — gives 1576, and it enters in exactly one place:
+    // two bodies brought into contact settle at an effusivity-weighted mean rather than at either
+    // one's temperature, so this is what says how much of the difference the tread actually feels.
+    double roadEffusivity = 1576.0;
+
+    // The thermal contact conductance of the tread-road interface itself, W/(m²·K), **in series**
+    // with the semi-infinite solution above: `1/h = 1/h_perfect + 1/h_contact`. **Zero is perfect
+    // contact**, which is what the model did before this existed and is bit-identical to it.
+    //
+    // It is here because the semi-infinite solution assumes the two surfaces touch everywhere, and
+    // rubber on rough asphalt does not — only the asperity tips carry heat. The tyre brief ranked
+    // that assumption as the last candidate that could explain a tread running twenty degrees below
+    // its window, and expected it to halve the road path.
+    //
+    // **It is measured rather than derived, on this exact interface, and it says the effect is a
+    // fifth rather than a half.** C. David Miller, *Thermal Conductance of and Heat Generation in
+    // Tire-Pavement Interface and Effect on Aircraft Braking*, NASA TN D-8161, 1976: a
+    // finite-difference analysis of temperature records from a free-rolling automotive tyre at
+    // 22.35 m/s and from thin-film thermometers cemented to the pavement it rolled over. He measures
+    // **3 × 10⁴ W/(m²·K) for rubber against the sensor's polyimide** — bounded below by 1.2 × 10⁴
+    // and possibly at or above 5.7 × 10⁴ — and converts it through the two materials'
+    // conductivities to **2.52 × 10⁴ for rubber against asphalt**, which is this figure. **He states
+    // it as a lower limit**, so the true resistance is at most this and probably less.
+    //
+    // His own explanation is the answer to the question the term was added to ask: *"This is a very
+    // high conductance for solids in contact. A conductance of this order of magnitude probably
+    // exists only because the rubber under pressure deforms to make molecular contact over a large
+    // fraction of the supporting surface in spite of asperities on that surface."*
+    //
+    // **The series form is an approximation and its size is stated rather than hidden.** The exact
+    // transient for two semi-infinite bodies joined by an interface conductance is
+    // `h(t) = h_c·exp(b²t)·erfc(b·sqrt(t))` with `b = h_c·(e₁+e₂)/(e₁·e₂)`, averaging over the
+    // residence time to `h_c·[e^τ·erfc(sqrt(τ)) − 1 + 2·sqrt(τ/pi)]/τ`. At this conductance and a
+    // 100 km/h residence that is 5242 W/(m²·K) against the series form's 5051 — **the series is
+    // 3.4% pessimistic**, which is 0.7% of the road path. It is taken because it keeps the unstated
+    // case exactly the old expression, and because it errs *cool*, which is the direction this model
+    // resolves uncertainty in. `TyreThermalTests` pins the gap so it cannot grow unnoticed.
+    double roadContactConductance = 0.0;
+
+    // Still-air convection from a cylinder, W/(m²·K). A floor under the forced-convection
+    // correlation rather than a term of its own: the Hilpert relation is a *forced* correlation and
+    // goes to zero with speed, and a parked car still cools. The textbook band for free convection in
+    // air is 5 to 10 and this is the low end, which is the conservative choice for a cooling term.
+    double naturalConvection = 5.0;
+
+    // What share of the power dissipated at the sliding contact patch heats the **rubber** rather
+    // than the road.
+    //
+    // **The brief that planned this work called this the one fitted number in the whole model, and
+    // it turns out to be derivable from two numbers already here.** Heat released at the plane
+    // between two semi-infinite bodies divides between them in proportion to their thermal
+    // effusivities, so the tread's share is `e_tread / (e_tread + e_road)` — and both effusivities
+    // are already stated above, the first as Clark's `sqrt(k·rho·c)` = 661 and the second as
+    // asphalt's 1576. That gives **0.2956**, which is what this is.
+    //
+    // It does not double-count the road conduction in `stepTyreThermal`. The heat equation is
+    // linear, so the interface problem superposes: a *source* at the plane with both bodies cold,
+    // which divides by effusivity, plus *no source* with the two bodies at different temperatures,
+    // which is the contact conduction. They are two different terms of one solution and both belong.
+    //
+    // **It is a lower bound and the reason is worth keeping.** The partition above assumes the heat
+    // appears exactly at the plane, and a real tyre's friction is substantially *hysteretic* — the
+    // rubber losing energy as it is deformed over the asperities, a fraction of a millimetre down
+    // rather than at the surface. Every joule generated that way is already in the rubber. Nobody
+    // publishes the split for rubber on asphalt, so the conservative end is taken: it makes the tyre
+    // run cooler, and cooler is the direction that makes this car's open braking defect worse rather
+    // than better, which is the right way for an uncertainty to be resolved.
+    double frictionToTread = 0.2956;
+
+    // --- what the temperature is worth ---
+    //
+    // Grip against the **core** temperature, dimensionless, multiplying `TyreModel::gripScale`.
+    TemperatureCurve grip;
+
+    // Where this compound wants to be, degrees Celsius. Not read by the model — the curve is what
+    // acts — and stated so that a fixture, a probe or a seat knob can ask a car for its own ideal
+    // rather than spelling a number that belongs to a compound.
+    double idealTemperature = 85.0;
+};
 
 export struct TyreModel
 {
@@ -104,9 +256,31 @@ export struct TyreModel
     double gripScale = 1.0;
     // Shifts where the peak sits in slip. Wear and temperature both move it; nothing does yet.
     double peakSlipScale = 1.0;
+
+    // The tread's heat balance. Inert unless `VehicleSetup::tyreThermal` switches it on, and inert
+    // whatever that says on a tyre that states no grip curve.
+    TyreThermal thermal;
 };
 
-// The carcass's own state: how far the contact patch has been dragged out of line with the wheel.
+// What every tyre in this project starts at, degrees Celsius.
+//
+// **65 is the middle of the plateau this project's curve states**, which is what makes it the right
+// default rather than a warm-sounding number: the curve is flat at exactly 1.00 from 55 to 75 °C, so
+// a default-constructed state multiplies grip by exactly one and every figure measured before there
+// was a thermal model reproduces to the bit. Every performance figure in this project was taken on a
+// tyre that is always at its best, and this is the statement of that assumption in one place.
+//
+// **It was 85 until 2026-08-28 and it moved with the window, not on its own.** The compound's plateau
+// slid 20 °C down when the curve stopped being a track tyre's, and this number has to travel with it
+// or every fixture in the suite quietly starts measuring an off-plateau tyre — 3 to 4% on the skidpad,
+// the 0-100 and the stop, with no physics changed at all. That coupling is asserted rather than
+// remembered: `grip.at(tyreDefaultTemperature) == 1.0` is a test.
+//
+// A fixture that wants a cold tyre says so in its own body — `seedTyreTemperatures` is how.
+export inline constexpr double tyreDefaultTemperature = 65.0;
+
+// The carcass's own state: how far the contact patch has been dragged out of line with the wheel,
+// and since 2026-08-28 how hot its three layers are.
 // This is what makes the model transient rather than instantaneous, and it is per wheel.
 export struct TyreState
 {
@@ -115,6 +289,14 @@ export struct TyreState
     // Nothing reads this yet. It is the slot the deferred wear model needs to exist in the
     // serialisable state from the beginning rather than being added to it later.
     double wear = 0.0;
+
+    // Degrees Celsius. The outer skin of the tread, the body of the tread rubber, and the belt and
+    // sidewalls behind it. **Grip reads the core** — see `TyreThermal` for the source that says so.
+    // The carcass is what carries heat from one corner to the next and makes lap five different from
+    // lap one; until stage 2 the inner gas is folded into it.
+    double surfaceTemperature = tyreDefaultTemperature;
+    double coreTemperature = tyreDefaultTemperature;
+    double carcassTemperature = tyreDefaultTemperature;
 };
 
 static_assert(std::is_trivially_copyable_v<TyreState>, "per-wheel tire state rides in the vehicle's POD state");
@@ -220,5 +402,108 @@ export [[nodiscard]] TyreForces evaluateTyre(const TyreModel& model, const doubl
 // solved; a few hundred evaluations, once per car at load time.
 export [[nodiscard]] TyreAligningPeak tyreAligningPeak(const TyreModel& model, const double verticalLoad,
                                                        const double surfaceGrip = 1.0);
+
+// --- the thermal model -------------------------------------------------------------------------
+
+// The three nodes' heat capacities and the conductances between them, derived from the tyre's own
+// geometry and the tread's material properties. Everything here has a unit; nothing here is fitted.
+//
+// Recomputed per wheel per tick rather than cached on the setup, which is about twenty flops against
+// a tick that casts eighty-four rays — and which means there is no derived copy that can go stale
+// against the geometry it came from.
+export struct TyreThermalNodes
+{
+    // J/K.
+    double surfaceCapacity = 0.0;
+    double coreCapacity = 0.0;
+    double carcassCapacity = 0.0;
+
+    // W/K, conduction along the tread's own depth.
+    double surfaceToCore = 0.0;
+    double coreToCarcass = 0.0;
+
+    // m². The tread band's outer face, which is what convects and what conducts into the road; and
+    // both sidewalls, which is what the carcass convects over.
+    double treadArea = 0.0;
+    double sidewallArea = 0.0;
+
+    // kg, reported because the split between the tread and everything else is the one piece of this
+    // derivation worth checking against a published tyre mass by eye.
+    double treadMass = 0.0;
+    double carcassMass = 0.0;
+};
+
+export [[nodiscard]] TyreThermalNodes tyreThermalNodes(const TyreThermal& thermal);
+
+// What one wheel's tread is being asked to absorb and lose over one tick.
+//
+// **Both generation terms are already computed in this engine and were being thrown away**, which is
+// most of the argument that this stage was ready to be built. TRT EVO names them FP, friction power
+// at the patch, and SEL, the strain energy loss that *is* rolling resistance — and this model has
+// `TyreForces::slipPower` in watts on every wheel every tick and `CornerSetup::rollingResistance`
+// beside it. Our SEL is better founded than the published one, which fits `f(F, omega, gamma, P)`
+// per tyre from rig tests: rolling resistance is the hysteresis loss by definition, so `Crr·Fz·v` is
+// the same energy stated thermodynamically.
+export struct TyreThermalInput
+{
+    // Watts, straight off `TyreForces::slipPower`. Heats the surface, scaled by the one fitted
+    // number.
+    double slipPower = 0.0;
+
+    // Newtons, and the rolling-resistance coefficient beside it. Their product with the road speed
+    // is the strain energy loss, in watts, with no free parameter at all — and it heats the core and
+    // the carcass rather than the surface, which is why a tyre warms up on a straight without
+    // sliding anywhere.
+    double verticalLoad = 0.0;
+    double rollingResistance = 0.0;
+
+    // How fast the tread is going over the road, m/s. Sets the residence time in the patch and so
+    // the road conduction.
+    double roadSpeed = 0.0;
+    // How fast the wheel is going through the air, m/s. The two differ by the slip and by nothing
+    // else on the ground, and a wheel in the air has one and not the other.
+    double airSpeed = 0.0;
+
+    // The contact patch's footprint, metres, or zero for a wheel that is not touching. Derived by
+    // the caller from the tyre's own deflection — the chord a radius makes at that penetration — so
+    // no constant enters here either.
+    double patchLength = 0.0;
+    double patchWidth = 0.0;
+
+    // The **rim** this tyre is mounted on, degrees Celsius, and how strongly the carcass is coupled
+    // to it, W/K. Bead seats and the inner air together; `WheelHardware::toTyre` in `:Brakes` is
+    // where the derivation lives.
+    //
+    // **It is a plain pair of doubles and not a wheel node, and that is deliberate**: `:Tyre` and
+    // `:Brakes` neither import each other and must not start to. The vehicle tick owns both and is
+    // the only thing that knows they are bolted together.
+    //
+    // **Zero conductance is the tyre stage 1 shipped**, which had nothing on the rim side at all,
+    // and it leaves the carcass's balance bit for bit what it was.
+    double wheelTemperature = 0.0;
+    double wheelConductance = 0.0;
+
+    AmbientConditions ambient;
+};
+
+// One tick of the heat balance, advancing `state`'s three temperatures.
+//
+// Each node is integrated **exactly** against the others held at their start-of-tick values, which
+// is `relaxTyre`'s treatment and is here for its reason: the closed form is unconditionally stable
+// and cannot stretch a time constant with the timestep. All three read the same start-of-tick
+// temperatures and are written afterwards, so the answer does not depend on the order they are
+// solved in.
+export void stepTyreThermal(const TyreThermal& thermal, TyreState& state, const TyreThermalInput& input,
+                            const double deltaTime);
+
+// What this tyre's temperature is worth to its grip, dimensionless — the curve read at the **core**.
+// Exactly 1.0 for a tyre that states no curve, and exactly 1.0 anywhere on the curve's own plateau.
+export [[nodiscard]] double tyreTemperatureGrip(const TyreThermal& thermal, const TyreState& state);
+
+// Put a tyre at a stated temperature, all three nodes together. What a fixture calls when it wants a
+// cold tyre — a starting temperature is part of a braking or a skidpad measurement the moment there
+// is a thermal model, and a fixture that does not say which one it is running is measuring something
+// it has not stated.
+export void seedTyreTemperature(TyreState& state, const double celsius);
 
 } // namespace raceengine

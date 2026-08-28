@@ -275,9 +275,20 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
 // measured to the millimetre.
 [[nodiscard]] BrakeHardware golfMk7FrontBrake()
 {
+    // **The disc's mass is published and it agrees with its own geometry.** CLP Automotive quote the
+    // OE part verbatim while selling a lighter one — "STOCK 340x30mm disc - 10.7kg (per disc)" — and a
+    // third party's 340 x 30 for this platform is listed at 10 kg. The swept ring alone, from 95 to
+    // 170 mm of radius with two cheeks and vanes filling about a third of the gap, is 9.7 kg of grey
+    // iron; a 50 mm hat is the rest. The agreement is the check, not the source.
     return BrakeHardware{.pistonBore = 0.060,
                          .pistons = 1,
                          .discDiameter = 0.340,
+                         .discThickness = 0.030,
+                         .discMass = 10.7,
+                         .discVented = true,
+                         // Brembo catalogue this part's height as 50 mm, which is the length of the
+                         // neck stage 3's heat has to come down. Sourced, like the diameter.
+                         .hatHeight = 0.050,
                          .padRadialHeight = 0.070,
                          .padOuterClearance = 0.005,
                          .frictionFaces = 2,
@@ -286,13 +297,53 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
 
 [[nodiscard]] BrakeHardware golfMk7RearBrake()
 {
+    // **The rear's mass is derived rather than published**, and it is derived from the front's: the
+    // front's published 10.7 kg implies that 0.719 of the disc's stated thickness is iron once the
+    // vanes are taken out, and the same construction on a 310 x 22 with this pad's swept ring gives
+    // 5.5 kg of ring and about 6.4 kg with its hat. Flagged, because nobody publishes it.
     return BrakeHardware{.pistonBore = 0.042,
                          .pistons = 1,
                          .discDiameter = 0.310,
+                         .discThickness = 0.022,
+                         .discMass = 6.4,
+                         .discVented = true,
+                         // **Not catalogued for this part and bounded**, on the same footing as the
+                         // rear's mass: a rear hat runs a little shorter than a front's because the
+                         // caliper behind it is smaller. 45 mm, and the whole rear path moves by
+                         // about a tenth across the 40-50 mm it could be.
+                         .hatHeight = 0.045,
                          .padRadialHeight = 0.057,
                          .padOuterClearance = 0.005,
                          .frictionFaces = 2,
                          .couple = lowMetallicOnCastIron()};
+}
+
+// The wheel the discs are bolted inside — **stage 3, and the only path this model has from a brake
+// at 500 °C to a tread at 50**.
+//
+// One statement for all four corners, because it is one part number: this car wears the same 18 × 7.5
+// wheel at each end and the discs behind them differ, which is why `wheelThermalOf` takes the brake
+// as well and derives a different hat neck front and rear.
+//
+// **The mass is sourced and is a class figure.** A direct replacement for this car's own 18 × 7.5
+// 5×112 57.1 mm wheel is quoted at 27 lb — 12.25 kg — and a reproduction usually runs a little
+// heavier than the casting it replaces, so the bias is known and is toward a slower wheel. Same
+// standing as the tyre's published mass, and flagged the same way.
+//
+// **The bolt circle is published as a PCD**: 5 × 112 mm gives a radius of 0.056 m. The hat wall at
+// 7 mm is bounded rather than measured, 5 to 9 mm for a 340 mm hat, and it is the number the whole
+// path turns on — far more than the bolted joint's, which is thirty times larger and is the one
+// nobody publishes. docs/brake-thermal-brief.md.
+[[nodiscard]] WheelHardware golfMk7Wheel()
+{
+    return WheelHardware{.mass = 12.25,
+                         .diameter = 0.4572,
+                         .emissivity = 0.85,
+                         .hatWallThickness = 0.007,
+                         .boltCircleRadius = 0.056,
+                         .jointConductance = 60.0,
+                         .toTyre = 4.0,
+                         .discRadiationShare = 0.5};
 }
 
 // The hydraulics, which are what turn a pedal into the pressure both axles see.
@@ -558,6 +609,28 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // setup-sheet reload. `docs/suspension-fidelity-brief.md`, item 3.
     setup.drivelineReaction = true;
 
+    // **The tyres carry a temperature, and the brakes carry one, and both were switched on together
+    // on 2026-08-28 on Dominic's instruction: *"put on for good"*.**
+    //
+    // They went on as a pair and not one at a time, which was the plan from the moment the second was
+    // built: brake heat through the rim is a term in the tread's own balance, so a car with a thermal
+    // brake and an isothermal tyre is a car with half of one model. Each was driven and accepted on
+    // its own first — the tyre as *"definitely noticable... could feel the understeer reduce"*, the
+    // brake as fade whose magnitude matched Dominic's own experience of Bathurst — and stage 3, the
+    // path between them, was measured before either default moved.
+    //
+    // **What this cost, and it was known before it was paid.** Every performance figure this project
+    // had was measured on a tyre permanently at its best and a brake that could not fade. The
+    // braking reference this car is furthest from — auto motor und sport's 35.5 m — is explicitly
+    // *kalt*, so a cold tyre is what makes that comparison like-for-like for the first time, and it
+    // makes the number worse before it makes it honest. `docs/known-red.md` carries whatever moved.
+    //
+    // `OSR_TYRE_THERMAL=off` and `OSR_BRAKE_THERMAL=off` are the way back and the controls, and both
+    // are re-stamped on every setup-sheet reload. docs/tyre-state-brief.md,
+    // docs/brake-thermal-brief.md.
+    setup.tyreThermal = true;
+    setup.brakeThermal = true;
+
     // car.ini CONTROLS: the steering wheel's lock in degrees each way, and the ratio between it and
     // the road wheel. The travel that produces that angle is solved off the linkage below.
     //
@@ -709,6 +782,20 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto rearPeak = torquePerPressure(rearBrake) * fullPressure[static_cast<std::size_t>(Corner::RearLeft)];
     const auto brakeTorque = std::array{frontPeak, frontPeak, rearPeak, rearPeak};
 
+    // And the thermal half of the same two parts. Derived from the hardware rather than stated
+    // alongside it, so the disc that makes the torque above is the disc that carries the heat below —
+    // there is no second statement of a mass, a diameter or a friction couple anywhere.
+    //
+    // **The wheel joins them since stage 3**, and it is derived from the same pair: `wheelThermalOf`
+    // reads the disc's own hat geometry to work out the neck the heat has to come down, and
+    // `brakeThermalOf`'s two-argument form tells the disc which share of its radiation now lands on
+    // the wheel rather than on the sky.
+    const auto wheel = golfMk7Wheel();
+    const auto discs = std::array{brakeThermalOf(frontBrake, wheel), brakeThermalOf(frontBrake, wheel),
+                                  brakeThermalOf(rearBrake, wheel), brakeThermalOf(rearBrake, wheel)};
+    const auto wheels = std::array{wheelThermalOf(wheel, frontBrake), wheelThermalOf(wheel, frontBrake),
+                                   wheelThermalOf(wheel, rearBrake), wheelThermalOf(wheel, rearBrake)};
+
     // Sprung load by statics about the other axle, from the sprung centre solved above.
     const auto frontSprung = sprungMass * standardGravity * (sprungCentre.z - golfRearAxle) / golfWheelbase;
     const auto rearSprung = sprungMass * standardGravity - frontSprung;
@@ -737,6 +824,8 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
                                     fastReboundRate[index], reboundKnee[index], *damper);
         corner.antiRollRate = antiRoll[index];
         corner.brakeTorque = brakeTorque[index];
+        corner.disc = discs[index];
+        corner.wheel = wheels[index];
         corner.unsprungMass = hubMass(index);
         corner.damperFriction = damperFriction[index];
         corner.lateralForceSteer = lateralForceSteer[index];
@@ -850,6 +939,106 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         corner.tyre.longitudinalShape = 1.50;
         corner.tyre.longitudinalCurvature = 0.0;
         corner.tyre.longitudinalStiffness = 28.0;
+
+        // --- the tread's heat balance ---
+        //
+        // On, since 2026-08-28 — `setup.tyreThermal` above, on Dominic's instruction and after he
+        // drove it. The sentence that stood here said the opposite and was left behind by that switch.
+        //
+        // **The geometry is the tyre's own size and is arithmetic, not data.** A 225/40 R18 on an 18
+        // inch rim: rim radius 0.2286 m, section height 0.40 × 0.225 = 0.090 m, so the outer radius
+        // is 0.3186 — which is `golfTyreRadius`, arrived at independently, and is the check that the
+        // size and the model agree. The tread band's width is `tyres.ini`'s own WIDTH.
+        corner.tyre.thermal.outerRadius = golfTyreRadius;
+        corner.tyre.thermal.rimRadius = 0.2286;
+        corner.tyre.thermal.treadWidth = 0.235;
+
+        // **Groove depth and tyre mass are published, for a named performance tyre in exactly this
+        // size**: a Michelin Pilot Sport 4S in 225/40 R18 states 9.5/32 inch of tread — 7.54 mm — and
+        // weighs 22.7 lb, 10.30 kg. This car wears AC's "Semislicks" rather than a Pilot Sport 4S, so
+        // it is a *class* figure and not this tyre's; what it buys is that the tread's mass comes out
+        // of geometry and the carcass's out of a published total, instead of both being guessed.
+        //
+        // The undertread below the groove floor and the void fraction of the pattern are the two
+        // numbers nobody publishes. Both are bounded rather than sourced — 1.5 to 3 mm of undertread
+        // and 25 to 30% void on a performance summer pattern — and they matter only through the
+        // tread's rubber volume, which they move by about a tenth either way.
+        corner.tyre.thermal.grooveDepth = 0.00754;
+        corner.tyre.thermal.underTread = 0.002;
+        corner.tyre.thermal.voidFraction = 0.28;
+        corner.tyre.thermal.tyreMass = 10.30;
+
+        // **The share of patch friction power that heats the rubber rather than the road was to be
+        // this model's one fitted number, and it is not fitted at all** — it is the effusivity
+        // partition of the two materials already stated above, `661 / (661 + 1576)`. The derivation
+        // and the reason it does not double-count the road conduction are on `TyreThermal`. Left as
+        // the model's own default rather than restated here, because it is a property of rubber
+        // against asphalt and not of this car.
+        //
+        // So there is **no fitted number in this tyre's thermal model**. What there is instead is
+        // four *bounded* ones — the undertread, the pattern's void fraction, the belt package's
+        // depth and still-air convection — each a textbook or construction band rather than a value
+        // chosen to make an output land somewhere. `docs/tyre-state-brief.md`, section 4.
+
+        // **This tyre states no contact conductance, so its road path assumes perfect contact.** That
+        // is not because the number is unknown — it is measured, at 2.52 × 10⁴ W/(m²·K) for rubber on
+        // asphalt, and `TyreThermal::roadContactConductance` carries the source. It is because what it
+        // buys is **a fifth of the road path and one to two degrees on the tread core**, which is
+        // below anything a seat can resolve and is not worth a driving-golden re-bless on a car nobody
+        // has driven since its defaults changed. `OSR_TYRE_CONTACT=25200` is the A/B, and stating it
+        // here is a one-line decision for whoever wants it. `docs/tyre-state-brief.md`.
+
+        // **AC's `tcurve_semis.lut`, slid 20 °C down its temperature axis on 2026-08-28 because the
+        // window it came with belongs to a different tyre from the one this car wears.** The shape is
+        // AC's, knot for knot and multiplier for multiplier; only where it sits has moved.
+        //
+        // **Why it moved.** The unslid plateau, 75 to 95 °C, was corroborated by Michelin's own
+        // technical bulletin for the Pilot Sport Cup 2 R — 70 to 100 °C with 90 ideal — and that is a
+        // **track** tyre's bulletin, while this car's tread depth and mass are a Pilot Sport **4S**'s,
+        // a **road** tyre. Two published sources put a summer road tyre's design operating temperature
+        // far below a racing tyre's:
+        //
+        //   Persson & Xu, *Rubber Friction: Theory, Mechanisms, and Challenges*, arXiv:2507.18782v3 —
+        //   "The typical operating temperature for summer tires is around 50 °C... In contrast, the
+        //   operating temperature for racing tires is ~100 °C or higher", with glass transition
+        //   temperatures of −30 °C for a summer compound against −10 °C for a racing one.
+        //
+        //   Fortunato, Ciaravola and Furno (**Bridgestone Technical Center Europe**), Scaraggi, Lorenz
+        //   and Persson, arXiv:1512.01359 — "for passenger car tires at typical operating temperatures
+        //   it appears as if the friction usually decreases with increasing temperature while for
+        //   special tires, e.g., motorsport tires, the friction may increase as the temperature
+        //   increases up to rather high temperatures."
+        //
+        // **The shift is bounded rather than chosen, and the seat chose inside the bound.** The two
+        // compounds' Tg differ by 20 °C, which is the smallest defensible shift; their published
+        // operating temperatures differ by 40, which is the largest. **20 is what ships**, on Dominic's
+        // instruction — *"I want the tyres to come in"* — because at 40 a lap's warm-up is worth
+        // +0.47% of grip and the tyre is effectively always ready, while at 20 it is +2.56% and the
+        // car still comes in. `OSR_TYRE_IDEAL=85` is the A/B and the way back to the track window.
+        //
+        // Its ends are another matter. 0.80 at the cold end and 0.60 at the hot one are nobody's
+        // measurement in either position, and they are used because the alternative is a cliff at the
+        // edge of the plateau. Flagged here exactly as `ARB FRONT 34000` is flagged, and for the same
+        // reason: a borrowed number is usable and must never be mistaken for a measured one. **Sliding
+        // a curve is not redrawing it** — nothing here reshapes a tail.
+        //
+        // The curve is read at the **tread core** and not at the surface. That is sourced, and it
+        // falsified this brief's own first draft — Farroni et al., *TRT EVO*, Proc IMechE Part D
+        // 233(1) 2019: grip correlates with the core layer, because a thin skin cannot change the
+        // tread block's bulk viscoelastic state fast enough to matter.
+        corner.tyre.thermal.grip = TemperatureCurve{
+            .count = 13,
+            .celsius = {{-20.0, 0.0, 20.0, 40.0, 55.0, 65.0, 75.0, 85.0, 120.0, 140.0, 180.0, 200.0, 230.0}},
+            .multiplier = {{0.80, 0.92, 0.95, 0.98, 1.00, 1.00, 1.00, 0.97, 0.95, 0.88, 0.82, 0.80, 0.60}}};
+
+        // The middle of that plateau, which is where every fixture starts. Persson's "around 50 °C"
+        // for a summer tyre sits inside it; 65 is taken because it is the centre of the flat region
+        // and therefore the seed with the most headroom either side before a capture starts moving.
+        //
+        // **`tyreDefaultTemperature` carries the same number and has to.** A seed left at the old
+        // plateau's centre would put every fixture in the suite off the flat part of this curve and
+        // move three to four per cent of skidpad, 0-100 and stopping distance with no physics changed.
+        corner.tyre.thermal.idealTemperature = 65.0;
 
         // Stated on the shaft, and sized inside the travel the linkage has. The bump stops AC states
         // do not carry across: its front BUMPSTOP_UP of 0.80 m is not a travel any suspension has and

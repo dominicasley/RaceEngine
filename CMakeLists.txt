@@ -99,6 +99,7 @@ add_library (Engine STATIC
         Input/Impl/PedalFeedbackImpl.cpp
         Input/Impl/PedalMotorsImpl.cpp
         Input/Impl/RackTorqueImpl.cpp
+        Physics/Impl/AmbientImpl.cpp
         Physics/Impl/BrakesImpl.cpp
         Physics/Impl/ClutchImpl.cpp
         Physics/Impl/ContactImpl.cpp
@@ -177,6 +178,7 @@ target_sources(Engine PUBLIC
         Assists/Api/BrakeControl.cppm
         Assists/Api/TractionControl.cppm
         Physics/Physics.cppm
+        Physics/Api/Ambient.cppm
         Physics/Api/RigidBody.cppm
         Physics/Api/JoltRuntime.cppm
         Physics/Api/ProvingGround.cppm

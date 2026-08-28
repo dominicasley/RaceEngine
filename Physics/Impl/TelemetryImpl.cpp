@@ -103,6 +103,11 @@ constexpr auto gravity = 9.80665;
         text += ",TC Torque " + tag + " [Nm]";
         text += ",XDS Torque " + tag + " [Nm]";
         text += ",Sensed Wheel Speed " + tag + " [m/s]";
+        text += ",Tyre Temp Surface " + tag + " [C]";
+        text += ",Tyre Temp Core " + tag + " [C]";
+        text += ",Tyre Temp Carcass " + tag + " [C]";
+        text += ",Disc Temp " + tag + " [C]";
+        text += ",Wheel Temp " + tag + " [C]";
     }
 
     text += "\n";
@@ -218,6 +223,16 @@ constexpr auto gravity = 9.80665;
             appendNumber(text, wheel.corneringBrakeTorque, 2);
             text += ",";
             appendNumber(text, wheel.sensedWheelSpeed, 4);
+            text += ",";
+            appendNumber(text, wheel.tyreSurfaceTemperature, 2);
+            text += ",";
+            appendNumber(text, wheel.tyreCoreTemperature, 2);
+            text += ",";
+            appendNumber(text, wheel.tyreCarcassTemperature, 2);
+            text += ",";
+            appendNumber(text, wheel.discTemperature, 2);
+            text += ",";
+            appendNumber(text, wheel.wheelTemperature, 2);
         }
 
         text += "\n";

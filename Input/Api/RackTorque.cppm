@@ -529,6 +529,27 @@ export struct WheelTrace
     // What the caliper is actually holding, pascals — the modulator's own state, and the channel that
     // separates "the driver asked for full pressure" from "the wheel got it".
     double brakePressure = 0.0;
+
+    // The tread **core**'s temperature, degrees Celsius, joined 2026-08-28 with the thermal tyre.
+    //
+    // One column and not the three the telemetry CSV carries, because this file is the *seat's*
+    // artefact rather than the physics ledger: the core is the layer grip reads, so it is the one a
+    // report like "it went away after three laps" has to be read against. It reads the seed
+    // temperature on a car with `tyreThermal` off, which is the value the rest of the model is
+    // assuming rather than a measurement — and that is worth having in the trace too, because the
+    // question a trace has to answer first is what the car was set up as.
+    double treadCoreTemperature = 0.0;
+
+    // And the brake disc's, degrees Celsius, joined 2026-08-28 with the fade model. It belongs on the
+    // seat's artefact more than most channels do: "the pedal went long at the end of the lap" is a
+    // report this column either confirms or refutes in one glance.
+    double discTemperature = 0.0;
+
+    // And the wheel's, joined with stage 3. It earns a column because it is the *answer* to stage 3
+    // rather than an input to it: a trace showing a disc at 500 °C, a rim at 90 and a tread at 50
+    // says in three numbers how much of a brake's heat a wheel lets past, which is the whole
+    // question. docs/brake-thermal-brief.md.
+    double wheelTemperature = 0.0;
 };
 
 export struct VehicleTrace
@@ -562,6 +583,13 @@ export struct VehicleTrace
     // purpose.** They are what makes a lap self-describing: two traces taken ten minutes apart
     // differed only in a setup-sheet line, and telling them apart meant reading a file that had since
     // been edited. A column that never changes is cheap; a trace nobody can date is not.
+    //
+    // **"Constant for a run" was a promise the writer did not keep until 2026-08-28**, and it cost a
+    // wrong reading of a seat trace the same day. The car publishes its first frames before the setup
+    // sheet has landed on it, so these read the *factory* configuration — everything off — for about
+    // four ticks and the session's own from the fifth. A reader who samples row 0, which is the
+    // obvious thing to do with a documented constant, is told the car had no electronics. The writer
+    // now stamps the settled value across every row; see `rackTorqueToCsv`.
     //
     // `tractionMode` is 0 off, 1 full, 2 sport — an integer rather than the enum because this module
     // is `raceengine.input` and naming `TractionMode` here would couple the trace format to the
@@ -693,6 +721,15 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
     // string that large, which is the one part of writing the file worth a thought.
     text.reserve(frames.size() * 640 + 2048);
 
+    // **Which electronics this run was driven with, taken from the last frame and written on every
+    // row.** These three columns document the *session*, and the car publishes about four frames
+    // before its setup sheet lands on it — so the head of the file otherwise reports the factory
+    // configuration, which is everything off. It read as a lap driven with no ABS on 2026-08-28 and
+    // was only caught because the driver knew otherwise. The last frame is the settled answer: a
+    // sheet reloaded mid-session states what the car finished under, which is the same rule a
+    // reloaded sheet already follows everywhere else.
+    const auto fitted = frames.empty() ? VehicleTrace{} : frames.back().vehicle;
+
     text += "Time [s],Sequence,"
             "Steering Torque [Nm],Assisted Torque [Nm],Rack Force [N],Tyre Rack Force [N],"
             "Rack Travel [mm],Rack Vel [mm/s],"
@@ -720,6 +757,9 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",ABS Active" + corner + " []";
         text += ",ABS Cycles" + corner + " []";
         text += ",Brake Pressure" + corner + " [bar]";
+        text += ",Tyre Temp Core" + corner + " [C]";
+        text += ",Disc Temp" + corner + " [C]";
+        text += ",Wheel Temp" + corner + " [C]";
     }
 
     text += "\n";
@@ -793,11 +833,16 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",";
         appendRackNumber(text, car.engineSpeed * rackRadiansPerSecondToRevolutionsPerMinute, 1);
 
-        text += car.antilockEnabled ? ",1," : ",0,";
-        appendRackInteger(text, static_cast<long long>(car.tractionMode));
+        // **The settled configuration and not this frame's**, which is what these three columns have
+        // always claimed to be. See `RackTorqueVehicle` for the four ticks that made the claim false
+        // and the seat trace it misread. The per-tick answers live in `tractionBrakeActive`,
+        // `tractionEngineActive`, `corneringActive` and the per-corner `ABS Active`, and those are
+        // untouched — fitted and active are two different questions and this only settles the first.
+        text += fitted.antilockEnabled ? ",1," : ",0,";
+        appendRackInteger(text, static_cast<long long>(fitted.tractionMode));
         text += car.tractionBrakeActive ? ",1" : ",0";
         text += car.tractionEngineActive ? ",1" : ",0";
-        text += car.corneringEnabled ? ",1" : ",0";
+        text += fitted.corneringEnabled ? ",1" : ",0";
         text += car.corneringActive ? ",1," : ",0,";
         appendRackNumber(text, car.engineTorqueReduction * 100.0, 3);
 
@@ -834,6 +879,12 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             text += ",";
             // Bar, like every other pressure a person reads. The model carries pascals.
             appendRackNumber(text, wheel.brakePressure / 1.0e5, 3);
+            text += ",";
+            appendRackNumber(text, wheel.treadCoreTemperature, 2);
+            text += ",";
+            appendRackNumber(text, wheel.discTemperature, 2);
+            text += ",";
+            appendRackNumber(text, wheel.wheelTemperature, 2);
         }
 
         text += "\n";

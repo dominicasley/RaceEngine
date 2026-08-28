@@ -24,6 +24,23 @@ module raceengine.physics;
 namespace raceengine
 {
 
+void seedDiscTemperatures(VehicleState& state, const double celsius)
+{
+    for (auto& corner : state.corners)
+    {
+        corner.discTemperature = celsius;
+        corner.wheelTemperature = celsius;
+    }
+}
+
+void seedTyreTemperatures(VehicleState& state, const double celsius)
+{
+    for (auto& corner : state.corners)
+    {
+        seedTyreTemperature(corner.tyre, celsius);
+    }
+}
+
 [[nodiscard]] Curve linearDamper(const double bumpRate, const double reboundRate)
 {
     return Curve{
@@ -578,11 +595,10 @@ namespace
                                .geometric = true};
 }
 
-[[nodiscard]] std::expected<VehicleStep, std::string> stepVehicle(const VehicleSetup& setup, VehicleState& state,
-                                                                  const VehicleInput& input,
-                                                                  const std::array<double, cornerCount>& driveTorques,
-                                                                  const PhysicsWorld& world, const double deltaTime,
-                                                                  const BrakeCommand& brakes)
+[[nodiscard]] std::expected<VehicleStep, std::string>
+stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& input,
+            const std::array<double, cornerCount>& driveTorques, const PhysicsWorld& world, const double deltaTime,
+            const BrakeCommand& brakes, const AmbientConditions& ambient)
 {
     RACEENGINE_ZONE_N("stepVehicle");
 
@@ -822,16 +838,79 @@ namespace
                 relaxTyre(corner.tyre, state.corners[index].tyre, solution.contact.longitudinalVelocity,
                           longitudinalSlipVelocity, solution.contact.lateralVelocity, deltaTime);
 
-            solution.contact.slip = tyreSlip(corner.tyre, state.corners[index].tyre);
-            solution.contact.tyre = evaluateTyre(corner.tyre, solution.forces.tireVertical, solution.contact.slip,
-                                                 solution.patch.gripMultiplier, longitudinalSlipVelocity,
-                                                 solution.contact.lateralVelocity, deflectionRate);
+            // **What the tread's temperature is worth, read off the state this tick starts with.**
+            // The multiplier has to be applied before the forces are evaluated and the temperature
+            // cannot be advanced until the slip power those forces produce is known, so grip carries
+            // one tick of explicit lag exactly as `complianceSteer` does. It is harmless here for a
+            // different reason than there: the loop is positive rather than negative — hotter is
+            // more grip is more slip power — but the tread's fastest time constant is a couple of
+            // seconds against a 360 Hz tick, so the lag is three parts in a thousand of the
+            // smallest thing in the loop.
+            //
+            // Copied and multiplied rather than branched, and that is what makes the switch inert:
+            // with `tyreThermal` off the copy is the setup's own bits and `gripScale` is untouched,
+            // and with it on inside the curve's plateau the multiplier is exactly 1.0, which in IEEE
+            // arithmetic leaves the value alone rather than nearly alone.
+            auto tyre = corner.tyre;
+            if (setup.tyreThermal)
+            {
+                tyre.gripScale *= tyreTemperatureGrip(corner.tyre.thermal, state.corners[index].tyre);
+            }
+
+            solution.contact.slip = tyreSlip(tyre, state.corners[index].tyre);
+            solution.contact.tyre =
+                evaluateTyre(tyre, solution.forces.tireVertical, solution.contact.slip, solution.patch.gripMultiplier,
+                             longitudinalSlipVelocity, solution.contact.lateralVelocity, deflectionRate);
         }
         else
         {
-            // A wheel in the air carries no deflection into the moment it lands with.
-            state.corners[index].tyre = TyreState{};
+            // A wheel in the air carries no deflection into the moment it lands with. **The
+            // temperatures survive**, which is the whole difference between a tyre that has a state
+            // and one that does not: a wheel over a kerb does not forget how hot it is.
+            state.corners[index].tyre.longitudinalDeflection = 0.0;
+            state.corners[index].tyre.lateralDeflection = 0.0;
             solution.contact = WheelContact{};
+        }
+
+        // --- the tread's heat balance ---
+        //
+        // Outside the contact branch because a wheel in the air still cools, and after the forces
+        // because the friction power it feeds on is one of them. Both generation terms were already
+        // computed by this tick and thrown away until now: `slipPower` at the patch, and rolling
+        // resistance against load and speed.
+        //
+        // The patch's footprint is the tyre's own deflection rather than a stated size — the chord a
+        // wheel of this radius makes at this penetration — so the road-conduction term carries no
+        // constant of its own. It over-states the true footprint, because a real tread does not
+        // conform right out to the geometric chord, and therefore over-states road cooling by about
+        // the square root of that: the conductance goes as `sqrt(patch length)`.
+        if (setup.tyreThermal)
+        {
+            const auto penetration = solution.patch.inContact ? solution.patch.penetration : 0.0;
+            const auto radius = corner.hardpoints.wheelRadius;
+            const auto chord =
+                penetration > 0.0
+                    ? 2.0 * std::sqrt(std::max(2.0 * radius * penetration - penetration * penetration, 0.0))
+                    : 0.0;
+
+            stepTyreThermal(corner.tyre.thermal, state.corners[index].tyre,
+                            TyreThermalInput{.slipPower = solution.contact.tyre.slipPower,
+                                             .verticalLoad = solution.forces.tireVertical,
+                                             .rollingResistance = corner.rollingResistance,
+                                             .roadSpeed = solution.contact.longitudinalVelocity,
+                                             .airSpeed = glm::length(state.chassis.linearVelocity),
+                                             .patchLength = chord,
+                                             .patchWidth = setup.sampling.width,
+                                             // **The rim, and only when there is a brake model to
+                                             // heat it.** The conductance is the wheel's own and it
+                                             // reaches the carcass, not the tread. One tick of lag
+                                             // on the wheel's temperature, which is read here before
+                                             // the brake loop advances it — three parts in a million
+                                             // of a node whose time constant is an hour.
+                                             .wheelTemperature = state.corners[index].wheelTemperature,
+                                             .wheelConductance = setup.brakeThermal ? corner.wheel.toTyre : 0.0,
+                                             .ambient = ambient},
+                            deltaTime);
         }
 
         // What the bushes will be holding on the next tick. The lateral force is resolved into the
@@ -1238,13 +1317,33 @@ namespace
         // hydraulics — gets exactly `brakeTorque * pedal` back out of it, so the change is inert for
         // them. A car that states them gets the servo's runout on both axles and the valve's knee on
         // the rear, which is the only place a *pedal-dependent* brake bias can come from.
+        //
+        // **And fade multiplies it** (2026-08-28). The pad's friction falls with the disc's
+        // temperature, and both arms of the branch above are subject to it — the assist layer's
+        // command is a torque the ECU asked for through a valve, and a valve cannot make a hot pad
+        // grip. Exactly 1.0 with the switch off, and exactly 1.0 anywhere on the curve's own flat
+        // part, which is everything below about 350 °C. docs/brake-thermal-brief.md.
         const auto rolling =
             setupCorner.rollingResistance * solution.forces.tireVertical * solution.contact.effectiveRadius;
-        const auto braking = brakes.commanded ? std::max(0.0, brakes.wheels[index])
-                                              : setupCorner.brakeTorque * brakePedalResponse(setup, index, input.brake);
+        const auto fade = setup.brakeThermal ? setupCorner.disc.couple.fade.at(corner.discTemperature) : 1.0;
+        const auto braking =
+            (brakes.commanded ? std::max(0.0, brakes.wheels[index])
+                              : setupCorner.brakeTorque * brakePedalResponse(setup, index, input.brake)) *
+            fade;
         const auto commanded = braking + rolling;
 
+        // The speed the brake is about to act at, read before the arrest below changes it. It is
+        // what turns a torque into watts, and it is why a **locked** wheel makes no heat at the disc:
+        // a pad clamped to a disc that is not turning dissipates nothing. That energy goes into the
+        // road instead, which the tyre's own thermal model already has.
+        const auto spinBefore = std::abs(corner.wheelSpeed);
+
         auto arrested = 0.0;
+
+        // Whether the pad was **sliding** against a turning disc this tick, or **holding** a wheel it
+        // had already stopped. The clamp below is what separates them: it fires exactly when the
+        // demand would have driven the wheel backwards, which is a wheel being held.
+        auto sliding = false;
 
         if (commanded > 0.0 && std::abs(corner.wheelSpeed) > 0.0)
         {
@@ -1253,8 +1352,66 @@ namespace
             const auto turning = corner.wheelSpeed;
             const auto arresting = std::abs(corner.wheelSpeed) * setupCorner.wheelInertia / deltaTime;
             const auto applied = std::min(commanded, arresting);
+            sliding = commanded <= arresting;
             corner.wheelSpeed -= std::copysign(applied / setupCorner.wheelInertia * deltaTime, corner.wheelSpeed);
             arrested = std::copysign(applied, turning);
+        }
+
+        // --- the disc's heat balance ---
+        //
+        // The friction power is the **brake's** share of what was actually applied, times the speed
+        // it was applied at. Rolling resistance rides in the same clamp and is not a brake, so it is
+        // taken out by the share rather than left to warm the disc: a coasting car would otherwise
+        // heat its brakes for ever.
+        //
+        // **And only while the pad is sliding**, which is not the same as "while the brake is on".
+        // A locked wheel is re-arrested every tick after the road's torque has nudged it, so a naive
+        // `torque × speed` reads a small power that is pure discretisation — it goes as the square of
+        // the timestep and vanishes as the tick shrinks. Measured at 360 Hz it was worth 1.8 °C over
+        // three seconds of a locked stop, about 4% of a real stop's rise, in the one case the answer
+        // should be exactly zero. A held wheel's energy goes into the road through the tyre, and the
+        // tyre's own thermal model already has it.
+        if (setup.brakeThermal)
+        {
+            const auto share = commanded > 0.0 ? braking / commanded : 0.0;
+            const auto airSpeed = glm::length(state.chassis.linearVelocity);
+
+            // --- and the wheel between the disc and the tyre (stage 3) ---
+            //
+            // **The coupling is computed once and handed to both nodes**, because it carries a
+            // radiation term that depends on both their temperatures and two independent evaluations
+            // of it would let the disc lose what the wheel does not gain. Conduction through the
+            // hat's neck in series with the bolted joint, plus that radiation.
+            //
+            // Both nodes read the temperatures the tick started with and are written afterwards, so
+            // the answer does not depend on which is solved first — `stepTyreThermal`'s treatment,
+            // for its reason.
+            //
+            // A car that states no wheel gets a coupling of exactly zero, and both steps then
+            // reproduce stage 2's arithmetic expression for expression.
+            const auto disc = corner.discTemperature;
+            const auto wheel = corner.wheelTemperature;
+            const auto coupling = discToWheelCoupling(setupCorner.disc, setupCorner.wheel, disc, wheel);
+
+            stepBrakeThermal(setupCorner.disc, corner.discTemperature,
+                             BrakeThermalInput{.frictionPower = sliding ? std::abs(arrested) * share * spinBefore : 0.0,
+                                               .airSpeed = airSpeed,
+                                               .wheelTemperature = wheel,
+                                               .wheelConductance = coupling,
+                                               .ambient = ambient},
+                             deltaTime);
+
+            // The tyre side is live only when the tyre carries a temperature. Letting the wheel
+            // exchange with a carcass nothing is simulating would warm it against a constant and
+            // create the energy the carcass never lost.
+            stepWheelThermal(setupCorner.wheel, corner.wheelTemperature,
+                             WheelThermalInput{.discTemperature = disc,
+                                               .discConductance = coupling,
+                                               .tyreTemperature = corner.tyre.carcassTemperature,
+                                               .tyreConductance = setup.tyreThermal ? setupCorner.wheel.toTyre : 0.0,
+                                               .airSpeed = airSpeed,
+                                               .ambient = ambient},
+                             deltaTime);
         }
 
         // --- what spinning the wheel up takes out of the body -----------------------------------
@@ -1370,6 +1527,11 @@ namespace
         frame.wheels[index].inContact = solution.patch.inContact;
         frame.wheels[index].contactingSamples = solution.patch.contactingSamples;
         frame.wheels[index].patchDepthSpread = solution.patch.depthSpread;
+        frame.wheels[index].tyreSurfaceTemperature = state.corners[index].tyre.surfaceTemperature;
+        frame.wheels[index].tyreCoreTemperature = state.corners[index].tyre.coreTemperature;
+        frame.wheels[index].tyreCarcassTemperature = state.corners[index].tyre.carcassTemperature;
+        frame.wheels[index].discTemperature = state.corners[index].discTemperature;
+        frame.wheels[index].wheelTemperature = state.corners[index].wheelTemperature;
     }
 
     return result;
