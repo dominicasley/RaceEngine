@@ -550,6 +550,20 @@ export struct WheelTrace
     // says in three numbers how much of a brake's heat a wheel lets past, which is the whole
     // question. docs/brake-thermal-brief.md.
     double wheelTemperature = 0.0;
+
+    // The cavity air's temperature and the pressure it is blowing, degrees Celsius and **psi gauge**,
+    // joined 2026-08-28 with stage 2.
+    //
+    // **They are here because a seat lap driven with `OSR_TYRE_PRESSURE=on` was otherwise
+    // indistinguishable from one driven without it.** The pressure channels were added to
+    // `TelemetryImpl`'s CSV first, which is a different file from the one a session writes, so the
+    // trace a driver actually produces could not answer "was it on". A knob whose effect a trace
+    // cannot show is a knob nobody can report on.
+    //
+    // psi rather than pascals or bar, alone among this model's pressures, because it is the one a
+    // driver sets by hand and reads off a gauge.
+    double gasTemperature = 0.0;
+    double tyrePressurePsi = 0.0;
 };
 
 export struct VehicleTrace
@@ -758,6 +772,8 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",ABS Cycles" + corner + " []";
         text += ",Brake Pressure" + corner + " [bar]";
         text += ",Tyre Temp Core" + corner + " [C]";
+        text += ",Tyre Temp Gas" + corner + " [C]";
+        text += ",Tyre Pressure" + corner + " [psi]";
         text += ",Disc Temp" + corner + " [C]";
         text += ",Wheel Temp" + corner + " [C]";
     }
@@ -881,6 +897,10 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             appendRackNumber(text, wheel.brakePressure / 1.0e5, 3);
             text += ",";
             appendRackNumber(text, wheel.treadCoreTemperature, 2);
+            text += ",";
+            appendRackNumber(text, wheel.gasTemperature, 2);
+            text += ",";
+            appendRackNumber(text, wheel.tyrePressurePsi, 3);
             text += ",";
             appendRackNumber(text, wheel.discTemperature, 2);
             text += ",";

@@ -343,6 +343,17 @@ export struct WheelHardware
     // to the air over both sidewalls before the core sees any of it.
     double toTyre = 4.0;
 
+    // What share of `toTyre` goes through the **air** rather than through the bead seats — 2.8 of the
+    // 4.0 above.
+    //
+    // **This exists because stage 2 gave the air its own node and the path would otherwise be counted
+    // twice.** With `tyrePressure` off nothing reads it and the lumped 4.0 stands, exactly as it did
+    // before the split. With it on, the wheel reaches the carcass through the beads alone here, and
+    // the cavity's share is resolved explicitly as wheel → air → liner in `TyrePressure` — whose two
+    // conductances are chosen so that their series is this same 2.8 W/K. **Two models of one cavity
+    // have to agree, and this is the number they agree on.**
+    double cavityShare = 0.7;
+
     // What share of the disc's radiating area sees this wheel. See `BrakeThermal::wheelRadiationShare`
     // — the partition lives there because it is the disc's area being divided.
     double discRadiationShare = 0.5;
@@ -376,6 +387,11 @@ export struct WheelThermal
 
     // W/K into the tyre's carcass.
     double toTyre = 0.0;
+
+    // What share of `toTyre` crosses the cavity air rather than the bead seats, carried through from
+    // `WheelHardware::cavityShare`. Read only when `VehicleSetup::tyrePressure` gives the air a node
+    // of its own, and then only to keep the path from being counted twice. See the hardware field.
+    double cavityShare = 0.0;
 };
 
 // The hat's own conduction from the swept ring to the mounting flange, W/K — geometry and grey

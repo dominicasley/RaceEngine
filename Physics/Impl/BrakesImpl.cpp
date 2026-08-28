@@ -234,7 +234,8 @@ void stepBrakeThermal(const BrakeThermal& thermal, double& celsius, const BrakeT
                         .diameter = diameter,
                         .emissivity = wheel.emissivity,
                         .toDisc = conduction,
-                        .toTyre = std::max(wheel.toTyre, 0.0)};
+                        .toTyre = std::max(wheel.toTyre, 0.0),
+                        .cavityShare = std::clamp(wheel.cavityShare, 0.0, 1.0)};
 }
 
 [[nodiscard]] BrakeThermal brakeThermalOf(const BrakeHardware& brake, const WheelHardware& wheel)

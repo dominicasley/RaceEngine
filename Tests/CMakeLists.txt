@@ -98,6 +98,7 @@ add_executable(EngineTests
         TyreShapeProbe.cpp
         TyreTests.cpp
         TyreThermalProbe.cpp
+        TyrePressureTests.cpp
         TyreThermalTests.cpp
         VehicleDataProbe.cpp
         AssistPlacementProbe.cpp

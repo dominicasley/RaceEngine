@@ -368,6 +368,19 @@ export struct VehicleSetup
     // docs/tyre-state-brief.md.
     bool tyreThermal = false;
 
+    // Whether the air inside the tyres carries a temperature and a pressure, and the carcass's
+    // vertical rate and rolling resistance follow it.
+    //
+    // **Second to `tyreThermal` and dependent on it in practice**, because pressure is the gas law
+    // applied to a temperature and there is nothing to apply it to until the tread has one. On with
+    // the tread's model off, the gas simply follows a carcass that never changes and the pressure
+    // never moves off its seed — which is a defensible state to be in and is not a useful one.
+    //
+    // Off is every performance figure this project has: a tyre permanently at its ideal pressure,
+    // which is what `CornerSetup::tireVerticalRate` and `CornerSetup::rollingResistance` are quoted
+    // at. `OSR_TYRE_PRESSURE=on|off` is the seat control. docs/tyre-state-brief.md, section 7.
+    bool tyrePressure = false;
+
     // Whether the brake discs carry a temperature, and the pads' friction follows it — which is fade.
     //
     // Off is the brake every figure in docs/ was measured on: a coefficient that is the same on the
@@ -470,6 +483,15 @@ export void seedDiscTemperatures(VehicleState& state, const double celsius);
 // is part of a measurement: a stop from 20 °C and a stop from 85 °C are different experiments, and a
 // fixture that does not say which one it is running has not stated its own preconditions.
 export void seedTyreTemperatures(VehicleState& state, const double celsius);
+
+// Put every tyre's cavity air at the temperature that makes it read its own ideal pressure.
+//
+// **What a fixture calls when it does not want to be measuring a pressure change.** Every
+// pressure-dependent number a car states is quoted at the ideal, so a car seeded here behaves exactly
+// as it did before `tyrePressure` existed — and that is the inertness proof, asserted rather than
+// hoped for. It takes the setup because the temperature is a property of the car's own cold and ideal
+// pressures and not of its state.
+export void seedTyreGasPressures(const VehicleSetup& setup, VehicleState& state);
 
 // `raceengine.assists` restates its own wheel count rather than importing this one, because it must
 // not be able to import anything from this module — see the head of `Assists/Api/WheelSensors.cppm`.

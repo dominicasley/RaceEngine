@@ -1031,6 +1031,31 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
             .celsius = {{-20.0, 0.0, 20.0, 40.0, 55.0, 65.0, 75.0, 85.0, 120.0, 140.0, 180.0, 200.0, 230.0}},
             .multiplier = {{0.80, 0.92, 0.95, 0.98, 1.00, 1.00, 1.00, 0.97, 0.95, 0.88, 0.82, 0.80, 0.60}}};
 
+        // --- the air inside it ---
+        //
+        // **`tyres.ini`'s own two numbers, and they are the only ones AC states about pressure that
+        // carry a meaning this model can check.** `PRESSURE_STATIC 28` and `PRESSURE_IDEAL 34`, psi
+        // gauge, converted to pascals here because every other pressure in this model is in pascals.
+        //
+        // **The reference temperature is a choice and is flagged as one.** AC states no temperature
+        // for either pressure, so 20 °C is this project's convention — the temperature a pressure is
+        // set at in a garage — and not a borrowed number. It matters: set the same 28 psi on a cold
+        // morning and the tyre is a different tyre all day.
+        //
+        // **And the pair says something about the window this car now runs.** The gas law fixes what
+        // 28 cold and 34 ideal mean together: the tyre reaches its ideal pressure when its air is at
+        // 61.2 °C, which is inside the 55-75 °C road window above and 24 °C below the track window it
+        // replaced. Two of AC's numbers now agree with a road tyre and none with a track one, and this
+        // one was arrived at through the gas law rather than through anybody's curve.
+        corner.tyre.pressure.coldPressure = 28.0 / psiPerPascal;
+        corner.tyre.pressure.coldReferenceTemperature = 20.0;
+        corner.tyre.pressure.idealPressure = 34.0 / psiPerPascal;
+
+        // The cavity's volume, from this tyre's own geometry: an annulus between the rim's 0.2286 m
+        // and the inner surface of the tread package, about 15 mm below the 0.3186 m outer radius,
+        // across the section's width. 28 litres, and it is used for the gas's heat capacity alone.
+        corner.tyre.pressure.cavityVolume = 0.0282;
+
         // The middle of that plateau, which is where every fixture starts. Persson's "around 50 °C"
         // for a summer tyre sits inside it; 65 is taken because it is the centre of the flat region
         // and therefore the seed with the most headroom either side before a capture starts moving.

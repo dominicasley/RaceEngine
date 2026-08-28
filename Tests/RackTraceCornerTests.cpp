@@ -164,7 +164,12 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // it to fifteen, and `Wheel Temp` joined with stage 3, taking it to sixteen — the rim is the
     // *answer* to that stage rather than an input to it, and a trace showing a disc at 500 C, a rim
     // at 90 and a tread at 50 says in three numbers how much a wheel lets past.
-    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 16 * tracedCornerCount);
+    //
+    // `Tyre Temp Gas` and `Tyre Pressure` joined with stage 2, taking it to eighteen. **They are here
+    // because a seat lap driven with the pressure model on was otherwise indistinguishable from one
+    // driven without it** — the channels went into a different CSV first, and the file a session
+    // actually writes could not answer "was it on".
+    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 18 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {

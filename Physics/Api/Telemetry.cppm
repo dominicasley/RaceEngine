@@ -135,6 +135,17 @@ export struct WheelTelemetry
     double tyreCoreTemperature = 0.0;
     double tyreCarcassTemperature = 0.0;
 
+    // The cavity air's temperature and the pressure that follows from it, degrees Celsius and **psi
+    // gauge**. Stage 2's two channels since 2026-08-28.
+    //
+    // **The pressure is in psi and not pascals**, alone among this model's pressures, because it is
+    // the one a driver reads off a gauge and sets by hand. A trace column exists to be looked at.
+    //
+    // They read the seed and the pressure it implies on a car with `tyrePressure` off, which is the
+    // same contract the three temperatures above keep: the value the rest of the model is assuming.
+    double tyreGasTemperature = 0.0;
+    double tyrePressurePsi = 0.0;
+
     // The brake disc's temperature, degrees Celsius. One channel and not three: a disc is one lump of
     // iron in this model, and what a plot of it answers is "did the brakes fade", which is a question
     // about one number.

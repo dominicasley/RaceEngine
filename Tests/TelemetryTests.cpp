@@ -180,7 +180,7 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
         // until the brake disc's one joined them, and twenty-three until the **wheel's** did with
         // stage 3. The rim gets its own column because it is the answer to that stage rather than an
         // input to it: what a reader wants is the disc, the rim and the tread side by side.
-        REQUIRE(header.size() == 34 + 24 * cornerCount);
+        REQUIRE(header.size() == 34 + 26 * cornerCount);
     }
 
     SECTION("the steering column is the rim's angle, and the demand is beside it")
@@ -235,7 +235,7 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
             // Twenty-two since the tread's surface, core and carcass temperatures joined them,
             // twenty-three since the brake disc's did, and twenty-four since the wheel's did with
             // stage 3.
-            REQUIRE(count == 24);
+            REQUIRE(count == 26);
         }
     }
 

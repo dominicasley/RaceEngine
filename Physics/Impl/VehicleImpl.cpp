@@ -41,6 +41,14 @@ void seedTyreTemperatures(VehicleState& state, const double celsius)
     }
 }
 
+void seedTyreGasPressures(const VehicleSetup& setup, VehicleState& state)
+{
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        seedTyreGasAtIdealPressure(setup.corners[index].tyre.pressure, state.corners[index].tyre);
+    }
+}
+
 [[nodiscard]] Curve linearDamper(const double bumpRate, const double reboundRate)
 {
     return Curve{
@@ -779,9 +787,20 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         const auto normalOfVertical = std::max(normal.y, 0.0);
 
         const auto closingSpeed = -glm::dot(wheelVelocity, normal);
+
+        // **The carcass is an air spring, so its rate follows the air.** Linear in gauge pressure —
+        // Rhyne's constant-belt model — and exactly 1.0 at the ideal pressure the car's own
+        // `tireVerticalRate` is quoted at, which is what makes the switch inert. This is the coupling
+        // Dominic will feel, because it changes ride and it changes the contact patch.
+        const auto verticalRate =
+            setup.tyrePressure
+                ? corner.tireVerticalRate *
+                      tyrePressureVerticalRateScale(corner.tyre.pressure, state.corners[index].tyre)
+                : corner.tireVerticalRate;
+
         solution.forces.tireVertical =
             solution.patch.inContact
-                ? std::max(0.0, corner.tireVerticalRate * solution.patch.penetration * normalOfVertical +
+                ? std::max(0.0, verticalRate * solution.patch.penetration * normalOfVertical +
                                     corner.tireVerticalDamping * closingSpeed)
                 : 0.0;
 
@@ -851,11 +870,13 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
             // with `tyreThermal` off the copy is the setup's own bits and `gripScale` is untouched,
             // and with it on inside the curve's plateau the multiplier is exactly 1.0, which in IEEE
             // arithmetic leaves the value alone rather than nearly alone.
+            // **One call, because the tyre is one tyre.** `tyreStateGrip` is the only place the
+            // thermal and pressure factors meet, so neither subsystem assigns `gripScale` on its own
+            // and the answer cannot depend on which stepper ran last. It returns exactly 1.0 with
+            // both switches off, which is what lets this multiply unconditionally.
             auto tyre = corner.tyre;
-            if (setup.tyreThermal)
-            {
-                tyre.gripScale *= tyreTemperatureGrip(corner.tyre.thermal, state.corners[index].tyre);
-            }
+            tyre.gripScale *=
+                tyreStateGrip(corner.tyre, state.corners[index].tyre, setup.tyreThermal, setup.tyrePressure);
 
             solution.contact.slip = tyreSlip(tyre, state.corners[index].tyre);
             solution.contact.tyre =
@@ -908,9 +929,37 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
                                              // the brake loop advances it — three parts in a million
                                              // of a node whose time constant is an hour.
                                              .wheelTemperature = state.corners[index].wheelTemperature,
-                                             .wheelConductance = setup.brakeThermal ? corner.wheel.toTyre : 0.0,
+                                             // **The beads alone once the air is its own node**, or
+                                             // the whole lumped path when it is not. Leaving the
+                                             // whole path in with `tyrePressure` on would carry the
+                                             // rim to the carcass twice — through here and again
+                                             // through the gas — and roughly double a term the brake
+                                             // work measured as worth about a degree.
+                                             .wheelConductance =
+                                                 setup.brakeThermal
+                                                     ? corner.wheel.toTyre *
+                                                           (setup.tyrePressure ? 1.0 - corner.wheel.cavityShare : 1.0)
+                                                     : 0.0,
                                              .ambient = ambient},
                             deltaTime);
+        }
+
+        // --- and the air inside it ---
+        //
+        // **Its own switch and its own call, after the carcass has moved.** The gas reads the carcass
+        // and the rim and generates nothing itself, so it is a one-node problem with two neighbours
+        // and it belongs outside the tread's stepper — the two models switch independently and must
+        // not acquire each other's switch.
+        //
+        // The rim reaches it through the wheel well, on the same condition the carcass's own rim term
+        // has: only when there is a brake model to supply a temperature.
+        if (setup.tyrePressure)
+        {
+            stepTyreGas(corner.tyre.pressure, state.corners[index].tyre,
+                        TyreThermalInput{.wheelTemperature = state.corners[index].wheelTemperature,
+                                         .wheelConductance = setup.brakeThermal ? corner.wheel.toTyre : 0.0,
+                                         .ambient = ambient},
+                        deltaTime);
         }
 
         // What the bushes will be holding on the next tick. The lateral force is resolved into the
@@ -1323,8 +1372,13 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         // command is a torque the ECU asked for through a valve, and a valve cannot make a hot pad
         // grip. Exactly 1.0 with the switch off, and exactly 1.0 anywhere on the curve's own flat
         // part, which is everything below about 350 °C. docs/brake-thermal-brief.md.
-        const auto rolling =
-            setupCorner.rollingResistance * solution.forces.tireVertical * solution.contact.effectiveRadius;
+        // **And pressure multiplies rolling resistance** (2026-08-28). A soft tyre bends its sidewalls
+        // further every revolution and hysteresis follows the deformation, so the coefficient rises
+        // as pressure falls. Exactly 1.0 at the ideal pressure the car's own figure is quoted at.
+        const auto rollingScale =
+            setup.tyrePressure ? tyrePressureRollingResistanceScale(setupCorner.tyre.pressure, corner.tyre) : 1.0;
+        const auto rolling = setupCorner.rollingResistance * rollingScale * solution.forces.tireVertical *
+                             solution.contact.effectiveRadius;
         const auto fade = setup.brakeThermal ? setupCorner.disc.couple.fade.at(corner.discTemperature) : 1.0;
         const auto braking =
             (brakes.commanded ? std::max(0.0, brakes.wheels[index])
@@ -1530,6 +1584,14 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         frame.wheels[index].tyreSurfaceTemperature = state.corners[index].tyre.surfaceTemperature;
         frame.wheels[index].tyreCoreTemperature = state.corners[index].tyre.coreTemperature;
         frame.wheels[index].tyreCarcassTemperature = state.corners[index].tyre.carcassTemperature;
+        frame.wheels[index].tyreGasTemperature = state.corners[index].tyre.gasTemperature;
+
+        // Published in psi because it is the one pressure in this model a driver sets by hand, and a
+        // trace column exists to be read. It is computed from the state whether or not the model is
+        // switched on, which is the same contract the temperature channels keep: the column says what
+        // the rest of the model is assuming.
+        frame.wheels[index].tyrePressurePsi =
+            tyrePressureAt(setup.corners[index].tyre.pressure, state.corners[index].tyre) * psiPerPascal;
         frame.wheels[index].discTemperature = state.corners[index].discTemperature;
         frame.wheels[index].wheelTemperature = state.corners[index].wheelTemperature;
     }

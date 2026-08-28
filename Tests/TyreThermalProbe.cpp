@@ -62,6 +62,16 @@ using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
 using raceengine::TractionMode;
 using raceengine::tyreDefaultTemperature;
+using raceengine::psiPerPascal;
+using raceengine::TyreState;
+using raceengine::seedTyreGasPressures;
+using raceengine::tyreGasTemperatureAtIdealPressure;
+using raceengine::Corner;
+using raceengine::rearAxle;
+using raceengine::tyrePressureAt;
+using raceengine::tyrePressureGripScale;
+using raceengine::tyrePressureRollingResistanceScale;
+using raceengine::tyrePressureVerticalRateScale;
 using raceengine::tyreThermalNodes;
 using raceengine::updateAssists;
 using raceengine::VehicleInput;
@@ -161,6 +171,9 @@ struct Temperatures
     double core = 0.0;
     double carcass = 0.0;
     double hottestCore = 0.0;
+    // The fourth node, since stage 2. Read here rather than in a struct of its own because every
+    // question about the air is a question about where it sits relative to the rubber.
+    double gas = 0.0;
 
     [[nodiscard]] static Temperatures of(const VehicleState& state)
     {
@@ -170,6 +183,7 @@ struct Temperatures
             reading.surface += 0.25 * corner.tyre.surfaceTemperature;
             reading.core += 0.25 * corner.tyre.coreTemperature;
             reading.carcass += 0.25 * corner.tyre.carcassTemperature;
+            reading.gas += 0.25 * corner.tyre.gasTemperature;
             reading.hottestCore = std::max(reading.hottestCore, corner.tyre.coreTemperature);
         }
 
@@ -586,7 +600,9 @@ TEST_CASE("what the tread warms up to, driven, and what the fitted number is wor
     std::printf("\n  Air %.1f C, track %.1f C. Tyres seeded at the track's temperature and driven.\n",
                 conditions.airTemperature, conditions.trackTemperature);
     std::printf("  Core temperature, degrees Celsius, mean of four corners.\n");
-    std::printf("  The plateau this compound wants is 55-75 C, slid 20 C down from AC's track window: a summer\n  road tyre works near 50 C (Persson & Xu, arXiv:2507.18782v3) where a racing tyre wants ~100.\n\n");
+    std::printf("  The plateau this compound wants is 55-75 C, slid 20 C down from AC's track window: a\n"
+                "  summer road tyre works near 50 C (Persson & Xu, arXiv:2507.18782v3) where a racing\n"
+                "  tyre wants ~100.\n\n");
 
     for (const auto share : {0.15, 0.2956, 0.50, 0.70})
     {
@@ -848,6 +864,172 @@ TEST_CASE("what the tread-road interface resistance is worth", "[.tyre-thermal]"
 
             std::printf("      %8.0f W/(m2.K)   cold %6.2f m  %.3f g      plateau %6.2f m  %.3f g\n", stated,
                         cold.distance, cold.meanDeceleration(), flat.distance, flat.meanDeceleration());
+        }
+
+        std::printf("\n");
+    }
+}
+
+TEST_CASE("what the tyre's air does, and what its pressure is worth", "[.tyre-pressure]")
+{
+    // **Stage 2's measurements live here and not in a test**, for the reason every measurement in
+    // this file does: a threshold attached to an instrument becomes a calibration target, which is
+    // Dominic's own correction (`diagnostic-not-a-calibration-target`).
+    const auto guard = JoltGuard{};
+    const auto conditions = weather();
+
+    auto setup = golfWith(true, -1.0);
+    setup.tyrePressure = true;
+    const auto pressure = setup.corners.front().tyre.pressure;
+
+    std::printf("\n  Air %.1f C, track %.1f C.\n", conditions.airTemperature, conditions.trackTemperature);
+    std::printf("  Cold %.1f psi set at %.1f C; ideal %.1f psi, which this tyre reaches at %.1f C of air.\n\n",
+                pressure.coldPressure * psiPerPascal, pressure.coldReferenceTemperature,
+                pressure.idealPressure * psiPerPascal, tyreGasTemperatureAtIdealPressure(pressure));
+
+    SECTION("what the gas law is worth across the temperatures this car actually sees")
+    {
+        std::printf("    gas temperature -> pressure, and what each coupling does with it\n");
+        std::printf("      %6s  %9s  %14s  %14s\n", "C", "psi", "vertical rate", "rolling res");
+
+        auto state = TyreState{};
+        for (const auto celsius : {0.0, 20.0, 31.5, 40.0, 50.0, 61.2, 70.0, 85.0})
+        {
+            state.gasTemperature = celsius;
+            std::printf("      %6.1f  %9.2f  %13.3f%%  %13.3f%%\n", celsius,
+                        tyrePressureAt(pressure, state) * psiPerPascal,
+                        100.0 * (tyrePressureVerticalRateScale(pressure, state) - 1.0),
+                        100.0 * (tyrePressureRollingResistanceScale(pressure, state) - 1.0));
+        }
+
+        std::printf("\n");
+    }
+
+    SECTION("what a stint does to the air, driven from cold")
+    {
+        const auto circleWorld = plate(900.0, 900.0, 8.0);
+        const auto marks = std::vector<double>{30.0, 60.0, 120.0, 240.0};
+
+        const auto cornering = hold(setup, circleWorld, 0.37, 20.0, 260.0, conditions.trackTemperature, marks);
+
+        auto gasState = TyreState{};
+        gasState.gasTemperature = cornering.temperatures.gas;
+
+        std::printf("    260 s of 0.37 lock at 20 m/s, every node from the track's temperature\n");
+        std::printf("      surface %5.1f C   core %5.1f C   carcass %5.1f C   **gas %5.1f C**\n",
+                    cornering.temperatures.surface, cornering.temperatures.core, cornering.temperatures.carcass,
+                    cornering.temperatures.gas);
+        std::printf("      pressure %5.2f psi against an ideal of %5.2f, and the air needs %.1f C to get there\n",
+                    tyrePressureAt(pressure, gasState) * psiPerPascal, pressure.idealPressure * psiPerPascal,
+                    tyreGasTemperatureAtIdealPressure(pressure));
+        std::printf("\n");
+    }
+
+    SECTION("and what it costs, against the same car at its ideal pressure")
+    {
+        const auto world = plate(600.0, 60.0, 2.0);
+
+        auto ideal = setup;
+        const auto cold = brake(setup, world, conditions.trackTemperature);
+        const auto warm = brake(ideal, world, tyreGasTemperatureAtIdealPressure(pressure));
+
+        std::printf("    100-0 with ABS, the pressure model on\n");
+        std::printf("      seeded at the ideal pressure     %6.2f m   %.3f g\n", warm.distance,
+                    warm.meanDeceleration());
+        std::printf("      seeded at the track temperature  %6.2f m   %.3f g\n", cold.distance,
+                    cold.meanDeceleration());
+        std::printf("\n");
+    }
+
+    SECTION("what a grip-against-pressure law would be worth, at the three published donor fits")
+    {
+        // **The form is sourced and the numbers are not**, and this section exists to say how much
+        // that costs rather than to close it. MF-Tyre 6.1 multiplies a peak friction coefficient by
+        // `1 + p3·dpi + p4·dpi²` — Besselink, Schmeitz & Pacejka, Vehicle System Dynamics
+        // 48(sup1):337, 2010 — and the campaign those terms were fitted on, de Hoogh, TU/e
+        // DCT 2005.46, measured five passenger car tyres at three pressures each. Fitting this
+        // quadratic to that report's own figures at **this model's own 4000 N nominal load** gives
+        // three pairs that disagree in size and in sign. The fourth is the closest relative this car
+        // has in any published measurement — a Goodyear Eagle F1 Asymmetric 255/45 ZR19 on a
+        // Flat-Trac at 33, 37 and 41 psi (Singh & Sivaramakrishnan, The Goodyear Tire & Rubber
+        // Company, *Extended Pacejka Tire Model for Enhanced Vehicle Stability Control*,
+        // arXiv:2305.18422) — and it is **lateral, monotonic and tiny**, with grip rising with
+        // pressure and no optimum anywhere in the measured range. Nothing here is a candidate to ship.
+        struct Donor
+        {
+            const char* name;
+            double linear;
+            double quadratic;
+        };
+
+        const auto donors = std::array<Donor, 4>{Donor{"185/60 R14, longitudinal", 0.173, -2.250},
+                                                 Donor{"205/55 R16, longitudinal", 0.098, -1.615},
+                                                 Donor{"225/55 R16, longitudinal", -0.018, 0.470},
+                                                 Donor{"255/45 ZR19 summer, lateral", 0.049, 0.035}};
+
+        // The pressures the driven lap finished at. **Stamped on rather than generated**, because
+        // this fixture has no brakes and the front-to-rear split is made *by* the brakes — a skidpad
+        // leaves all four wheels at ambient, which is the fixture that reported the rim's sign
+        // backwards last night. `traces/rack-exit-20260828-pressure-seat.csv`.
+        constexpr auto frontPsi = 33.10;
+        constexpr auto rearPsi = 30.58;
+        constexpr auto seed = 31.5;
+
+        auto split = setup;
+        for (auto index = std::size_t{0}; index < cornerCount; index++)
+        {
+            auto& air = split.corners[index].tyre.pressure;
+            air.coldReferenceTemperature = seed;
+            air.coldPressure = (rearAxle(static_cast<Corner>(index)) ? rearPsi : frontPsi) / psiPerPascal;
+        }
+
+        std::printf("    the Magic Formula's own pressure terms, at the lap's own %.2f / %.2f psi\n", frontPsi,
+                    rearPsi);
+        std::printf("      %-30s %8s %10s %9s %9s %10s\n", "donor tyre", "linear", "quadratic", "front", "rear",
+                    "balance");
+
+        for (const auto& donor : donors)
+        {
+            auto front = TyreState{};
+            auto rear = TyreState{};
+            front.gasTemperature = seed;
+            rear.gasTemperature = seed;
+
+            auto air = split.corners.front().tyre.pressure;
+            air.gripPressureLinear = donor.linear;
+            air.gripPressureQuadratic = donor.quadratic;
+            const auto atFront = tyrePressureGripScale(air, front);
+
+            air.coldPressure = rearPsi / psiPerPascal;
+            const auto atRear = tyrePressureGripScale(air, rear);
+
+            std::printf("      %-30s %8.3f %10.3f %8.2f%% %8.2f%% %9.2f%%\n", donor.name, donor.linear,
+                        donor.quadratic, 100.0 * (atFront - 1.0), 100.0 * (atRear - 1.0),
+                        100.0 * (atFront / atRear - 1.0));
+        }
+
+        // And what that is worth on the car. The control and each donor differ in **nothing but the
+        // two coefficients**, so the delta is the grip law alone — the vertical rate and the rolling
+        // resistance are identical across every row, both already carrying the same split.
+        const auto world = plate(900.0, 900.0, 8.0);
+        const auto marks = std::vector<double>{};
+        const auto control = hold(split, world, 0.37, 20.0, 12.0, seed, marks);
+
+        std::printf("\n    skidpad at 0.37 lock, the same car with only the two coefficients changed\n");
+        std::printf("      none stated, which is the shipped car  %.4f g\n", control.lateralAcceleration);
+
+        for (const auto& donor : donors)
+        {
+            auto stated = split;
+            for (auto& corner : stated.corners)
+            {
+                corner.tyre.pressure.gripPressureLinear = donor.linear;
+                corner.tyre.pressure.gripPressureQuadratic = donor.quadratic;
+            }
+
+            const auto held = hold(stated, world, 0.37, 20.0, 12.0, seed, marks);
+            std::printf("      %-38s %.4f g   %+.2f%%\n", donor.name, held.lateralAcceleration,
+                        100.0 * (held.lateralAcceleration / control.lateralAcceleration - 1.0));
         }
 
         std::printf("\n");

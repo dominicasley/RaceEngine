@@ -117,15 +117,28 @@ namespace
     options.unattended =
         std::getenv("RACEENGINE_UNATTENDED") != nullptr || std::getenv("RACEENGINE_DUMP_FRAME") != nullptr;
     options.outputHz = 500.0;
-    // Five minutes of a 360 Hz publish, and the rate in that sentence is why the number moved
-    // (2026-08-21). The stage-one trace is the deliverable rather than a diagnostic — it is recorded
-    // whether or not a device is attached and whether or not anybody has asked for it — and what
-    // makes it one is the *window*: a wheel complaint is settled by reading back the minutes before
-    // the driver reached for the key. When the simulation moved onto its own thread the publish rate
-    // tripled, so the 36000 frames that had been five minutes silently became a hundred seconds, and
-    // both this comment and `~PlayerCar`'s said five. 96 bytes a frame, so the window costs 10.4 MB
-    // against the 3.5 it did; that is the price of the instrument still being the one described.
-    options.traceCapacity = 108000;
+    // **Ten minutes of a 360 Hz publish**, on Dominic's instruction (2026-08-28).
+    //
+    // The stage-one trace is the deliverable rather than a diagnostic — it is recorded whether or not
+    // a device is attached and whether or not anybody has asked for it — and what makes it one is the
+    // *window*: a wheel complaint is settled by reading back the minutes before the driver reached for
+    // the key.
+    //
+    // **The window has now been overrun twice by real drives and each time it cost the cold start.**
+    // A thermal or pressure model is a statement about the first few minutes of a session, so a ring
+    // that keeps the *last* five minutes of a nine-minute stint throws away precisely the part those
+    // models are about: the 2026-08-28 stage-2 lap ran 545 s and its trace began at t = 245.
+    //
+    // It moved once before for the opposite reason (2026-08-21): the simulation went onto its own
+    // thread, the publish rate tripled, and 36000 frames that had been five minutes silently became a
+    // hundred seconds while both this comment and `~PlayerCar`'s went on saying five.
+    //
+    // **The cost is memory and it is no longer small.** This comment used to say 96 bytes a frame and
+    // 10.4 MB, which was true when a frame was a dozen doubles; a frame now carries eighteen channels
+    // per corner and comes to about **768 bytes**, so ten minutes is roughly **166 MB** resident
+    // against 83 for five. That is the price of a session-length instrument and it is stated here so
+    // the next person to widen it knows what it costs.
+    options.traceCapacity = 216000;
 
     // The pedals' motors, on for any set that has them. **Safe to state unconditionally**: the
     // profile only says a ClubSport V3 *would* have motors, and nothing is written until the device

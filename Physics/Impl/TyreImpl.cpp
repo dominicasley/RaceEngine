@@ -488,6 +488,145 @@ void seedTyreTemperature(TyreState& state, const double celsius)
     state.surfaceTemperature = celsius;
     state.coreTemperature = celsius;
     state.carcassTemperature = celsius;
+    state.gasTemperature = celsius;
+}
+
+// --- the air inside, and what its pressure is worth ---
+
+namespace
+{
+
+// Zero Celsius in kelvin, and dry air's gas constant and constant-volume specific heat.
+//
+// The last two are the only new material constants stage 2 needs and both are textbook: 287.05
+// J/(kg·K) for the specific gas constant of dry air, and 718 J/(kg·K) for c_v. **Nothing about the
+// gas is fitted** — its mass comes from the pressure it is at and the volume it is in.
+constexpr auto absoluteZero = 273.15;
+constexpr auto airGasConstant = 287.05;
+constexpr auto airSpecificHeatConstantVolume = 718.0;
+
+} // namespace
+
+[[nodiscard]] double tyrePressureAt(const TyrePressure& pressure, const TyreState& state)
+{
+    const auto coldKelvin = pressure.coldReferenceTemperature + absoluteZero;
+    if (coldKelvin <= 0.0)
+    {
+        return pressure.coldPressure;
+    }
+
+    const auto gasKelvin = std::max(state.gasTemperature + absoluteZero, 0.0);
+
+    return (pressure.coldPressure + atmosphericPressure) * gasKelvin / coldKelvin - atmosphericPressure;
+}
+
+[[nodiscard]] double tyreGasTemperatureAtIdealPressure(const TyrePressure& pressure)
+{
+    const auto coldAbsolute = pressure.coldPressure + atmosphericPressure;
+    if (coldAbsolute <= 0.0)
+    {
+        return pressure.coldReferenceTemperature;
+    }
+
+    const auto coldKelvin = pressure.coldReferenceTemperature + absoluteZero;
+
+    return coldKelvin * (pressure.idealPressure + atmosphericPressure) / coldAbsolute - absoluteZero;
+}
+
+void seedTyreGasAtIdealPressure(const TyrePressure& pressure, TyreState& state)
+{
+    state.gasTemperature = tyreGasTemperatureAtIdealPressure(pressure);
+}
+
+[[nodiscard]] double tyrePressureVerticalRateScale(const TyrePressure& pressure, const TyreState& state)
+{
+    if (pressure.idealPressure <= 0.0)
+    {
+        return 1.0;
+    }
+
+    // Gauge pressure, because it is the difference across the carcass that carries the load. Floored
+    // at zero rather than allowed negative: a tyre below atmospheric is not a tyre this model has
+    // anything to say about, and a negative rate would be a spring pulling the car down.
+    return std::max(tyrePressureAt(pressure, state), 0.0) / pressure.idealPressure;
+}
+
+[[nodiscard]] double tyrePressureRollingResistanceScale(const TyrePressure& pressure, const TyreState& state)
+{
+    if (pressure.idealPressure <= 0.0)
+    {
+        return 1.0;
+    }
+
+    // Floored well above zero, because the power law diverges at zero pressure and a flat tyre's
+    // rolling resistance is a different physical problem rather than a very large number.
+    const auto ratio = std::max(tyrePressureAt(pressure, state) / pressure.idealPressure, 0.1);
+
+    return std::pow(ratio, -pressure.rollingResistanceExponent);
+}
+
+[[nodiscard]] double tyrePressureGripScale(const TyrePressure& pressure, const TyreState& state)
+{
+    if (pressure.idealPressure <= 0.0)
+    {
+        return 1.0;
+    }
+
+    // The Magic Formula's own dimensionless pressure increment, referred to the pressure every
+    // number this tyre states is quoted at.
+    const auto dpi = (tyrePressureAt(pressure, state) - pressure.idealPressure) / pressure.idealPressure;
+
+    // **Exactly 1.0 whenever both coefficients are zero, at any pressure**, because a zero times a
+    // finite number is a zero. That is the shipped car, and it is the one coupling here whose
+    // inertness is bit-exact rather than a part in a million.
+    const auto scale = 1.0 + pressure.gripPressureLinear * dpi + pressure.gripPressureQuadratic * dpi * dpi;
+
+    // Floored, because a stated pair is somebody's fit over the three pressures it was measured at
+    // and a downward parabola extrapolated far enough reaches zero grip, which is not a tyre. The
+    // floor cannot round the shipped car: `std::max(1.0, 0.1)` is 1.0.
+    return std::max(scale, 0.1);
+}
+
+[[nodiscard]] double tyreStateGrip(const TyreModel& tyre, const TyreState& state, const bool thermal,
+                                   const bool pressure)
+{
+    // **Multiplied, and in this one place.** Both factors are exactly 1.0 when their switch is off,
+    // so a car with neither model on comes out of here bit for bit unchanged — which is what lets
+    // the caller multiply unconditionally instead of branching.
+    auto scale = 1.0;
+
+    if (thermal)
+    {
+        scale *= tyreTemperatureGrip(tyre.thermal, state);
+    }
+
+    if (pressure)
+    {
+        scale *= tyrePressureGripScale(tyre.pressure, state);
+    }
+
+    return scale;
+}
+
+void stepTyreGas(const TyrePressure& pressure, TyreState& state, const TyreThermalInput& input,
+                 const double deltaTime)
+{
+    // The mass of air in there, from the pressure it is currently at. About 98 grams for a 225/40 R18
+    // at 28 psi, which is 70 J/K — three orders below the carcass, and the reason this node could be
+    // folded into the carcass right up until something needed to read its temperature.
+    const auto absolute = std::max(tyrePressureAt(pressure, state) + atmosphericPressure, 1.0);
+    const auto kelvin = std::max(state.gasTemperature + absoluteZero, 1.0);
+    const auto mass = absolute * pressure.cavityVolume / (airGasConstant * kelvin);
+    const auto capacity = mass * airSpecificHeatConstantVolume;
+
+    // Two neighbours: the carcass through the liner, and the wheel through the rim well. The second
+    // is zero unless there is a brake thermal model to supply a rim temperature, and zero leaves the
+    // gas following the carcass alone — which is exactly what it did when it was part of it.
+    const auto liner = std::max(pressure.linerConductance, 0.0);
+    const auto rim = input.wheelConductance > 0.0 ? std::max(pressure.rimConductance, 0.0) : 0.0;
+
+    state.gasTemperature = advanceNode(state.gasTemperature, capacity, 0.0, liner + rim,
+                                       liner * state.carcassTemperature + rim * input.wheelTemperature, deltaTime);
 }
 
 } // namespace raceengine

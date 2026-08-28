@@ -172,6 +172,134 @@ export struct TyreThermal
     double idealTemperature = 85.0;
 };
 
+// Standard atmospheric pressure, pascals. The gas law needs absolute pressure and every tyre
+// pressure anybody quotes is a gauge one, so the conversion happens once and here.
+export inline constexpr double atmosphericPressure = 101325.0;
+
+// One pascal in psi, for the places where a human number has to be read or printed. Tyre pressures
+// are quoted in psi or bar everywhere in the sources, and stored in pascals like every other
+// pressure in this model.
+export inline constexpr double psiPerPascal = 1.0 / 6894.757;
+
+// The air inside the tyre, and what its pressure is worth to the car.
+//
+// **The gas law is the whole model and it has no constant to choose.** A tyre is a fixed volume, so
+// absolute pressure follows absolute temperature: set 28 psi in a garage at 20 °C and the same tyre
+// reads 34 psi when its air reaches 61 °C. That is not a coincidence with `PRESSURE_IDEAL 34` — it
+// is what that number *means*, and it is why pressure had to come after temperature rather than
+// before it.
+//
+// **Two couplings act, and neither imports a fitted number.** The carcass's vertical rate is linear
+// in gauge pressure, which is the constant-belt result — Rhyne, *Development of a Vertical Stiffness
+// Relationship for Belted Radial Tires*, Tire Science and Technology 33(3):136, 2005, which derives
+// stiffness from the contained air in an inextensible ring — and AC's own `PRESSURE_SPRING_GAIN`
+// agrees with a line through the origin to 1.1%. Rolling resistance falls as a power of pressure,
+// because a softer tyre bends its sidewalls further and hysteresis follows the deformation.
+//
+// **Grip against pressure has a sourced form and no sourced number, and those are two different
+// problems.** The Magic Formula's own pressure extension multiplies a peak friction coefficient by
+// `1 + p3·dpi + p4·dpi²` against a dimensionless `dpi = (P − P_ideal)/P_ideal` — Besselink, Schmeitz
+// & Pacejka, *An improved Magic Formula/Swift tyre model that can handle inflation pressure changes*,
+// Vehicle System Dynamics 48(sup1):337, 2010. So the shape is published and carries a convention,
+// unlike AC's `PRESSURE_D_GAIN`, which has no unit and no reference exactly as its thermal gains had.
+// **The two coefficients are a property of the individual tyre and cannot be borrowed**, which is a
+// measured conclusion rather than a search that came up short — see the fields below.
+export struct TyrePressure
+{
+    // What this tyre is set to cold, **gauge** pascals, and the air temperature it was set at.
+    //
+    // 28 psi at 20 °C for the Golf: AC's own `PRESSURE_STATIC`, and 20 °C because that is the
+    // temperature a pressure is set at rather than a property of the car. A driver who sets his
+    // pressures on a cold morning has a different tyre all day, which is a real effect and is what
+    // stating the reference rather than assuming it buys.
+    double coldPressure = 193053.0;
+    double coldReferenceTemperature = 20.0;
+
+    // Where this tyre wants to be, **gauge** pascals — AC's `PRESSURE_IDEAL`, 34 psi for the Golf.
+    //
+    // **Every pressure-dependent number the car states is quoted at this pressure**, which is what
+    // makes it the reference rather than a target: `CornerSetup::tireVerticalRate` and
+    // `CornerSetup::rollingResistance` are both the ideal-pressure values, so a tyre sitting exactly
+    // here multiplies both by exactly one and the whole model is inert.
+    double idealPressure = 234421.0;
+
+    // The cavity's volume, cubic metres. Derived from the tyre's own geometry rather than stated:
+    // it is only used for the gas's heat capacity, which is tiny — about 70 J/K against the
+    // carcass's thousands — so the gas follows what surrounds it with a time constant of seconds.
+    double cavityVolume = 0.0282;
+
+    // W/K from the carcass's inner liner into the air, and from the rim well into it.
+    //
+    // **Derived so that the two models of this one cavity agree, and that pinned the coefficient the
+    // brake model had only bounded.** `WheelThermal::toTyre` states the whole wheel-to-tyre path as
+    // 4.0 W/K, of which 2.8 is the air — the liner's 0.6 m² and the rim well's 0.27 m² in series
+    // through air stirred by rotation at a bounded 10-30 W/(m²·K). Resolving that series into two
+    // conductances requires `h / (1/0.27 + 1/0.6) = 2.8`, so **h = 15.0 W/(m²·K)** — inside the
+    // bound, and now a number rather than a range. That gives 9.0 W/K on the liner and 4.05 on the
+    // rim, and their series is the 2.8 the brake model already shipped.
+    //
+    // **Getting this wrong is a double count, and the first draft did.** With the air as a node, the
+    // wheel reaches the carcass twice — once through `toTyre`'s lumped 4.0 and again through the gas
+    // — unless the lumped path drops its cavity share, which is what `WheelThermal::cavityShare` is
+    // for. It was caught by measuring rather than by reading: the air came out five degrees below the
+    // carcass on a stint and the rim's grip on it looked too strong.
+    double linerConductance = 9.0;
+    double rimConductance = 4.05;
+
+    // How rolling resistance follows pressure, as an exponent: `rr = rr_ideal · (P/P_ideal)^-e`.
+    //
+    // **Bounded, not fitted.** The mechanism is textbook — lower pressure means more sidewall
+    // bending and shearing per revolution, so more hysteresis — and published exponents for a
+    // pneumatic tyre cluster near 0.5. The one clean fitted figure found, `Cr = 0.1071·P^-0.477`
+    // at r² = 0.99, is measured on **bicycle** tyres and is recorded as a neighbour rather than as
+    // this tyre's own. AC's `PRESSURE_RR_GAIN 0.55` sits at the top of the 0.4-0.55 band.
+    double rollingResistanceExponent = 0.5;
+
+    // What pressure is worth to grip, as the Magic Formula's own two pressure terms on a peak
+    // friction coefficient: `1 + linear·dpi + quadratic·dpi²`, with `dpi = (P − P_ideal)/P_ideal`.
+    //
+    // **Both are exactly 0.0, so the factor is exactly 1.0 at every pressure**, and that is a
+    // bit-exact inertness proof rather than an approximate one: a zero times a finite number is a
+    // zero, where the vertical-rate and rolling-resistance couplings are computed ratios that only
+    // round to one at the ideal.
+    //
+    // **The form is sourced and the numbers are not, because they are not a property of tyres in
+    // general.** The campaign these terms were fitted on — de Hoogh, *Implementing Inflation Pressure
+    // and Velocity Effects into the Magic Formula Tyre Model*, TU/e DCT 2005.46, 2005: five passenger
+    // car tyres on the TNO Tyre Test Trailer at three pressures each — concludes for the **lateral**
+    // peak that the measurements *"do not show a clear tyre independent relation"*, and the two
+    // TIME-project reports it cites disagree over whether there is any effect at all. For the
+    // **longitudinal** peak an optimum does appear, but fitting this quadratic to that report's own
+    // figures at this model's own 4000 N nominal load gives `quadratic` = **−2.25** on a 185/60 R14,
+    // **−1.62** on a 205/55 R16 and **+0.47** on a 225/55 R16. **The curvature inverts on the widest
+    // tyre in the set**, which is the one nearest this car's 225/40 R18. Marshek & Cuderman's
+    // vehicle-level braking tests (SAE 2002-01-0306) reach it from the other end: an optimum on small
+    // tyres and *"no noticeable effect at all"* on large ones.
+    //
+    // **And the closest relative this car has in any published measurement agrees that it is small.**
+    // A Goodyear Eagle F1 Asymmetric 255/45 ZR19 on a Flat-Trac at 33, 37 and 41 psi — Singh &
+    // Sivaramakrishnan, The Goodyear Tire & Rubber Company, *Extended Pacejka Tire Model for Enhanced
+    // Vehicle Stability Control*, arXiv:2305.18422 — moves its peak **lateral** grip by 1.1% across
+    // that whole 8 psi at nominal load, monotonically and with no optimum in range, and the authors
+    // write that the effect *"doesn't seem to be very dominant"*. **The adaptation they publish for
+    // peak grip is then in tread depth and temperature only**, while the cornering-stiffness equation
+    // in the same paper does carry explicit pressure terms — so the omission is specific to peak grip.
+    //
+    // **So this is not a number waiting to be looked up.** Stating those four donor fits on this car
+    // at the pressures a driven lap finished at moves its front-to-rear grip balance by **+3.54%,
+    // +2.31%, −0.57% and +0.33%** — a change of sign, and an order of magnitude between the smallest
+    // and the largest — against the 1.2% of balance the thermal model moved and the seat could feel.
+    // **The two nearest this car's tyre are the two smallest.** Choosing
+    // one would be choosing this car's handling balance rather than sourcing a coefficient.
+    //
+    // **There is deliberately no seat knob**, unlike `OSR_TYRE_IDEAL`, which was built to let Dominic
+    // choose between two ends of a *sourced* band. Here the literature does not fix the sign, so a
+    // seat verdict could only fit a grip law to a feeling. `[.tyre-pressure]` measures what each donor
+    // fit would be worth instead, which is the question that can be answered.
+    double gripPressureLinear = 0.0;
+    double gripPressureQuadratic = 0.0;
+};
+
 export struct TyreModel
 {
     // The load the coefficients are quoted at. Everything load-dependent is relative to this.
@@ -260,6 +388,10 @@ export struct TyreModel
     // The tread's heat balance. Inert unless `VehicleSetup::tyreThermal` switches it on, and inert
     // whatever that says on a tyre that states no grip curve.
     TyreThermal thermal;
+
+    // The air inside it. Inert unless `VehicleSetup::tyrePressure` switches it on, and inert then
+    // too on a tyre whose gas is sitting at its own ideal pressure.
+    TyrePressure pressure;
 };
 
 // What every tyre in this project starts at, degrees Celsius.
@@ -293,10 +425,22 @@ export struct TyreState
     // Degrees Celsius. The outer skin of the tread, the body of the tread rubber, and the belt and
     // sidewalls behind it. **Grip reads the core** — see `TyreThermal` for the source that says so.
     // The carcass is what carries heat from one corner to the next and makes lap five different from
-    // lap one; until stage 2 the inner gas is folded into it.
+    // lap one.
     double surfaceTemperature = tyreDefaultTemperature;
     double coreTemperature = tyreDefaultTemperature;
     double carcassTemperature = tyreDefaultTemperature;
+
+    // The air in the cavity, degrees Celsius, and the fourth node since 2026-08-28. Until stage 2 it
+    // was folded into the carcass; it is its own node now because **pressure follows this
+    // temperature and nothing else**, and the gas is not the carcass — it sits behind the liner and
+    // is stirred by the rim as well.
+    //
+    // **Its seed is not `tyreDefaultTemperature` and must not be.** A default-constructed tyre has
+    // to sit at its own *ideal pressure*, the way a default-constructed tread sits on its own
+    // plateau, and the gas temperature that does that is a property of the car's cold and ideal
+    // pressures rather than of its compound. `seedTyreGasAtIdealPressure` is how, and it is the one
+    // seed in this model that is computed rather than stated.
+    double gasTemperature = tyreDefaultTemperature;
 };
 
 static_assert(std::is_trivially_copyable_v<TyreState>, "per-wheel tire state rides in the vehicle's POD state");
@@ -496,6 +640,23 @@ export struct TyreThermalInput
 export void stepTyreThermal(const TyreThermal& thermal, TyreState& state, const TyreThermalInput& input,
                             const double deltaTime);
 
+// One tick of the cavity air's own balance, advancing `state.gasTemperature`.
+//
+// **Separate from `stepTyreThermal` on purpose.** The two models switch independently, so the gas
+// must not ride inside the tread's stepper and acquire its switch; and the gas is a one-node problem
+// with two neighbours, which the same closed form solves exactly.
+//
+// The air is stirred between the carcass's inner liner and the rim well, and it reads the wheel
+// through the same `TyreThermalInput` fields the tread's stepper does — zero conductance when there
+// is no brake thermal model, which leaves the gas following the carcass alone.
+//
+// **Its heat capacity is computed rather than stated**, because it depends on how much air is in
+// there: the ideal gas law gives the density from the pressure the tyre is currently at, and about
+// 70 J/K comes out. That is small enough that the gas tracks its neighbours with a time constant of
+// seconds, which is why it never needed to be a node until pressure did.
+export void stepTyreGas(const TyrePressure& pressure, TyreState& state, const TyreThermalInput& input,
+                        const double deltaTime);
+
 // What this tyre's temperature is worth to its grip, dimensionless — the curve read at the **core**.
 // Exactly 1.0 for a tyre that states no curve, and exactly 1.0 anywhere on the curve's own plateau.
 export [[nodiscard]] double tyreTemperatureGrip(const TyreThermal& thermal, const TyreState& state);
@@ -505,5 +666,52 @@ export [[nodiscard]] double tyreTemperatureGrip(const TyreThermal& thermal, cons
 // is a thermal model, and a fixture that does not say which one it is running is measuring something
 // it has not stated.
 export void seedTyreTemperature(TyreState& state, const double celsius);
+
+// What this tyre is blowing, **gauge** pascals, at the gas temperature it is currently carrying.
+//
+// The gas law at constant volume and nothing else: `P_abs = P_cold_abs · T_abs / T_cold_abs`. Exact,
+// with no constant to choose and nothing borrowed.
+export [[nodiscard]] double tyrePressureAt(const TyrePressure& pressure, const TyreState& state);
+
+// The gas temperature at which this tyre sits at its own ideal pressure, degrees Celsius.
+//
+// **The inverse of the line above, and it is the model's one computed seed.** Every pressure-dependent
+// number a car states — its vertical rate, its rolling resistance — is quoted at the ideal pressure,
+// so a tyre seeded here multiplies both by exactly one and the whole suite is inert. For the Golf's
+// 28 psi set at 20 °C against an ideal of 34 it comes out at 61.2 °C, which is a fact about AC's own
+// two numbers rather than a choice.
+export [[nodiscard]] double tyreGasTemperatureAtIdealPressure(const TyrePressure& pressure);
+
+// Put a tyre's gas at the temperature that makes it read its own ideal pressure.
+export void seedTyreGasAtIdealPressure(const TyrePressure& pressure, TyreState& state);
+
+// What this tyre's pressure is worth to the carcass's vertical rate, dimensionless.
+//
+// Linear in **gauge** pressure, which is the constant-belt result: the load is carried by the
+// contained air, so the rate follows the pressure that contains it. Exactly 1.0 at the ideal.
+export [[nodiscard]] double tyrePressureVerticalRateScale(const TyrePressure& pressure, const TyreState& state);
+
+// And what it is worth to rolling resistance, dimensionless. `(P/P_ideal)^-e`, exactly 1.0 at the
+// ideal, and **greater than one below it** — a soft tyre drags.
+export [[nodiscard]] double tyrePressureRollingResistanceScale(const TyrePressure& pressure, const TyreState& state);
+
+// And what it is worth to grip, dimensionless. The Magic Formula's `1 + p3·dpi + p4·dpi²` against a
+// dimensionless `dpi = (P − P_ideal)/P_ideal`, and **exactly 1.0 at every pressure on the shipped
+// car**, because both coefficients are zero and no tyre-independent pair exists to put there.
+//
+// One factor for both axes, which the sourced form is not: the Magic Formula carries `ppx3/ppx4` and
+// `ppy3/ppy4` separately, and only the longitudinal pair has a repeatable shape. That is a second
+// reason a stated pair here is a **bound** rather than a model. `TyrePressure` above has the rest.
+export [[nodiscard]] double tyrePressureGripScale(const TyrePressure& pressure, const TyreState& state);
+
+// What the tread's temperature and the gas's pressure are worth to grip **together**, dimensionless.
+//
+// **This is the one place the two multiply**, and it exists so that neither subsystem assigns
+// `TyreModel::gripScale` on its own. The tyre is one tyre: a cold over-inflated tyre is not two
+// independent corrections that happen to land on the same field, and letting two steppers each write
+// it would make the answer depend on which ran last. The pressure factor is exactly 1.0 on the
+// shipped car, at every pressure, because its two coefficients are zero.
+export [[nodiscard]] double tyreStateGrip(const TyreModel& tyre, const TyreState& state, bool thermal,
+                                          bool pressure);
 
 } // namespace raceengine
