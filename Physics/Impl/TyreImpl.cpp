@@ -323,6 +323,33 @@ TyreDeflectionRate relaxTyre(const TyreModel& model, TyreState& state, const dou
 namespace
 {
 
+// Zero Celsius in kelvin, and the Stefan-Boltzmann constant — here rather than beside the gas
+// constants below because the radiation term needs them first. One anonymous namespace per
+// translation unit, so the gas-law block further down shares these.
+constexpr auto absoluteZero = 273.15;
+constexpr auto stefanBoltzmann = 5.670374419e-8;
+
+// Grey-body radiation from an exterior surface to surroundings at the air's temperature, as a
+// conductance in W/K — the exact secant of the fourth power between the two temperatures,
+// `eps·sigma·A·(Ts² + Ta²)(Ts + Ta)`, which is the brake disc's own convention: the full T⁴
+// difference, linearised only in how far the temperature moves within one tick. Zero emissivity is
+// exactly zero conductance, and adding an exact 0.0 to a conductance sum is the identity — which is
+// what keeps a car that states no emissivity bit-identical to the model before the term existed.
+[[nodiscard]] double radiativeConductance(const double emissivity, const double area, const double celsius,
+                                          const double airCelsius)
+{
+    if (emissivity <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const auto surface = celsius + absoluteZero;
+    const auto ambient = airCelsius + absoluteZero;
+
+    return std::clamp(emissivity, 0.0, 1.0) * stefanBoltzmann * std::max(area, 0.0) *
+           (surface * surface + ambient * ambient) * (surface + ambient);
+}
+
 // Forced convection from a cylinder in cross flow — the Hilpert correlation, which is what the
 // thermoRIDE model (Farroni et al., *Appl. Sci.* 2020, 10, 1604) states for a tyre:
 //
@@ -460,14 +487,27 @@ void stepTyreThermal(const TyreThermal& thermal, TyreState& state, const TyreThe
         roadConductance = resisted * conductingArea;
     }
 
+    // **And the same exterior surfaces radiate**, grey-body against surroundings taken at the air's
+    // temperature — the tread band from the surface node, both sidewalls from the carcass, no area
+    // invented that the convection above does not already use. At a standstill this is the larger
+    // half of the air-side cooling (about 7 W/(m²·K) at 90 °C against the still-air floor's 5); at
+    // speed it is 6-10% of the forced path. The unstated case is an exact 0.0 added to each sum,
+    // which is the identity — a car with no emissivity is the pre-radiation model to the bit. A
+    // sky-temperature refinement is deliberately out of scope, as it is for the disc and the wheel.
+    const auto surfaceRadiation =
+        radiativeConductance(thermal.emissivity, nodes.treadArea, state.surfaceTemperature, air);
+    const auto carcassRadiation =
+        radiativeConductance(thermal.emissivity, nodes.sidewallArea, state.carcassTemperature, air);
+
     // --- and the three nodes, all reading the same start-of-tick temperatures ---
     const auto surface = state.surfaceTemperature;
     const auto core = state.coreTemperature;
     const auto carcass = state.carcassTemperature;
 
-    state.surfaceTemperature =
-        advanceNode(surface, nodes.surfaceCapacity, frictionPower, surfaceAir + roadConductance + nodes.surfaceToCore,
-                    surfaceAir * air + roadConductance * road + nodes.surfaceToCore * core, deltaTime);
+    state.surfaceTemperature = advanceNode(
+        surface, nodes.surfaceCapacity, frictionPower,
+        surfaceAir + surfaceRadiation + roadConductance + nodes.surfaceToCore,
+        (surfaceAir + surfaceRadiation) * air + roadConductance * road + nodes.surfaceToCore * core, deltaTime);
 
     state.coreTemperature =
         advanceNode(core, nodes.coreCapacity, rollingPower * coreShare, nodes.surfaceToCore + nodes.coreToCarcass,
@@ -481,12 +521,14 @@ void stepTyreThermal(const TyreThermal& thermal, TyreState& state, const TyreThe
     const auto rim = std::max(input.wheelConductance, 0.0);
 
     state.carcassTemperature =
-        rim > 0.0
-            ? advanceNode(carcass, nodes.carcassCapacity, rollingPower * (1.0 - coreShare),
-                          nodes.coreToCarcass + carcassAir + rim,
-                          nodes.coreToCarcass * core + carcassAir * air + rim * input.wheelTemperature, deltaTime)
-            : advanceNode(carcass, nodes.carcassCapacity, rollingPower * (1.0 - coreShare),
-                          nodes.coreToCarcass + carcassAir, nodes.coreToCarcass * core + carcassAir * air, deltaTime);
+        rim > 0.0 ? advanceNode(carcass, nodes.carcassCapacity, rollingPower * (1.0 - coreShare),
+                                nodes.coreToCarcass + carcassAir + carcassRadiation + rim,
+                                nodes.coreToCarcass * core + (carcassAir + carcassRadiation) * air +
+                                    rim * input.wheelTemperature,
+                                deltaTime)
+                  : advanceNode(carcass, nodes.carcassCapacity, rollingPower * (1.0 - coreShare),
+                                nodes.coreToCarcass + carcassAir + carcassRadiation,
+                                nodes.coreToCarcass * core + (carcassAir + carcassRadiation) * air, deltaTime);
 }
 
 [[nodiscard]] double tyreTemperatureGrip(const TyreThermal& thermal, const TyreState& state)
@@ -507,12 +549,12 @@ void seedTyreTemperature(TyreState& state, const double celsius)
 namespace
 {
 
-// Zero Celsius in kelvin, and dry air's gas constant and constant-volume specific heat.
+// Dry air's gas constant and constant-volume specific heat. (`absoluteZero` lives with the thermal
+// constants above — same anonymous namespace.)
 //
-// The last two are the only new material constants stage 2 needs and both are textbook: 287.05
+// These are the only new material constants stage 2 needs and both are textbook: 287.05
 // J/(kg·K) for the specific gas constant of dry air, and 718 J/(kg·K) for c_v. **Nothing about the
 // gas is fitted** — its mass comes from the pressure it is at and the volume it is in.
-constexpr auto absoluteZero = 273.15;
 constexpr auto airGasConstant = 287.05;
 constexpr auto airSpecificHeatConstantVolume = 718.0;
 

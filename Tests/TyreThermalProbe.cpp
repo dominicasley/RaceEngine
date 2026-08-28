@@ -42,6 +42,7 @@ using raceengine::AssistState;
 using raceengine::brakeCircuitPressures;
 using raceengine::BrakeCommand;
 using raceengine::bringUpJolt;
+using raceengine::Corner;
 using raceengine::cornerCount;
 using raceengine::CornerSide;
 using raceengine::DrivelineState;
@@ -54,24 +55,26 @@ using raceengine::noDriveTorque;
 using raceengine::outboardSign;
 using raceengine::PhysicsWorld;
 using raceengine::ProvingGroundDescriptor;
+using raceengine::psiPerPascal;
+using raceengine::rearAxle;
 using raceengine::roadTorques;
+using raceengine::seedTyreGasPressures;
+using raceengine::seedTyreTemperature;
 using raceengine::seedTyreTemperatures;
 using raceengine::startEngine;
 using raceengine::stepDriveline;
+using raceengine::stepTyreThermal;
 using raceengine::stepVehicle;
 using raceengine::tearDownJolt;
 using raceengine::TractionMode;
 using raceengine::tyreDefaultTemperature;
-using raceengine::psiPerPascal;
-using raceengine::TyreState;
-using raceengine::seedTyreGasPressures;
 using raceengine::tyreGasTemperatureAtIdealPressure;
-using raceengine::Corner;
-using raceengine::rearAxle;
 using raceengine::tyrePressureAt;
 using raceengine::tyrePressureGripScale;
 using raceengine::tyrePressureRollingResistanceScale;
 using raceengine::tyrePressureVerticalRateScale;
+using raceengine::TyreState;
+using raceengine::TyreThermalInput;
 using raceengine::tyreThermalNodes;
 using raceengine::updateAssists;
 using raceengine::VehicleInput;
@@ -540,6 +543,20 @@ struct Launch
     return setup;
 }
 
+// And with a stated exterior emissivity. Zero is the pre-radiation model and the control; the
+// shipped tyre states tyre thermography's 0.95 since 2026-08-29.
+[[nodiscard]] VehicleSetup golfWithEmissivity(const double emissivity)
+{
+    auto setup = golfWith(true, -1.0);
+
+    for (auto& corner : setup.corners)
+    {
+        corner.tyre.thermal.emissivity = emissivity;
+    }
+
+    return setup;
+}
+
 } // namespace
 
 TEST_CASE("where the tread's heat goes, and how much of it there is to move", "[.tyre-thermal]")
@@ -974,6 +991,117 @@ TEST_CASE("what the groove's share of the patch is worth on the road path", "[.t
 
         std::printf("\n    The hardest fixture here is the 40 m/s corner's hottest core, which is where the\n"
                     "    +2.8 C estimate in docs/tyre-state-brief.md was made.\n\n");
+    }
+}
+
+TEST_CASE("what the exterior's radiation is worth parked and driven", "[.tyre-thermal]")
+{
+    // `TyreThermal::emissivity`, stated 0.95 on the Golf since 2026-08-29 — tyre thermography's own
+    // figure, twice at the same value (Applied Sciences 16:2656, 2026; Allouis, Farroni, Sakhnevych
+    // & Timpone, WCE 2016). The control is the same car at zero, which is the pre-radiation model
+    // to the bit. There is deliberately no seat knob: a term whose effect only a twenty-minute park
+    // can show is not a seat knob, and the way back is one line of car data.
+    const auto built = golfWith(true, -1.0);
+    const auto thermal = built.corners.front().tyre.thermal;
+    const auto nodes = tyreThermalNodes(thermal);
+
+    constexpr auto stefanBoltzmann = 5.670374419e-8;
+    constexpr auto kelvin = 273.15;
+
+    const auto secant = [&](const double surfaceCelsius, const double airCelsius)
+    {
+        const auto surface = surfaceCelsius + kelvin;
+        const auto ambient = airCelsius + kelvin;
+        return thermal.emissivity * stefanBoltzmann * (surface * surface + ambient * ambient) * (surface + ambient);
+    };
+
+    SECTION("the coefficient, beside the two convections it sits with")
+    {
+        const auto linearised = 4.0 * thermal.emissivity * stefanBoltzmann * std::pow(300.0, 3.0);
+
+        std::printf("\n  Emissivity %.2f over the exterior the convection already uses: tread band %.4f m2,\n"
+                    "  sidewalls %.4f m2. Surroundings at the air's temperature; no sky refinement.\n\n",
+                    thermal.emissivity, nodes.treadArea, nodes.sidewallArea);
+        std::printf("    linearised 4 eps sigma T^3 at 300 K        %5.2f W/(m2.K)\n", linearised);
+        std::printf("    exact secant, 90 C tyre over 15 C air      %5.2f W/(m2.K)\n", secant(90.0, 15.0));
+        std::printf("    exact secant, 65 C tyre over 20 C air      %5.2f W/(m2.K)\n", secant(65.0, 20.0));
+        std::printf("    the still-air convection floor             %5.2f W/(m2.K)\n", thermal.naturalConvection);
+        std::printf("    forced convection at 100 km/h is ~70, so at speed the term is 6-10%% and parked\n"
+                    "    it is the larger half of the air-side cooling.\n\n");
+    }
+
+    SECTION("the parked time constant, which is what the term was added for")
+    {
+        // A hot tyre standing on the road in cool air — the existing parked fixture, run to the
+        // 1/e point of the core's elevation over the track. No Jolt and no car: the stepper alone.
+        const auto cold = AmbientConditions{.airTemperature = 15.0, .trackTemperature = 20.0};
+
+        const auto parked = [&](const double emissivity)
+        {
+            auto tyre = thermal;
+            tyre.emissivity = emissivity;
+
+            auto state = TyreState{};
+            seedTyreTemperature(state, 90.0);
+
+            const auto input =
+                TyreThermalInput{.verticalLoad = 4000.0, .patchLength = 0.12, .patchWidth = 0.235, .ambient = cold};
+
+            const auto threshold = cold.trackTemperature + (90.0 - cold.trackTemperature) / 2.718281828459045;
+
+            auto elapsed = 0.0;
+            while (state.coreTemperature > threshold && elapsed < 7200.0)
+            {
+                stepTyreThermal(tyre, state, input, tick);
+                elapsed += tick;
+            }
+
+            return elapsed;
+        };
+
+        const auto without = parked(0.0);
+        const auto with = parked(thermal.emissivity);
+
+        std::printf("\n  Parked at 90 C, air %.0f C, track %.0f C — time for the core to shed 1/e of its\n"
+                    "  elevation over the track.\n\n",
+                    15.0, 20.0);
+        std::printf("    emissivity 0.00 (the pre-radiation model)   %6.1f s   %5.1f min\n", without, without / 60.0);
+        std::printf("    emissivity %.2f (the shipped tyre)          %6.1f s   %5.1f min\n", thermal.emissivity, with,
+                    with / 60.0);
+        std::printf("    ratio %.3f\n\n", with / without);
+    }
+
+    SECTION("and what it is worth on the tread, driven, which is predicted to be small")
+    {
+        const auto guard = JoltGuard{};
+        const auto straightWorld = plate(8000.0, 100.0, 8.0);
+        const auto circleWorld = plate(1400.0, 900.0, 8.0);
+        const auto conditions = weather();
+        const auto marks = std::vector<double>{};
+
+        std::printf("\n  Air %.1f C, track %.1f C, seeded at the track's temperature and driven four minutes.\n\n",
+                    conditions.airTemperature, conditions.trackTemperature);
+        std::printf("    fixture                    emissivity 0         %.2f stated     gain\n", thermal.emissivity);
+
+        const auto row = [&](const char* label, const PhysicsWorld& world, const double steering, const double speed,
+                             const bool hottest)
+        {
+            const auto control =
+                hold(golfWithEmissivity(0.0), world, steering, speed, 260.0, conditions.trackTemperature, marks);
+            const auto radiating = hold(golfWithEmissivity(thermal.emissivity), world, steering, speed, 260.0,
+                                        conditions.trackTemperature, marks);
+
+            const auto before = hottest ? control.temperatures.hottestCore : control.temperatures.core;
+            const auto after = hottest ? radiating.temperatures.hottestCore : radiating.temperatures.core;
+
+            std::printf("    %-26s %8.1f C            %8.1f C      %+5.2f\n", label, before, after, after - before);
+        };
+
+        row("straight 100 km/h, core", straightWorld, 0.0, hundred, false);
+        row("corner 20 m/s, hottest core", circleWorld, 0.37, 20.0, true);
+        row("corner 40 m/s, hottest core", circleWorld, 0.20, 40.0, true);
+
+        std::printf("\n");
     }
 }
 

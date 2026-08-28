@@ -990,6 +990,24 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         // `docs/tyre-state-brief.md`.
         corner.tyre.thermal.roadContactConductance = 25200.0;
 
+        // **The tyre's exterior radiates, and the figure is tyre thermography's own, stated twice at
+        // the same value.** "The emissivity (ε) was set to 0.95, which is the standard characteristic
+        // value for rubber tires and automotive paint" — Hu, Li, Ma, Cheng, Zheng & Zhang, *Deep
+        // Learning-Based Real-Time Vehicle Tire and Tank Temperature Monitoring Using Thermal
+        // Cameras*, Applied Sciences 16:2656, 2026 (doi 10.3390/app16062656). And "the both tire
+        // surfaces emissivity has been set constant equal to 0.95" — Allouis, Farroni, Sakhnevych &
+        // Timpone, *Tire Thermal Characterization: Test Procedure and Model Parameters Evaluation*,
+        // WCE 2016, the same group whose Hilpert correlation and core-temperature finding this model
+        // already carries. Carbon black is most of why: a filled tread is nearly a black body.
+        //
+        // What it is worth is a parked tyre — at a standstill radiation is ~7 W/(m²·K) against the
+        // still-air floor's 5, which is what took the recorded ~35-minute parked time constant
+        // towards the truth's ~20 — and at speed it hides inside the forced path. Stated 2026-08-29.
+        //
+        // **There is deliberately NO seat knob for this one**: a term whose effect only a
+        // twenty-minute park can show is not a seat knob, and the way back is this line at 0.0.
+        corner.tyre.thermal.emissivity = 0.95;
+
         // **AC's `tcurve_semis.lut`, slid 20 °C down its temperature axis on 2026-08-28 because the
         // window it came with belongs to a different tyre from the one this car wears.** The shape is
         // AC's, knot for knot and multiplier for multiplier; only where it sits has moved.

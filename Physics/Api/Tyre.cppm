@@ -149,6 +149,32 @@ export struct TyreThermal
     // air is 5 to 10 and this is the low end, which is the conservative choice for a cooling term.
     double naturalConvection = 5.0;
 
+    // Grey-body emissivity of the tyre's exterior, dimensionless. **Zero is no radiation at all**,
+    // which is what the model did before this existed and is bit-identical to it — the
+    // `roadContactConductance` pattern, so every car is the old car until it states one.
+    //
+    // It acts on exactly the surfaces the convection to air already uses — the tread band from the
+    // surface node and both sidewalls from the carcass — with the full T⁴ difference written as the
+    // brake disc writes it, the exact secant `eps·sigma·(Ts² + Ta²)(Ts + Ta)`. The surroundings are
+    // taken at the **air** temperature; a sky-temperature refinement (a clear night sky radiates
+    // colder than the air, which is `AmbientImpl`'s own observation about tarmac) is deliberately
+    // out of scope here, exactly as it is for the disc and the wheel.
+    //
+    // Why it exists: at a standstill the forced correlation is gone and rubber at 90 °C radiating to
+    // 15 °C surroundings is worth about 7 W/(m²·K) against the 5 the still-air floor carries — the
+    // term is *larger* than the convection it sat beside, which is why a parked tyre cooled with a
+    // ~35-minute time constant where the truth is nearer 20. At speed it is 6-10% of the forced path
+    // and disappears into it, which is why leaving it out never showed on a lap.
+    //
+    // The figure a car should state is sourced twice, both from tyre thermography and both 0.95:
+    // "The emissivity (ε) was set to 0.95, which is the standard characteristic value for rubber
+    // tires and automotive paint" (Hu, Li, Ma, Cheng, Zheng & Zhang, Applied Sciences 16:2656, 2026,
+    // doi 10.3390/app16062656), and "the both tire surfaces emissivity has been set constant equal
+    // to 0.95" (Allouis, Farroni, Sakhnevych & Timpone, *Tire Thermal Characterization: Test
+    // Procedure and Model Parameters Evaluation*, WCE 2016 — the same group whose Hilpert relation
+    // and TRT core-temperature finding this model already carries).
+    double emissivity = 0.0;
+
     // What share of the power dissipated at the sliding contact patch heats the **rubber** rather
     // than the road.
     //

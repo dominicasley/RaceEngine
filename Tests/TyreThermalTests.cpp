@@ -621,6 +621,86 @@ TEST_CASE("the road path conducts through the rubber and not the grooves", "[phy
     }
 }
 
+TEST_CASE("the tyre's exterior radiates and the shipped tyre states its emissivity", "[physics][tyre][thermal][golf]")
+{
+    // `TyreThermal::emissivity`. Grey-body exchange from the same exterior surfaces the convection
+    // to air uses — the tread band from the surface node, both sidewalls from the carcass — against
+    // surroundings at the air's temperature, written as the brake disc writes it: the exact secant
+    // of the fourth power, re-evaluated every tick. The recovery trick is the interface case's: one
+    // step from a hot surface with every far end at one temperature inverts to the sum of the paths
+    // leaving it, and the radiation is held at its start-of-tick secant across the tick, so the
+    // inversion recovers it exactly.
+    const auto thermal = golfThermal();
+    const auto nodes = tyreThermalNodes(thermal);
+
+    constexpr auto sink = 20.0;
+    constexpr auto hot = 100.0;
+    constexpr auto speed = 27.7778;
+    constexpr auto stefanBoltzmann = 5.670374419e-8;
+
+    const auto surfaceConductance = [&](const double emissivity)
+    {
+        auto tyre = thermal;
+        tyre.emissivity = emissivity;
+
+        auto state = TyreState{};
+        seedTyreTemperature(state, sink);
+        state.surfaceTemperature = hot;
+
+        stepTyreThermal(
+            tyre, state,
+            TyreThermalInput{.roadSpeed = speed,
+                             .airSpeed = speed,
+                             .patchLength = 0.1910,
+                             .patchWidth = 0.235,
+                             .ambient = AmbientConditions{.airTemperature = sink, .trackTemperature = sink}},
+            tick);
+
+        return -nodes.surfaceCapacity / tick * std::log((state.surfaceTemperature - sink) / (hot - sink));
+    };
+
+    SECTION("the shipped Golf states tyre thermography's own figure")
+    {
+        // 0.95 twice at the same value: Applied Sciences 16:2656 (2026) and Allouis, Farroni,
+        // Sakhnevych & Timpone, WCE 2016 — the sources are quoted where the car states it.
+        REQUIRE(thermal.emissivity == 0.95);
+    }
+
+    SECTION("and a tyre that states none is the model that had no such term at all")
+    {
+        // The default is exactly zero, and a zero emissivity is an exact 0.0 added to each
+        // conductance sum, which is the IEEE identity — the `roadContactConductance` pattern, so
+        // every other car is the pre-radiation model to the bit.
+        REQUIRE(TyreThermal{}.emissivity == 0.0);
+        REQUIRE(surfaceConductance(0.0) == surfaceConductance(0.0));
+    }
+
+    SECTION("a stated emissivity adds exactly the secant of the fourth power to the air path")
+    {
+        const auto surface = hot + 273.15;
+        const auto ambient = sink + 273.15;
+        const auto secant = thermal.emissivity * stefanBoltzmann * nodes.treadArea *
+                            (surface * surface + ambient * ambient) * (surface + ambient);
+
+        REQUIRE(surfaceConductance(thermal.emissivity) - surfaceConductance(0.0) ==
+                Catch::Approx(secant).epsilon(1e-9));
+    }
+
+    SECTION("and at a standstill the radiative coefficient beats the still-air floor")
+    {
+        // The recorded defect, as arithmetic: rubber at 90 °C against 15 °C surroundings is about
+        // 7.5 W/(m²·K) of radiation where the still-air convection floor is 5 — the term is larger
+        // than the convection it sits beside, which is why the parked time constant needed it.
+        const auto surface = 90.0 + 273.15;
+        const auto ambient = 15.0 + 273.15;
+        const auto coefficient =
+            thermal.emissivity * stefanBoltzmann * (surface * surface + ambient * ambient) * (surface + ambient);
+
+        REQUIRE(coefficient > thermal.naturalConvection);
+        REQUIRE(coefficient < 2.0 * thermal.naturalConvection);
+    }
+}
+
 TEST_CASE("a tyre warms when it is worked and cools when it is not", "[physics][tyre][thermal][golf]")
 {
     const auto thermal = golfThermal();
@@ -689,14 +769,13 @@ TEST_CASE("a tyre warms when it is worked and cools when it is not", "[physics][
         // of mass, so a tyre that cooled quickly here would be the surprising answer — and the upper
         // bound is what would catch a model that had stopped losing heat at all.
         //
-        // **And this is where the neglected radiation shows up**, which is worth recording rather
-        // than hiding behind a wide bound. TRT EVO states radiation as an explicit modelling
-        // assumption — "supposed to be negligible" — and against 70 W/(m²·K) of forced convection at
-        // speed it is. At a standstill the forced term is gone and rubber radiating at 90 °C to a
-        // 15 °C sky is worth about 7 W/(m²·K), which is *more* than the 5 this model's still-air
-        // convection carries. So a parked tyre here cools with roughly a 35-minute time constant
-        // where the truth is nearer 20. It is the length of a pit stop and not the shape of a lap,
-        // which is why it is written down rather than fixed inside this stage.
+        // **The radiation this comment used to record as neglected is in the model now**
+        // (2026-08-29, `TyreThermal::emissivity`, stated 0.95 on the Golf from tyre thermography).
+        // TRT EVO's "supposed to be negligible" is right at speed — against 70 W/(m²·K) of forced
+        // convection it is 6-10% — and wrong here: at a standstill rubber radiating at 90 °C to
+        // 15 °C surroundings is worth about 7 W/(m²·K) against the 5 the still-air floor carries,
+        // which is what had a parked tyre cooling with a ~35-minute time constant where the truth
+        // is nearer 20. The A/B below measures exactly that.
         auto state = TyreState{};
         seedTyreTemperature(state, 90.0);
 
@@ -725,6 +804,52 @@ TEST_CASE("a tyre warms when it is worked and cools when it is not", "[physics][
         REQUIRE(state.coreTemperature < 40.0);
         REQUIRE(state.carcassTemperature < 40.0);
         REQUIRE(state.coreTemperature > cold.airTemperature - 1.0);
+    }
+
+    SECTION("and radiation is what makes a parked tyre cool at the pace it should")
+    {
+        // The parked time constant, measured as the time the core takes to shed 1/e of its
+        // elevation over the track, with the Golf's stated emissivity against none. The arithmetic
+        // that sizes the band: the stated 0.95 at 90 °C over 15 °C surroundings is ~7.5 W/(m²·K)
+        // over 0.78 m² of exterior, about 5.9 W/K against roughly 18 W/K of patch conduction and
+        // still-air convection — so a quarter to a third off the constant, and asserted **both
+        // ways** so that a change which makes the term huge or inert has to say so. The measured
+        // pair itself is printed by `[.tyre-thermal]`, not pinned here —
+        // `diagnostic-not-a-calibration-target`.
+        const auto parkedTimeConstant = [&](const double emissivity)
+        {
+            auto tyre = thermal;
+            tyre.emissivity = emissivity;
+
+            auto state = TyreState{};
+            seedTyreTemperature(state, 90.0);
+
+            const auto input = TyreThermalInput{.verticalLoad = 4000.0,
+                                                .rollingResistance = 0.012,
+                                                .patchLength = 0.12,
+                                                .patchWidth = 0.235,
+                                                .ambient = cold};
+
+            const auto threshold = cold.trackTemperature + (90.0 - cold.trackTemperature) / std::numbers::e;
+
+            auto elapsed = 0.0;
+            while (state.coreTemperature > threshold && elapsed < 3600.0)
+            {
+                stepTyreThermal(tyre, state, input, tick);
+                elapsed += tick;
+            }
+
+            REQUIRE(elapsed < 3600.0);
+            return elapsed;
+        };
+
+        const auto without = parkedTimeConstant(0.0);
+        const auto with = parkedTimeConstant(thermal.emissivity);
+
+        CAPTURE(without, with);
+        REQUIRE(with < without);
+        REQUIRE(with / without > 0.5);
+        REQUIRE(with / without < 0.9);
     }
 
     SECTION("nothing runs away, however hard it is driven")
