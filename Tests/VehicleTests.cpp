@@ -108,6 +108,79 @@ TEST_CASE("a travel stop comes in softly and then not at all", "[physics][vehicl
     REQUIRE(heavy > 2.0 * light);
 }
 
+TEST_CASE("a travel stop's hysteresis is the loop the material publishes and nothing until stated",
+          "[physics][vehicle]")
+{
+    // The sourcing is on `TravelStop::hysteresis`: BASF characterise a microcellular stop's
+    // dissipation as a hysteresis-loop area of 10-20 % of the deformation work, not as a viscous
+    // constant. This case pins the conversion — a fraction h of the elastic force opposing the
+    // motion loses exactly 2h/(1+h) of a quasi-static stroke's work — and the default's inertness.
+    const auto plain = TravelStop{.gap = 0.04, .rate = 300000.0, .progression = 2.5, .damping = 20000.0};
+    auto lossy = plain;
+    lossy.hysteresis = 0.07;
+
+    SECTION("unstated it is the exact same stop to the bit")
+    {
+        // The pre-hysteresis force law, written out: adding a literal +0.0 to a non-negative term
+        // cannot change a bit, and this is the assertion that keeps that from being folklore.
+        for (const auto past : {0.001, 0.005, 0.02, 0.04})
+        {
+            for (const auto velocity : {-0.5, -0.01, 0.0, 0.01, 0.5})
+            {
+                const auto elastic = plain.rate * std::pow(past, plain.progression) /
+                                     std::pow(std::max(plain.gap, 1e-6), plain.progression - 1.0);
+                REQUIRE(plain.force(past, velocity) == std::max(0.0, elastic + plain.damping * velocity));
+            }
+        }
+    }
+
+    SECTION("a quasi-static in-out stroke loses the published fraction of its work")
+    {
+        // Integrate one full stroke to 20 mm and back at a speed far above `hysteresisSpeed`, so
+        // the tanh is fully developed, with the viscous term off so the loop is the hysteresis
+        // alone. Trapezoidal on 2000 slices a side.
+        auto zeroDamping = lossy;
+        zeroDamping.damping = 0.0;
+
+        constexpr auto depth = 0.020;
+        constexpr auto slices = 2000;
+        constexpr auto speed = 1.0;
+
+        auto workIn = 0.0;
+        auto workOut = 0.0;
+
+        for (auto slice = 0; slice < slices; slice++)
+        {
+            const auto shallow = depth * static_cast<double>(slice) / slices;
+            const auto deep = depth * static_cast<double>(slice + 1) / slices;
+            const auto step = deep - shallow;
+
+            workIn += 0.5 * (zeroDamping.force(shallow, speed) + zeroDamping.force(deep, speed)) * step;
+            workOut += 0.5 * (zeroDamping.force(shallow, -speed) + zeroDamping.force(deep, -speed)) * step;
+        }
+
+        const auto absorbed = (workIn - workOut) / workIn;
+        REQUIRE(absorbed == Catch::Approx(2.0 * 0.07 / 1.07).epsilon(0.001));
+    }
+
+    SECTION("it cannot spike on entry and cannot trip the push-only clamp on release")
+    {
+        // The viscous term at 0.5 m/s is 10 kN before the stop has stored a single joule; the
+        // hysteresis scales with the elastic force, so it arrives with the material and not with
+        // the impact.
+        auto pure = TravelStop{.gap = 0.04, .rate = 300000.0, .progression = 2.5, .damping = 0.0};
+        pure.hysteresis = 0.07;
+
+        REQUIRE(pure.force(1e-9, 0.5) < 1.0);
+        REQUIRE(plain.force(1e-9, 0.5) > 9000.0);
+
+        // Releasing at any speed, the factor is 1 - h and the stop still pushes.
+        const auto releasing = pure.force(0.02, -5.0);
+        REQUIRE(releasing > 0.0);
+        REQUIRE(releasing == Catch::Approx(pure.force(0.02, 0.0) * (1.0 - 0.07)).epsilon(1e-6));
+    }
+}
+
 TEST_CASE("the placeholder car is a car", "[physics][vehicle]")
 {
     const auto setup = placeholderSedan();

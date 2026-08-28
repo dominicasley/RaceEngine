@@ -53,6 +53,16 @@ export struct AxleTune
     // sheet beside the bump and rebound rates it sits on top of.
     std::optional<double> damperFriction;
 
+    // The **bump** stop's viscous damping, N·s/m on the shaft, and its rate-independent hysteresis
+    // as a fraction of its own elastic force (`TravelStop::hysteresis` carries the sourcing). On the
+    // sheet because the shipped 40000 N·s/m is a placed number — about five times the front
+    // corner's own critical damping — and the sourced alternative (`stopdamping 0` with
+    // `stophysteresis 0.07`) is a feel change that belongs to whoever is driving. The droop stop is
+    // deliberately not reachable from here: on a strut it is the damper topping out, a different
+    // mechanism with its own account (docs/known-red.md, the droop-travel entry).
+    std::optional<double> stopDamping;
+    std::optional<double> stopHysteresis;
+
     // Lateral-force compliance steer, **degrees per kilonewton** — the unit a K&C rig reports it in
     // and the unit the published figures behind it are quoted in, converted on the way in rather
     // than making a human write radians per newton. Negative is toe-out, which is what a production

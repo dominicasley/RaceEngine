@@ -179,6 +179,14 @@ namespace
             {
                 axle.damperFriction = *number;
             }
+            else if (field == "stopdamping")
+            {
+                axle.stopDamping = *number;
+            }
+            else if (field == "stophysteresis")
+            {
+                axle.stopHysteresis = *number;
+            }
             else if (field == "compliancesteer")
             {
                 axle.complianceSteer = *number;
@@ -276,7 +284,7 @@ namespace
     const auto axle = [](const AxleTune& sheet)
     {
         return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque ||
-               sheet.damperFriction || sheet.complianceSteer;
+               sheet.damperFriction || sheet.stopDamping || sheet.stopHysteresis || sheet.complianceSteer;
     };
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
@@ -322,6 +330,18 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
         if (sheet.damperFriction)
         {
             corner.damperFriction = *sheet.damperFriction;
+        }
+
+        // The bump stop only. The droop stop is the damper topping out — a different mechanism —
+        // and a sheet key that quietly reached both would be a change the driver did not ask for.
+        if (sheet.stopDamping)
+        {
+            corner.bumpStop.damping = *sheet.stopDamping;
+        }
+
+        if (sheet.stopHysteresis)
+        {
+            corner.bumpStop.hysteresis = *sheet.stopHysteresis;
         }
 
         if (sheet.complianceSteer)

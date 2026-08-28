@@ -155,6 +155,52 @@ TEST_CASE("applying a tune changes what it names and leaves the rest of the car 
     }
 }
 
+TEST_CASE("the bump stop's dissipation is the driver's to restate", "[physics][setup]")
+{
+    // `front.stopdamping` and `front.stophysteresis` exist because the shipped 40000 N·s/m is a
+    // placed number about five times the front corner's critical damping, and the sourced
+    // alternative — BASF's hysteresis-loop band, `stopdamping 0` with `stophysteresis 0.07` — is a
+    // feel change that belongs on the sheet, beside `friction`, changed between two laps rather
+    // than two builds.
+    const auto built = placeholderSedan();
+    REQUIRE(built.has_value());
+
+    auto car = built.value();
+    const auto before = built.value();
+
+    const auto tune = parseVehicleTune("front.stopdamping 0\nfront.stophysteresis 0.07\n");
+    REQUIRE(tune.has_value());
+
+    applyVehicleTune(tune.value(), car);
+
+    SECTION("both front corners' bump stops and nothing else")
+    {
+        REQUIRE(car.corners[0].bumpStop.damping == 0.0);
+        REQUIRE(car.corners[1].bumpStop.damping == 0.0);
+        REQUIRE(car.corners[0].bumpStop.hysteresis == 0.07);
+        REQUIRE(car.corners[1].bumpStop.hysteresis == 0.07);
+
+        REQUIRE(car.corners[2].bumpStop.damping == before.corners[2].bumpStop.damping);
+        REQUIRE(car.corners[2].bumpStop.hysteresis == 0.0);
+    }
+
+    SECTION("the droop stop is a different mechanism and the key does not reach it")
+    {
+        // On a strut the rebound limit is the damper topping out, not a bumper somebody specifies
+        // (the droop-travel account in docs/known-red.md). A key named for the bump stop that
+        // quietly restated both would be a change the driver did not ask for.
+        REQUIRE(car.corners[0].droopStop.damping == before.corners[0].droopStop.damping);
+        REQUIRE(car.corners[1].droopStop.damping == before.corners[1].droopStop.damping);
+    }
+
+    SECTION("the elastic half of the stop is the car's and stays it")
+    {
+        REQUIRE(car.corners[0].bumpStop.gap == before.corners[0].bumpStop.gap);
+        REQUIRE(car.corners[0].bumpStop.rate == before.corners[0].bumpStop.rate);
+        REQUIRE(car.corners[0].bumpStop.progression == before.corners[0].bumpStop.progression);
+    }
+}
+
 TEST_CASE("a damper stated on one side keeps what the other side already was", "[physics][setup]")
 {
     const auto built = placeholderSedan();

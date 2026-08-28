@@ -112,7 +112,29 @@ export struct TravelStop
     // what an impact puts into it, so a car dropped onto its stops pogos instead of settling — which
     // is exactly what this model did before the term existed, bouncing higher than it was dropped
     // from. Real bump stops are microcellular elastomer and lose a great deal of it as heat.
+    //
+    // **"A great deal" is wrong and this constant is not how the material loses it** (2026-08-29).
+    // BASF's own Cellasto technical brochure characterises the material's dissipation as the
+    // hysteresis-loop area over the deformation work, "approximately between 10 % and 20 % (static)"
+    // — "relatively low for Cellasto (low damping) and is one of the reasons for its extreme fatigue
+    // strength" — not as a viscous constant at all. The `hysteresis` field below is that statement's
+    // shape; this viscous constant survives because it is what every current car ships with and what
+    // the seat has accepted, and zeroing it is a decision for the seat, not for a source.
     double damping = 30000.0;
+
+    // Rate-independent hysteresis, as a fraction of the stop's own elastic force opposing the
+    // motion — the form a microcellular stop's dissipation is actually published in. A quasi-static
+    // in-out stroke loses `2h/(1+h)` of the work it puts in, so BASF's 10-20 % band converts to
+    // 0.053-0.111 here, and their Fig. 5 densities (11.9-13.1 %) to 0.063-0.070. Zero is the
+    // shipped behaviour on every car, to the bit; unlike the viscous term it cannot spike on entry
+    // (it scales with the elastic force, which starts at zero) and cannot trip the push-only clamp
+    // on release (the factor stays above zero for any fraction below one).
+    double hysteresis = 0.0;
+
+    // How fast the stop must be moving for the hysteresis to be fully developed, metres per second.
+    // The same numerical regularisation as `CornerSetup::damperFrictionSpeed` and for the same
+    // reason: a hard sign term at 360 Hz makes a limit cycle rather than a dead band.
+    double hysteresisSpeed = 0.01;
 
     // `past` is how far into the stop the travel has gone, `rate of change` how fast it is going
     // further in. The stop can only push: a damping term large enough to go negative would have it
@@ -125,8 +147,10 @@ export struct TravelStop
         }
 
         const auto elastic = rate * std::pow(past, progression) / std::pow(std::max(gap, 1e-6), progression - 1.0);
+        const auto hysteretic =
+            hysteresis == 0.0 ? 0.0 : elastic * hysteresis * std::tanh(rateOfChange / hysteresisSpeed);
 
-        return std::max(0.0, elastic + damping * rateOfChange);
+        return std::max(0.0, elastic + damping * rateOfChange + hysteretic);
     }
 };
 

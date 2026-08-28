@@ -1047,13 +1047,15 @@ TEST_CASE("the front bump stop's rate, against the travel a real one has", "[.br
     const auto world = PhysicsWorld::create(gripPlate(1.0));
     REQUIRE(world.has_value());
 
-    const auto withStop = [&base](const double rate, const double damping, const double rearScale)
+    const auto withStop =
+        [&base](const double rate, const double damping, const double hysteresis, const double rearScale)
     {
         auto car = base.value();
         for (auto index = std::size_t{0}; index < cornerCount; index++)
         {
             car.corners[index].bumpStop.rate = rate;
             car.corners[index].bumpStop.damping = damping;
+            car.corners[index].bumpStop.hysteresis = hysteresis;
             if (index >= 2)
             {
                 car.corners[index].springRate *= rearScale;
@@ -1112,25 +1114,198 @@ TEST_CASE("the front bump stop's rate, against the travel a real one has", "[.br
     // 55000 to 900000, which is `40000 x 0.18 m/s` and therefore the stop's **damper**, not its
     // spring. At 40000 N.s/m that term is five times the corner's own critical damping, so the stop
     // does not so much stiffen the car as hit it.
-    std::printf("   rate     damping   rear spring   lowest rear axle   F travel   R droop force   R extension\n");
+    //
+    // **Two rows added 2026-08-29 with the hysteresis term**: the corner's own critical damping
+    // (derived in the drop-strike case below), and the BASF-sourced alternative — no viscous
+    // constant at all, 7 % of the elastic force as rate-independent hysteresis, which is the middle
+    // of the band their own Fig. 5 densities convert to.
+    std::printf("   rate     damping   hyst   rear spring   lowest rear axle   peak F stop   F travel   R droop "
+                "force   R extension\n");
 
-    const auto cases = std::array{std::tuple{900000.0, 40000.0, 1.0, "shipped"},
-                                  std::tuple{900000.0, 10000.0, 1.0, ""},
-                                  std::tuple{900000.0, 4000.0, 1.0, ""},
-                                  std::tuple{900000.0, 0.0, 1.0, "no stop damping"},
-                                  std::tuple{55000.0, 4000.0, 1.0, "AC rate, sane damping"},
-                                  std::tuple{55000.0, 4000.0, 18076.0 / 57000.0, "...and the rear fix"}};
+    const auto cases = std::array{std::tuple{900000.0, 40000.0, 0.0, 1.0, "shipped"},
+                                  std::tuple{900000.0, 10000.0, 0.0, 1.0, ""},
+                                  std::tuple{900000.0, 8000.0, 0.0, 1.0, "~ critical"},
+                                  std::tuple{900000.0, 4000.0, 0.0, 1.0, ""},
+                                  std::tuple{900000.0, 0.0, 0.0, 1.0, "no stop damping"},
+                                  std::tuple{900000.0, 0.0, 0.07, 1.0, "BASF hysteresis only"},
+                                  std::tuple{55000.0, 4000.0, 0.0, 1.0, "AC rate, sane damping"},
+                                  std::tuple{55000.0, 4000.0, 0.0, 18076.0 / 57000.0, "...and the rear fix"}};
 
-    for (const auto& [rate, damping, rearScale, note] : cases)
+    for (const auto& [rate, damping, hysteresis, rearScale, note] : cases)
     {
-        const auto measured = run(withStop(rate, damping, rearScale));
+        const auto measured = run(withStop(rate, damping, hysteresis, rearScale));
 
-        std::printf("  %8.0f  %8.0f   %9.0f   %14.1f N  %7.1f mm  %11.1f N  %8.1f mm  %s\n", rate, damping,
-                    57000.0 * rearScale, measured[0], 1000.0 * measured[2], measured[4], 1000.0 * measured[5], note);
+        std::printf("  %8.0f  %8.0f  %5.2f   %9.0f   %14.1f N  %9.1f N  %7.1f mm  %11.1f N  %8.1f mm  %s\n", rate,
+                    damping, hysteresis, 57000.0 * rearScale, measured[0], measured[1], 1000.0 * measured[2],
+                    measured[4], 1000.0 * measured[5], note);
     }
 
     std::printf("\n  Watch the travel column: a stop soft enough to stop ringing the car is also a stop\n");
     std::printf("  that lets the suspension run further, and the linkage has a hard limit behind it.\n");
+}
+
+TEST_CASE("dropping the car onto its front stops: shipped damping against critical and the material's own loop",
+          "[.brake-model]")
+{
+    // The 40000 N·s/m question, measured on the event it was placed for. The viscous constant
+    // exists because a car dropped onto pure-spring stops pogoed; since then the car has grown a
+    // kneed damper, 107 N of seal friction and real droop travel, so whether the stop still needs
+    // to be the thing that settles the car is a measurement and not a memory.
+    //
+    // Three stops: shipped (40000), the front corner's own critical damping (derived below from
+    // the car's numbers, not typed), and the sourced one — no viscous constant, 7 % of the elastic
+    // force as rate-independent hysteresis, the middle of what BASF's Cellasto brochure publishes
+    // (a 10-20 % hysteresis-loop share of the deformation work; their Fig. 5 densities give
+    // 11.9-13.1 %, and loop share A converts to a force fraction h by A = 2h/(1+h)).
+    const auto guard = JoltGuard{};
+
+    const auto base = golfGtiMk7();
+    REQUIRE(base.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0));
+    REQUIRE(world.has_value());
+
+    // --- the critical-damping arithmetic, from the car rather than from a comment ---
+    const auto properties = computeMassProperties(base->sprung);
+    REQUIRE(properties.has_value());
+
+    const auto& front = base->corners[0];
+    const auto frontAxle = front.hardpoints.wheelCentre.z;
+    const auto rearAxle = base->corners[2].hardpoints.wheelCentre.z;
+    const auto share = (properties->centreOfMass.z - rearAxle) / (frontAxle - rearAxle);
+    const auto cornerMass = properties->mass * share / 2.0;
+
+    const auto kinematics =
+        raceengine::solveDamperKinematics(front.hardpoints, raceengine::damperElementOf(front.hardpoints), 0.0, 0.0);
+    REQUIRE(kinematics.has_value());
+    const auto ratio = std::abs(kinematics->motionRatio);
+
+    const auto wheelRate = front.springRate * ratio * ratio;
+    const auto criticalWheel = 2.0 * std::sqrt(wheelRate * cornerMass);
+    const auto criticalShaft = criticalWheel / (ratio * ratio);
+
+    // And against the stiffest mode the stop itself reaches: its tangent stiffness at the 12.9 mm
+    // the 0.35-pedal braking trace penetrates to.
+    const auto braked = 0.0129;
+    const auto tangent = front.bumpStop.rate * front.bumpStop.progression *
+                         std::pow(braked, front.bumpStop.progression - 1.0) /
+                         std::pow(front.bumpStop.gap, front.bumpStop.progression - 1.0);
+    const auto criticalOnStop = 2.0 * std::sqrt(tangent * cornerMass / (ratio * ratio));
+
+    std::printf("\n=== the front bump stop's damping against the corner's own critical ===\n");
+    std::printf("  front corner sprung mass          %8.1f kg  (sprung %.1f kg, front share %.3f)\n", cornerMass,
+                properties->mass, share);
+    std::printf("  damper motion ratio at design     %8.3f\n", ratio);
+    std::printf("  front wheel rate                  %8.0f N/m\n", wheelRate);
+    std::printf("  critical damping at the wheel     %8.0f N.s/m\n", criticalWheel);
+    std::printf("  critical damping on the shaft     %8.0f N.s/m\n", criticalShaft);
+    std::printf("  shipped stop damping (shaft)      %8.0f N.s/m = %.1fx critical\n", front.bumpStop.damping,
+                front.bumpStop.damping / criticalShaft);
+    std::printf("  stop tangent stiffness at 12.9 mm %8.0f N/m; critical against IT %8.0f N.s/m (%.2fx)\n", tangent,
+                criticalOnStop, front.bumpStop.damping / criticalOnStop);
+    std::printf("  a bulk polyurethane's own damping ratio is 0.044-0.133 of critical (PMC11643408)\n");
+
+    // --- the drop ---
+    struct Strike
+    {
+        double peakStop = 0.0;
+        double viscousShare = 0.0;
+        double deepest = 0.0;
+        int touches = 0;
+        double firstPeak = 0.0;
+        double later = 0.0;
+        double settling = 0.0;
+    };
+
+    const auto measure = [&](const double damping, const double hysteresis)
+    {
+        auto car = base.value();
+        for (auto& corner : car.corners)
+        {
+            corner.bumpStop.damping = damping;
+            corner.bumpStop.hysteresis = hysteresis;
+        }
+
+        auto state = VehicleState{};
+        settle(car, state, world.value(), 0.0);
+
+        const auto rested = stepVehicle(car, state, VehicleInput{}, noDriveTorque, world.value(), tick);
+        REQUIRE(rested.has_value());
+        const auto rest = rested->corners[0].suspension.wheelTravel;
+
+        state.chassis.linearVelocity = glm::dvec3(0.0, -3.0, 0.0);
+
+        auto result = Strike{};
+        auto outside = 0;
+        constexpr auto steps = 360 * 8;
+
+        for (auto step = 1; step <= steps; step++)
+        {
+            const auto stepped = stepVehicle(car, state, VehicleInput{}, noDriveTorque, world.value(), tick);
+            REQUIRE(stepped.has_value());
+
+            const auto stop = stepped->corners[0].forces.bumpStop;
+            const auto excursion = std::abs(stepped->corners[0].suspension.wheelTravel - rest);
+
+            if (stop > result.peakStop)
+            {
+                result.peakStop = stop;
+                const auto viscous = damping * stepped->corners[0].damperVelocity;
+                result.viscousShare = stop > 0.0 ? std::max(0.0, viscous) / stop : 0.0;
+            }
+
+            result.deepest = std::max(result.deepest, stepped->corners[0].suspension.wheelTravel - rest);
+            result.touches += stop > 0.0 ? 1 : 0;
+
+            if (step <= 360)
+            {
+                result.firstPeak = std::max(result.firstPeak, excursion);
+            }
+            else
+            {
+                result.later = std::max(result.later, excursion);
+            }
+
+            if (excursion > 0.002)
+            {
+                outside = step;
+            }
+        }
+
+        result.settling = static_cast<double>(outside) * tick;
+
+        return result;
+    };
+
+    std::printf("\n=== a 3.0 m/s drop onto the wheels, front corner ===\n");
+    std::printf("   damping   hyst   peak F stop   viscous share   deepest   touches   settle to 2 mm   worst after "
+                "1 s\n");
+
+    const auto cases =
+        std::array{std::tuple{front.bumpStop.damping, 0.0, "shipped"}, std::tuple{criticalShaft, 0.0, "critical"},
+                   std::tuple{0.0, 0.07, "BASF hysteresis only"}, std::tuple{0.0, 0.0, "bare spring"}};
+
+    for (const auto& [damping, hysteresis, note] : cases)
+    {
+        const auto strike = measure(damping, hysteresis);
+
+        std::printf("  %8.0f  %5.2f  %10.1f N  %13.1f %%  %7.2f mm  %7d  %13.3f s  %11.2f mm  %s\n", damping,
+                    hysteresis, strike.peakStop, 100.0 * strike.viscousShare, 1000.0 * strike.deepest, strike.touches,
+                    strike.settling, 1000.0 * strike.later, note);
+
+        // The one bound worth holding here: with the sourced dissipation instead of the placed
+        // constant the car must still settle inside the window — the main damper and its friction
+        // own the settle now, and if that stops being true this table is where it shows first.
+        if (hysteresis > 0.0)
+        {
+            CHECK(strike.settling < 8.0);
+            CHECK(strike.touches > 0);
+        }
+    }
+
+    std::printf("\n  The stop the material describes arrives with the elastic force and cannot spike on entry;\n");
+    std::printf("  the shipped constant's peak is mostly its own viscous term. Whether the car should keep the\n");
+    std::printf("  placed constant is the seat's call: front.stopdamping / front.stophysteresis on the sheet.\n");
 }
 
 TEST_CASE("how much travel the linkage actually has, against the stops placed in it", "[.brake-model]")
