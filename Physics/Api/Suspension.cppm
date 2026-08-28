@@ -275,14 +275,26 @@ export void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionStat
 // and putting it there would also make the kinematic solve unrepeatable.
 //
 // What it is not: a translation. A real bush deflects the upright sideways and rearward as well as
-// twisting it, and only the toe term has a published figure behind it
-// (docs/suspension-fidelity-brief.md, item 1). So the hub stays exactly where the linkage put it and
-// the wheel turns about it, which is the part that is sourced and nothing else.
+// twisting it, and the two rotation terms are the ones with published figures behind them — toe
+// here, camber in `applyComplianceCamber` below (docs/suspension-fidelity-brief.md, item 1). So the
+// hub stays exactly where the linkage put it and the wheel turns about it, which is the part that is
+// sourced and nothing else.
 //
 // The Jacobians are left alone for the same reason they are left alone by steering: they are the
 // linkage's, differenced from the linkage's own solves, and a hundredth of a degree of bush twist is
 // not a change to what the wishbones do.
 export void applyComplianceSteer(const CornerHardpoints& hardpoints, SuspensionState& state, const double steerAngle);
+
+// Lean the solved wheel by a small angle about the chassis's forward axis, and re-read the same
+// list `applyComplianceSteer` re-reads — camber, toe, the contact patch and the half track.
+//
+// The same seam for the same reason: compliance is a force effect and cannot live inside a solve
+// that is not told about forces. The axis is the chassis's own forward, which is what a camber
+// angle is measured about and what the published figure this is driven by was measured as (a K&C
+// rig reads camber change against a lateral force applied at the contact patch). The hub does not
+// move; the sideways displacement a real bush also takes has no published figure and is not
+// smuggled in as a side effect of the rotation.
+export void applyComplianceCamber(const CornerHardpoints& hardpoints, SuspensionState& state, const double camberAngle);
 
 // The load-time diagnostic the brief asks for, and the reason it is not optional: bump steer that
 // emerges from the geometry is correct and desirable, and bump steer that emerges from a typo in a

@@ -377,6 +377,31 @@ void applyComplianceSteer(const CornerHardpoints& hardpoints, SuspensionState& s
     readOffWheel(hardpoints, state);
 }
 
+void applyComplianceCamber(const CornerHardpoints& hardpoints, SuspensionState& state, const double camberAngle)
+{
+    // About the chassis's own forward axis, which is what a camber angle is measured about and how
+    // the K&C figure this is driven by is stated (camber change against a lateral force applied at
+    // the contact patch).
+    //
+    // The sign, derived once so nobody re-derives it wrong. The frame is +x the car's left, +y up,
+    // +z forward, and `glm::angleAxis` turns by the right-hand rule on components: a positive angle
+    // about +z carries the point a radius *below* the hub — the patch — towards **+x** and the top
+    // of the wheel towards −x. The caller passes `lateralForceCamber x (tyre lateral force resolved
+    // into the body's +x)`, so with the published positive coefficient the patch complies *with* the
+    // force, which is the source's own convention: positive means the contact point displaces
+    // vehicle-inward under the rig's inward force and the tyre leans over it. On the loaded outside
+    // wheel of a corner the road force points at the turn centre, so the patch tucks under and the
+    // top of the wheel leans **out of the turn** — camber lost in the adverse direction, on both
+    // wheels of the axle, which is the physical statement the measurement makes.
+    //
+    // `readOffWheel` then reports it with the sign convention it already owns: the spin axis picks
+    // up a y component of `outboard x sin(angle)`, so the same lean reads as positive (top-out)
+    // camber on the right wheel and negative on the left, which is SAE camber doing its job.
+    state.uprightOrientation = glm::angleAxis(camberAngle, glm::dvec3(0.0, 0.0, 1.0)) * state.uprightOrientation;
+
+    readOffWheel(hardpoints, state);
+}
+
 void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionState& state)
 {
     // The front view collapses z, so each wishbone becomes the line from where its pivot axis

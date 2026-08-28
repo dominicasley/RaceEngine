@@ -201,6 +201,31 @@ TEST_CASE("the bump stop's dissipation is the driver's to restate", "[physics][s
     }
 }
 
+TEST_CASE("compliance camber rides the sheet in the unit the rig reports", "[physics][setup]")
+{
+    // `compliancecamber` is degrees per kilonewton on the sheet — the unit the K&C figures behind
+    // it are quoted in — and radians per newton on the car, converted exactly as `compliancesteer`
+    // is. `front.compliancecamber 0` is the A/B against the Golf's own stated 0.17.
+    const auto built = placeholderSedan();
+    REQUIRE(built.has_value());
+
+    auto car = built.value();
+    const auto before = built.value();
+
+    const auto tune = parseVehicleTune("front.compliancecamber 0.17\n");
+    REQUIRE(tune.has_value());
+
+    applyVehicleTune(tune.value(), car);
+
+    REQUIRE(car.corners[0].lateralForceCamber == 0.17 * 0.017453292519943295 / 1000.0);
+    REQUIRE(car.corners[1].lateralForceCamber == 0.17 * 0.017453292519943295 / 1000.0);
+    REQUIRE(car.corners[2].lateralForceCamber == before.corners[2].lateralForceCamber);
+    REQUIRE(car.corners[3].lateralForceCamber == before.corners[3].lateralForceCamber);
+
+    // And the steer coefficient beside it is untouched — two keys, two mechanisms.
+    REQUIRE(car.corners[0].lateralForceSteer == before.corners[0].lateralForceSteer);
+}
+
 TEST_CASE("a damper stated on one side keeps what the other side already was", "[physics][setup]")
 {
     const auto built = placeholderSedan();

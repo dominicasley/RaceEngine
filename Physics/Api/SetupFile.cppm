@@ -68,6 +68,12 @@ export struct AxleTune
     // than making a human write radians per newton. Negative is toe-out, which is what a production
     // car is set up for.
     std::optional<double> complianceSteer;
+
+    // Lateral-force compliance camber, **degrees per kilonewton**, the same rig and the same unit.
+    // Positive means the patch complies with the force and the tyre leans over it, which is what
+    // every production car measured does; `compliancecamber 0` is the A/B against the car's own
+    // stated figure.
+    std::optional<double> complianceCamber;
 };
 
 export struct DifferentialTune

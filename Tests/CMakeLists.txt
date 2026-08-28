@@ -25,6 +25,7 @@ add_executable(EngineTests
         CameraServiceTests.cpp
         CarAudioTests.cpp
         ClutchTests.cpp
+        ComplianceCamberSweepProbe.cpp
         ComplianceTests.cpp
         ContactPatchChamferProbe.cpp
         ContactPatchTests.cpp

@@ -687,6 +687,16 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
                                  state.corners[index].complianceSteer);
         }
 
+        // And the lean the same bushes are holding, about the chassis's forward axis, branched the
+        // same way for the same inertness. Applied after the steer twist; the two rotations are
+        // about different axes, so their order matters only at second order in angles of a
+        // hundredth of a radian.
+        if (corner.lateralForceCamber != 0.0)
+        {
+            applyComplianceCamber(corner.hardpoints, result.corners[index].suspension,
+                                  state.corners[index].complianceCamber);
+        }
+
         // The wheel, in the world. The suspension solved it in chassis coordinates; the chassis
         // says where those are.
         const auto& suspension = result.corners[index].suspension;
@@ -969,13 +979,24 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         //
         // A wheel in the air relaxes to nothing, which is the same statement the tyre's carcass makes
         // one branch up.
-        if (corner.lateralForceSteer != 0.0)
+        if (corner.lateralForceSteer != 0.0 || corner.lateralForceCamber != 0.0)
         {
             const auto sideways = glm::dot(glm::inverse(state.chassis.orientation) *
                                                (solution.contact.tyre.lateral * solution.contact.lateral),
                                            glm::dvec3(1.0, 0.0, 0.0));
 
-            state.corners[index].complianceSteer = corner.lateralForceSteer * sideways;
+            // Each written only when its coefficient is stated, so a car stating one of the two
+            // leaves the other's state at the exact 0.0 it was constructed with — `0.0 * sideways`
+            // is `-0.0` for a negative force, and a state hash reads bits.
+            if (corner.lateralForceSteer != 0.0)
+            {
+                state.corners[index].complianceSteer = corner.lateralForceSteer * sideways;
+            }
+
+            if (corner.lateralForceCamber != 0.0)
+            {
+                state.corners[index].complianceCamber = corner.lateralForceCamber * sideways;
+            }
         }
 
         // --- generalised force on the corner's one degree of freedom ---

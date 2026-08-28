@@ -18,6 +18,7 @@
 
 import raceengine.physics;
 
+using raceengine::applyComplianceCamber;
 using raceengine::cornerCount;
 using raceengine::CornerHardpoints;
 using raceengine::CornerSetup;
@@ -28,6 +29,7 @@ using raceengine::dropLinkStated;
 using raceengine::golfGtiMk7;
 using raceengine::golfMk7FrontCorner;
 using raceengine::golfMk7RearCorner;
+using raceengine::outboardSign;
 using raceengine::placeholderCorner;
 using raceengine::solveAntiRollBar;
 using raceengine::solveCornerWithJacobian;
@@ -499,4 +501,114 @@ TEST_CASE("damper friction reaches the implicit damping coefficient", "[physics]
     REQUIRE(damperDampingCoefficient(plain, plainStill) ==
             plainStill.lengthPerAngle * plainStill.lengthPerAngle *
                 std::max(0.0, (plain.damper.at(1e-4) - plain.damper.at(-1e-4)) / 2e-4));
+}
+
+// --- item 1's other half: lateral-force compliance camber ---------------------------------------
+
+namespace
+{
+
+// The published figure exactly as the car data states it: Kawata, Kouno & Sakuma, Trans. JSME
+// 89(919) 2023, Table 2 — median 0.17 deg/kN across four front axles — converted to radians per
+// newton the same way the setup sheet converts it.
+constexpr auto camberPerNewton = 0.17 * 0.017453292519943295 / 1000.0;
+
+} // namespace
+
+TEST_CASE("a compliance camber of nothing leaves the solved corner untouched to the bit",
+          "[physics][suspension][compliance]")
+{
+    // The vehicle step branches on the coefficient, so a car stating none never calls this at all —
+    // but the stronger statement holds too: even called with a zero angle, the identity rotation and
+    // the re-read reproduce the same bits, because `readOffWheel` is one statement of what the
+    // orientation decides and the orientation has not moved.
+    const auto hardpoints = golfMk7FrontCorner(CornerSide::Left);
+    const auto untouched = solvedAt(hardpoints, 0.01);
+
+    auto twisted = untouched;
+    applyComplianceCamber(hardpoints, twisted, 0.0);
+
+    REQUIRE(twisted.uprightOrientation.w == untouched.uprightOrientation.w);
+    REQUIRE(twisted.uprightOrientation.x == untouched.uprightOrientation.x);
+    REQUIRE(twisted.uprightOrientation.y == untouched.uprightOrientation.y);
+    REQUIRE(twisted.uprightOrientation.z == untouched.uprightOrientation.z);
+    REQUIRE(twisted.camber == untouched.camber);
+    REQUIRE(twisted.toe == untouched.toe);
+    REQUIRE(twisted.contactPatch == untouched.contactPatch);
+    REQUIRE(twisted.halfTrack == untouched.halfTrack);
+}
+
+TEST_CASE("a stated compliance camber produces the derived lean at a known force", "[physics][suspension][compliance]")
+{
+    // 3.2 kN of lateral force at the coefficient the car states is 0.544 degrees of lean. The angle
+    // is applied about the chassis's forward axis, so what `readOffWheel` reports moves by
+    // `-outboard x angle` — the sign the spin-axis construction folds in — and the toe does not move
+    // at all, because a rotation about +z leaves every vector's z component alone. That last part is
+    // the difference between camber compliance and steer compliance, asserted rather than assumed.
+    const auto angle = camberPerNewton * 3200.0;
+
+    for (const auto side : {CornerSide::Left, CornerSide::Right})
+    {
+        const auto hardpoints = golfMk7FrontCorner(side);
+        const auto untouched = solvedAt(hardpoints, 0.0);
+
+        auto twisted = untouched;
+        applyComplianceCamber(hardpoints, twisted, angle);
+
+        CAPTURE(outboardSign(side), untouched.camber, twisted.camber);
+
+        REQUIRE(twisted.camber - untouched.camber == Catch::Approx(-outboardSign(side) * angle).epsilon(0.01));
+        REQUIRE(twisted.toe == Catch::Approx(untouched.toe).margin(1e-12));
+
+        // The hub does not move — the wheel leans about it, which is the whole of what is sourced.
+        REQUIRE(twisted.wheelCentre == untouched.wheelCentre);
+    }
+}
+
+TEST_CASE("the loaded outside wheel leans out of the turn and its patch tucks under",
+          "[physics][suspension][compliance]")
+{
+    // The sign case, stated on the physical situation rather than on the arithmetic. In a left turn
+    // the road pushes every patch towards the turn centre, +x, so the vehicle step hands this corner
+    // a positive angle. On the right — outside, loaded — wheel that must read as the top leaning
+    // away from the car (positive SAE camber, out of a left turn: the adverse direction) with the
+    // patch displacing vehicle-inward, which is the source's own sign convention for a positive
+    // coefficient.
+    const auto hardpoints = golfMk7FrontCorner(CornerSide::Right);
+    const auto untouched = solvedAt(hardpoints, 0.0);
+
+    const auto outsideWheelLoad = 4200.0;
+    auto twisted = untouched;
+    applyComplianceCamber(hardpoints, twisted, camberPerNewton * outsideWheelLoad);
+
+    CAPTURE(untouched.camber, twisted.camber, untouched.contactPatch.x, twisted.contactPatch.x);
+
+    REQUIRE(twisted.camber > untouched.camber);
+    REQUIRE(twisted.contactPatch.x > untouched.contactPatch.x);
+
+    // And the same force leans the inside wheel the same way in space — towards the outside of the
+    // turn — which its own outboard sign reads as negative camber. Both wheels lean out of the turn;
+    // neither gains the camber a designer would want.
+    const auto inside = golfMk7FrontCorner(CornerSide::Left);
+    const auto insideUntouched = solvedAt(inside, 0.0);
+
+    auto insideTwisted = insideUntouched;
+    applyComplianceCamber(inside, insideTwisted, camberPerNewton * 1400.0);
+
+    REQUIRE(insideTwisted.camber < insideUntouched.camber);
+}
+
+TEST_CASE("which axle states compliance camber and what it states", "[physics][suspension][compliance]")
+{
+    // Pinned the way the drop-link facts are, so the day the figure moves — or the day somebody
+    // sources a rear measurement — a test says so. The rear is deliberately zero: the JSME campaign
+    // measured front axles only, and Heissing/Ersoy's rear < 1.0 deg/kN is a design target rather
+    // than a measurement.
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    REQUIRE(built->corners[0].lateralForceCamber == camberPerNewton);
+    REQUIRE(built->corners[1].lateralForceCamber == camberPerNewton);
+    REQUIRE(built->corners[2].lateralForceCamber == 0.0);
+    REQUIRE(built->corners[3].lateralForceCamber == 0.0);
 }

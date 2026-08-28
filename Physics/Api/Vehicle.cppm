@@ -205,11 +205,26 @@ export struct CornerSetup
     // angle and that is most of what the rack feels like. Production cars are set up for a slight
     // **toe-out** under lateral force, which is a negative value here.
     //
-    // Only the toe term is carried. A real bush also moves the upright sideways and rearward and
-    // takes camber with it, and those have no published figure behind them for this class of car —
-    // so the hub stays where the linkage put it. `applyComplianceSteer` is the seam and says why.
-    // docs/suspension-fidelity-brief.md, item 1.
+    // The toe term and, below, the camber term are carried. A real bush also moves the upright
+    // sideways and rearward, and those translations have no published figure behind them for this
+    // class of car — so the hub stays where the linkage put it. `applyComplianceSteer` is the seam
+    // and says why. docs/suspension-fidelity-brief.md, item 1.
     double lateralForceSteer = 0.0;
+
+    // **Lateral-force compliance camber**: how far this corner's wheel is leaned about the
+    // chassis's forward axis per newton of lateral force at its contact patch, radians per newton,
+    // **signed**. Positive means the patch complies *with* the force — the contact point displaces
+    // vehicle-inward under a cornering load and the tyre leans over it, which is what every
+    // production car measured does and is the adverse direction: the loaded outside wheel leans out
+    // of the turn.
+    //
+    // What it reaches in this model is the *geometry* and not the force law: the tilted spin axis
+    // moves the sampled contact patch and redistributes penetration across its width, and the
+    // constructed patch point moves the lever arm the geometric load path carries the tyre force
+    // through. `evaluateTyre` has no camber input, so there is no camber thrust and no
+    // camber-dependent grip — stated here so nobody reads this coefficient as one.
+    // `applyComplianceCamber` is the seam. docs/suspension-fidelity-brief.md, item 1.
+    double lateralForceCamber = 0.0;
 
     // Placeholder: a hub, upright, brake and wheel for a mid-size car.
     double unsprungMass = 38.0;
@@ -474,6 +489,12 @@ export struct CornerState
     // bush also has a real relaxation of about this order, so what the lag models is not nothing —
     // but nobody has sourced its time constant, so it is not claimed as one.
     double complianceSteer = 0.0;
+
+    // And how far they have leaned it about the chassis's forward axis, radians — the camber twin
+    // of the field above, carried from the previous tick for the same reason. The lag is even
+    // safer here: camber never reaches the tyre's force law (see `lateralForceCamber`), so the loop
+    // this sits in is not merely negative feedback, it is very nearly open.
+    double complianceCamber = 0.0;
 
     // The brake disc's temperature, degrees Celsius. Seeded at `brakeDefaultTemperature`, which is
     // cold — see `VehicleSetup::brakeThermal` for why cold is the inert seed here and warm was the

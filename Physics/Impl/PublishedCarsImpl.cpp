@@ -767,6 +767,33 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto lateralForceSteer =
         std::array{-0.021 * 0.017453292519943295 / 1000.0, -0.021 * 0.017453292519943295 / 1000.0, 0.0, 0.0};
 
+    // **Lateral-force compliance camber, radians per newton at the contact patch** — the camber
+    // half of the same rigid-linkage statement: every joint is an ideal pin or ball, so without
+    // this the car takes no camber under lateral load beyond what the kinematics give.
+    //
+    // Source: Kawata, Kouno & Sakuma, *Transactions of the JSME* Vol. 89, No. 919 (2023),
+    // DOI 10.1299/transjsme.22-00301 (open access on J-Stage, in Japanese) — the **same measurement
+    // campaign and cars** as the compliance-steer figure above. Table 2, front-axle camber change
+    // at 1000 N of lateral force applied at both contact patches: **0.137, 0.162, 0.25 and
+    // 0.179 deg**, i.e. 0.14-0.25 deg/kN. The **median, ~0.17 deg/kN**, is what is taken. The
+    // paper's stated sign convention: positive means the contact point displaces vehicle-inward
+    // and the tyre leans over it — the patch complies *with* the force, so under cornering load
+    // both wheels lean out of the turn, which is the adverse direction.
+    //
+    // **This is a class figure and not this car's**, the same honest limit as the steer above: the
+    // four production cars span 1.8x. Corroborated as a band by Heissing & Ersoy, *Chassis
+    // Handbook* (2011), Table 1-6, which states the front-axle design target as camber compliance
+    // **< 0.3 deg/kN** — the whole measured spread sits inside it. The rear is deliberately zero:
+    // the JSME campaign measured front axles only, and Heissing/Ersoy's rear figure (< 1.0 deg/kN)
+    // is a design *target* rather than a measurement, so there is no number to state. Stating the
+    // front bound as if it were the rear's would be authoring a balance change nobody measured.
+    //
+    // What this coefficient reaches is the contact patch's geometry and the load path's lever arm
+    // only — the tyre's force law has no camber input, and `CornerSetup::lateralForceCamber` says
+    // so. `front.compliancecamber 0` on the setup sheet is the A/B.
+    const auto lateralForceCamber =
+        std::array{0.17 * 0.017453292519943295 / 1000.0, 0.17 * 0.017453292519943295 / 1000.0, 0.0, 0.0};
+
     // The brakes, and **`brakes.ini` no longer appears in this line at all** (2026-08-23). Neither
     // `MAX_TORQUE` nor `FRONT_SHARE` is read: the peak is `peakBrakeTorque` on the hardware above and
     // the split is whatever the two calipers make of one line pressure. Sources per part and the two
@@ -852,6 +879,7 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         corner.unsprungMass = hubMass(index);
         corner.damperFriction = damperFriction[index];
         corner.lateralForceSteer = lateralForceSteer[index];
+        corner.lateralForceCamber = lateralForceCamber[index];
 
         // tyres.ini, the Semislicks compound — AC's own default for this car, taken whole so the
         // grip and the carcass describe the same tyre: carcass rate and damping, angular inertia,
