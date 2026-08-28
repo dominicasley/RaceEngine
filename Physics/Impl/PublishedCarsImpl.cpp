@@ -711,21 +711,36 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // viscous term is smallest — small amplitudes and low velocities, which is straight-line running
     // on coarse tarmac, the first millimetre of a steering input and the settling after a kerb.
     //
-    // Source: Deubel, Dittrich, Meinck and Prokop, *Experimental analysis and modelling of friction
-    // in automotive shock absorbers operating under side forces*, Tribology International, 2025. The
-    // specimen is a twin-tube damper from the **MacPherson front suspension of a VW Passat B8** —
-    // MQB, the Mk7 Golf's own platform, which is as close a match as this project has ever had for a
-    // borrowed number. Its pin-slider test reports approximately **117 N breakaway and 107 N
-    // sliding**, with breakaway 2-14% above sliding (7% taken as representative) and the force
+    // Front source: Deubel, Dittrich, Meinck and Prokop, *Experimental analysis and modelling of
+    // friction in automotive shock absorbers operating under side forces*, Tribology International,
+    // 2025. The specimen is a twin-tube damper from the **MacPherson front suspension of a VW Passat
+    // B8** — MQB, the Mk7 Golf's own platform, which is as close a match as this project has ever
+    // had for a borrowed number. Its pin-slider test reports approximately **117 N breakaway and
+    // 107 N sliding**, with breakaway 2-14% above sliding (7% taken as representative) and the force
     // direction-independent to within 5% at moderate side force and velocity — which is what makes a
     // single symmetric constant a fair reduction of it.
     //
-    // **The rear is the front's figure standing in for an unsourced one**, and is the weaker half of
-    // this: that paper's whole point is that a MacPherson strut's friction is driven by the *side
-    // force* the layout puts through the rod, and a rear damper that stands nearly upright carries
-    // far less of it. So the rear is very likely lower and nobody has measured it. Marked here rather
-    // than hidden in an average.
-    const auto damperFriction = std::array{107.0, 107.0, 107.0, 107.0};
+    // Rear source: Herzog and Augsburg, *Study on Friction in Automotive Shock Absorbers Part 2:
+    // Validation of Friction Simulations via Novel Single Friction Point Test Rigs*, Vehicles 3,
+    // 197-211, 2021 (doi 10.3390/vehicles3020013, CC-BY). The specimen: *"The reference shock
+    // absorber is a common series monotube damper intended for rear axle applications in compact
+    // cars"* — 11 mm rod, 36 mm tube, 25 bar. Its full-damper midstroke friction F_MS, *"defined as
+    // the sum of the absolute forces at midstroke"*, is about **50 N** — roughly 22 N compression
+    // and 28 N rebound, so **~25 N sliding per direction**, read off the paper's Figures 4 and 7 at
+    // a reading error of about ±3 N because the totals are never stated in prose. The breakdown the
+    // paper measures per friction point: rod guide 13-16 N per direction, piston 6-7 N, floating
+    // piston ~3 N. The in-text corroborating bound: the gas push-out force *"exceeds about 238 N,
+    // which is one to two magnitudes higher than the expected friction force"*.
+    //
+    // **The prediction that stood here landed** — the previous comment said a rear damper that
+    // stands nearly upright carries far less rod side force and is "very likely lower", and the
+    // measured rear is about a quarter of the strut. The caveats, stated rather than hidden: the
+    // specimen is a **monotube at 25 bar** where a Golf 7 rear is most likely a low-pressure
+    // twin-tube whose rod-seal pre-tension differs; it is **one damper model**; it is the
+    // **compact-car class and not this car** — a class figure exactly as the compliance steer below
+    // is; and the number is read off plots, not printed. `rear.friction` on the setup sheet is the
+    // way back and the A/B.
+    const auto damperFriction = std::array{107.0, 107.0, 25.0, 25.0};
 
     // **Lateral-force compliance steer, radians per newton at the contact patch.** Every joint in
     // this model's linkage is an ideal pin or ball, so the rigid car takes no toe under load at all.

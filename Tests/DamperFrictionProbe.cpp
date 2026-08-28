@@ -9,7 +9,8 @@
 //
 // This probe turns that into a number and an A/B, because a seat report with a named mechanism still
 // has to be isolated. It drops the car onto its wheels and counts how long the rear takes to stop
-// moving, with the shipped 107 N and with it zeroed and nothing else touched.
+// moving, with the shipped friction (107 N front / 25 N rear since 2026-08-29) and with it zeroed
+// and nothing else touched.
 //
 // Hidden behind a dot tag — `./EngineTests "[.damper-friction]"`.
 
@@ -172,8 +173,13 @@ TEST_CASE("damper friction: what it is worth to a car that has just been hit", "
     // The claim the seat made, asserted: the corner stops sooner with friction than without it, and
     // it is not bought by a softer hit. The numbers are **not** pinned — what is pinned is the
     // direction, because that is what the report said and it is what a Coulomb term must do. A pinned
-    // figure here would be a characterisation of a borrowed 107 N nobody has measured on this car.
+    // figure here would be a characterisation of borrowed class figures nobody has measured on this
+    // car — the front is a Passat B8 strut's, the rear a compact-class monotube's.
     CHECK(shipped.settlingTime < viscous.settlingTime);
-    CHECK(shipped.residual < viscous.residual);
+    // 2026-08-29, with the rear sourced at 25 N: the residual's direction claim went with the 107 N
+    // that made it — the sub-micron difference collapsed from -33% to +0.4%, below this probe's
+    // resolution — so what is asserted is that the corner ends dead still, a hundredth of the
+    // settled band, and the direction rides the settling time alone.
+    CHECK(shipped.residual < 0.02);
     CHECK(shipped.peak > 0.9 * viscous.peak);
 }
