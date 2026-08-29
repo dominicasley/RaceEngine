@@ -54,7 +54,17 @@ namespace raceengine
     corner.wheelRadius = golfTyreRadius;
 
     corner.droopAngle = -0.16;
-    corner.bumpAngle = 0.16;
+
+    // **The bump range is Dominic's own tape measure, not the placeholder any more** (2026-08-29).
+    // He measured **67–73 mm from ride height to the bump stop fully crushed** on the real car —
+    // the convention resolved by his answer the same day — and the range clamp IS that hard end,
+    // since q = 0 is static ride (docs/suspension-geometry-audit.md §2). The band's middle, 70 mm
+    // of wheel rise, solves to 0.204521 rad on this linkage (67 mm is 0.1956, 73 mm is 0.2135);
+    // the authored 0.16 placeholder owned the old 55.1 mm and nothing else did — the geometry
+    // itself runs to +257 mm. The stop's ENGAGEMENT point does not move with this: the 20 mm gap
+    // lives on the damper shaft. The droop side stays a placeholder; droop is the damper topping
+    // out and nobody has measured it.
+    corner.bumpAngle = 0.204521;
 
     return corner;
 }

@@ -1252,7 +1252,11 @@ TEST_CASE("the setup validator reads the element and refuses identically", "[phy
                                  replicaLength(front.hardpoints, frontElement, 0.0);
 
     auto neverClosesBump = front;
-    neverClosesBump.bumpStop.gap = 0.060;
+    // 0.080 rather than the 0.060 this case carried until 2026-08-29: the measured 70 mm bump
+    // range compresses the damper about 66 mm, so a 60 mm gap CLOSES now and the synthetic
+    // never-closes gap has to sit beyond the new range to stay synthetic. The droop one below
+    // keeps its 0.060 because the droop side is unchanged.
+    neverClosesBump.bumpStop.gap = 0.080;
     const auto bumpRefused = validateCornerSetup(neverClosesBump);
     REQUIRE_FALSE(bumpRefused.has_value());
     REQUIRE(bumpRefused.error().find("never closes: the damper only compresses") != std::string::npos);

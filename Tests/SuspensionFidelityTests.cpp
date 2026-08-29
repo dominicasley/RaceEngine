@@ -686,6 +686,26 @@ TEST_CASE("the recession map is linear inside the band's context and saturates o
     STATIC_REQUIRE(raceengine::recessionDisplacement(0.0, 22269.0) == 0.0);
 }
 
+TEST_CASE("the front bump travel is Dominic's measurement, ride height to the stop fully crushed",
+          "[physics][suspension][golf]")
+{
+    // 67-73 mm of wheel rise from static ride to the hard end of travel, measured by Dominic on
+    // the real car with the convention resolved 2026-08-29 (ride height to the stop fully
+    // crushed). The clamp is that hard end, so the solved travel at `bumpAngle` must sit inside
+    // his band — asserted against the linkage rather than as a copy of the angle, so a hardpoint
+    // change that silently moves the travel fails here even with the angle untouched.
+    for (const auto side : {CornerSide::Left, CornerSide::Right})
+    {
+        const auto hardpoints = golfMk7FrontCorner(side);
+        const auto atClamp = solvedAt(hardpoints, hardpoints.bumpAngle);
+
+        CAPTURE(outboardSign(side), atClamp.wheelTravel);
+
+        REQUIRE(atClamp.wheelTravel > 0.067);
+        REQUIRE(atClamp.wheelTravel < 0.073);
+    }
+}
+
 TEST_CASE("which axle states recession and what it states", "[physics][suspension][compliance]")
 {
     // Pinned at zero on all four corners, and the pin is the point: the only published figures for

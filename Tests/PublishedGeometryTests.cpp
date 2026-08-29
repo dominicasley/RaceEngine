@@ -146,9 +146,14 @@ TEST_CASE("a production front strut solves and behaves like one", "[physics][pub
     SECTION("the wheel scrubs sideways as it rises, which is what a strut does")
     {
         // Half-track change, so it is one wheel's lateral movement rather than the pair's.
+        //
+        // Re-pinned 1.63 -> 1.29 on 2026-08-29 when the bump end moved 0.16 -> 0.2045 rad
+        // (Dominic's measured 67-73 mm of travel replacing the placeholder): the mean is taken
+        // over the swept range and a strut's scrub falls off with compression, so a wider range
+        // dilutes it. The geometry did not move; the window the average is taken over did.
         const auto scrub = perTenMillimetres(sweep.value(), [](const auto& s) { return s.halfTrack * 1000.0; });
 
-        REQUIRE(scrub == Catch::Approx(1.63).margin(0.10));
+        REQUIRE(scrub == Catch::Approx(1.29).margin(0.10));
     }
 
     SECTION("the roll centre is above ground and falls as the car compresses")
