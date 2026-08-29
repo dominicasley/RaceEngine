@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -288,6 +289,48 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
     assists.antilock.enabled = true;
 
     return assists;
+}
+
+// **Criterion 5's two cases compare ensembles, not single stops, since 2026-08-29.** A full-pedal
+// stop on mu 0.35 is chaotic — the assisted trajectory especially: across a ±0.7% entry-speed band
+// its peak yaw rate spans 0.111 to 0.330 and its lateral travel 2.1 to 13.4 m, mode-hopping between
+// keeping its steering and washing out. Eight documented flips on fraction-of-a-per-cent plant
+// changes (`docs/known-red.md`) were single rolls of that dice being divided by each other. The
+// fifteen entry speeds below are deterministic, inside the fixture's own settling tolerance, and
+// each member is the same stop the criteria always measured; the criteria assert MEDIANS, which the
+// isolation A/B (`docs/known-red.md`, 2026-08-29) showed move by 2-8% under a plant change that
+// swung single rolls by over 70%. `[.abs-ensemble]` prints the member-level table.
+[[nodiscard]] std::vector<StopResult> steeringEnsemble(const VehicleSetup& setup, const PhysicsWorld& world,
+                                                       const bool assisted, const double steering)
+{
+    auto runs = std::vector<StopResult>{};
+    runs.reserve(15);
+
+    for (auto k = -7; k <= 7; k++)
+    {
+        const auto entry = hundred * (1.0 + 0.001 * static_cast<double>(k));
+        const auto assists = assisted ? withAntilock(setup) : golfGtiMk7Assists(setup);
+        runs.push_back(stop(setup, world, assists, entry, 1.0, steering));
+    }
+
+    return runs;
+}
+
+// The middle member of an odd-sized ensemble. For the median to change cluster, half the members
+// have to change cluster with it — a distribution-level result rather than a re-roll.
+template <typename Projection> [[nodiscard]] double medianOf(const std::vector<StopResult>& runs, Projection projection)
+{
+    auto values = std::vector<double>{};
+    values.reserve(runs.size());
+
+    for (const auto& run : runs)
+    {
+        values.push_back(projection(run));
+    }
+
+    std::sort(values.begin(), values.end());
+
+    return values[values.size() / 2];
 }
 
 } // namespace
@@ -753,6 +796,16 @@ TEST_CASE("the car still steers under full braking with the anti-lock system on"
     // in this file: on dry the front wheels never lock, so there is no steering to lose and the
     // comparison would be vacuous. Choosing a surface where the failure is reachable is the whole
     // point of testing the complement.
+    //
+    // **Ensemble medians since 2026-08-29, and the bounds did not move.** This case compared one
+    // assisted roll against one locked roll for a year of plant changes and flipped eight times
+    // (`docs/known-red.md`); the ensemble helper's comment carries the measured distributions. The
+    // locked arm turned out to be the smooth one — 0.1302 to 0.1306 of peak yaw across the whole
+    // band — and the ASSISTED arm the chaotic one, so a flip was almost always the assisted dice
+    // re-rolling, not the baseline. On medians the verdict is stable and currently red: 0.2217
+    // against a needed 2 x 0.1304, with ten of fifteen members keeping their steering and five
+    // washing out. What closes it is the controller keeping its steering advantage on low grip —
+    // the recovery law's own territory — and never a loosened bound.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -764,31 +817,44 @@ TEST_CASE("the car still steers under full braking with the anti-lock system on"
     // A third of lock, held from the moment the pedal goes down.
     const auto steering = 0.35;
 
-    const auto plain = stop(setup.value(), world.value(), golfGtiMk7Assists(setup.value()), hundred, 1.0, steering);
-    const auto assisted = stop(setup.value(), world.value(), withAntilock(setup.value()), hundred, 1.0, steering);
+    const auto plain = steeringEnsemble(setup.value(), world.value(), false, steering);
+    const auto assisted = steeringEnsemble(setup.value(), world.value(), true, steering);
 
-    REQUIRE(plain.stopped);
-    REQUIRE(assisted.stopped);
-    REQUIRE(assisted.onPlate);
+    for (const auto& run : plain)
+    {
+        REQUIRE(run.stopped);
 
-    CAPTURE(plain.peakYawRate, assisted.peakYawRate, plain.lateralTravel, assisted.lateralTravel);
+        // The wheels lock without it — the precondition that makes this a test of steering rather
+        // than of two identical runs, and it has to hold for every member or the medians compare
+        // a mixture.
+        REQUIRE(run.meanTrueSlip > 0.8);
+    }
 
-    // The wheels lock without it — the precondition that makes this a test of steering rather than
-    // of two identical runs.
-    REQUIRE(plain.meanTrueSlip > 0.8);
+    for (const auto& run : assisted)
+    {
+        REQUIRE(run.stopped);
+        REQUIRE(run.onPlate);
+    }
+
+    const auto plainYaw = medianOf(plain, [](const StopResult& run) { return run.peakYawRate; });
+    const auto assistedYaw = medianOf(assisted, [](const StopResult& run) { return run.peakYawRate; });
+    const auto plainTravel = medianOf(plain, [](const StopResult& run) { return run.lateralTravel; });
+    const auto assistedTravel = medianOf(assisted, [](const StopResult& run) { return run.lateralTravel; });
+
+    CAPTURE(plainYaw, assistedYaw, plainTravel, assistedTravel);
 
     // With the system on the car answers the wheel: more than twice the yaw rate over a stop of the
-    // same length. Measured at 5.2 times.
-    REQUIRE(assisted.peakYawRate > 2.0 * plain.peakYawRate);
+    // same length. Measured at 5.2 times on 2026-08-23's car; the 2026-08-29 median is 1.70 times.
+    REQUIRE(assistedYaw > 2.0 * plainYaw);
 
     // And it went where it was pointed rather than merely somewhere: a third of lock to the right is
     // a right turn.
-    REQUIRE(assisted.lateralTravel * plain.lateralTravel > 0.0);
+    REQUIRE(assistedTravel * plainTravel > 0.0);
 
     // **Whether the car goes where it points is the other half and it has its own case below**,
     // because that is what stopped holding: the yaw rate is five times the locked run's and the
     // lateral displacement is only 1.3 times it, which is a car rotating more than it is travelling.
-    REQUIRE(std::abs(assisted.lateralTravel) > std::abs(plain.lateralTravel));
+    REQUIRE(std::abs(assistedTravel) > std::abs(plainTravel));
 }
 
 TEST_CASE("and the steering it keeps puts the car somewhere else, not just at another angle",
@@ -810,6 +876,13 @@ TEST_CASE("and the steering it keeps puts the car somewhere else, not just at an
     // The distinction the bound exists for is a real one. Yaw rate alone cannot tell a car that is
     // being steered from a car that is rotating about its own centre while it slides, which is why
     // both halves of criterion 5 exist and are asserted separately.
+    //
+    // **Ensemble medians since 2026-08-29, the same change as the case above and the same bounds.**
+    // The single assisted roll spanned 2.1 to 13.4 m of travel across a ±0.7% entry-speed band —
+    // this criterion's flips were that spread being sampled once. The median is 8.11 m against a
+    // needed 3 x 2.999: stable, red, and 10% under the bound rather than a coin toss across it.
+    // Under the flip-seven plant A/B the median moved 8%, so a future green here needs the
+    // assisted DISTRIBUTION to move, not one member.
     const auto guard = JoltGuard{};
 
     const auto setup = golfGtiMk7();
@@ -820,14 +893,24 @@ TEST_CASE("and the steering it keeps puts the car somewhere else, not just at an
 
     const auto steering = 0.35;
 
-    const auto plain = stop(setup.value(), world.value(), golfGtiMk7Assists(setup.value()), hundred, 1.0, steering);
-    const auto assisted = stop(setup.value(), world.value(), withAntilock(setup.value()), hundred, 1.0, steering);
+    const auto plain = steeringEnsemble(setup.value(), world.value(), false, steering);
+    const auto assisted = steeringEnsemble(setup.value(), world.value(), true, steering);
 
-    REQUIRE(plain.stopped);
-    REQUIRE(assisted.stopped);
+    for (const auto& run : plain)
+    {
+        REQUIRE(run.stopped);
+    }
 
-    CAPTURE(plain.lateralTravel, assisted.lateralTravel);
-    REQUIRE(std::abs(assisted.lateralTravel) > 3.0 * std::abs(plain.lateralTravel));
+    for (const auto& run : assisted)
+    {
+        REQUIRE(run.stopped);
+    }
+
+    const auto plainTravel = medianOf(plain, [](const StopResult& run) { return std::abs(run.lateralTravel); });
+    const auto assistedTravel = medianOf(assisted, [](const StopResult& run) { return std::abs(run.lateralTravel); });
+
+    CAPTURE(plainTravel, assistedTravel);
+    REQUIRE(assistedTravel > 3.0 * plainTravel);
 }
 
 TEST_CASE("the cycling frequency falls out of the hydraulics rather than being prescribed",
@@ -1399,4 +1482,542 @@ TEST_CASE("the car keeps all four wheels on the ground through a hard stop", "[a
     CAPTURE(run.distance);
 
     REQUIRE(run.grounded);
+}
+
+TEST_CASE("the rear channel's re-apply is metered separately, and it ships at the front's rate",
+          "[assists][antilock][braking][rear-metering]")
+{
+    // **The mechanism is sourced and the number is not, and both halves are deliberate** — the
+    // recession pattern again. Robert Bosch GmbH's US patent 5,284,385 (filed 1990) states that
+    // production ABS reduces the REAR axle's pressure build-up rate against the front's, by
+    // lengthening the holding phases of exactly the inlet-valve pulsing `reapplyGradient` averages,
+    // because dynamic axle-load transfer relieves the rear axle and a rear build-up decoupled from
+    // the deceleration "leads inevitably to vehicle instability". Its only figure is "e.g. to halve
+    // it" — an example, not a measurement — so `rearReapplyGradient` ships AT the front's value and
+    // the modulator is bit-inert until somebody states a number. `[.rear-metering]` prints what the
+    // halving does to the cycling criterion's table.
+    SECTION("the shipped rear rate is the front's, pinned with its grade")
+    {
+        // The grade that flips this pin: a measured rear build rate (none is published anywhere
+        // reachable — Burckhardt's book is the one untried place), or Dominic stating the patent's
+        // own halving example on the car. A number picked to move a cycling frequency must never
+        // flip it — that is the prescribing criterion 6 exists to forbid.
+        const auto modulator = raceengine::BrakeModulator{};
+
+        REQUIRE(modulator.rearReapplyGradient == modulator.reapplyGradient);
+    }
+
+    SECTION("and the selection is live: a stated rear rate reaches only the rear channel")
+    {
+        // `advanceAntilockChannel` driven directly through one Reapply step, no world needed. The
+        // reference is invalid so the slip-aware taper is 1.0 and the arithmetic is exactly
+        // `pressure += gradient * dt`, which makes the halving assertable as an equality.
+        auto setup = raceengine::AntilockSetup{};
+        setup.enabled = true;
+
+        auto reading = raceengine::WheelSpeedReading{};
+        reading.speed = 80.0;
+        reading.valid = true;
+        reading.pulses = 100;
+
+        const auto step = [&](const raceengine::BrakeChannel channel)
+        {
+            auto state = raceengine::AntilockChannelState{};
+            state.phase = ModulatorPhase::Reapply;
+            state.pressure = 2.0e6;
+            state.departurePressure = 8.0e6;
+            state.lastPulses = reading.pulses;
+
+            return raceengine::advanceAntilockChannel(setup, channel, state, reading, 25.0, 27.0, -5.0, false, 1.0e7,
+                                                      0.001) -
+                   2.0e6;
+        };
+
+        const auto frontRise = step(raceengine::BrakeChannel::FrontLeft);
+        const auto rearAtDefault = step(raceengine::BrakeChannel::Rear);
+
+        // Ships bit-identical: the same value selected is the same arithmetic.
+        REQUIRE(frontRise == rearAtDefault);
+        REQUIRE(frontRise == 3.0e4);
+
+        setup.modulator.rearReapplyGradient = 0.5 * setup.modulator.reapplyGradient;
+
+        REQUIRE(step(raceengine::BrakeChannel::Rear) == 0.5 * frontRise);
+        REQUIRE(step(raceengine::BrakeChannel::FrontLeft) == frontRise);
+    }
+}
+
+TEST_CASE("what separate rear metering does to the cycling table", "[.rear-metering]")
+{
+    // Criterion 6's own sweep with the rear re-apply metered at fractions of the front's rate:
+    // `./EngineTests "[.rear-metering]"`. **A diagnostic and not a calibration target** — the
+    // Bosch source at `BrakeModulator::rearReapplyGradient` fixes the mechanism and the sign
+    // (rear slower) and gives only "halve" as an example figure; this table is what that example
+    // does to the criterion's channels, the stop and the yaw, so the decision about stating it
+    // can be made on numbers. Factor 1.00 is the shipped car and doubles as the inertness row.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    struct Surface
+    {
+        double left;
+        double right;
+    };
+
+    std::printf("\n=== the cycling table against the rear re-apply factor (criterion 6's fixture) ===\n");
+    std::printf("\n%-7s %-11s | %9s %9s %9s %9s | %9s %9s\n", "factor", "surface", "FL Hz", "FL peaks", "R Hz",
+                "R peaks", "dist m", "yaw deg");
+    std::printf("%s\n", "--------------------------------------------------------------------------------------");
+
+    for (const auto factor : {1.0, 0.75, 0.5, 0.33})
+    {
+        for (const auto surface : {Surface{1.00, 1.00}, Surface{0.60, 0.60}, Surface{1.00, 0.35}})
+        {
+            const auto world = PhysicsWorld::create(gripPlate(surface.left, surface.right));
+            REQUIRE(world.has_value());
+
+            auto assists = withAntilock(setup.value());
+            assists.antilock.modulator.rearReapplyGradient = factor * assists.antilock.modulator.reapplyGradient;
+
+            const auto run = stop(setup.value(), world.value(), assists, hundred, 1.0);
+
+            REQUIRE(run.stopped);
+
+            const auto frequency = [&](const std::size_t wheel)
+            {
+                const auto peaks = static_cast<double>(run.pressurePeaks[wheel]);
+
+                return run.engagedTime[wheel] > 0.5 && peaks >= 5.0 ? peaks / run.engagedTime[wheel] : 0.0;
+            };
+
+            std::printf("%-7.2f %5.2f/%-5.2f | %9.3f %9u %9.3f %9u | %9.2f %9.2f\n", factor, surface.left,
+                        surface.right, frequency(0), run.pressurePeaks[0], frequency(2), run.pressurePeaks[2],
+                        run.distance, run.finalYaw * degrees);
+        }
+    }
+
+    std::printf("\n  0.00 Hz means the channel had under 5 pressure peaks or under 0.5 s engaged on that\n");
+    std::printf("  surface. The band criterion 6 asserts is 4-20 Hz per working channel; the shipped car's\n");
+    std::printf("  red is the front channel on the split surface. Factor 0.50 is Bosch 5,284,385's own\n");
+    std::printf("  example; 1.00 is the shipped car.\n");
+}
+
+TEST_CASE("what separates a washed-out assisted stop from a steering one", "[.washout]")
+{
+    // The co-design's opening measurement: `./EngineTests "[.washout]"`. The steering pair's
+    // ensemble showed the assisted arm mode-hopping — ten of fifteen members keep their steering
+    // on mu 0.35 and five wash out — and this table is the per-member mechanism. For each ensemble
+    // member it aggregates, over the braking ticks above 5 m/s: how far past the tyre's own peak
+    // the front wheels sat, what the ECU believed that slip was, whether the belief ever armed the
+    // slip-aware guards, what the reference's rate read against the truth, and what lateral force
+    // the front axle had left. Read it against the washed/steering classification in the first two
+    // columns before believing any co-design change.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(0.35, 0.35));
+    REQUIRE(world.has_value());
+
+    const auto steering = 0.35;
+
+    std::printf("\n=== the assisted arm, per member: fronts against their own peak, and what the ECU believed ===\n");
+    std::printf("\n%3s %8s %8s | %8s %8s %8s %8s | %8s %8s %8s\n", "k", "peakYaw", "latTrv m", "over-pk", "trueSlip",
+                "estSlip", "armed%", "lat N", "refAccEr", "dump%");
+    std::printf("%s\n",
+                "---------------------------------------------------------------------------------------------");
+
+    for (auto k = -7; k <= 7; k++)
+    {
+        const auto entry = hundred * (1.0 + 0.001 * static_cast<double>(k));
+        const auto assists = withAntilock(setup.value());
+
+        auto state = VehicleState{};
+        settle(setup.value(), state, world.value(), entry);
+
+        auto assistState = AssistState{};
+        auto lastStep = VehicleStep{};
+
+        const auto sense = [&]
+        {
+            auto sensors = AssistSensors{};
+            for (auto index = std::size_t{0}; index < cornerCount; index++)
+            {
+                sensors.wheelSpeeds[index] = state.corners[index].wheelSpeed;
+            }
+            sensors.yawRate = lastStep.telemetry.yawRate;
+            sensors.lateralAcceleration = lastStep.telemetry.acceleration.x;
+            sensors.steeringWheelAngle = lastStep.telemetry.steeringWheelAngle;
+
+            return sensors;
+        };
+
+        for (auto step = 0; step < 180; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {}, noBrakePressure, tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+        }
+
+        auto input = VehicleInput{};
+        input.brake = 1.0;
+        input.steering = steering;
+
+        const auto start = state.chassis.position;
+
+        auto peakYaw = 0.0;
+        auto overPeak = 0.0;
+        auto trueSlip = 0.0;
+        auto estimatedSlip = 0.0;
+        auto armed = 0.0;
+        auto pastBandTicks = 0.0;
+        auto lateralForce = 0.0;
+        auto rateError = 0.0;
+        auto dumpTicks = 0.0;
+        auto ticks = 0.0;
+        auto previousSpeed = state.chassis.linearVelocity.z;
+
+        for (auto step = 0; step < 360 * 30; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {.brake = 1.0, .throttle = 0.0},
+                                               brakeCircuitPressures(setup.value(), 1.0), tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+
+            peakYaw = std::max(peakYaw, std::abs(lastStep.telemetry.yawRate));
+
+            const auto speed = state.chassis.linearVelocity.z;
+
+            if (speed > 5.0)
+            {
+                const auto trueAcceleration = (speed - previousSpeed) / tick;
+
+                for (const auto wheel : {std::size_t{0}, std::size_t{1}})
+                {
+                    const auto& corner = lastStep.corners[wheel];
+                    const auto peak = corner.contact.tyre.longitudinalPeakSlip;
+                    const auto slip = std::abs(corner.contact.slip.slipRatio);
+
+                    overPeak += peak > 1e-9 ? slip / peak : 0.0;
+                    trueSlip += slip;
+                    estimatedSlip += command.channels.estimatedSlip[wheel];
+                    lateralForce += std::abs(corner.contact.tyre.lateral);
+
+                    // The slip-aware guards arm on the ECU's own belief crossing the calibrated
+                    // band while the reference is valid — computed here from the channels exactly
+                    // as `advanceAntilockChannel` computes `pastBand`.
+                    if (slip > 0.20)
+                    {
+                        pastBandTicks += 1.0;
+
+                        if (command.channels.referenceValid && command.channels.estimatedSlip[wheel] > 0.20)
+                        {
+                            armed += 1.0;
+                        }
+                    }
+
+                    if (command.channels.antilockPhase[wheel] == ModulatorPhase::Dump)
+                    {
+                        dumpTicks += 1.0;
+                    }
+                }
+
+                rateError += command.channels.referenceAcceleration - trueAcceleration;
+                ticks += 1.0;
+            }
+
+            previousSpeed = speed;
+
+            if (speed <= 0.0)
+            {
+                break;
+            }
+        }
+
+        REQUIRE(ticks > 0.0);
+
+        std::printf("%3d %8.4f %8.2f | %8.2f %8.3f %8.3f %7.1f%% | %8.0f %8.2f %7.1f%%\n", k, peakYaw,
+                    state.chassis.position.x - start.x, overPeak / (2.0 * ticks), trueSlip / (2.0 * ticks),
+                    estimatedSlip / (2.0 * ticks), pastBandTicks > 0.0 ? 100.0 * armed / pastBandTicks : 0.0,
+                    lateralForce / (2.0 * ticks), rateError / ticks, 100.0 * dumpTicks / (2.0 * ticks));
+    }
+
+    std::printf("\n  over-pk: mean front |slip| over the tyre's own peak slip (1.0 = at the peak).\n");
+    std::printf("  armed%%: of the ticks a front wheel's TRUE slip was past the 0.20 band, how many the\n");
+    std::printf("  ECU's belief ALSO read past it with a valid reference — the slip-aware guards' duty.\n");
+    std::printf("  refAccEr: mean (referenceAcceleration - true acceleration), m/s^2; both are negative\n");
+    std::printf("  under braking, so a negative error is the ECU believing a HARDER stop than the truth.\n");
+    std::printf("  lat N: mean front |lateral| per wheel.\n");
+}
+
+TEST_CASE("the front-left channel's cycle, tick by tick, washed against steering", "[.washout-trace]")
+{
+    // The washout probe's aggregate says the two modes differ in how the front channels CYCLE —
+    // washed members settle near 0.41 mean front slip with the fewest dumps — and this prints the
+    // cycle itself for the adjacent pair that lands on opposite sides: k=+1 washes (peak yaw
+    // 0.1255), k=+2 steers (0.2390), 0.1% of entry speed apart. One row per 100 ms: the front-left
+    // wheel's true slip, the ECU's belief, the channel's phase, its pressure as a fraction of the
+    // request, and the wheel's lateral force.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(0.35, 0.35));
+    REQUIRE(world.has_value());
+
+    const auto steering = 0.35;
+    const auto phaseName = [](const ModulatorPhase phase)
+    {
+        switch (phase)
+        {
+        case ModulatorPhase::Passive:
+            return "Passive";
+        case ModulatorPhase::Hold:
+            return "Hold";
+        case ModulatorPhase::Dump:
+            return "Dump";
+        case ModulatorPhase::Recover:
+            return "Recover";
+        case ModulatorPhase::Reapply:
+            return "Reapply";
+        }
+
+        return "?";
+    };
+
+    for (const auto k : {1, 2})
+    {
+        const auto entry = hundred * (1.0 + 0.001 * static_cast<double>(k));
+        const auto assists = withAntilock(setup.value());
+
+        auto state = VehicleState{};
+        settle(setup.value(), state, world.value(), entry);
+
+        auto assistState = AssistState{};
+        auto lastStep = VehicleStep{};
+
+        const auto sense = [&]
+        {
+            auto sensors = AssistSensors{};
+            for (auto index = std::size_t{0}; index < cornerCount; index++)
+            {
+                sensors.wheelSpeeds[index] = state.corners[index].wheelSpeed;
+            }
+            sensors.yawRate = lastStep.telemetry.yawRate;
+            sensors.lateralAcceleration = lastStep.telemetry.acceleration.x;
+            sensors.steeringWheelAngle = lastStep.telemetry.steeringWheelAngle;
+
+            return sensors;
+        };
+
+        for (auto step = 0; step < 180; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {}, noBrakePressure, tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+        }
+
+        auto input = VehicleInput{};
+        input.brake = 1.0;
+        input.steering = steering;
+
+        std::printf("\n=== k=%+d (%s) — front-left, one row per 100 ms ===\n", k, k == 1 ? "WASHES" : "STEERS");
+        std::printf("%6s %8s %8s %9s %8s %8s %7s\n", "t s", "slip", "estSlip", "phase", "press", "lat N", "cycles");
+
+        auto window = 0;
+        auto cycleTotal = std::uint32_t{0};
+
+        for (auto step = 0; step < 360 * 10; step++)
+        {
+            const auto command = updateAssists(assists, assistState, sense(), {.brake = 1.0, .throttle = 0.0},
+                                               brakeCircuitPressures(setup.value(), 1.0), tick);
+            const auto stepped =
+                stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick, command.brakes);
+            REQUIRE(stepped.has_value());
+            lastStep = stepped.value();
+
+            cycleTotal = command.channels.antilockCycles[0];
+
+            if (++window == 36)
+            {
+                window = 0;
+
+                const auto request = brakeCircuitPressures(setup.value(), 1.0)[0];
+
+                std::printf("%6.1f %8.3f %8.3f %9s %8.2f %8.0f %7u\n", static_cast<double>(step + 1) * tick,
+                            std::abs(lastStep.corners[0].contact.slip.slipRatio), command.channels.estimatedSlip[0],
+                            phaseName(command.channels.antilockPhase[0]),
+                            request > 0.0 ? command.channels.pressure[0] / request : 0.0,
+                            std::abs(lastStep.corners[0].contact.tyre.lateral), cycleTotal);
+            }
+
+            if (state.chassis.linearVelocity.z <= 5.0)
+            {
+                break;
+            }
+        }
+    }
+}
+
+TEST_CASE("the dry stop's tail with the recovery law on, tick by tick", "[.dry-tail]")
+{
+    // Where the Reapply stuck-exit's dry cost lives: `./EngineTests "[.dry-tail]"`. The recovery
+    // law's A/B case shows every above-5 m/s utilisation IMPROVED by the branch and the law-on
+    // stop 0.27 m LONGER than law-off, so the loss is in the tail. One row per 25 ms below
+    // 12 m/s: both left wheels' true and estimated slip, phase, pressure fraction and cycles.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0, 1.0));
+    REQUIRE(world.has_value());
+
+    const auto assists = withAntilock(setup.value());
+
+    auto state = VehicleState{};
+    settle(setup.value(), state, world.value(), hundred);
+
+    auto assistState = AssistState{};
+    auto lastStep = VehicleStep{};
+
+    const auto sense = [&]
+    {
+        auto sensors = AssistSensors{};
+        for (auto index = std::size_t{0}; index < cornerCount; index++)
+        {
+            sensors.wheelSpeeds[index] = state.corners[index].wheelSpeed;
+        }
+        sensors.yawRate = lastStep.telemetry.yawRate;
+        sensors.lateralAcceleration = lastStep.telemetry.acceleration.x;
+
+        return sensors;
+    };
+
+    for (auto step = 0; step < 180; step++)
+    {
+        const auto command = updateAssists(assists, assistState, sense(), {}, noBrakePressure, tick);
+        const auto stepped =
+            stepVehicle(setup.value(), state, VehicleInput{}, noDriveTorque, world.value(), tick, command.brakes);
+        REQUIRE(stepped.has_value());
+        lastStep = stepped.value();
+    }
+
+    auto input = VehicleInput{};
+    input.brake = 1.0;
+
+    const auto phaseLetter = [](const ModulatorPhase phase)
+    {
+        switch (phase)
+        {
+        case ModulatorPhase::Passive:
+            return 'P';
+        case ModulatorPhase::Hold:
+            return 'H';
+        case ModulatorPhase::Dump:
+            return 'D';
+        case ModulatorPhase::Recover:
+            return 'C';
+        case ModulatorPhase::Reapply:
+            return 'R';
+        }
+
+        return '?';
+    };
+
+    std::printf("\n=== dry, law on, below 12 m/s — FL and RL: slip / estSlip / phase / press ===\n");
+    std::printf("%6s %6s | %6s %6s %2s %5s %4s | %6s %6s %2s %5s %4s\n", "t s", "v m/s", "slipF", "estF", "ph", "prF",
+                "cycF", "slipR", "estR", "ph", "prR", "cycR");
+
+    auto window = 0;
+
+    for (auto step = 0; step < 360 * 30; step++)
+    {
+        const auto command = updateAssists(assists, assistState, sense(), {.brake = 1.0, .throttle = 0.0},
+                                           brakeCircuitPressures(setup.value(), 1.0), tick);
+        const auto stepped =
+            stepVehicle(setup.value(), state, input, noDriveTorque, world.value(), tick, command.brakes);
+        REQUIRE(stepped.has_value());
+        lastStep = stepped.value();
+
+        const auto speed = state.chassis.linearVelocity.z;
+
+        if (speed < 12.0 && ++window == 9)
+        {
+            window = 0;
+
+            const auto request = brakeCircuitPressures(setup.value(), 1.0);
+
+            std::printf(
+                "%6.2f %6.2f | %6.3f %6.3f %2c %5.2f %4u | %6.3f %6.3f %2c %5.2f %4u\n",
+                static_cast<double>(step + 1) * tick, speed, std::abs(lastStep.corners[0].contact.slip.slipRatio),
+                command.channels.estimatedSlip[0], phaseLetter(command.channels.antilockPhase[0]),
+                request[0] > 0.0 ? command.channels.pressure[0] / request[0] : 0.0, command.channels.antilockCycles[0],
+                std::abs(lastStep.corners[2].contact.slip.slipRatio), command.channels.estimatedSlip[2],
+                phaseLetter(command.channels.antilockPhase[2]),
+                request[2] > 0.0 ? command.channels.pressure[2] / request[2] : 0.0, command.channels.antilockCycles[2]);
+        }
+
+        if (speed <= 0.0)
+        {
+            break;
+        }
+    }
+}
+
+TEST_CASE("what the steering-criteria ensemble distributions look like", "[.abs-ensemble]")
+{
+    // The distributions behind criterion 5's two cases: `./EngineTests "[.abs-ensemble]"`.
+    //
+    // **This is a diagnostic and not a calibration target.** Both steering criteria compare one
+    // assisted stop against one locked stop, and both trajectories are chaotic: eight documented
+    // flips on fraction-of-a-per-cent plant changes (`docs/known-red.md`), every one a re-roll of
+    // one arm or the other and never a change in the mechanism under test. This table is what
+    // either arm's single number is a sample OF — fifteen stops per arm across a ±0.7% entry-speed
+    // band, which is smaller than the fixture's own settling tolerance. Read it before trusting
+    // any single-roll verdict on `:746` or `:795`, and before choosing an ensemble statistic.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(0.35, 0.35));
+    REQUIRE(world.has_value());
+
+    const auto steering = 0.35;
+
+    std::printf("\n=== criterion 5's two arms, fifteen entry speeds each, mu 0.35, full pedal, 0.35 lock ===\n");
+    std::printf("\n%-9s %9s | %12s %14s %10s %9s %9s\n", "arm", "entry m/s", "peakYawRate", "lateralTravel", "finalYaw",
+                "distance", "meanSlip");
+    std::printf("%s\n", "---------------------------------------------------------------------------------");
+
+    for (const auto assisted : {false, true})
+    {
+        const auto runs = steeringEnsemble(setup.value(), world.value(), assisted, steering);
+
+        for (auto member = std::size_t{0}; member < runs.size(); member++)
+        {
+            const auto& run = runs[member];
+            const auto entry = hundred * (1.0 + 0.001 * (static_cast<double>(member) - 7.0));
+
+            REQUIRE(run.stopped);
+
+            std::printf("%-9s %9.3f | %12.5f %14.3f %10.3f %9.2f %9.3f\n", assisted ? "assisted" : "locked", entry,
+                        run.peakYawRate, run.lateralTravel, run.finalYaw * degrees, run.distance, run.meanTrueSlip);
+        }
+
+        std::printf("%-9s %9s | %12.5f %14.3f  (medians; travel as magnitude)\n", assisted ? "assisted" : "locked",
+                    "median", medianOf(runs, [](const StopResult& run) { return run.peakYawRate; }),
+                    medianOf(runs, [](const StopResult& run) { return std::abs(run.lateralTravel); }));
+    }
 }

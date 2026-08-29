@@ -49,12 +49,18 @@ namespace raceengine
     return false;
 }
 
-[[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, AntilockChannelState& state,
-                                            const WheelSpeedReading& wheel, const double wheelRoadSpeed,
-                                            const double referenceSpeed, const double referenceAcceleration,
-                                            const bool referenceValid, const double requestedPressure,
-                                            const double deltaTime)
+[[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, const BrakeChannel channel,
+                                            AntilockChannelState& state, const WheelSpeedReading& wheel,
+                                            const double wheelRoadSpeed, const double referenceSpeed,
+                                            const double referenceAcceleration, const bool referenceValid,
+                                            const double requestedPressure, const double deltaTime)
 {
+    // The rear outlet is the same valve; the rear INLET is pulsed on its own duty factor in
+    // production (the Bosch source at `BrakeModulator::rearReapplyGradient`), and the average of
+    // that pulsing is this selection.
+    const auto reapplyGradient =
+        channel == BrakeChannel::Rear ? setup.modulator.rearReapplyGradient : setup.modulator.reapplyGradient;
+
     // --- what the sensor has told the controller since it last looked -------------------------
     //
     // Updated on the pulse and not on the clock. Between pulses the controller genuinely has no new
@@ -113,12 +119,28 @@ namespace raceengine
     const auto losing = state.acceleration < setup.lockDeceleration;
     const auto surging = excess > setup.recoverySurge;
 
+    // **The slip the slip-aware law reads is computed against a staleness-projected wheel, and
+    // only the law's** (2026-08-29, the co-design's first estimator-side step — the "honest fix"
+    // the 2026-08-24 entry named, applied to the guards alone). The sensed wheel speed is bounded
+    // above by the tooth pitch over the reading's age, which at walking pace understates a rolling
+    // wheel by whole tenths of slip — the recorded phantom-dump mechanism. The projection is the
+    // ECU's own dead reckoning: the wheel, had it merely followed the car since its last tooth,
+    // would be at `lastSpeed + referenceAcceleration · sinceUpdate`; the guard reads whichever of
+    // the two stories says the wheel is FASTER, so a genuinely departing or locked wheel (whose
+    // projection falls with the car while its pulses stop) keeps its high slip, and a rolling
+    // wheel between sparse teeth stops being read as half locked. With fresh pulses the projection
+    // equals the held reading and the guard slip IS the sensed slip, so nothing changes at speed.
+    // The pre-law transitions — Hold's dump confirm, Recover's re-departure — keep the raw sensed
+    // slip: they are the blessed pre-law loop and stay to the bit.
+    const auto projectedWheel = std::max(wheelRoadSpeed, state.lastSpeed + referenceAcceleration * state.sinceUpdate);
+    const auto guardSlip = referenceValid ? estimatedSlip(referenceSpeed, projectedWheel) : 0.0;
+
     // The one judgement the slip-aware recovery law adds, and it is a statement about the ECU's own
     // belief rather than about the tyre: the estimated slip is past the calibrated band. Everything
     // it gates degrades to the previous law when the reference is invalid — and, just as
     // deliberately, when the estimator under-reads, which is what it does in exactly the case the
     // acceleration-only loop exists to survive.
-    const auto pastBand = setup.slipAwareRecovery && referenceValid && slip > setup.slipEnter;
+    const auto pastBand = setup.slipAwareRecovery && referenceValid && guardSlip > setup.slipEnter;
 
     switch (state.phase)
     {
@@ -279,16 +301,49 @@ namespace raceengine
         // is re-pinning, and it is the one thing the whole law exists to stop.
         const auto proximity =
             setup.slipAwareRecovery && referenceValid
-                ? std::clamp((setup.slipEnter - slip) / std::max(setup.slipEnter - setup.slipExit, 1e-9), 0.0, 1.0)
+                ? std::clamp((setup.slipEnter - guardSlip) / std::max(setup.slipEnter - setup.slipExit, 1e-9), 0.0, 1.0)
                 : 1.0;
         const auto fast = state.pressure < state.departurePressure && !pastBand;
 
-        state.pressure =
-            std::min(request, state.pressure + setup.modulator.reapplyGradient * (fast ? 1.0 : proximity) * deltaTime);
+        state.pressure = std::min(request, state.pressure + reapplyGradient * (fast ? 1.0 : proximity) * deltaTime);
 
         if (losing)
         {
             state.phase = ModulatorPhase::Hold;
+        }
+        else if (pastBand && excess < -setup.recoveryAcceleration && guardSlip > 2.0 * setup.slipEnter - setup.slipExit)
+        {
+            // **Stuck in Reapply is a trap without this branch, and it was found locking a front
+            // wheel for five seconds** (2026-08-29, the `[.washout-trace]` probe, on the steering
+            // pair's own mu 0.35 fixture). Past the band the proximity taper is exactly zero, so
+            // this phase holds a constant pressure — a de facto Hold with no exit watch. A wheel
+            // that departs SLOWLY under that held pressure never fires `losing` (the excess
+            // deceleration stays under the lock threshold on low grip), walks from the band's edge
+            // to a full lock over two seconds, and the lock then silences its tone ring — no
+            // pulses, so the channel's own acceleration reading freezes and `losing` can never
+            // fire again. The ECU watched an estimated slip of 0.998 with a valid reference for
+            // 5.5 s and had no transition to take. This is the Recover phase's stuck branch with
+            // two more gates, both drawn from what the build measured and neither a new constant.
+            // **A full band-width past the band** (2·slipEnter − slipExit): at the band itself —
+            // where the Recover branch fires — a re-applying channel is often riding the
+            // productive band-edge excursions of a lightly loaded wheel on the shallow far side of
+            // its curve, and the first cut of this branch, without the gate, was measured dumping
+            // those on the dry rear: law-on utilisation 0.767 → 0.738 and the stop +1.15 m against
+            // the law-off arm. A wheel a band-width past the band is not excursioning, it is
+            // leaving. **And the wheel must be falling away from the car by more than the
+            // calibrated recovery margin** (excess < −recoveryAcceleration — the same half-g every
+            // relative trigger in this file keeps above the tone ring's noise floor, used
+            // symmetrically): a bare sign test (excess < 0) sat AT that noise floor and collected
+            // 6.5 mm of jitter-fired dumps in the dry tail, which was enough to fail the law's own
+            // distance gate. The margin leaves a residual mode — a member of the steering
+            // ensemble can still ride ~0.4 slip with late rescues — but a LOCK cannot persist:
+            // a locked wheel's frozen pulse-derived acceleration reads deeply negative and keeps
+            // this branch firing. With the law off or the reference invalid `pastBand` is false
+            // and this branch does not exist, which preserves the estimator-collapse degradation
+            // to the bit.
+            state.phase = ModulatorPhase::Dump;
+            state.cycles++;
+            state.departurePressure = state.pressure;
         }
         else if (state.pressure >= request)
         {

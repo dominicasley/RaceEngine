@@ -92,11 +92,28 @@ export enum class ModulatorPhase : std::uint32_t { Passive, Hold, Dump, Recover,
 // wheel's own re-acceleration produce, and `AntilockBrakingTests` measures it.
 export struct BrakeModulator
 {
-    // 1000 bar/s.
+    // 1000 bar/s. Corroborated after the fact by a bench measurement of a passenger-car HCU:
+    // decompression gradients of −90.5 to −94.8 MPa/s at master pressures of 8-15 MPa (Chang'an
+    // University ABS test bench, J. Traffic & Transportation Eng. 2011-05).
     double dumpGradient = 1.0e8;
     // 300 bar/s. Real units pulse the inlet valve to get this; the average is what matters to the
     // wheel and the average is what is modelled.
     double reapplyGradient = 3.0e7;
+    // The rear channel's own re-apply average, Pa/s — **the rear axle IS metered separately in
+    // production, and that is sourced**: Robert Bosch GmbH, US patent 5,284,385 (filed 1990),
+    // reduces the rear build rate against the front's by lengthening the build train's holding
+    // phases (the duty factor of exactly the pulsing the front figure above averages), halving the
+    // first pressure pulse, or holding outright — because dynamic axle-load transfer relieves the
+    // rear axle, a rear build-up decoupled from the deceleration "leads inevitably to vehicle
+    // instability", and the reduced rate "avoid[s] high control frequency at the rear axle".
+    //
+    // **No measured rear figure exists anywhere reachable** — the patent's own example is "e.g. to
+    // halve it", which is an example and not a measurement, so the default is the front's value and
+    // the mechanism ships bit-inert. A number here below the front's is a statement of Bosch's
+    // mechanism at example grade; the pin in `AntilockBrakingTests` names that grade and flips the
+    // day one is stated. (Burckhardt, *Radschlupf-Regelsysteme*, printed book only, is the one
+    // place a real table may exist — on the human-fetch list.)
+    double rearReapplyGradient = 3.0e7;
 };
 
 export struct AntilockSetup
@@ -260,10 +277,13 @@ export [[nodiscard]] bool antilockDrivesWheel(const BrakeChannel channel, const 
 // `referenceAcceleration` is `ReferenceSpeedState::rate`: how fast the ECU believes the *car* is
 // changing speed. Every threshold above is measured against it, so this controller carries the
 // estimator's errors as well as its own — which is correct, and is where the character comes from.
-export [[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, AntilockChannelState& state,
-                                                   const WheelSpeedReading& wheel, const double wheelRoadSpeed,
-                                                   const double referenceSpeed, const double referenceAcceleration,
-                                                   const bool referenceValid, const double requestedPressure,
-                                                   const double deltaTime);
+//
+// `channel` is which of the modulator's three channels this is, and it exists because the rear one
+// is metered separately (`BrakeModulator::rearReapplyGradient` and its source above).
+export [[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, const BrakeChannel channel,
+                                                   AntilockChannelState& state, const WheelSpeedReading& wheel,
+                                                   const double wheelRoadSpeed, const double referenceSpeed,
+                                                   const double referenceAcceleration, const bool referenceValid,
+                                                   const double requestedPressure, const double deltaTime);
 
 } // namespace raceengine

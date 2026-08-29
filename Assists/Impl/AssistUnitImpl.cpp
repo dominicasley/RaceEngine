@@ -134,7 +134,7 @@ namespace
             const auto wheelSpeed = std::abs(sensedRoadSpeed(setup.reference, readings[controlWheel]));
 
             const auto pressure = advanceAntilockChannel(
-                setup.antilock, state.antilock.channels[index], readings[controlWheel], wheelSpeed,
+                setup.antilock, channel, state.antilock.channels[index], readings[controlWheel], wheelSpeed,
                 state.reference.speed, state.reference.rate, state.reference.valid, channelRequest, period);
 
             for (auto wheel = std::size_t{0}; wheel < wheelCount; wheel++)
