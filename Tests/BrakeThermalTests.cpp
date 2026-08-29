@@ -349,6 +349,14 @@ TEST_CASE("the thermal brake is inert with its switch off and inert while the pa
     auto on = golf();
     on.brakeThermal = true;
 
+    // Pressure held off on BOTH cars since 2026-08-29, when the Golf began shipping it on: the disc
+    // heats the wheel and the wheel heats the cavity air, so with the gas live the brake switch
+    // reaches the car through a vertical rate that is a computed ratio rather than a flat 1.0 — a
+    // real coupling, not a leak. This case isolates the brake-thermal plumbing alone; the pressure
+    // model's own inertness proof lives in TyrePressureTests.
+    off.tyrePressure = false;
+    on.tyrePressure = false;
+
     const auto weather = AmbientConditions{.airTemperature = 20.0, .trackTemperature = 30.0};
 
     const auto stop = [&](const VehicleSetup& setup)

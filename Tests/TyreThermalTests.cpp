@@ -931,6 +931,14 @@ TEST_CASE("the thermal tyre is inert with its switch off and inert on its own pl
     auto on = built.value();
     on.tyreThermal = true;
 
+    // Pressure held off on BOTH cars since 2026-08-29, when the Golf began shipping it on: with the
+    // gas live the tread's temperature feeds the cavity air and the air feeds the vertical rate, so
+    // the thermal switch genuinely moves the car even on the grip plateau — a real coupling, not a
+    // leak. This case isolates the tyre-thermal plumbing alone; the pressure model's own inertness
+    // proof lives in TyrePressureTests.
+    off.tyrePressure = false;
+    on.tyrePressure = false;
+
     const auto weather = AmbientConditions{.airTemperature = 15.0, .trackTemperature = 20.0};
 
     const auto roll = [&](const VehicleSetup& setup, const AmbientConditions& ambient)

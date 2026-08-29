@@ -639,6 +639,24 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     setup.tyreThermal = true;
     setup.brakeThermal = true;
 
+    // **And the air inside them carries a temperature and a pressure, since 2026-08-29, on Dominic's
+    // instruction: *"put it on. just because i cant feel something doesn't mean its bad."***
+    //
+    // He drove it that morning and answered the specific balance question with "no difference" —
+    // and the switch stands on the trace rather than on the seat, because the trace proves the model
+    // live where the seat cannot resolve it: `traces/rack-exit-20260829-stack-seat.csv` shows the
+    // front gas 31.5 → 53 °C over the stint and a 2.3 psi front-to-rear split that nothing states
+    // anywhere in this model — it is the brake balance arriving in the air. A real term does not
+    // need to be feelable to be right.
+    //
+    // What it adds: the gas law on the cavity air, the carcass's vertical rate linear in gauge
+    // pressure, rolling resistance on a bounded power of it, and a grip factor that is *literally*
+    // 1.0 at every pressure because both Magic Formula coefficients are 0.0 (stage 2b, closed
+    // without a number). **Every performance figure in docs/ older than this date was measured with
+    // this off** — a tyre permanently at its ideal pressure. `OSR_TYRE_PRESSURE=off` is the control
+    // and the way back, re-stamped on every setup-sheet reload. docs/tyre-state-brief.md, section 7.
+    setup.tyrePressure = true;
+
     // car.ini CONTROLS: the steering wheel's lock in degrees each way, and the ratio between it and
     // the road wheel. The travel that produces that angle is solved off the linkage below.
     //
