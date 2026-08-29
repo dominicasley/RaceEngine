@@ -564,6 +564,14 @@ export struct WheelTrace
     // driver sets by hand and reads off a gauge.
     double gasTemperature = 0.0;
     double tyrePressurePsi = 0.0;
+
+    // The bushes' fore-aft deflection of this wheel, metres, positive forward — longitudinal
+    // recession, joined 2026-08-29 with the mechanism itself rather than after a lap could not
+    // show it. It is the ONLY channel the recession coefficient moves at all: camber compliance
+    // shows in a camber column and pressure in its own pair, and a sheet stating `front.recession`
+    // would otherwise write a trace indistinguishable from one without it — the exact defect the
+    // gas pair above records. Exactly 0.0 on a car stating no coefficient.
+    double recession = 0.0;
 };
 
 export struct VehicleTrace
@@ -776,6 +784,7 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",Tyre Pressure" + corner + " [psi]";
         text += ",Disc Temp" + corner + " [C]";
         text += ",Wheel Temp" + corner + " [C]";
+        text += ",Recession" + corner + " [mm]";
     }
 
     text += "\n";
@@ -905,6 +914,8 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             appendRackNumber(text, wheel.discTemperature, 2);
             text += ",";
             appendRackNumber(text, wheel.wheelTemperature, 2);
+            text += ",";
+            appendRackNumber(text, wheel.recession * 1000.0, 3);
         }
 
         text += "\n";

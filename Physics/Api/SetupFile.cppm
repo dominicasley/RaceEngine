@@ -74,6 +74,16 @@ export struct AxleTune
     // every production car measured does; `compliancecamber 0` is the A/B against the car's own
     // stated figure.
     std::optional<double> complianceCamber;
+
+    // Longitudinal recession, **millimetres per kilonewton** of longitudinal force at the patch —
+    // the unit the front axle's design band is quoted in (Heissing/Ersoy Table 1-6: front
+    // 4–8 mm/kN of braking force). Positive means the wheel complies with the force: rearward
+    // under braking. **No car states one — the band is a design target, not a measurement** — so
+    // this key IS the A/B, not the way back from one. The rear's published band is 8–16 mm PER G
+    // of deceleration, a different unit; any value stated here must be converted through the car's
+    // own rear brake share first — the worked conversion for the Golf is beside its compliance
+    // figures in `PublishedCarsImpl.cpp`.
+    std::optional<double> recession;
 };
 
 export struct DifferentialTune

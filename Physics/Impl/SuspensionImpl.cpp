@@ -402,6 +402,23 @@ void applyComplianceCamber(const CornerHardpoints& hardpoints, SuspensionState& 
     readOffWheel(hardpoints, state);
 }
 
+void applyComplianceRecession(const CornerHardpoints& hardpoints, SuspensionState& state, const double displacement)
+{
+    // Along the chassis's own forward axis, which is what a K&C rig's longitudinal compliance
+    // channel is measured along (wheel-centre fore-aft displacement against a braking force applied
+    // at the contact patch). The hub moves here — the one compliance channel that is a translation
+    // rather than a twist — and the caller passes `longitudinalForceRecession x (tyre longitudinal
+    // force resolved into the body's +z)`, so with a positive coefficient the wheel complies *with*
+    // the force: rearward under braking, forward under traction.
+    //
+    // `readOffWheel` rebuilds the constructed patch from the moved centre, so the patch recedes
+    // with the hub; the orientation is untouched, so camber and toe re-read to the same bits and
+    // the half track does not move.
+    state.wheelCentre.z += displacement;
+
+    readOffWheel(hardpoints, state);
+}
+
 void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionState& state)
 {
     // The front view collapses z, so each wishbone becomes the line from where its pivot axis

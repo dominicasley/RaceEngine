@@ -697,6 +697,15 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
                                   state.corners[index].complianceCamber);
         }
 
+        // And the fore-aft deflection they are holding — the translation third of the same bush,
+        // branched the same way for the same inertness. Applied after the two rotations; a
+        // translation commutes with both, so the order is a convention rather than a choice.
+        if (corner.longitudinalForceRecession != 0.0)
+        {
+            applyComplianceRecession(corner.hardpoints, result.corners[index].suspension,
+                                     state.corners[index].complianceRecession);
+        }
+
         // The wheel, in the world. The suspension solved it in chassis coordinates; the chassis
         // says where those are.
         const auto& suspension = result.corners[index].suspension;
@@ -997,6 +1006,21 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
             {
                 state.corners[index].complianceCamber = corner.lateralForceCamber * sideways;
             }
+        }
+
+        // The recession the same bushes will be holding, from the longitudinal force resolved into
+        // the **body's** own forward axis for the same banked-road reason the lateral one is. A
+        // wheel in the air relaxes to nothing here too. Through `recessionDisplacement` rather
+        // than a bare product, so a kerb strike's one-tick force spike saturates at the map's
+        // stated travel instead of teleporting the hub.
+        if (corner.longitudinalForceRecession != 0.0)
+        {
+            const auto fore = glm::dot(glm::inverse(state.chassis.orientation) *
+                                           (solution.contact.tyre.longitudinal * solution.contact.forward),
+                                       glm::dvec3(0.0, 0.0, 1.0));
+
+            state.corners[index].complianceRecession =
+                recessionDisplacement(corner.longitudinalForceRecession, fore);
         }
 
         // --- generalised force on the corner's one degree of freedom ---
@@ -1598,6 +1622,13 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         frame.wheels[index].damperVelocity = solution.damperVelocity;
         frame.wheels[index].angularVelocity = state.corners[index].wheelSpeed;
         frame.wheels[index].camber = solution.suspension.camber;
+
+        // The state as this tick leaves it — the deflection the next solve will be handed, one
+        // tick ahead of what this frame's geometry carried, which at 360 Hz is a distinction a
+        // trace cannot resolve. It reads exactly 0.0 on a car stating no coefficient — which is
+        // the trace's way of answering "was it on", the question the pressure channels existed to
+        // answer and were added too late for.
+        frame.wheels[index].complianceRecession = state.corners[index].complianceRecession;
         frame.wheels[index].gripMultiplier = solution.patch.gripMultiplier;
         frame.wheels[index].inContact = solution.patch.inContact;
         frame.wheels[index].contactingSamples = solution.patch.contactingSamples;

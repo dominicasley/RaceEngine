@@ -529,8 +529,9 @@ struct Launch
     return setup;
 }
 
-// And with a stated road-conducting fraction of the patch. One is the gross patch and is what the
-// shipped tyre states; 0.72 is `1 - voidFraction` and is what this tread's grooves leave touching.
+// And with a stated road-conducting fraction of the patch. 0.72 is `1 - voidFraction`, what this
+// tread's grooves leave touching, and is what the shipped tyre states since 2026-08-29; one is the
+// gross patch and is the control.
 [[nodiscard]] VehicleSetup golfWithArea(const double fraction)
 {
     auto setup = golfWith(true, -1.0);
@@ -952,8 +953,8 @@ TEST_CASE("what the groove's share of the patch is worth on the road path", "[.t
 
         std::printf("\n  Rolling at 100 km/h, residence %.4f s, gross patch %.4f m2.\n\n", residence, patchArea);
         std::printf("    area fraction                        road path      of gross\n");
-        std::printf("    1.00 gross (shipped)                 %7.2f W/K      100.0%%\n", perfect * patchArea);
-        std::printf("    %.2f rubber only                     %7.2f W/K      %5.1f%%\n", grooved,
+        std::printf("    1.00 gross (the control)             %7.2f W/K      100.0%%\n", perfect * patchArea);
+        std::printf("    %.2f rubber only (shipped)           %7.2f W/K      %5.1f%%\n", grooved,
                     perfect * patchArea * grooved, 100.0 * grooved);
         std::printf("    and stacked with the interface's %.0f W/(m2.K):\n", interface_);
         std::printf("    1.00 with the interface              %7.2f W/K      %5.1f%%\n", series * patchArea,

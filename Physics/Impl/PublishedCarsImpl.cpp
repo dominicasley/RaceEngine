@@ -812,6 +812,24 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto lateralForceCamber =
         std::array{0.17 * 0.017453292519943295 / 1000.0, 0.17 * 0.017453292519943295 / 1000.0, 0.0, 0.0};
 
+    // **Longitudinal recession is deliberately NOT stated on any axle**, and this comment is the
+    // record of why, so nobody reads the 0.0 as an oversight. The mechanism exists
+    // (`CornerSetup::longitudinalForceRecession`, `front./rear.recession` on the sheet, mm/kN) and
+    // the only published figures for it are **design targets, not measurements**: Heissing & Ersoy,
+    // *Chassis Handbook* (2011), Table 1-6 — front **4–8 mm/kN of braking force**, rear **8–16 mm
+    // per g of deceleration** (the table's own footnote; a different unit). The compliance steer
+    // and camber above are stated because a K&C rig measured four production cars; a target is what
+    // a manufacturer aims at, and stating one as if it were a reading is the line this project held
+    // when it left the camber's rear at zero against exactly this table.
+    //
+    // The A/B for the seat, worked out here so the sheet key is one line: **`front.recession 6`**
+    // (the band's middle) and **`rear.recession 10`** — the rear's per-g band referred through this
+    // car's own rear brake share at a hard pedal, where the band's context lives: 1452 kg × g is
+    // 14.24 kN per g, the EBD bias at a full pedal is 0.834, so a rear wheel carries ~1.18 kN per g
+    // and 8–16 mm/g is 6.8–13.5 mm/kN, middle ≈ 10. Below the valve's knee (bias 0.686) the same
+    // band converts to 3.6–7.2 mm/kN — the conversion is pedal-dependent and that is one more
+    // reason the number is a suggestion on a sheet rather than a statement on the car.
+
     // The brakes, and **`brakes.ini` no longer appears in this line at all** (2026-08-23). Neither
     // `MAX_TORQUE` nor `FRONT_SHARE` is read: the peak is `peakBrakeTorque` on the hardware above and
     // the split is whatever the two calipers make of one line pressure. Sources per part and the two
@@ -1058,6 +1076,17 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         // moved no golden. `OSR_TYRE_CONTACT=perfect` is the control and the way back.
         // `docs/tyre-state-brief.md`.
         corner.tyre.thermal.roadContactConductance = 25200.0;
+
+        // **And the road path conducts through the rubber that touches, not through the grooves**:
+        // 28% of this tread's patch is groove (the same bounded void fraction the tread's mass is
+        // derived from), and still air across a 7.5 mm groove carries a thousandth of the rubber's
+        // path — a groove is a hole, not a second path. Stated 2026-08-29, after shipping bit-inert
+        // at the gross patch for a day; the fraction multiplies AFTER the series composition with
+        // the contact conductance above, because Miller's tyre was smooth-tread and the two terms
+        // do not overlap. Together they take the 100 km/h road path to 163.3 W/K, 57.6% of gross —
+        // worth under three degrees of core on the hardest fixture, inside the plateau either way.
+        // `OSR_TYRE_ROAD_AREA=1.0` is the control and the way back.
+        corner.tyre.thermal.roadAreaFraction = 0.72;
 
         // **The tyre's exterior radiates, and the figure is tyre thermography's own, stated twice at
         // the same value.** "The emissivity (ε) was set to 0.95, which is the standard characteristic

@@ -226,6 +226,34 @@ TEST_CASE("compliance camber rides the sheet in the unit the rig reports", "[phy
     REQUIRE(car.corners[0].lateralForceSteer == before.corners[0].lateralForceSteer);
 }
 
+TEST_CASE("recession rides the sheet in the unit the design band is quoted in", "[physics][setup]")
+{
+    // `recession` is millimetres per kilonewton on the sheet — the unit Heissing/Ersoy's front
+    // band is quoted in — and metres per newton on the car. No car states one, so this key is the
+    // A/B itself rather than the way back from a stated figure: `front.recession 6` with
+    // `rear.recession 10` is the suggested pairing, worked out beside the Golf's compliance
+    // figures in `PublishedCarsImpl.cpp`.
+    const auto built = placeholderSedan();
+    REQUIRE(built.has_value());
+
+    auto car = built.value();
+    const auto before = built.value();
+
+    const auto tune = parseVehicleTune("front.recession 6\nrear.recession 10\n");
+    REQUIRE(tune.has_value());
+
+    applyVehicleTune(tune.value(), car);
+
+    REQUIRE(car.corners[0].longitudinalForceRecession == 6.0 * 1.0e-3 / 1000.0);
+    REQUIRE(car.corners[1].longitudinalForceRecession == 6.0 * 1.0e-3 / 1000.0);
+    REQUIRE(car.corners[2].longitudinalForceRecession == 10.0 * 1.0e-3 / 1000.0);
+    REQUIRE(car.corners[3].longitudinalForceRecession == 10.0 * 1.0e-3 / 1000.0);
+
+    // The two rotation coefficients beside it are untouched — three channels, three keys.
+    REQUIRE(car.corners[0].lateralForceSteer == before.corners[0].lateralForceSteer);
+    REQUIRE(car.corners[0].lateralForceCamber == before.corners[0].lateralForceCamber);
+}
+
 TEST_CASE("a damper stated on one side keeps what the other side already was", "[physics][setup]")
 {
     const auto built = placeholderSedan();

@@ -19,6 +19,7 @@
 import raceengine.physics;
 
 using raceengine::applyComplianceCamber;
+using raceengine::applyComplianceRecession;
 using raceengine::cornerCount;
 using raceengine::CornerHardpoints;
 using raceengine::CornerSetup;
@@ -611,4 +612,93 @@ TEST_CASE("which axle states compliance camber and what it states", "[physics][s
     REQUIRE(built->corners[1].lateralForceCamber == camberPerNewton);
     REQUIRE(built->corners[2].lateralForceCamber == 0.0);
     REQUIRE(built->corners[3].lateralForceCamber == 0.0);
+}
+
+// --- item 1's translation third: longitudinal recession -----------------------------------------
+
+TEST_CASE("a recession of nothing leaves the solved corner untouched to the bit",
+          "[physics][suspension][compliance]")
+{
+    // The vehicle step branches on the coefficient, so a car stating none never calls this at all —
+    // and even called with a zero displacement, adding 0.0 to a real coordinate and re-reading the
+    // unmoved centre reproduces the same bits.
+    const auto hardpoints = golfMk7FrontCorner(CornerSide::Left);
+    const auto untouched = solvedAt(hardpoints, 0.01);
+
+    auto receded = untouched;
+    applyComplianceRecession(hardpoints, receded, 0.0);
+
+    REQUIRE(receded.wheelCentre == untouched.wheelCentre);
+    REQUIRE(receded.contactPatch == untouched.contactPatch);
+    REQUIRE(receded.camber == untouched.camber);
+    REQUIRE(receded.toe == untouched.toe);
+    REQUIRE(receded.halfTrack == untouched.halfTrack);
+}
+
+TEST_CASE("a stated recession produces the derived displacement at a known force",
+          "[physics][suspension][compliance]")
+{
+    // 3 kN of braking force at the design band's middle — 6 mm/kN — is 18 mm of rearward
+    // displacement, linear and exact. The braking force on the car points rearward, so the vehicle
+    // step hands this seam a negative displacement; the hub moves by exactly it, the constructed
+    // patch moves with the hub, and nothing the orientation decides moves at all.
+    constexpr auto recessionPerNewton = 6.0 * 1.0e-3 / 1000.0;
+    const auto displacement = recessionPerNewton * -3000.0;
+
+    for (const auto side : {CornerSide::Left, CornerSide::Right})
+    {
+        const auto hardpoints = golfMk7FrontCorner(side);
+        const auto untouched = solvedAt(hardpoints, 0.0);
+
+        auto receded = untouched;
+        applyComplianceRecession(hardpoints, receded, displacement);
+
+        CAPTURE(outboardSign(side), untouched.wheelCentre.z, receded.wheelCentre.z);
+
+        REQUIRE(receded.wheelCentre.z - untouched.wheelCentre.z == Catch::Approx(-0.018).epsilon(1e-9));
+        REQUIRE(receded.contactPatch.z - untouched.contactPatch.z == Catch::Approx(-0.018).epsilon(1e-9));
+
+        REQUIRE(receded.wheelCentre.x == untouched.wheelCentre.x);
+        REQUIRE(receded.wheelCentre.y == untouched.wheelCentre.y);
+        REQUIRE(receded.camber == untouched.camber);
+        REQUIRE(receded.toe == untouched.toe);
+        REQUIRE(receded.halfTrack == untouched.halfTrack);
+    }
+}
+
+TEST_CASE("the recession map is linear inside the band's context and saturates outside it",
+          "[physics][suspension][compliance]")
+{
+    // The guard, pinned. Inside the band's own context the map IS the coefficient times the force
+    // — the sourced linearity is not distorted anywhere it is claimed. Outside it — a kerb
+    // strike's one-tick ±20 kN spike, measured at ±222 mm of hub displacement unguarded on the
+    // scripted launch — it saturates at ±50 mm, the band's in-context edge, a stated bound on an
+    // extrapolation and not a modelled bump stop.
+    constexpr auto sixPerKilonewton = 6.0 * 1.0e-3 / 1000.0;
+    constexpr auto tenPerKilonewton = 10.0 * 1.0e-3 / 1000.0;
+
+    // The linear cases are Approx because the product is arithmetic on converted units; the
+    // saturated ones are exact because the map returns its own literal.
+    REQUIRE(raceengine::recessionDisplacement(sixPerKilonewton, -3000.0) == Catch::Approx(-0.018).epsilon(1e-12));
+    REQUIRE(raceengine::recessionDisplacement(sixPerKilonewton, 3000.0) == Catch::Approx(0.018).epsilon(1e-12));
+    STATIC_REQUIRE(raceengine::recessionDisplacement(tenPerKilonewton, -22269.0) == -0.05);
+    STATIC_REQUIRE(raceengine::recessionDisplacement(tenPerKilonewton, 22269.0) == 0.05);
+    STATIC_REQUIRE(raceengine::recessionDisplacement(0.0, 22269.0) == 0.0);
+}
+
+TEST_CASE("which axle states recession and what it states", "[physics][suspension][compliance]")
+{
+    // Pinned at zero on all four corners, and the pin is the point: the only published figures for
+    // this channel are Heissing/Ersoy's design targets (front 4-8 mm/kN of braking force; rear
+    // 8-16 mm PER G — a different unit), and a design target does not set a car number. The day a
+    // measurement is sourced — or the day a target is stated on Dominic's word — this fails and the
+    // entry that flips it has to say which grade of number it stated. `front.recession` /
+    // `rear.recession` on the sheet are the A/B until then.
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        REQUIRE(built->corners[index].longitudinalForceRecession == 0.0);
+    }
 }

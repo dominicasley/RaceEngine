@@ -81,6 +81,12 @@ export struct WheelTelemetry
     // surface-blending fault shows up in first, and both were expensive to add later in every
     // engine that did.
     double camber = 0.0;
+
+    // The bushes' fore-aft deflection of this wheel, metres, positive forward — the state
+    // `CornerSetup::longitudinalForceRecession` drives. Exactly 0.0 on a car stating no
+    // coefficient, which is what makes a trace able to answer "was it on": camber's compliance
+    // shows in the camber channel, and this is the only channel recession shows in at all.
+    double complianceRecession = 0.0;
     double gripMultiplier = 1.0;
 
     bool inContact = false;

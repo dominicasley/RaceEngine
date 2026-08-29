@@ -226,6 +226,28 @@ export struct CornerSetup
     // `applyComplianceCamber` is the seam. docs/suspension-fidelity-brief.md, item 1.
     double lateralForceCamber = 0.0;
 
+    // **Longitudinal recession**: how far this corner's wheel centre displaces along the chassis's
+    // forward axis per newton of longitudinal force at its contact patch, metres per newton,
+    // **signed**. Positive means the wheel complies *with* the force — rearward under braking,
+    // forward under traction — which is what every production axle is built for: the fore-aft
+    // bushing is the soft one, because impact harshness rides it.
+    //
+    // **No measurement of any car exists for this channel, and that is why every car ships 0.0.**
+    // What exists is a design-target band — Heissing & Ersoy, *Chassis Handbook* (2011), Table 1-6:
+    // front **4–8 mm/kN of braking force**; rear **8–16 mm PER G of deceleration** (the table's own
+    // footnote — a different unit, folding in the car's rear brake share) — and a design target is
+    // what a manufacturer aims at, not what a rig read. The same grade line the camber's rear is
+    // held at. `front.recession` / `rear.recession` on the setup sheet (mm/kN) are the A/B.
+    //
+    // What it reaches is the wheel's *position* and not the force law: the sampled patch grid and
+    // the applied-force point move with the hub, so the vertical load's pitch lever and the road
+    // the patch reads both shift. The linkage Jacobians, the rack's kingpin geometry and the tyre
+    // model see nothing. `applyComplianceRecession` is the seam and says why. The
+    // force-to-displacement map saturates at ±50 mm (`recessionDisplacement`), because the linear
+    // coefficient is only claimed inside the band's own context and a kerb strike's one-tick 20 kN
+    // spike must not teleport the hub a fifth of a metre.
+    double longitudinalForceRecession = 0.0;
+
     // Placeholder: a hub, upright, brake and wheel for a mid-size car.
     double unsprungMass = 38.0;
 
@@ -465,6 +487,25 @@ export [[nodiscard]] std::array<double, cornerCount> brakeCircuitPressures(const
 // in the same way. With no servo and no valve it is the pedal itself, to the bit.
 export [[nodiscard]] double brakePedalResponse(const VehicleSetup& setup, const std::size_t corner, const double pedal);
 
+// The fore-aft bush's force-to-displacement map: linear at the stated coefficient, saturated at
+// ±50 mm. The guard is the stage-2b floor's argument over again — a published form used outside
+// its data needs a stated bound, not trust. Heissing/Ersoy's band is quoted for braking forces (a
+// full-pedal front wheel carries about 5.5 kN, and 8 mm/kN of that is 44 mm), while a kerb strike
+// puts a one-tick ±20 kN spike through the patch, four times outside the band's context; measured
+// unguarded on the scripted launch, that read ±222 mm of hub displacement — no bushing's travel.
+// Fifty millimetres is the band's own in-context edge rounded up, a guard against extrapolation
+// and not a modelled bump stop. Inside it the map is the coefficient times the force, exactly.
+//
+// In the interface because it is constexpr; the state write in `VehicleImpl.cpp` is the one
+// consumer, so the trace's `Recession` column and the applied geometry cannot disagree.
+export [[nodiscard]] constexpr double recessionDisplacement(const double recessionPerNewton, const double force)
+{
+    constexpr auto travelLimit = 0.05;
+    const auto displacement = recessionPerNewton * force;
+
+    return displacement > travelLimit ? travelLimit : displacement < -travelLimit ? -travelLimit : displacement;
+}
+
 export struct CornerState
 {
     // The corner's whole degree of freedom: where the lower wishbone is, and how fast it is moving.
@@ -495,6 +536,12 @@ export struct CornerState
     // safer here: camber never reaches the tyre's force law (see `lateralForceCamber`), so the loop
     // this sits in is not merely negative feedback, it is very nearly open.
     double complianceCamber = 0.0;
+
+    // And how far they have let it recede along the chassis's forward axis, metres — the
+    // translation third of the same bush, carried from the previous tick for the same reason. The
+    // lag argument is the camber's: recession never reaches the tyre's force law, so the loop is
+    // very nearly open.
+    double complianceRecession = 0.0;
 
     // The brake disc's temperature, degrees Celsius. Seeded at `brakeDefaultTemperature`, which is
     // cold — see `VehicleSetup::brakeThermal` for why cold is the inert seed here and warm was the

@@ -394,8 +394,12 @@ TEST_CASE("the tread-road interface resists heat and the shipped tyre states it"
         constexpr auto measured = 25200.0; // NASA TN D-8161, rubber on asphalt, and a lower limit.
         const auto series = 1.0 / (1.0 / perfect + 1.0 / measured);
 
+        // Through the car's own stated area fraction, because the Golf states 0.72 since
+        // 2026-08-29 and the fraction multiplies AFTER the series composition — so this case pins
+        // that order from the conductance's side exactly as the groove case pins it from the
+        // fraction's.
         REQUIRE(surfaceConductance(0.0) - surfaceConductance(measured) ==
-                Catch::Approx((perfect - series) * patchArea).epsilon(1e-9));
+                Catch::Approx((perfect - series) * patchArea * thermal.roadAreaFraction).epsilon(1e-9));
     }
 
     SECTION("and what the measured figure is worth is a fifth of the road path, not a half")
@@ -521,16 +525,22 @@ TEST_CASE("the road path conducts through the rubber and not the grooves", "[phy
                          (effusivity + thermal.roadEffusivity);
     const auto patchArea = patchLength * patchWidth;
 
-    SECTION("the shipped Golf states the gross patch, which is the model as it has always been")
+    SECTION("the shipped Golf states 0.72 — the tread that touches, not the gross patch")
     {
-        REQUIRE(thermal.roadAreaFraction == 1.0);
+        // Flipped deliberately on 2026-08-29: this case pinned the shipped 1.0 while the fraction
+        // rode only the `OSR_TYRE_ROAD_AREA` knob, and the statement was made on the car the same
+        // day the recession work landed. 0.72 is 1 minus the tread's own bounded void fraction —
+        // the same 28% the tread's mass is derived from — so the two uses cannot drift apart
+        // without someone editing both.
+        REQUIRE(thermal.roadAreaFraction == 0.72);
     }
 
     SECTION("and a tyre that states 1.0 is bit-identical to one that never heard of the field")
     {
         // Not "close to": at one the branch takes the gross patch, so the expression is character
-        // for character the one that shipped. Stepped under work rather than compared at rest, so
-        // the claim covers the whole path and not just the field's default.
+        // for character the pre-fraction model. Stepped under work rather than compared at rest, so
+        // the claim covers the whole path and not just the field's default. Both cars are built
+        // here rather than read off the Golf, because the Golf states 0.72 now.
         const auto worked = [&](const TyreThermal& tyre) {
             auto state = TyreState{};
             seedTyreTemperature(state, 31.5);
@@ -556,7 +566,13 @@ TEST_CASE("the road path conducts through the rubber and not the grooves", "[phy
         auto stated = thermal;
         stated.roadAreaFraction = 1.0;
 
-        const auto unstated = worked(thermal);
+        auto defaulted = thermal;
+        defaulted.roadAreaFraction = TyreThermal{}.roadAreaFraction;
+
+        // The default IS the gross patch — the field a car never states.
+        REQUIRE(TyreThermal{}.roadAreaFraction == 1.0);
+
+        const auto unstated = worked(defaulted);
         const auto gross = worked(stated);
 
         REQUIRE(unstated.surfaceTemperature == gross.surfaceTemperature);

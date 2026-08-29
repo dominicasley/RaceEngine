@@ -133,6 +133,14 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         wheel.treadCoreTemperature = sentinel(corner, 10);
         wheel.discTemperature = sentinel(corner, 11);
         wheel.wheelTemperature = sentinel(corner, 12);
+
+        // The stage-2 pair had ridden the column count without sentinels of their own since they
+        // joined — the one shape of gap this file exists to close — and gained them when the
+        // recession column joined on 2026-08-29.
+        wheel.gasTemperature = sentinel(corner, 13);
+        wheel.tyrePressurePsi = sentinel(corner, 14);
+        // Metres in, millimetres out.
+        wheel.recession = sentinel(corner, 15) / 1000.0;
     }
 
     const auto rows = lines(rackTorqueToCsv({frame}));
@@ -169,7 +177,11 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // because a seat lap driven with the pressure model on was otherwise indistinguishable from one
     // driven without it** — the channels went into a different CSV first, and the file a session
     // actually writes could not answer "was it on".
-    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 18 * tracedCornerCount);
+    //
+    // `Recession` joined on 2026-08-29 with longitudinal recession itself, taking it to nineteen —
+    // added WITH the mechanism rather than after a lap could not show it, because it is the only
+    // channel the coefficient moves at all.
+    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 19 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -201,6 +213,9 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         REQUIRE(named("Tyre Temp Core", "[C]") == Catch::Approx(sentinel(corner, 10)).epsilon(1e-9));
         REQUIRE(named("Disc Temp", "[C]") == Catch::Approx(sentinel(corner, 11)).epsilon(1e-9));
         REQUIRE(named("Wheel Temp", "[C]") == Catch::Approx(sentinel(corner, 12)).epsilon(1e-9));
+        REQUIRE(named("Tyre Temp Gas", "[C]") == Catch::Approx(sentinel(corner, 13)).epsilon(1e-9));
+        REQUIRE(named("Tyre Pressure", "[psi]") == Catch::Approx(sentinel(corner, 14)).epsilon(1e-9));
+        REQUIRE(named("Recession", "[mm]") == Catch::Approx(sentinel(corner, 15)).epsilon(1e-9));
     }
 }
 

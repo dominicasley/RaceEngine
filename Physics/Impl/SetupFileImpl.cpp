@@ -195,6 +195,10 @@ namespace
             {
                 axle.complianceCamber = *number;
             }
+            else if (field == "recession")
+            {
+                axle.recession = *number;
+            }
             else
             {
                 return false;
@@ -289,7 +293,7 @@ namespace
     {
         return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque ||
                sheet.damperFriction || sheet.stopDamping || sheet.stopHysteresis || sheet.complianceSteer ||
-               sheet.complianceCamber;
+               sheet.complianceCamber || sheet.recession;
     };
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
@@ -361,6 +365,13 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
         {
             // The same conversion for the same reason.
             corner.lateralForceCamber = *sheet.complianceCamber * 0.017453292519943295 / 1000.0;
+        }
+
+        if (sheet.recession)
+        {
+            // Millimetres per kilonewton on the sheet — the unit the design band is quoted in —
+            // metres per newton in the model.
+            corner.longitudinalForceRecession = *sheet.recession * 1.0e-3 / 1000.0;
         }
     };
 

@@ -73,6 +73,7 @@ add_executable(EngineTests
         RackTorqueTests.cpp
         RackSignTests.cpp
         RackTraceCornerTests.cpp
+        RecessionSweepProbe.cpp
         RendererSeamTests.cpp
         RigidBodyTests.cpp
         SceneManagerServiceTests.cpp

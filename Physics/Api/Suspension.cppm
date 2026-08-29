@@ -275,8 +275,9 @@ export void computeRollCentre(const CornerHardpoints& hardpoints, SuspensionStat
 // and putting it there would also make the kinematic solve unrepeatable.
 //
 // What it is not: a translation. A real bush deflects the upright sideways and rearward as well as
-// twisting it, and the two rotation terms are the ones with published figures behind them — toe
-// here, camber in `applyComplianceCamber` below (docs/suspension-fidelity-brief.md, item 1). So the
+// twisting it, and this seam carries only the toe twist — camber is `applyComplianceCamber`, the
+// rearward translation is `applyComplianceRecession`, and the **sideways** translation has no
+// published figure of any grade and stays out (docs/suspension-fidelity-brief.md, item 1). So the
 // hub stays exactly where the linkage put it and the wheel turns about it, which is the part that is
 // sourced and nothing else.
 //
@@ -295,6 +296,20 @@ export void applyComplianceSteer(const CornerHardpoints& hardpoints, SuspensionS
 // move; the sideways displacement a real bush also takes has no published figure and is not
 // smuggled in as a side effect of the rotation.
 export void applyComplianceCamber(const CornerHardpoints& hardpoints, SuspensionState& state, const double camberAngle);
+
+// Displace the solved wheel along the chassis's forward axis by a small distance, and re-read the
+// same list the two rotations re-read — the constructed patch follows the hub, camber, toe and the
+// half track do not move, because the orientation is untouched.
+//
+// The same seam for the same reason: compliance is a force effect and cannot live inside a solve
+// that is not told about forces. This is the one compliance channel that IS a translation — the
+// hub moves, because the published quantity is the wheel centre's fore-aft displacement per unit of
+// braking force (a K&C rig reads it at the wheel). The Jacobians are left alone exactly as the
+// rotations leave them: a couple of centimetres of bush deflection is not a change to what the
+// wishbones do, and `belowCentre` — the loaded-radius lever the geometric load path assembles — is
+// a difference of two points that move together.
+export void applyComplianceRecession(const CornerHardpoints& hardpoints, SuspensionState& state,
+                                     const double displacement);
 
 // The load-time diagnostic the brief asks for, and the reason it is not optional: bump steer that
 // emerges from the geometry is correct and desirable, and bump steer that emerges from a typo in a
