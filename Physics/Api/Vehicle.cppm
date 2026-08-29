@@ -241,11 +241,17 @@ export struct CornerSetup
     //
     // What it reaches is the wheel's *position* and not the force law: the sampled patch grid and
     // the applied-force point move with the hub, so the vertical load's pitch lever and the road
-    // the patch reads both shift. The linkage Jacobians, the rack's kingpin geometry and the tyre
-    // model see nothing. `applyComplianceRecession` is the seam and says why. The
-    // force-to-displacement map saturates at ±50 mm (`recessionDisplacement`), because the linear
-    // coefficient is only claimed inside the band's own context and a kerb strike's one-tick 20 kN
-    // spike must not teleport the hub a fifth of a metre.
+    // the patch reads both shift. **And through the patch it reaches the steering weight** — a
+    // claim this comment originally got wrong, corrected 2026-08-29 night after the seat found
+    // it: the rack torque is the tyre resultant's moment about the kingpin axis applied at the
+    // patch the solve reports, and the kingpin does not recede with the hub, so braking grows the
+    // mechanical trail by the recession (~30 mm against this car's 36) and power shrinks it.
+    // Measured on the seat A/B: rack force per g of lateral +28% under trail braking, −32% on
+    // power. What still sees nothing: the linkage Jacobians and the tyre's force law.
+    // `applyComplianceRecession` is the seam and says why. The force-to-displacement map
+    // saturates at ±50 mm (`recessionDisplacement`), because the linear coefficient is only
+    // claimed inside the band's own context and a kerb strike's one-tick 20 kN spike must not
+    // teleport the hub a fifth of a metre.
     double longitudinalForceRecession = 0.0;
 
     // Placeholder: a hub, upright, brake and wheel for a mid-size car.

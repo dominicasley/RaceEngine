@@ -5,9 +5,13 @@
 // force; rear 8-16 mm per g, a different unit) — so the stated car here is built through the setup
 // sheet itself (`front.recession 6`, `rear.recession 10`, the suggested A/B worked out beside the
 // Golf's compliance figures), which proves the whole sheet-to-car path in the same run that
-// measures the mechanism. Recession never reaches the tyre's force law, the rack's kingpin
-// geometry or the linkage Jacobians: what this measures is the whole of the coupling that exists —
-// the hub and the sampled patch moving fore-aft, and the vertical load's pitch lever with them.
+// measures the mechanism. Recession never reaches the tyre's force law or the linkage Jacobians.
+// It DOES reach the steering weight — corrected 2026-08-29 night, the seat found it first: the
+// rack reads the tyre resultant's moment about the kingpin at the patch the solve reports, and
+// the patch recedes while the kingpin does not, so trail grows under braking and shrinks on
+// power. This probe's straight-line stop measures the position couplings — the hub and sampled
+// patch moving fore-aft, the vertical load's pitch lever with them; the steering signature is in
+// the seat traces (docs/suspension-fidelity-brief.md, the A/B entry).
 //
 // The stop distance is printed WITH its caveat: the cold 100-0's recorded noise floor is 1.47 m
 // and non-monotonic, so a distance delta here is not a result unless it dwarfs that. The
