@@ -708,17 +708,17 @@ TEST_CASE("the front bump travel is Dominic's measurement, ride height to the st
 
 TEST_CASE("which axle states recession and what it states", "[physics][suspension][compliance]")
 {
-    // Pinned at zero on all four corners, and the pin is the point: the only published figures for
-    // this channel are Heissing/Ersoy's design targets (front 4-8 mm/kN of braking force; rear
-    // 8-16 mm PER G — a different unit), and a design target does not set a car number. The day a
-    // measurement is sourced — or the day a target is stated on Dominic's word — this fails and the
-    // entry that flips it has to say which grade of number it stated. `front.recession` /
-    // `rear.recession` on the sheet are the A/B until then.
+    // Flipped from all-zero on 2026-08-29 night, exactly the way the zero pin's comment demanded:
+    // a target was stated on Dominic's word, and this comment says which grade of number it is.
+    // Front 6 mm/kN is the middle of Heissing/Ersoy's design band; rear 10 mm/kN is the per-g
+    // band referred through the car's own full-pedal bias — targets plus an accepted seat A/B
+    // (*"different — better"* twice, the steering coupling measured on his traces), not a rig
+    // measurement. `front.recession 0` / `rear.recession 0` is the way back.
     const auto built = golfGtiMk7();
     REQUIRE(built.has_value());
 
-    for (auto index = std::size_t{0}; index < cornerCount; index++)
-    {
-        REQUIRE(built->corners[index].longitudinalForceRecession == 0.0);
-    }
+    REQUIRE(built->corners[0].longitudinalForceRecession == 6.0 * 1.0e-3 / 1000.0);
+    REQUIRE(built->corners[1].longitudinalForceRecession == 6.0 * 1.0e-3 / 1000.0);
+    REQUIRE(built->corners[2].longitudinalForceRecession == 10.0 * 1.0e-3 / 1000.0);
+    REQUIRE(built->corners[3].longitudinalForceRecession == 10.0 * 1.0e-3 / 1000.0);
 }

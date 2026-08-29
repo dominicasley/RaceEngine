@@ -229,10 +229,9 @@ TEST_CASE("compliance camber rides the sheet in the unit the rig reports", "[phy
 TEST_CASE("recession rides the sheet in the unit the design band is quoted in", "[physics][setup]")
 {
     // `recession` is millimetres per kilonewton on the sheet — the unit Heissing/Ersoy's front
-    // band is quoted in — and metres per newton on the car. No car states one, so this key is the
-    // A/B itself rather than the way back from a stated figure: `front.recession 6` with
-    // `rear.recession 10` is the suggested pairing, worked out beside the Golf's compliance
-    // figures in `PublishedCarsImpl.cpp`.
+    // band is quoted in — and metres per newton on the car. The Golf states 6 front / 10 rear
+    // since 2026-08-29 night, so `recession 0` is the A/B and the way back; the worked conversion
+    // is beside the Golf's compliance figures in `PublishedCarsImpl.cpp`.
     const auto built = placeholderSedan();
     REQUIRE(built.has_value());
 

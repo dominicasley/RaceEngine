@@ -1,11 +1,11 @@
 // What longitudinal recession is worth on a straight-line stop: `./EngineTests "[.recession]"`.
 //
-// The A/B the mechanism shipped with, printed rather than argued. **No car states a coefficient**
-// — the only published figures are Heissing/Ersoy's design targets (front 4-8 mm/kN of braking
-// force; rear 8-16 mm per g, a different unit) — so the stated car here is built through the setup
-// sheet itself (`front.recession 6`, `rear.recession 10`, the suggested A/B worked out beside the
-// Golf's compliance figures), which proves the whole sheet-to-car path in the same run that
-// measures the mechanism. Recession never reaches the tyre's force law or the linkage Jacobians.
+// The A/B the mechanism shipped with, printed rather than argued. **The Golf states front 6 /
+// rear 10 mm/kN since 2026-08-29 night** — a seat-accepted design target (Heissing/Ersoy's band:
+// front 4-8 mm/kN of braking force; rear 8-16 mm per g, a different unit, referred through the
+// car's own bias) — so the ZEROED car here is built through the setup sheet itself
+// (`front.recession 0`, `rear.recession 0`, the way back), which proves the whole sheet-to-car
+// path in the same run that measures the mechanism. Recession never reaches the tyre's force law or the linkage Jacobians.
 // It DOES reach the steering weight — corrected 2026-08-29 night, the seat found it first: the
 // rack reads the tyre resultant's moment about the kingpin at the patch the solve reports, and
 // the patch recedes while the kingpin does not, so trail grows under braking and shrinks on
@@ -154,23 +154,23 @@ TEST_CASE("what longitudinal recession is worth on a straight-line stop", "[.rec
     const auto shipped = golfGtiMk7();
     REQUIRE(shipped.has_value());
 
-    // The stated car is built THROUGH the sheet, so this run proves parse -> apply -> corner ->
-    // solve -> telemetry in one piece — the "prove a seat knob moves the car before handing it
-    // over" rule, applied before there is a seat to hand it to.
-    auto stated = shipped.value();
-    const auto tune = parseVehicleTune("front.recession 6\nrear.recession 10\n");
+    // The zeroed car is built THROUGH the sheet, so this run proves parse -> apply -> corner ->
+    // solve -> telemetry in one piece — the sheet key is the way back now, and the way back has
+    // to be proven to move the car exactly as the knob rule demands.
+    auto rigid = shipped.value();
+    const auto tune = parseVehicleTune("front.recession 0\nrear.recession 0\n");
     REQUIRE(tune.has_value());
-    applyVehicleTune(tune.value(), stated);
+    applyVehicleTune(tune.value(), rigid);
 
     std::printf("\n=== longitudinal recession against a 0.35-pedal 100-0 stop ===\n");
 
-    const auto zeroed = stopFromHundred(shipped.value(), world.value());
-    const auto receded = stopFromHundred(stated, world.value());
+    const auto zeroed = stopFromHundred(rigid, world.value());
+    const auto receded = stopFromHundred(shipped.value(), world.value());
 
     std::printf("\n  %-34s %10s %11s %14s %14s\n", "", "stop [m]", "|dive| [deg]", "recession F", "recession R");
-    std::printf("  %-34s %10.2f %11.3f %11.1f mm %11.1f mm\n", "no recession - every shipped car", zeroed.distance,
+    std::printf("  %-34s %10.2f %11.3f %11.1f mm %11.1f mm\n", "sheet: recession 0 - the rigid car", zeroed.distance,
                 zeroed.peakDive, zeroed.frontRecession * 1000.0, zeroed.rearRecession * 1000.0);
-    std::printf("  %-34s %10.2f %11.3f %11.1f mm %11.1f mm\n", "sheet: front 6 / rear 10 mm/kN", receded.distance,
+    std::printf("  %-34s %10.2f %11.3f %11.1f mm %11.1f mm\n", "shipped: front 6 / rear 10 mm/kN", receded.distance,
                 receded.peakDive, receded.frontRecession * 1000.0, receded.rearRecession * 1000.0);
 
     std::printf("\n  The distance delta is %+.2f m against a recorded 1.47 m non-monotonic noise floor —\n"

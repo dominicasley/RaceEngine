@@ -232,12 +232,13 @@ export struct CornerSetup
     // forward under traction — which is what every production axle is built for: the fore-aft
     // bushing is the soft one, because impact harshness rides it.
     //
-    // **No measurement of any car exists for this channel, and that is why every car ships 0.0.**
-    // What exists is a design-target band — Heissing & Ersoy, *Chassis Handbook* (2011), Table 1-6:
-    // front **4–8 mm/kN of braking force**; rear **8–16 mm PER G of deceleration** (the table's own
-    // footnote — a different unit, folding in the car's rear brake share) — and a design target is
-    // what a manufacturer aims at, not what a rig read. The same grade line the camber's rear is
-    // held at. `front.recession` / `rear.recession` on the setup sheet (mm/kN) are the A/B.
+    // **No measurement of any car exists for this channel.** What exists is a design-target band —
+    // Heissing & Ersoy, *Chassis Handbook* (2011), Table 1-6: front **4–8 mm/kN of braking
+    // force**; rear **8–16 mm PER G of deceleration** (the table's own footnote — a different
+    // unit, folding in the car's rear brake share) — and a design target is what a manufacturer
+    // aims at, not what a rig read. The default is 0.0; the Golf states the band's middle since
+    // 2026-08-29 night, **on Dominic's word after a driven A/B**, with the grade flagged where it
+    // is stated. `front.recession` / `rear.recession` on the setup sheet (mm/kN) are the A/B.
     //
     // What it reaches is the wheel's *position* and not the force law: the sampled patch grid and
     // the applied-force point move with the hub, so the vertical load's pitch lever and the road

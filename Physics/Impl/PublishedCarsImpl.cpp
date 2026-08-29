@@ -822,23 +822,26 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     const auto lateralForceCamber =
         std::array{0.17 * 0.017453292519943295 / 1000.0, 0.17 * 0.017453292519943295 / 1000.0, 0.0, 0.0};
 
-    // **Longitudinal recession is deliberately NOT stated on any axle**, and this comment is the
-    // record of why, so nobody reads the 0.0 as an oversight. The mechanism exists
-    // (`CornerSetup::longitudinalForceRecession`, `front./rear.recession` on the sheet, mm/kN) and
-    // the only published figures for it are **design targets, not measurements**: Heissing & Ersoy,
-    // *Chassis Handbook* (2011), Table 1-6 — front **4–8 mm/kN of braking force**, rear **8–16 mm
-    // per g of deceleration** (the table's own footnote; a different unit). The compliance steer
-    // and camber above are stated because a K&C rig measured four production cars; a target is what
-    // a manufacturer aims at, and stating one as if it were a reading is the line this project held
-    // when it left the camber's rear at zero against exactly this table.
+    // **Longitudinal recession, metres per newton at the patch — STATED on Dominic's word,
+    // 2026-08-29 night, after a driven A/B, and the sourcing grade travels with the number.** The
+    // only published figures are **design targets, not measurements**: Heissing & Ersoy, *Chassis
+    // Handbook* (2011), Table 1-6 — front **4–8 mm/kN of braking force**, rear **8–16 mm per g of
+    // deceleration** (the table's own footnote; a different unit). The front states the band's
+    // middle, 6 mm/kN; the rear states 10 mm/kN — the per-g band referred through this car's own
+    // full-pedal EBD bias (14.24 kN per g × 0.166 rear share / 2 wheels ≈ 1.18 kN per wheel per g,
+    // so 8–16 mm/g is 6.8–13.5 mm/kN; below the valve's knee the same band converts to 3.6–7.2,
+    // and that pedal dependence is part of why these are targets and not readings).
     //
-    // The A/B for the seat, worked out here so the sheet key is one line: **`front.recession 6`**
-    // (the band's middle) and **`rear.recession 10`** — the rear's per-g band referred through this
-    // car's own rear brake share at a hard pedal, where the band's context lives: 1452 kg × g is
-    // 14.24 kN per g, the EBD bias at a full pedal is 0.834, so a rear wheel carries ~1.18 kN per g
-    // and 8–16 mm/g is 6.8–13.5 mm/kN, middle ≈ 10. Below the valve's knee (bias 0.686) the same
-    // band converts to 3.6–7.2 mm/kN — the conversion is pedal-dependent and that is one more
-    // reason the number is a suggestion on a sheet rather than a statement on the car.
+    // What put them on the car is the seat, not the table: a two-session A/B on the sheet keys —
+    // *"different — better"* on trail braking and on braking bumps — and the steering coupling
+    // measured on his own traces (rack force per lateral g +28% under trail braking, −32% on
+    // power; the patch recedes while the kingpin does not, so the trail breathes with the
+    // longitudinal force). The compliance steer and camber above stand on a K&C rig's measured
+    // median; this pair stands on a design band plus an accepted seat verdict, which is a
+    // different grade and says so here. `front.recession 0` / `rear.recession 0` on the sheet is
+    // the A/B and the way back.
+    const auto longitudinalForceRecession =
+        std::array{6.0 * 1.0e-3 / 1000.0, 6.0 * 1.0e-3 / 1000.0, 10.0 * 1.0e-3 / 1000.0, 10.0 * 1.0e-3 / 1000.0};
 
     // The brakes, and **`brakes.ini` no longer appears in this line at all** (2026-08-23). Neither
     // `MAX_TORQUE` nor `FRONT_SHARE` is read: the peak is `peakBrakeTorque` on the hardware above and
@@ -926,6 +929,7 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         corner.damperFriction = damperFriction[index];
         corner.lateralForceSteer = lateralForceSteer[index];
         corner.lateralForceCamber = lateralForceCamber[index];
+        corner.longitudinalForceRecession = longitudinalForceRecession[index];
 
         // tyres.ini, the Semislicks compound — AC's own default for this car, taken whole so the
         // grip and the carcass describe the same tyre: carcass rate and damping, angular inertia,
