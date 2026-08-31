@@ -98,6 +98,56 @@ export [[nodiscard]] Curve kneedDamper(const double bumpRate, const double fastB
                                        const DamperKinematics& kinematics);
 Curve kneedDamper(double, double, double, double, double, double, const SpringKinematics&) = delete;
 
+// How many Maxwell elements a stop's dynamic branch carries. **Five, because that is the number
+// the source needed** — Pech et al. approximate their specimen's dynamic-stiffening envelope by a
+// piece-wise linear function and read the bend points off as contact points; five segments fit it
+// (VSD 2024, 10.1080/00423114.2024.2378858, Figure 16). It is a fixed array rather than a vector
+// because `CornerState` carries one of these per corner and that struct is memcpy'd by the
+// harness.
+export inline constexpr std::size_t jounceElementCount = 5;
+
+// One Maxwell element of a jounce bumper's dynamic branch: a spring in series with a damper, with
+// its own free travel before it touches anything.
+//
+// **This is where a real bump stop's rate dependence lives, and its absence is what flipped the
+// car** (docs/suspension-fidelity-brief.md, 2026-08-30). A Maxwell element is a pure spring well
+// above its cut-off frequency, transmits nothing well below it, and dissipates most where the
+// excitation sits on it — which is exactly "stiff and lossy at strike rates, transparent
+// quasi-statically". A viscous constant cannot be any of those things: it is proportional to
+// velocity everywhere, which is why the shipped 40000 N·s/m has to be five times a corner's
+// critical damping to stop a pogo.
+export struct JounceElement
+{
+    // How far past the stop's own touch point this element starts carrying, metres. The source's
+    // "free travel"; the elements differ in it, which is what makes the branch progressive.
+    double contactPoint = 0.0;
+
+    // N/m, the series spring — and therefore the force this element carries per metre at
+    // frequencies well above its cut-off.
+    double stiffness = 0.0;
+
+    // rad/s, `stiffness / dampingCoefficient`. The source parameterises the pair this way round on
+    // purpose: the cut-off is what the fit is conditioned on, and it is the quantity a stability
+    // bound is written against.
+    double cutoff = 0.0;
+};
+
+// Everything one stop remembers between ticks. Zero is "not touching anything", which is the state
+// a stop is reset to the moment it leaves contact — the source resets its elements after each load
+// event, and a friction element that remembers a stroke it is no longer in is remembering the
+// wrong stroke.
+export struct TravelStopState
+{
+    // The Dahl element's output, normalised to ±1 so the saturation stays `TravelStop::hysteresis`
+    // times the elastic force and the field means the same thing whichever branch is running.
+    double dahl = 0.0;
+
+    std::array<double, jounceElementCount> elementForce{};
+    std::array<double, jounceElementCount> elementInput{};
+};
+
+static_assert(std::is_trivially_copyable_v<TravelStopState>, "CornerState carries one and is copied by bytes");
+
 // A stop that comes in gradually and then very hard. `gap` is how much travel there is before it
 // touches; past that the force rises as the deflection to `progression`, so it is soft where it
 // first bites and immovable at the end. A linear stop either lets the suspension through it or
@@ -134,7 +184,75 @@ export struct TravelStop
     // How fast the stop must be moving for the hysteresis to be fully developed, metres per second.
     // The same numerical regularisation as `CornerSetup::damperFrictionSpeed` and for the same
     // reason: a hard sign term at 360 Hz makes a limit cycle rather than a dead band.
+    //
+    // Superseded where the Dahl branch below is stated, and that is the point of it: a real
+    // bump stop's hysteresis develops over a **displacement**, which is a measured property, not
+    // over a velocity, which is a number picked to keep a solver quiet.
     double hysteresisSpeed = 0.01;
+
+    // --- the sourced dynamic branch, and every field of it is zero on every car in this project --
+    //
+    // Pech et al. measure a production passenger-car jounce bumper on a servo-hydraulic rig and fit
+    // it as three parallel submodels: a static force-displacement characteristic, a **modified Dahl
+    // friction element** whose saturation follows a displacement-dependent weighting function, and
+    // **five Maxwell elements with their own contact points**. `rate`/`progression` above are the
+    // first; these fields are the second and the third.
+    //
+    // Nothing here is stated on any car, so `statesDynamicBranch()` is false everywhere and the
+    // arithmetic below is the arithmetic this model has always run. `jounceBumperCandidate` builds
+    // a transferred parameter set from a stop's own static law; `stopdynamic 1` on a setup sheet
+    // installs it for one session. **The transfer is from one published specimen and is graded as
+    // such** — see that function and docs/suspension-fidelity-brief.md.
+
+    // The Dahl coefficient, per metre, normalised so it is the reciprocal of the displacement the
+    // friction force takes to build. `sigmaMin` at zero deflection rising to `sigmaMax` at
+    // `dahlReference` through the source's own distortable exponent. **Zero disables the branch**,
+    // which leaves `hysteresis` running through the `tanh` above exactly as it always did.
+    //
+    // The source publishes the *form* (its Equation 3) and does **not** publish its specimen's
+    // three fitted values — Figure 12's right-hand panel has no numbers on its axis — so a
+    // candidate set leaves min and max equal, which is the conventional constant-coefficient Dahl
+    // and states nothing the source did not.
+    double dahlSigmaMin = 0.0;
+    double dahlSigmaMax = 0.0;
+    double dahlSigmaExponent = 1.0;
+
+    // The deflection the source's whole measurement programme is scaled by: on their specimen the
+    // displacement at 9 kN, 71 mm. Metres. Only the Dahl's displacement dependence reads it.
+    double dahlReference = 0.0;
+
+    std::array<JounceElement, jounceElementCount> elements{};
+
+    // Half-width of the C1 fade-in around each element's contact point, metres. A hard contact
+    // point is a step in stiffness, and the source shapes it (their Figure 17, an order-3
+    // polynomial through four constraints — which for these four is a quadratic). **Placed, not
+    // sourced**: they optimise it and publish no value.
+    double elementSmoothing = 0.0;
+
+    // Whether this stop carries any of the branch above. A car that states none of it takes the
+    // untouched `force()` path and never reads or writes a `TravelStopState`.
+    [[nodiscard]] bool statesDynamicBranch() const
+    {
+        if (dahlSigmaMax > 0.0)
+        {
+            return true;
+        }
+
+        for (const auto& element : elements)
+        {
+            if (element.stiffness > 0.0 && element.cutoff > 0.0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The whole stop force with the dynamic branch running, advancing `state` by one tick. Only
+    // called where `statesDynamicBranch()` is true, so `force()` above stays the shipped path bit
+    // for bit.
+    [[nodiscard]] double dynamicForce(double past, double rateOfChange, double deltaTime, TravelStopState& state) const;
 
     // `past` is how far into the stop the travel has gone, `rate of change` how fast it is going
     // further in. The stop can only push: a damping term large enough to go negative would have it
@@ -153,6 +271,34 @@ export struct TravelStop
         return std::max(0.0, elastic + damping * rateOfChange + hysteretic);
     }
 };
+
+// The reference force the source scales its whole measurement programme by: 9 kN, chosen on their
+// specimen as a 200% safety margin over the 3 kN a real road put through it. Their "reference
+// displacement" is whatever deflection the bumper reaches this at, and every published fraction
+// below is a fraction of that displacement.
+export inline constexpr double jounceReferenceForce = 9000.0;
+
+// A candidate dynamic branch for a stop, transferred from the source's specimen onto that stop's
+// own static law.
+//
+// **The grade, stated first: this is one published specimen's fitted shape carried onto a stop
+// whose static law is four and a half times shorter, and no jounce bumper of this car has been
+// measured.** It is a candidate to measure with, not a car number. Nothing installs it by default.
+//
+// The transfer is the source's own scaling variable. Pech et al. set out to build "a generic
+// procedure for jounce bumpers that differ in characteristic properties like the unstressed length
+// or the stiffness", and the variable they scale everything by is the deflection at 9 kN. So this
+// solves *this* stop's static law for its own deflection at 9 kN and places the elements at the
+// same fractions of it, carrying the same force at the same fraction — which is the one transfer
+// the source's own construction licenses. On the Golf's front bump stop that reference deflection
+// is 15.9 mm against the specimen's 71.
+//
+// `cutoff` is left as a parameter because the source publishes **no fitted value** for it, only the
+// band it must lie in: above the static ramps' excitation frequency and below the dynamic ones'.
+// On their programme that is roughly 0.35 to 28 rad/s, and the default here is the geometric middle
+// of it. It is a frequency, so it is carried across unscaled while the stiffnesses and contact
+// points are not — a relaxation rate is a property of the material, not of how far it is squashed.
+export [[nodiscard]] TravelStop jounceBumperCandidate(const TravelStop& stop, double cutoff = 3.1);
 
 export struct CornerSetup
 {
@@ -560,6 +706,14 @@ export struct CornerState
     // that the whole corner is cold, and a wheel left at whatever the last run finished on would
     // carry a stint's worth of heat into it.
     double wheelTemperature = brakeDefaultTemperature;
+
+    // What the **bump** stop's dynamic branch remembers. Written only by a corner whose stop
+    // states that branch, which is no car in this project, so on every shipped car these bytes are
+    // the zeros they were constructed with and stay them for the whole session.
+    //
+    // The droop stop deliberately has no state and no branch: on a strut it is the damper topping
+    // out, a different mechanism with its own account, and the source measured a jounce bumper.
+    TravelStopState bumpStopState;
 };
 
 // The vehicle's own state and nothing else's. Engine speed lived here until the driveline was given

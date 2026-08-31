@@ -13,6 +13,9 @@
 import raceengine.input;
 import raceengine.physics;
 
+using raceengine::advanceYawMomentDelay;
+using raceengine::AntilockChannelState;
+using raceengine::AntilockSetup;
 using raceengine::AssistSensors;
 using raceengine::AssistSetup;
 using raceengine::AssistState;
@@ -35,6 +38,7 @@ using raceengine::VehicleInput;
 using raceengine::VehicleSetup;
 using raceengine::VehicleState;
 using raceengine::VehicleStep;
+using raceengine::YawMomentDelayState;
 
 // The anti-lock system, measured on the car it is fitted to.
 //
@@ -135,6 +139,18 @@ struct StopResult
     bool stopped = false;
     bool onPlate = true;
     bool grounded = true;
+
+    // How long the yaw moment build-up delay was engaged for, seconds, and the lowest ceiling it
+    // held the high front channel at. **Zero on every shipped car**, because the feature is off —
+    // and reported at all because a feature that measures as inert has to say whether it never
+    // engaged or engaged and did nothing, and those are different bugs.
+    double yawDelayTime = 0.0;
+    double yawDelayLowest = 0.0;
+    double peakLateral = 0.0;
+
+    // When each channel first let pressure go, seconds after the pedal moved. The gap between the
+    // two fronts on a split surface is the whole window a yaw moment build-up delay has to work in.
+    std::array<double, cornerCount> firstCycle{};
 };
 
 void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& world, const double speed)
@@ -156,8 +172,15 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
 
 // One stop, in neutral, with the pedal held. Nothing drives the wheels, so what is measured is the
 // brake system and the tyre.
+// `pedalRamp` is how long the pedal takes to reach `pedal`, seconds. **Zero — a step — is the
+// default and every case written before 2026-08-30 uses it**, and with it the arithmetic below is
+// the arithmetic it always was, to the bit. A ramp exists because a step pedal is not a driver: it
+// puts every wheel on the car past its locking level inside one physics tick, which is fine for
+// measuring a stop and is fatal to any mechanism whose trigger is *one* wheel locking before
+// another.
 [[nodiscard]] StopResult stop(const VehicleSetup& setup, const PhysicsWorld& world, AssistSetup assists,
-                              const double entry, const double pedal, const double steering = 0.0)
+                              const double entry, const double pedal, const double steering = 0.0,
+                              const double pedalRamp = 0.0)
 {
     auto state = VehicleState{};
     settle(setup, state, world, entry);
@@ -212,8 +235,11 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
 
     for (auto step = 0; step < 360 * 30; step++)
     {
-        const auto command = updateAssists(assists, assistState, sense(), {.brake = pedal, .throttle = 0.0},
-                                           brakeCircuitPressures(setup, pedal), tick);
+        const auto applied = pedalRamp > 0.0 ? pedal * std::min(1.0, result.time / pedalRamp) : pedal;
+        input.brake = applied;
+
+        const auto command = updateAssists(assists, assistState, sense(), {.brake = applied, .throttle = 0.0},
+                                           brakeCircuitPressures(setup, applied), tick);
 
         const auto stepped = stepVehicle(setup, state, input, noDriveTorque, world, tick, command.brakes);
         REQUIRE(stepped.has_value());
@@ -222,10 +248,25 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
         result.time += tick;
         samples++;
         result.peakYawRate = std::max(result.peakYawRate, std::abs(lastStep.telemetry.yawRate));
+        result.peakLateral = std::max(result.peakLateral, std::abs(lastStep.telemetry.acceleration.x));
+
+        if (assistState.antilock.yawDelay.engaged)
+        {
+            result.yawDelayTime += tick;
+            result.yawDelayLowest = result.yawDelayTime <= tick
+                                        ? assistState.antilock.yawDelay.ceiling
+                                        : std::min(result.yawDelayLowest, assistState.antilock.yawDelay.ceiling);
+        }
 
         for (auto index = std::size_t{0}; index < cornerCount; index++)
         {
             result.cycles[index] = command.channels.antilockCycles[index];
+
+            if (result.firstCycle[index] == 0.0 && command.channels.antilockCycles[index] > 0)
+            {
+                result.firstCycle[index] = result.time;
+            }
+
             result.meanTrueSlip += std::abs(lastStep.telemetry.wheels[index].slipRatio) / cornerCount;
 
             if (index < 2)
@@ -2019,5 +2060,431 @@ TEST_CASE("what the steering-criteria ensemble distributions look like", "[.abs-
         std::printf("%-9s %9s | %12.5f %14.3f  (medians; travel as magnitude)\n", assisted ? "assisted" : "locked",
                     "median", medianOf(runs, [](const StopResult& run) { return run.peakYawRate; }),
                     medianOf(runs, [](const StopResult& run) { return std::abs(run.lateralTravel); }));
+    }
+}
+
+TEST_CASE("what yaw moment build-up delay is worth, against the share it is metered at", "[.yaw-delay]")
+{
+    // `./EngineTests "[.yaw-delay]"`. **A diagnostic and not a calibration target.** The mechanism
+    // is Limpert's (`AntilockSetup::yawMomentDelay` carries the passage): on a split surface the
+    // high wheel's pressure is built in stages from the moment the low wheel first dumps, and hands
+    // over to individual control the moment the high wheel reaches its own locking level. The book
+    // publishes no rate for the staging and says outright that the whole feature is "a compromise
+    // between good steering response and minimized stopping distance", with "differences ... between
+    // ABS manufacturers". So this table exists so that the decision — whether this car should have
+    // it, and metered how hard — can be made on numbers by whoever drives the car.
+    //
+    // **The feature ships OFF.** The `off` row is the shipped car and doubles as the inertness row.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    struct Surface
+    {
+        double left;
+        double right;
+        const char* name;
+    };
+
+    // The mirrored split is a control rather than a second data point: the mechanism is symmetric,
+    // so the two SPLIT rows must be each other's mirror image. They also settle which side of the
+    // plate each front channel is on, which is not something to assume in a left-handed frame.
+    const auto surfaces = std::array{Surface{1.00, 1.00, "dry"}, Surface{0.60, 0.60, "damp"},
+                                     Surface{0.35, 0.35, "slippery"}, Surface{1.00, 0.35, "SPLIT"},
+                                     Surface{0.35, 1.00, "SPLIT-rev"}};
+
+    // **On a pedal that is applied rather than stepped**, which the third table below shows is the
+    // whole difference between this feature acting and this feature being invisible. A tenth of a
+    // second is roughly what a real application takes and is the figure `docs/known-red.md` already
+    // quotes against the four-wheels-stop fixture's own step pedal.
+    const auto ramp = 0.10;
+
+    std::printf("\n=== the split-mu and control table against the delay's apply share (0.10 s pedal ramp) ===\n");
+    std::printf("\n%-8s %-9s | %8s %8s %8s %9s | %8s %8s %8s | %7s %9s %8s\n", "share", "surface", "dist m",
+                "yaw deg", "lat m", "peak yaw/s", "FL Hz", "FR Hz", "R Hz", "delay s", "FL 1st ms", "FR 1st ms");
+    std::printf("%s\n",
+                "--------------------------------------------------------------------------------------------------"
+                "----------");
+
+    for (const auto share : {-1.0, 0.10, 0.25, 0.50, 1.00})
+    {
+        for (const auto& surface : surfaces)
+        {
+            const auto world = PhysicsWorld::create(gripPlate(surface.left, surface.right));
+            REQUIRE(world.has_value());
+
+            auto assists = withAntilock(setup.value());
+            if (share > 0.0)
+            {
+                assists.antilock.yawMomentDelay = true;
+                assists.antilock.yawDelayApplyShare = share;
+            }
+
+            const auto run = stop(setup.value(), world.value(), assists, hundred, 1.0, 0.0, ramp);
+            REQUIRE(run.stopped);
+
+            const auto frequency = [&](const std::size_t wheel)
+            {
+                const auto peaks = static_cast<double>(run.pressurePeaks[wheel]);
+
+                return run.engagedTime[wheel] > 0.5 && peaks >= 5.0 ? peaks / run.engagedTime[wheel] : 0.0;
+            };
+
+            if (share > 0.0)
+            {
+                std::printf("%-8.2f ", share);
+            }
+            else
+            {
+                std::printf("%-8s ", "off");
+            }
+
+            std::printf("%-9s | %8.2f %8.2f %8.2f %9.3f | %8.3f %8.3f %8.3f | %7.3f %9.2f %8.2f\n", surface.name,
+                        run.distance, run.finalYaw * degrees, run.lateralTravel, run.peakYawRate, frequency(0),
+                        frequency(1), frequency(2), run.yawDelayTime, 1000.0 * run.firstCycle[0],
+                        1000.0 * run.firstCycle[1]);
+        }
+    }
+
+    std::printf("\n  0.000 Hz means the channel had under 5 pressure peaks or under 0.5 s engaged. Criterion 6's\n");
+    std::printf("  band is 4-20 Hz per working channel and its red is the front channel on the split surface.\n");
+    std::printf("  The three uniform surfaces are controls: the delay engages on a left-to-right asymmetry,\n");
+    std::printf("  so anything it does to them is the engagement test firing where there is no split.\n");
+
+    // **Why every row above is identical**, and it is the fixture rather than the feature: with a
+    // step pedal both front channels first let pressure go one physics tick apart even on the split
+    // surface, so Limpert's own handover — the high wheel reaching its locking level — fires before
+    // the staging can do anything. A real pedal takes about a tenth of a second, and this car's
+    // brakes are 2.4 times its front lock pressure at full travel, so how long the low wheel has the
+    // road to itself is entirely a property of how the pedal is applied.
+    std::printf("\n=== the window the mechanism has, against how the pedal is applied (SPLIT surface) ===\n");
+    std::printf("\n%-7s %-7s %-6s | %8s %8s %8s | %9s %9s %8s\n", "ramp s", "pedal", "delay", "dist m", "yaw deg",
+                "lat m", "FL 1st ms", "FR 1st ms", "held s");
+    std::printf("%s\n", "----------------------------------------------------------------------------------------");
+
+    const auto world = PhysicsWorld::create(gripPlate(1.00, 0.35));
+    REQUIRE(world.has_value());
+
+    for (const auto application : {0.0, 0.05, 0.10, 0.20})
+    {
+        for (const auto pedal : {0.35, 0.60, 1.00})
+        {
+            for (const auto on : {false, true})
+            {
+                auto assists = withAntilock(setup.value());
+                assists.antilock.yawMomentDelay = on;
+
+                const auto run = stop(setup.value(), world.value(), assists, hundred, pedal, 0.0, application);
+                REQUIRE(run.stopped);
+
+                std::printf("%-7.2f %-7.2f %-6s | %8.2f %8.2f %8.2f | %9.2f %9.2f %8.3f\n", application, pedal,
+                            on ? "ON" : "off", run.distance, run.finalYaw * degrees, run.lateralTravel,
+                            1000.0 * run.firstCycle[0], 1000.0 * run.firstCycle[1], run.yawDelayTime);
+            }
+        }
+    }
+
+    std::printf("\n  `held s` is how long the delay held the high front channel below what the driver asked.\n");
+    std::printf("  A first-cycle time of 0.00 ms means that channel never let any pressure go at all.\n");
+}
+
+TEST_CASE("what yaw moment build-up delay does to the steering the car keeps", "[.yaw-delay]")
+{
+    // The steering pair's own fixture, run against the delay. **Ensemble medians**, because a
+    // full-pedal stop on mu 0.35 is chaotic and a single roll of it has flipped these criteria eight
+    // times (`docs/known-red.md`). The unassisted arm is measured once: it has no anti-lock unit, so
+    // no setting of this feature can reach it.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(0.35, 0.35));
+    REQUIRE(world.has_value());
+
+    const auto steering = 0.35;
+    const auto plain = steeringEnsemble(setup.value(), world.value(), false, steering);
+
+    const auto plainYaw = medianOf(plain, [](const StopResult& run) { return run.peakYawRate; });
+    const auto plainTravel = medianOf(plain, [](const StopResult& run) { return std::abs(run.lateralTravel); });
+
+    std::printf("\n=== the steering pair's medians against the delay's apply share ===\n");
+    std::printf("  unassisted median peak yaw rate %.4f /s, lateral travel %.2f m\n", plainYaw, plainTravel);
+    std::printf("  the criteria want yaw > 2.0x and travel > 3.0x those\n\n");
+    std::printf("%-8s | %10s %8s | %10s %8s | %8s\n", "share", "yaw /s", "x plain", "travel m", "x plain", "dist m");
+    std::printf("%s\n", "-------------------------------------------------------------------------");
+
+    for (const auto share : {-1.0, 0.25, 0.50})
+    {
+        auto runs = std::vector<StopResult>{};
+        runs.reserve(15);
+
+        for (auto k = -7; k <= 7; k++)
+        {
+            const auto entry = hundred * (1.0 + 0.001 * static_cast<double>(k));
+
+            auto assists = withAntilock(setup.value());
+            if (share > 0.0)
+            {
+                assists.antilock.yawMomentDelay = true;
+                assists.antilock.yawDelayApplyShare = share;
+            }
+
+            runs.push_back(stop(setup.value(), world.value(), assists, entry, 1.0, steering));
+        }
+
+        for (const auto& run : runs)
+        {
+            REQUIRE(run.stopped);
+        }
+
+        const auto yaw = medianOf(runs, [](const StopResult& run) { return run.peakYawRate; });
+        const auto travel = medianOf(runs, [](const StopResult& run) { return std::abs(run.lateralTravel); });
+        const auto distance = medianOf(runs, [](const StopResult& run) { return run.distance; });
+
+        if (share > 0.0)
+        {
+            std::printf("%-8.2f | ", share);
+        }
+        else
+        {
+            std::printf("%-8s | ", "off");
+        }
+
+        std::printf("%10.4f %8.2f | %10.2f %8.2f | %8.2f\n", yaw, yaw / plainYaw, travel, travel / plainTravel,
+                    distance);
+    }
+
+    std::printf("\n  This surface is UNIFORM, so the delay should not engage at all here and these rows\n");
+    std::printf("  should agree. A difference is the engagement test firing on two front channels that\n");
+    std::printf("  merely dumped a control period apart, which is a real exposure of the mechanism.\n");
+}
+
+TEST_CASE("yaw moment build-up delay is off everywhere, and does what the book says when it is not",
+          "[assists][antilock][braking][splitmu]")
+{
+    // The mechanism is Limpert's, §9.3.1: staged pressure build at the "high" wheel from the moment
+    // the "low" wheel's first pressure reduction, handing over to individual control when the high
+    // wheel reaches its own locking level. `AntilockSetup::yawMomentDelay` carries the passage and
+    // the two placed numbers; `[.yaw-delay]` prices the compromise it is.
+    //
+    // **It ships off**, and this case asserts that first, because the whole build was done on the
+    // promise that no golden would move.
+    auto setup = AntilockSetup{};
+    setup.enabled = true;
+
+    auto state = YawMomentDelayState{};
+
+    auto low = AntilockChannelState{};
+    auto high = AntilockChannelState{};
+
+    // The low wheel has let pressure go and is holding 20 bar; the high wheel has not moved and the
+    // driver is asking for 110 at both.
+    low.cycles = 1;
+    low.phase = ModulatorPhase::Reapply;
+    low.pressure = 20.0e5;
+    const auto requests = std::array<double, 2>{110.0e5, 110.0e5};
+
+    // **The brake application has to begin before either wheel has cycled**, because the trigger is
+    // the first pressure reduction *of this application* and `cycles` never resets. One step with
+    // both channels quiet is what a driver's foot arriving on the pedal looks like, and it is what
+    // the seat lap of 2026-08-30 proved is not optional: without it the delay reads a counter that
+    // has been non-zero since the first corner and never arms again.
+    const auto begin = [&]
+    {
+        const auto quiet = AntilockChannelState{};
+        return advanceYawMomentDelay(setup, state, quiet, quiet, requests, 0.0, true, 0.001);
+    };
+
+    SECTION("off is off, on this setup and on the car's own")
+    {
+        REQUIRE_FALSE(setup.yawMomentDelay);
+
+        const auto golf = golfGtiMk7();
+        REQUIRE(golf.has_value());
+        REQUIRE_FALSE(golfGtiMk7Assists(golf.value()).antilock.yawMomentDelay);
+
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+    }
+
+    setup.yawMomentDelay = true;
+
+    SECTION("it engages on one front having reduced pressure and not the other")
+    {
+        // Neither: nothing to delay for.
+        auto quiet = AntilockChannelState{};
+        REQUIRE(advanceYawMomentDelay(setup, state, quiet, high, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+        REQUIRE(state.applied);
+
+        // One: the other is the high wheel, and the ceiling is what the road has just proved the
+        // low side will take.
+        const auto ceiling = advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001);
+        REQUIRE(state.engaged);
+        REQUIRE(state.highChannel == 1);
+        REQUIRE(ceiling == Catch::Approx(20.0e5));
+    }
+
+    SECTION("both having reduced pressure is not a split surface")
+    {
+        REQUIRE(begin() == 0.0);
+
+        auto other = low;
+        REQUIRE(advanceYawMomentDelay(setup, state, low, other, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+    }
+
+    SECTION("a channel that dumped on an earlier application cannot arm this one")
+    {
+        // **The case the seat lap found.** `cycles` is cumulative, so by the second corner of a lap
+        // both fronts have dumped many times; if the trigger read the raw counter, the delay would
+        // be dead for the rest of the session. Baselined at the start of each application, a wheel
+        // that cycled a minute ago is simply a wheel that has not cycled yet.
+        REQUIRE(begin() == 0.0);
+        REQUIRE(state.baseCycles[0] == 0);
+
+        auto stale = AntilockChannelState{};
+        stale.cycles = 47;
+        stale.phase = ModulatorPhase::Passive;
+
+        auto alsoStale = AntilockChannelState{};
+        alsoStale.cycles = 51;
+
+        // Both have cycled before, neither has cycled in this application: nothing to arm on.
+        auto fresh = YawMomentDelayState{};
+        REQUIRE(advanceYawMomentDelay(setup, fresh, stale, alsoStale, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(fresh.engaged);
+
+        // Now one of them reduces pressure inside this application, and it arms.
+        auto reducing = stale;
+        reducing.cycles = 48;
+        reducing.phase = ModulatorPhase::Reapply;
+        reducing.pressure = 20.0e5;
+
+        REQUIRE(advanceYawMomentDelay(setup, fresh, reducing, alsoStale, requests, 0.0, true, 0.001) ==
+                Catch::Approx(20.0e5));
+        REQUIRE(fresh.engaged);
+        REQUIRE(fresh.highChannel == 1);
+    }
+
+    SECTION("the staircase climbs at a share of the modulator's own re-apply gradient")
+    {
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+
+        const auto step = setup.yawDelayStagePeriod * setup.modulator.reapplyGradient * setup.yawDelayApplyShare;
+
+        // It holds between steps rather than sliding: a controller period short of the stage period
+        // leaves it exactly where it was.
+        auto elapsed = 0.0;
+        while (elapsed + 0.001 < setup.yawDelayStagePeriod)
+        {
+            REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) == Catch::Approx(20.0e5));
+            elapsed += 0.001;
+        }
+
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) ==
+                Catch::Approx(20.0e5 + step));
+    }
+
+    SECTION("it follows the low wheel down while that wheel is still reducing")
+    {
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) == Catch::Approx(20.0e5));
+
+        auto dumping = low;
+        dumping.phase = ModulatorPhase::Dump;
+        dumping.pressure = 8.0e5;
+
+        REQUIRE(advanceYawMomentDelay(setup, state, dumping, high, requests, 0.0, true, 0.001) == Catch::Approx(8.0e5));
+
+        // And not back up again while it is still dumping, whatever that channel reports next.
+        dumping.pressure = 15.0e5;
+        REQUIRE(advanceYawMomentDelay(setup, state, dumping, high, requests, 0.0, true, 0.001) == Catch::Approx(8.0e5));
+    }
+
+    SECTION("it hands over when the high wheel reaches its own locking level")
+    {
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+        REQUIRE(state.engaged);
+
+        // **Its own first pressure reduction, not its first `Hold`.** A hold is a threshold being
+        // watched; the book's handover is the wheel reaching its locking level, which is the same
+        // event the trigger reads on the low wheel.
+        auto watching = high;
+        watching.phase = ModulatorPhase::Hold;
+        REQUIRE(advanceYawMomentDelay(setup, state, low, watching, requests, 0.0, true, 0.001) > 0.0);
+        REQUIRE(state.engaged);
+
+        auto dumped = high;
+        dumped.cycles = 1;
+        dumped.phase = ModulatorPhase::Dump;
+        REQUIRE(advanceYawMomentDelay(setup, state, low, dumped, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+        REQUIRE(state.completed);
+    }
+
+    SECTION("and it does not re-arm until the foot comes off the pedal")
+    {
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+
+        auto dumped = high;
+        dumped.cycles = 1;
+        REQUIRE(advanceYawMomentDelay(setup, state, low, dumped, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE(state.completed);
+
+        // The low wheel keeps cycling: the delay stays out of it, because the high wheel is
+        // individually controlled from here.
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+
+        // **The foot coming off is what ends an application**, not the channels going quiet: this
+        // modulator returns a channel to `Passive` between cycles, and a stop has dozens of those.
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, false, 0.001) == 0.0);
+        REQUIRE_FALSE(state.completed);
+        REQUIRE_FALSE(state.applied);
+
+        // And the next application arms again, on its own first pressure reduction.
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+        REQUIRE(state.engaged);
+    }
+
+    SECTION("it is a braking feature and a foot off the pedal takes it out")
+    {
+        // Yaw under power is traction control's business, and without this the delay arms on a
+        // traction-control brake intervention — measured, one tick of a scripted standing launch.
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, false, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+        REQUIRE(state.engaged);
+
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, false, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+    }
+
+    SECTION("a lateral accelerometer switches it off in a corner, which is the book's own rule")
+    {
+        // "A lateral acceleration sensor switches off the yaw moment delay feature for lateral
+        // acceleration exceeding 0.4 g", because there the outer wheel's braking force makes a
+        // moment that opposes the lateral force's rather than adding to it.
+        REQUIRE(setup.yawDelayLateralLimit == Catch::Approx(0.4 * 9.80665));
+
+        REQUIRE(begin() == 0.0);
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 0.0, true, 0.001) > 0.0);
+        REQUIRE(state.engaged);
+
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, 5.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
+
+        // Either sign of it, and it stays off while the car is still cornering.
+        REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, -5.0, true, 0.001) == 0.0);
+        REQUIRE_FALSE(state.engaged);
     }
 }

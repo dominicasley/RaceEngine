@@ -114,6 +114,31 @@ namespace
             requested[wheel] = std::max(driverPressure[wheel], intervention);
         }
 
+        // The yaw moment build-up delay, stepped before the channels because it is the one part of
+        // this controller that reads across them: the high front wheel's request is capped by the
+        // low front wheel's signals. Reading the phases as they stand — last period's — is what
+        // gives it the one-period lag a real unit's captured samples have.
+        //
+        // **Off on every car**, so `ceiling` is 0.0, `engaged` is false and the cap below is never
+        // taken.
+        auto frontRequests = std::array<double, 2>{};
+        for (auto index = std::size_t{0}; index < 2; index++)
+        {
+            const auto channel = channelAt(index);
+            for (auto wheel = std::size_t{0}; wheel < wheelCount; wheel++)
+            {
+                if (antilockDrivesWheel(channel, wheel))
+                {
+                    frontRequests[index] = std::max(frontRequests[index], requested[wheel]);
+                }
+            }
+        }
+
+        const auto ceiling =
+            advanceYawMomentDelay(setup.antilock, state.antilock.yawDelay, state.antilock.channels[0],
+                                  state.antilock.channels[1], frontRequests, sensors.lateralAcceleration, braking,
+                                  period);
+
         for (auto index = std::size_t{0}; index < brakeChannelCount; index++)
         {
             const auto channel = channelAt(index);
@@ -129,6 +154,15 @@ namespace
                 {
                     channelRequest = std::max(channelRequest, requested[wheel]);
                 }
+            }
+
+            // And the delay's staged ceiling, on the high front channel alone. Every other channel
+            // — the low front and the rear — is untouched by it, which is the whole mechanism: the
+            // low wheel is already being modulated by its own signals and the rear axle has no part
+            // in a left-to-right asymmetry.
+            if (state.antilock.yawDelay.engaged && index == state.antilock.yawDelay.highChannel)
+            {
+                channelRequest = std::min(channelRequest, ceiling);
             }
 
             const auto wheelSpeed = std::abs(sensedRoadSpeed(setup.reference, readings[controlWheel]));
@@ -158,6 +192,8 @@ namespace
     // --- what the actuators are at -------------------------------------------------------------
     output.brakes.commanded = assistsEngaged(setup);
     output.throttleScale = tractionThrottleScale(state.traction);
+    output.channels.yawDelayEngaged = state.antilock.yawDelay.engaged;
+    output.channels.yawDelayCeiling = state.antilock.yawDelay.engaged ? state.antilock.yawDelay.ceiling : 0.0;
 
     for (auto wheel = std::size_t{0}; wheel < wheelCount; wheel++)
     {

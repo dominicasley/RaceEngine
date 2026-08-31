@@ -144,6 +144,14 @@ export struct AssistChannels
 
     std::array<bool, wheelCount> antilockActive{};
     std::array<std::uint32_t, wheelCount> antilockCycles{};
+
+    // Whether the yaw moment build-up delay is holding a front channel below what the driver is
+    // asking for, and the ceiling it is holding it at, pascals. **False and zero on every car**,
+    // because the feature is off by default — and reported at all because a feature nobody can see
+    // in a trace is a feature nobody can report on, which the tyre-pressure switch already cost a
+    // lap to learn.
+    bool yawDelayEngaged = false;
+    double yawDelayCeiling = 0.0;
     bool tractionBrakeActive = false;
     bool tractionEngineActive = false;
     bool corneringActive = false;

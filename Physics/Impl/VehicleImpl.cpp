@@ -507,6 +507,176 @@ constexpr std::array<std::size_t, cornerCount> acrossAxle = {1, 0, 3, 2};
 
 } // namespace
 
+namespace
+{
+
+// The C1 fade-in of one Maxwell element around its contact point. Below `contact - half` the
+// element is not touching and its input is exactly zero; above `contact + half` its input is the
+// deflection past the contact point; between them a polynomial joins the two with matching value
+// and slope at both ends.
+//
+// The source calls for an order-3 polynomial "because of the resulting four constraints". Those
+// four constraints — value 0 and slope 0 at the lower end, value `half` and slope 1 at the upper —
+// are satisfied by a quadratic, and solving the cubic for them returns a zero cubic term. So this
+// is that cubic, written in the form it collapses to rather than in the form that hides it.
+[[nodiscard]] double elementInput(const double past, const JounceElement& element, const double half)
+{
+    const auto beyond = past - element.contactPoint;
+
+    if (half <= 0.0)
+    {
+        return std::max(0.0, beyond);
+    }
+
+    if (beyond <= -half)
+    {
+        return 0.0;
+    }
+
+    if (beyond >= half)
+    {
+        return beyond;
+    }
+
+    const auto through = (beyond + half) / (2.0 * half);
+    return half * through * through;
+}
+
+} // namespace
+
+double TravelStop::dynamicForce(const double past, const double rateOfChange, const double deltaTime,
+                                TravelStopState& state) const
+{
+    // Out of contact the stop carries nothing and forgets everything. **The forgetting is the
+    // source's**: it resets its Maxwell states after each load event, so that the elements attach
+    // at their contact points on the next strike rather than carrying a residue from the last one.
+    // A friction element is the same argument — a bumper that has let go is not part-way through a
+    // stroke.
+    if (past <= 0.0)
+    {
+        state = TravelStopState{};
+        return 0.0;
+    }
+
+    const auto elastic = rate * std::pow(past, progression) / std::pow(std::max(gap, 1e-6), progression - 1.0);
+
+    // --- the modified Dahl element ---------------------------------------------------------------
+    //
+    // The state is normalised to ±1 and the saturation is `hysteresis` times the elastic force, so
+    // this branch reaches exactly the same force the `tanh` path reaches when it is fully
+    // developed. What it does differently is *how it gets there*: over a displacement set by the
+    // Dahl coefficient rather than over a velocity set by a smoothing constant. That is the whole
+    // substance of the change, because a bump stop's hysteresis loop has a measured **width** in
+    // millimetres and no width at all in metres per second.
+    auto hysteretic = 0.0;
+    if (dahlSigmaMax > 0.0 && hysteresis != 0.0)
+    {
+        // The source's displacement-dependent coefficient. Their weighting function follows the
+        // static characteristic, so `w(x)/w(xref)` is `(past/xref)^progression` here, and the
+        // ratio is clamped at one because past the reference deflection they measured nothing.
+        auto coefficient = dahlSigmaMax;
+        if (dahlSigmaMax > dahlSigmaMin && dahlReference > 0.0)
+        {
+            const auto weighting = std::min(1.0, std::pow(past / dahlReference, progression));
+            coefficient = dahlSigmaMin + std::pow(weighting, dahlSigmaExponent) * (dahlSigmaMax - dahlSigmaMin);
+        }
+
+        const auto step = rateOfChange * deltaTime;
+        const auto direction = step > 0.0 ? 1.0 : (step < 0.0 ? -1.0 : 0.0);
+
+        state.dahl = std::clamp(state.dahl + coefficient * (1.0 - state.dahl * direction) * step, -1.0, 1.0);
+        hysteretic = elastic * hysteresis * state.dahl;
+    }
+    else if (hysteresis != 0.0)
+    {
+        hysteretic = elastic * hysteresis * std::tanh(rateOfChange / hysteresisSpeed);
+    }
+
+    // --- the Maxwell branch ----------------------------------------------------------------------
+    //
+    // Each element is stepped by the source's own discrete form: the continuous transfer function
+    // `c·s / (s + w)` through the bilinear transform. That is chosen rather than an explicit
+    // integration of the same equation because the bilinear map takes the whole left half plane
+    // into the unit disc — the element cannot go unstable at any timestep, which an explicit step
+    // can and which the source has to constrain its fit to avoid.
+    auto dynamic = 0.0;
+    for (auto index = std::size_t{0}; index < jounceElementCount; index++)
+    {
+        const auto& element = elements[index];
+        if (element.stiffness <= 0.0 || element.cutoff <= 0.0)
+        {
+            continue;
+        }
+
+        const auto span = element.cutoff * deltaTime + 2.0;
+        const auto decay = (element.cutoff * deltaTime - 2.0) / span;
+        const auto gain = 2.0 * element.stiffness / span;
+
+        const auto input = elementInput(past, element, elementSmoothing);
+        const auto force =
+            std::max(0.0, -decay * state.elementForce[index] + gain * (input - state.elementInput[index]));
+
+        state.elementForce[index] = force;
+        state.elementInput[index] = input;
+        dynamic += force;
+    }
+
+    return std::max(0.0, elastic + damping * rateOfChange + hysteretic + dynamic);
+}
+
+TravelStop jounceBumperCandidate(const TravelStop& stop, const double cutoff)
+{
+    // The source's specimen, read off its own figures and written here in the two dimensionless
+    // forms the transfer needs. Contact points as fractions of the reference deflection, and
+    // stiffnesses as `c · xref / Fref` — so a stiffness is "how much of the reference force this
+    // element carries over the whole reference deflection".
+    //
+    // Read from Figure 16: contact points at 2.0, 38.0, 49.0, 63.5 and 69.0 mm against a reference
+    // deflection of 71 mm, and segment gradients of 6.11, 17.27, 23.45, 109.09 and 280.0 N/mm,
+    // differenced into per-element stiffnesses. Summed at the reference deflection these carry
+    // 1.91 kN of dynamic stiffening against the figure's own envelope of about 2.0 kN there and
+    // the paper's stated 2.8 kN peak at full stroke, which is the arithmetic checking out.
+    constexpr auto fractions = std::array<double, jounceElementCount>{0.02817, 0.53521, 0.69014, 0.89437, 0.97183};
+    constexpr auto stiffnesses = std::array<double, jounceElementCount>{0.04820, 0.08804, 0.04876, 0.67561, 1.34829};
+
+    // This stop's own reference deflection: where its static law reaches the source's 9 kN.
+    // `elastic = rate · x^p / gap^(p-1)`, so inverting it is one root.
+    const auto scale = std::pow(std::max(stop.gap, 1e-6), stop.progression - 1.0);
+    const auto reference = std::pow(jounceReferenceForce * scale / std::max(stop.rate, 1e-6), 1.0 / stop.progression);
+
+    auto candidate = stop;
+    candidate.dahlReference = reference;
+
+    // The saturation: the source limits its Dahl output at half the weighting function's value at
+    // the reference deflection, "which is about 0.9 kN for this specimen" against a 9 kN reference
+    // force. So the hysteresis half-height is a tenth of the elastic force, which is exactly what
+    // this field means — and it lands at the top of BASF's own 10-20% loop-share band for the
+    // material, from a completely independent measurement.
+    candidate.hysteresis = 0.10;
+
+    // **Placed, not sourced.** The three coefficients of the source's Equation 3 are not published,
+    // so the candidate runs the conventional constant-coefficient Dahl (min equal to max) at a
+    // transition displacement of a twentieth of the reference deflection. The displacement
+    // dependence is implemented and switched off rather than invented.
+    candidate.dahlSigmaMin = 20.0 / std::max(reference, 1e-6);
+    candidate.dahlSigmaMax = candidate.dahlSigmaMin;
+    candidate.dahlSigmaExponent = 1.0;
+
+    // **Placed too**: the source optimises its fade-in half-width and publishes no value. A
+    // fiftieth of the reference deflection is well inside the closest pair of contact points,
+    // which is what the parameter has to be for the elements to stay distinguishable.
+    candidate.elementSmoothing = 0.02 * reference;
+
+    for (auto index = std::size_t{0}; index < jounceElementCount; index++)
+    {
+        candidate.elements[index] = JounceElement{.contactPoint = fractions[index] * reference,
+                                                  .stiffness = stiffnesses[index] * jounceReferenceForce / reference,
+                                                  .cutoff = cutoff};
+    }
+
+    return candidate;
+}
+
 [[nodiscard]] double damperDampingCoefficient(const CornerSetup& corner, const DamperForceSolution& damper)
 {
     // The exact expression the force pass always used, with the Jacobian and the velocity now the
@@ -772,7 +942,20 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
         const auto spring = solveSpringForce(corner, suspension);
         solution.forces.spring = spring.force;
         solution.forces.damper = damper.force;
-        solution.forces.bumpStop = corner.bumpStop.force(compression - corner.bumpStop.gap, solution.damperVelocity);
+
+        // The bump stop's dynamic branch, where a car states one. **The branch is on the setup's
+        // own data and no car in this project states it**, so every shipped car takes the second
+        // expression — which is the expression it always took, unchanged — and never touches
+        // `bumpStopState`. That is the inertness proof, and it is a property of the data rather
+        // than of a flag somebody has to remember to leave alone.
+        solution.forces.bumpStop =
+            corner.bumpStop.statesDynamicBranch()
+                ? corner.bumpStop.dynamicForce(compression - corner.bumpStop.gap, solution.damperVelocity, deltaTime,
+                                               state.corners[index].bumpStopState)
+                : corner.bumpStop.force(compression - corner.bumpStop.gap, solution.damperVelocity);
+
+        // The droop stop has no branch: on a strut it is the damper topping out, and the source
+        // measured a jounce bumper.
         solution.forces.droopStop =
             -corner.droopStop.force(-compression - corner.droopStop.gap, -solution.damperVelocity);
 

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <numbers>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -178,6 +179,277 @@ TEST_CASE("a travel stop's hysteresis is the loop the material publishes and not
         const auto releasing = pure.force(0.02, -5.0);
         REQUIRE(releasing > 0.0);
         REQUIRE(releasing == Catch::Approx(pure.force(0.02, 0.0) * (1.0 - 0.07)).epsilon(1e-6));
+    }
+}
+
+TEST_CASE("the sourced jounce branch is off on every car and behaves like its source when it is not",
+          "[physics][vehicle]")
+{
+    // The structure is Pech et al., VSD 2024 (10.1080/00423114.2024.2378858): a static
+    // force-displacement characteristic, a modified Dahl friction element and five Maxwell elements
+    // with their own contact points. `jounceBumperCandidate` transfers it onto a stop's own static
+    // law. **Nothing in this project states it**, which is the first thing this case asserts,
+    // because the whole build was done on the promise that both goldens would not move.
+    const auto plain = TravelStop{.gap = 0.04, .rate = 300000.0, .progression = 2.5, .damping = 20000.0};
+
+    SECTION("no stop on any car states it")
+    {
+        REQUIRE_FALSE(plain.statesDynamicBranch());
+        REQUIRE_FALSE(TravelStop{}.statesDynamicBranch());
+
+        const auto golf = raceengine::golfGtiMk7();
+        REQUIRE(golf.has_value());
+
+        for (const auto& corner : golf->corners)
+        {
+            REQUIRE_FALSE(corner.bumpStop.statesDynamicBranch());
+            REQUIRE_FALSE(corner.droopStop.statesDynamicBranch());
+        }
+
+        const auto placeholder = placeholderSedan();
+        REQUIRE(placeholder.has_value());
+
+        for (const auto& corner : placeholder->corners)
+        {
+            REQUIRE_FALSE(corner.bumpStop.statesDynamicBranch());
+        }
+    }
+
+    SECTION("the transfer lands on the source's own numbers")
+    {
+        const auto candidate = raceengine::jounceBumperCandidate(plain);
+        REQUIRE(candidate.statesDynamicBranch());
+
+        // The reference deflection is where this stop's static law reaches the source's 9 kN, which
+        // is the variable their whole measurement programme is scaled by.
+        REQUIRE(plain.force(candidate.dahlReference) ==
+                Catch::Approx(raceengine::jounceReferenceForce).epsilon(1e-9));
+
+        // Their specimen's static hysteresis half-height is 0.9 kN against 9 kN — a tenth, and the
+        // top of BASF's independently published 10-20% loop-share band for the material.
+        REQUIRE(candidate.hysteresis == Catch::Approx(0.10));
+
+        // Contact points climb and lie inside the reference deflection; the stiffest elements come
+        // in last, which is what makes the branch progressive rather than a single added spring.
+        auto previous = 0.0;
+        for (const auto& element : candidate.elements)
+        {
+            REQUIRE(element.contactPoint > previous);
+            REQUIRE(element.contactPoint < candidate.dahlReference);
+            REQUIRE(element.stiffness > 0.0);
+            previous = element.contactPoint;
+        }
+
+        REQUIRE(candidate.elements[4].stiffness > candidate.elements[0].stiffness);
+
+        // Summed at the reference deflection the elements carry the share the source's own envelope
+        // shows there: a fifth to a quarter of the static force, against their stated 2.8 kN of
+        // 9 kN at full stroke.
+        auto carried = 0.0;
+        for (const auto& element : candidate.elements)
+        {
+            carried += element.stiffness * (candidate.dahlReference - element.contactPoint);
+        }
+
+        REQUIRE(carried > 0.15 * raceengine::jounceReferenceForce);
+        REQUIRE(carried < 0.30 * raceengine::jounceReferenceForce);
+    }
+
+    SECTION("a Maxwell element is a spring above its cut-off and passes nothing far below it")
+    {
+        // The defining behaviour, and the reason the source reaches for this element rather than a
+        // damper: it stiffens with rate and disappears quasi-statically.
+        auto stop = plain;
+        stop.damping = 0.0;
+        stop.hysteresis = 0.0;
+        stop.elements[0] = raceengine::JounceElement{.contactPoint = 0.0, .stiffness = 100000.0, .cutoff = 10.0};
+
+        const auto sweep = [&](const double speed)
+        {
+            auto state = raceengine::TravelStopState{};
+            const auto step = 1.0 / 3600.0;
+            const auto depth = 0.010;
+            const auto ticks = static_cast<int>(depth / (speed * step));
+
+            auto force = 0.0;
+            for (auto index = 1; index <= ticks; index++)
+            {
+                const auto past = speed * step * static_cast<double>(index);
+                force = stop.dynamicForce(past, speed, step, state);
+            }
+
+            // The element's own contribution: everything above the static law it sits on.
+            return force - stop.force(speed * step * static_cast<double>(ticks));
+        };
+
+        // Fast: 10 mm in 10 ms is about 100 rad/s of content against a 10 rad/s cut-off, so the
+        // element has barely relaxed and carries nearly the whole 100 kN/m x 10 mm = 1000 N.
+        const auto fast = sweep(1.0);
+        REQUIRE(fast > 900.0);
+        REQUIRE(fast < 1000.0);
+
+        // Slow: 10 mm at 1 mm/s takes ten seconds against a 0.1 s relaxation, so almost all of it
+        // has leaked away through the series damper.
+        const auto slow = sweep(0.001);
+        REQUIRE(slow < 0.05 * fast);
+    }
+
+    SECTION("the Dahl element saturates at the stated fraction and reverses over a displacement")
+    {
+        auto stop = plain;
+        stop.damping = 0.0;
+        stop.hysteresis = 0.10;
+        stop.dahlSigmaMin = 500.0;
+        stop.dahlSigmaMax = 500.0;
+
+        auto state = raceengine::TravelStopState{};
+        const auto step = 1.0 / 3600.0;
+        const auto speed = 0.1;
+
+        // In, far enough for the friction element to develop: 20 mm against a 2 mm transition.
+        auto past = 0.0;
+        auto latest = 0.0;
+        for (auto index = 0; index < 720; index++)
+        {
+            past += speed * step;
+            latest = stop.dynamicForce(past, speed, step, state);
+        }
+
+        REQUIRE(latest > 0.0);
+
+        // Saturated to within a ten-thousandth, which is a Dahl element approaching its limit
+        // exponentially rather than clipping at it.
+        REQUIRE(state.dahl > 0.9999);
+        REQUIRE(stop.dynamicForce(past, speed, step, state) ==
+                Catch::Approx(stop.force(past) * 1.10).epsilon(1e-4));
+
+        // Out. **The transition is a displacement, not a velocity** — which is the whole reason
+        // this element replaces the `tanh`. One tick of reversal has barely moved it; a couple of
+        // millimetres has taken it all the way over.
+        const auto oneTick = state.dahl;
+        latest = stop.dynamicForce(past, -speed, step, state);
+        REQUIRE(latest > 0.0);
+        REQUIRE(state.dahl > 0.9 * oneTick);
+
+        // Half a transition length back and it has not moved much; one transition length and it is
+        // already through zero, which is the Dahl's own `ln 2 / sigma`. **Both distances are in
+        // millimetres and neither depends on how fast the stop is moving.**
+        for (auto index = 0; index < 25; index++)
+        {
+            past -= speed * step;
+            latest = stop.dynamicForce(past, -speed, step, state);
+        }
+
+        REQUIRE(state.dahl > 0.3);
+
+        for (auto index = 0; index < 30; index++)
+        {
+            past -= speed * step;
+            latest = stop.dynamicForce(past, -speed, step, state);
+        }
+
+        REQUIRE(state.dahl < 0.0);
+
+        // And five transition lengths takes it to the other saturation.
+        for (auto index = 0; index < 400; index++)
+        {
+            past -= speed * step;
+            latest = stop.dynamicForce(past, -speed, step, state);
+        }
+
+        REQUIRE(latest > 0.0);
+        REQUIRE(state.dahl < -0.99);
+    }
+
+    SECTION("leaving the stop forgets the stroke")
+    {
+        // The source resets its Maxwell states after each load event, so the elements attach at
+        // their contact points on the next strike instead of carrying a residue from the last one.
+        auto stop = raceengine::jounceBumperCandidate(plain);
+
+        auto state = raceengine::TravelStopState{};
+        const auto step = 1.0 / 3600.0;
+
+        auto latest = 0.0;
+        for (auto index = 1; index <= 100; index++)
+        {
+            latest = stop.dynamicForce(0.0001 * static_cast<double>(index), 0.36, step, state);
+        }
+
+        REQUIRE(latest > 0.0);
+
+        REQUIRE(state.dahl > 0.0);
+        REQUIRE(state.elementForce[0] > 0.0);
+
+        REQUIRE(stop.dynamicForce(-0.001, -0.36, step, state) == 0.0);
+        REQUIRE(state.dahl == 0.0);
+        REQUIRE(state.elementForce[0] == 0.0);
+        REQUIRE(state.elementInput[0] == 0.0);
+    }
+
+    SECTION("and the branch cannot replace the placed viscous constant, which is the measured finding")
+    {
+        // **Built, measured, and it does not do the job the constant is doing.** Cycled at the
+        // 2 Hz the flip trace pogoed at, over the depth it reached, the sourced branch takes an
+        // order of magnitude less energy out of the car than the shipped 40000 N·s/m does. The
+        // arithmetic behind it is the source's own: their dynamic stiffening peaks at 2.8 kN
+        // against a 9 kN reference force, and a Maxwell element's loss is a fraction of that
+        // again — where a viscous constant at 5x a corner's critical damping is not bounded by
+        // anything the material says.
+        //
+        // The vehicle-level table is `[.jounce-stop]`; this is the same result at the element,
+        // where it needs no car and cannot drift with one.
+        const auto golf = raceengine::golfGtiMk7();
+        REQUIRE(golf.has_value());
+
+        const auto& front = golf->corners[0].bumpStop;
+
+        auto bare = front;
+        bare.damping = 0.0;
+        bare.hysteresis = 0.0;
+
+        const auto loop = [&](const TravelStop& stop)
+        {
+            auto state = raceengine::TravelStopState{};
+            const auto step = 1.0 / 3600.0;
+            const auto frequency = 2.0;
+            const auto depth = 0.012;
+
+            auto work = 0.0;
+            auto previous = 0.0;
+
+            for (auto index = 1; index <= 3600; index++)
+            {
+                const auto now = step * static_cast<double>(index);
+                const auto phase = 2.0 * std::numbers::pi * frequency * now;
+                const auto past = depth * 0.5 * (1.0 - std::cos(phase));
+                const auto speed = depth * 0.5 * std::sin(phase) * 2.0 * std::numbers::pi * frequency;
+
+                const auto force = stop.statesDynamicBranch() ? stop.dynamicForce(past, speed, step, state)
+                                                              : stop.force(past, speed);
+                work += force * (past - previous);
+                previous = past;
+            }
+
+            return work;
+        };
+
+        const auto shipped = loop(front);
+        const auto sourced = loop(raceengine::jounceBumperCandidate(bare));
+        const auto spring = loop(bare);
+
+        // The bare spring is the floor: a lossless law over closed cycles returns what it takes.
+        REQUIRE(std::abs(spring) < 0.5);
+
+        // Both do take energy out, so neither is inert...
+        REQUIRE(sourced > 1.0);
+        REQUIRE(shipped > 1.0);
+
+        // ...and the sourced branch is worth less than a fifth of the placed constant. A two-sided
+        // band, so that both a build that quietly strengthens the branch and one that weakens it
+        // show up here rather than in a seat session.
+        REQUIRE(sourced < 0.20 * shipped);
+        REQUIRE(sourced > 0.01 * shipped);
     }
 }
 

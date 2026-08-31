@@ -181,7 +181,7 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // `Recession` joined on 2026-08-29 with longitudinal recession itself, taking it to nineteen —
     // added WITH the mechanism rather than after a lap could not show it, because it is the only
     // channel the coefficient moves at all.
-    REQUIRE(header.size() == 13 + 9 + 5 + 7 + 19 * tracedCornerCount);
+    REQUIRE(header.size() == 13 + 9 + 5 + 9 + 19 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -255,6 +255,11 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
     car.tractionEngineActive = false;
     car.corneringEnabled = true;
     car.corneringActive = false;
+    // Fitted and active set opposite ways round on purpose: a lap driven with the yaw delay
+    // switched on but never triggered has to be distinguishable from one driven without it, which
+    // is the whole reason both columns exist.
+    car.yawDelayEnabled = true;
+    car.yawDelayActive = false;
     car.engineTorqueReduction = 0.425;
 
     const auto rows = lines(rackTorqueToCsv({frame}));
@@ -267,6 +272,12 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
     {
         return std::stod(values[columnOf(header, channel)]);
     };
+
+    REQUIRE(named("Yaw Delay Fitted []") == Catch::Approx(1.0).margin(1e-9));
+    REQUIRE(named("Yaw Delay Active []") == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(named("XDS Fitted []") == Catch::Approx(1.0).margin(1e-9));
+    REQUIRE(named("XDS Active []") == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(named("Engine Reduction [%]") == Catch::Approx(42.5).epsilon(1e-6));
 
     REQUIRE(named("CoG X [m]") == Catch::Approx(123.25));
     REQUIRE(named("CoG Z [m]") == Catch::Approx(-456.75));

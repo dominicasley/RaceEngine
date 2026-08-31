@@ -9,6 +9,142 @@ module raceengine.assists;
 namespace raceengine
 {
 
+double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& state,
+                             const AntilockChannelState& left, const AntilockChannelState& right,
+                             const std::array<double, 2>& frontRequests, const double lateralAcceleration,
+                             const bool braking, const double deltaTime)
+{
+    // Off, not braking, or in a corner. **The corner case is Limpert's own and is not a guard
+    // somebody added**: above 0.4 g the delay is switched off deliberately, because there the big
+    // braking force at the outer wheel makes a moment that opposes the lateral force's rather than
+    // adding to it.
+    if (!setup.yawMomentDelay || !braking)
+    {
+        state = YawMomentDelayState{};
+        return 0.0;
+    }
+
+    // The start of this brake application, and the cycle counts it began with. **The baseline is the
+    // whole reason this works over a session** — see `YawMomentDelayState::baseCycles`.
+    if (!state.applied)
+    {
+        state.applied = true;
+        state.baseCycles = {left.cycles, right.cycles};
+    }
+
+    // In a corner. Disengages without forgetting the application, because the book switches the
+    // feature off here rather than ending it: a car that comes back under 0.4 g in the same stop
+    // should still be able to use what is left of its staircase.
+    if (std::abs(lateralAcceleration) > setup.yawDelayLateralLimit)
+    {
+        state.engaged = false;
+        state.ceiling = 0.0;
+        state.sinceStage = 0.0;
+        return 0.0;
+    }
+
+    const auto channels = std::array<const AntilockChannelState*, 2>{&left, &right};
+
+    // **"Pressure reduction", not "intervention".** `cycles` counts entries to the dump and nothing
+    // else, so it is exactly the book's trigger; `Hold` is a threshold being watched and is not a
+    // reduction. Using intervention instead would arm this on a wheel that never let any pressure
+    // go.
+    const auto reduced =
+        std::array<bool, 2>{left.cycles > state.baseCycles[0], right.cycles > state.baseCycles[1]};
+    const auto intervening =
+        std::array<bool, 2>{left.phase != ModulatorPhase::Passive, right.phase != ModulatorPhase::Passive};
+
+    // Reducing *now*, which is what "as soon as the first pressure reduction ... takes place" says.
+    // `cycles` never resets, so a channel that dumped once during an earlier brake application
+    // still reports `reduced` on the next one — and arming off that would cap the high wheel from
+    // the first millisecond of a stop, before any wheel had gone anywhere, at a ceiling read off a
+    // channel whose `pressure` is meaningless while it is passive.
+    const auto controlling = std::array<bool, 2>{reduced[0] && intervening[0], reduced[1] && intervening[1]};
+
+    if (!state.engaged)
+    {
+        // "As soon as the first pressure reduction caused by wheel lockup tendencies takes place at
+        // the 'low' wheel." One front having let pressure go while the other has not **is** a split
+        // surface as far as this unit can tell, and identifying the high wheel that way needs no
+        // surface estimate of any kind.
+        if (state.completed || controlling[0] == controlling[1] ||
+            (controlling[0] ? reduced[1] : reduced[0]))
+        {
+            return 0.0;
+        }
+
+        const auto high = controlling[0] ? std::size_t{1} : std::size_t{0};
+        const auto other = high == 0 ? std::size_t{1} : std::size_t{0};
+
+        // **Where the staircase starts, and this is the one modelling choice in the mechanism.**
+        // The book describes two variants: on cars with ordinary handling the high wheel is simply
+        // built "in stages or steps", and on cars "with particularly critical handling
+        // characteristics" its solenoid is given "a specific pressure-holding and reduction time",
+        // with "the pressure modulation of the 'low' and 'high' wheels ... interrelated". This
+        // implements the second, because the first is inert here — a driver's pedal is already at
+        // everything they are asking for by the time a wheel locks, so a ceiling latched at the
+        // request has nothing to stage. **Measured: latched at the request, the delay lasted 17 ms
+        // and every apply share gave the same answer.**
+        //
+        // "Interrelated" read literally: the ceiling is the **low channel's own pressure**, which is
+        // the level the road on that side has just proved it will take. It follows that channel down
+        // for as long as it is still reducing, and is staged up from wherever it got to once that
+        // wheel starts coming back. No new calibrated quantity is introduced anywhere.
+        state.engaged = true;
+        state.highChannel = high;
+        state.ceiling = std::min(frontRequests[high], channels[other]->pressure);
+        state.sinceStage = 0.0;
+
+        return state.ceiling;
+    }
+
+    // **Handover, and it is the half of the mechanism that keeps the stop short.** "When the
+    // pressure at the 'high' wheel has reached its locking level, it is no longer influenced by the
+    // signals of the 'low' wheel; that is, it is individually controlled." **Its own first pressure
+    // reduction is that**, and it is the same test the trigger uses on the low wheel — deliberately,
+    // because "reached its locking level" and "let pressure go" are one event and reading the
+    // handover off `Hold` instead ends the delay on a threshold the unit is merely watching.
+    // Measured: on `Hold` the staircase never ran and every apply share gave the same answer. The
+    // other way out is the staircase arriving: there is then nothing left to hold the wheel back
+    // from.
+    //
+    // **The low wheel going quiet is deliberately NOT a release**, and that was measured: this
+    // modulator returns a channel to `Passive` between cycles, so releasing on it ended the delay
+    // after 17 ms — one dump-and-recover — and the mechanism did about a third of what it does when
+    // it is allowed to run its staircase out.
+    const auto low = state.highChannel == 0 ? std::size_t{1} : std::size_t{0};
+
+    if (reduced[state.highChannel] || state.ceiling >= frontRequests[state.highChannel])
+    {
+        state = YawMomentDelayState{};
+        state.completed = true;
+        return 0.0;
+    }
+
+    // Still reducing at the low wheel: the ceiling follows it down. This is the "pressure-holding
+    // and reduction time" half, and it is what stops the high wheel building through the worst of
+    // the asymmetry.
+    if (channels[low]->phase == ModulatorPhase::Dump)
+    {
+        state.ceiling = std::min(state.ceiling, channels[low]->pressure);
+        state.sinceStage = 0.0;
+
+        return state.ceiling;
+    }
+
+    // "Increased in stages or steps": the ceiling holds and then jumps, rather than sliding. The
+    // mean rate is a share of the modulator's own re-apply gradient, so the staircase's tread width
+    // changes how granular it is and not how fast it gets there.
+    state.sinceStage += deltaTime;
+    if (state.sinceStage >= setup.yawDelayStagePeriod)
+    {
+        state.ceiling += setup.yawDelayStagePeriod * setup.modulator.reapplyGradient * setup.yawDelayApplyShare;
+        state.sinceStage = 0.0;
+    }
+
+    return state.ceiling;
+}
+
 [[nodiscard]] std::size_t antilockControlWheel(const BrakeChannel channel, const WheelSpeedReadings& wheels)
 {
     switch (channel)

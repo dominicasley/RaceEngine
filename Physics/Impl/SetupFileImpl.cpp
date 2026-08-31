@@ -187,6 +187,10 @@ namespace
             {
                 axle.stopHysteresis = *number;
             }
+            else if (field == "stopdynamic")
+            {
+                axle.stopDynamic = *number;
+            }
             else if (field == "compliancesteer")
             {
                 axle.complianceSteer = *number;
@@ -232,6 +236,14 @@ namespace
         else if (key == "steering.invert")
         {
             tune.steering.invert = *number != 0.0;
+        }
+        else if (key == "assist.yawdelay")
+        {
+            tune.assists.yawDelay = *number != 0.0;
+        }
+        else if (key == "assist.yawdelayshare")
+        {
+            tune.assists.yawDelayShare = *number;
         }
         else if (key == "assist.abs")
         {
@@ -292,13 +304,14 @@ namespace
     const auto axle = [](const AxleTune& sheet)
     {
         return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque ||
-               sheet.damperFriction || sheet.stopDamping || sheet.stopHysteresis || sheet.complianceSteer ||
-               sheet.complianceCamber || sheet.recession;
+               sheet.damperFriction || sheet.stopDamping || sheet.stopHysteresis || sheet.stopDynamic ||
+               sheet.complianceSteer || sheet.complianceCamber || sheet.recession;
     };
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
            tune.differential.coastRamp || tune.feedback.gain || tune.feedback.ceilingTorque || tune.feedback.damping ||
-           tune.feedback.damperBandwidth || tune.steering.invert || tune.assists.antilock || tune.assists.traction ||
+           tune.feedback.damperBandwidth || tune.steering.invert || tune.assists.antilock ||
+           tune.assists.yawDelay || tune.assists.yawDelayShare || tune.assists.traction ||
            tune.assists.cornering || tune.pedal.onsetPeaks || tune.pedal.brakeFullPeaks || tune.pedal.throttleFullPeaks;
 }
 
@@ -351,6 +364,15 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
         if (sheet.stopHysteresis)
         {
             corner.bumpStop.hysteresis = *sheet.stopHysteresis;
+        }
+
+        // Applied last of the three so that a sheet asking for the sourced branch gets the sourced
+        // branch's own hysteresis rather than whatever the two keys above left behind. The
+        // candidate is derived from the stop as it stands at this point, so `stopdamping 0` on the
+        // line before is read by it — which is the A/B this key exists for.
+        if (sheet.stopDynamic && *sheet.stopDynamic != 0.0)
+        {
+            corner.bumpStop = jounceBumperCandidate(corner.bumpStop);
         }
 
         if (sheet.complianceSteer)
@@ -406,6 +428,8 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
 void applyVehicleTune(const VehicleTune& tune, AssistSetup& assists)
 {
     assists.antilock.enabled = tune.assists.antilock.value_or(assists.antilock.enabled);
+    assists.antilock.yawMomentDelay = tune.assists.yawDelay.value_or(assists.antilock.yawMomentDelay);
+    assists.antilock.yawDelayApplyShare = tune.assists.yawDelayShare.value_or(assists.antilock.yawDelayApplyShare);
     assists.traction.mode = tune.assists.traction.value_or(assists.traction.mode);
     assists.cornering.enabled = tune.assists.cornering.value_or(assists.cornering.enabled);
 }

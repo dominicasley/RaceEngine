@@ -631,6 +631,14 @@ export struct VehicleTrace
     // edited since.
     bool corneringEnabled = false;
     bool corneringActive = false;
+
+    // The yaw moment build-up delay, and it gets the fitted/active pair from the start rather than
+    // learning the lesson a third time: `yawDelayActive` is only true while the delay is actually
+    // holding a front channel down, and on a uniform surface that may be never — so a lap driven
+    // with the feature switched on would read exactly like a lap driven without it.
+    bool yawDelayEnabled = false;
+    bool yawDelayActive = false;
+
     // 0 with the driver's foot untouched, 1 with the throttle shut.
     double engineTorqueReduction = 0.0;
 
@@ -760,7 +768,8 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             "G Force Lat [g],G Force Long [g],Yaw Rate [deg/s],"
             "Ride Height F [mm],Ride Height R [mm],"
             "Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear [],Engine RPM [rpm],"
-            "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Fitted [],XDS Active [],Engine Reduction [%]";
+            "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Fitted [],XDS Active [],"
+            "Yaw Delay Fitted [],Yaw Delay Active [],Engine Reduction [%]";
 
     for (const auto* tag : tracedCornerAbbreviations)
     {
@@ -868,7 +877,9 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += car.tractionBrakeActive ? ",1" : ",0";
         text += car.tractionEngineActive ? ",1" : ",0";
         text += fitted.corneringEnabled ? ",1" : ",0";
-        text += car.corneringActive ? ",1," : ",0,";
+        text += car.corneringActive ? ",1" : ",0";
+        text += fitted.yawDelayEnabled ? ",1" : ",0";
+        text += car.yawDelayActive ? ",1," : ",0,";
         appendRackNumber(text, car.engineTorqueReduction * 100.0, 3);
 
         // By index, in the order the header was written. Nothing here names a corner: the loop and

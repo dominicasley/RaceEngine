@@ -206,6 +206,87 @@ export struct AntilockSetup
     // low disables this law; only the first version of this file, which required slip to *confirm*
     // an intervention, could be disarmed by it.
     bool slipAwareRecovery = true;
+
+    // --- yaw moment build-up delay, and it ships OFF ---------------------------------------------
+    //
+    // **The one feature both split-mu criteria name as absent**, now with a citable description
+    // rather than a folk memory of one. Limpert, *Brake Design and Safety* 3rd ed., §9.3.1
+    // (`docs/fetched/limpert.txt`): on a split-coefficient surface, "brake line pressure is
+    // increased at the 'high' wheel in stages or steps as soon as the first pressure reduction
+    // caused by wheel lockup tendencies takes place at the 'low' wheel. When the pressure at the
+    // 'high' wheel has reached its locking level, it is no longer influenced by the signals of the
+    // 'low' wheel; that is, it is individually controlled."
+    //
+    // It is a mechanism **this car's class needs**: Limpert scopes it to "smaller vehicles with
+    // lower values of mass moment of inertia", where the yaw builds faster than a driver can
+    // countersteer, against heavy long-wheelbase cars that develop it slowly enough to manage
+    // without.
+    //
+    // And it is explicitly a **compromise** — "between good steering response and minimized stopping
+    // distance", with the book noting that "differences exist between ABS manufacturers" and that
+    // directional stability may be lost where minimum stopping distance is the design objective. So
+    // whether it goes on this car is a decision about what the car should be, not a defect to fix,
+    // and it is not one to take without the driver.
+    bool yawMomentDelay = false;
+
+    // How much of the modulator's own re-apply gradient the high wheel may build at while the delay
+    // is engaged. **PLACED**: Limpert describes the staging and publishes no rate for it, and
+    // neither does the Bosch material behind the modulator's other gradients. Expressed as a share
+    // of an existing calibrated quantity rather than as a new pascals-per-second, so that it cannot
+    // drift away from the hydraulics it is a fraction of. Swept in `[.yaw-delay]`.
+    double yawDelayApplyShare = 0.25;
+
+    // The hold between steps, seconds — "in stages or steps". **PLACED, and cosmetic to the
+    // average**: the share above sets the mean rate and this sets only how granular the staircase
+    // is. Twenty controller periods at the default control rate.
+    double yawDelayStagePeriod = 0.02;
+
+    // Lateral acceleration above which the delay switches off, m/s². **Sourced, and one of the few
+    // hard numbers in the passage**: "prior to the electronic stability system, to optimize braking
+    // while turning, a lateral acceleration sensor switches off the yaw moment delay feature for
+    // lateral acceleration exceeding 0.4 g" — because in a corner the large braking force wanted at
+    // the outer wheel produces a moment that opposes the lateral force's, leaving a mildly
+    // understeering car the driver can hold. 0.4 × 9.80665 = 3.923.
+    double yawDelayLateralLimit = 3.92266;
+};
+
+// What the yaw moment delay is holding. Zero on every tick of every car until the feature is
+// switched on, which is what makes it bit-inert rather than merely off.
+export struct YawMomentDelayState
+{
+    bool engaged = false;
+
+    // Which front channel is the "high" one — the wheel on the grippier side, identified by its
+    // being the one that has **not** yet asked for a pressure reduction.
+    std::size_t highChannel = 0;
+
+    // The staged ceiling that channel's request is capped at, pascals. Meaningless while
+    // `engaged` is false.
+    double ceiling = 0.0;
+    double sinceStage = 0.0;
+
+    // Whether a brake application is under way, and what each front channel's cycle count stood at
+    // when it began.
+    //
+    // **`AntilockChannelState::cycles` never resets, and reading it directly cost a seat lap.** The
+    // trigger is "the first pressure reduction *of this brake application*", and the first version
+    // of this asked whether the other front had ever reduced pressure at all. On a single-stop
+    // fixture those are the same question. On a 372 s session they are not: both fronts crossed
+    // zero cycles on the same tick 25 s in, and the delay was disarmed for the remaining 347 —
+    // through 25 of the lap's 44 brake applications that each had a genuine window, one of them
+    // 361 ms wide. Every fixture in this repository is one stop with a fresh state, so nothing
+    // could see it (`traces/rack-exit-20260830-yawdelay-seat.csv`).
+    bool applied = false;
+    std::array<std::uint32_t, 2> baseCycles{};
+
+    // Whether this brake application's delay is over. Once the high wheel has taken its own control
+    // — or the staircase has climbed to everything the driver is asking for — the book is explicit
+    // that it "is no longer influenced by the signals of the 'low' wheel", and that has to mean for
+    // the rest of the application rather than until the next time the low wheel cycles. Without it
+    // the staircase re-arms every time it finishes and the high wheel is held down for the whole
+    // stop; measured, that turned a 7.7% distance penalty into the same steering benefit at 7.0%,
+    // and it is the difference between the book's "small" increase and an open-ended one.
+    bool completed = false;
 };
 
 // One channel of the modulator and of the controller that drives it.
@@ -255,6 +336,8 @@ export struct AntilockChannelState
 export struct AntilockState
 {
     std::array<AntilockChannelState, brakeChannelCount> channels{};
+
+    YawMomentDelayState yawDelay;
 };
 
 // Which wheel a channel is controlling on, given what the sensors report.
@@ -280,6 +363,29 @@ export [[nodiscard]] bool antilockDrivesWheel(const BrakeChannel channel, const 
 //
 // `channel` is which of the modulator's three channels this is, and it exists because the rear one
 // is metered separately (`BrakeModulator::rearReapplyGradient` and its source above).
+// One step of the yaw moment build-up delay, answering the ceiling the **high** front channel's
+// request must be capped at. `state.engaged` says whether there is a cap at all and
+// `state.highChannel` says which of the two front channels it applies to.
+//
+// It lives above `advanceAntilockChannel` rather than inside it because it is the one part of this
+// controller that is **not** per-channel: the whole mechanism is one front wheel's pressure being
+// held down by the other front wheel's signals, which a per-channel step cannot see.
+//
+// `left` and `right` are the two front channels as they stood at the start of this controller
+// period, and `frontRequests` is what everything upstream wants at each of them. That one period of
+// lag is deliberate and is what a real unit has: it reacts to the sample it has captured, not to one
+// it has not taken yet.
+// `braking` is whether the driver is on the pedal. **It is a scope condition and not a guard**: the
+// book describes this feature entirely for braking on a split surface, and yaw during acceleration
+// is traction control's business. Without it the delay arms on a traction-control brake
+// intervention — measured, it fired for one tick of a scripted standing launch, which is a wheel
+// being braked for spinning and nothing to do with a split surface.
+export [[nodiscard]] double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& state,
+                                                  const AntilockChannelState& left, const AntilockChannelState& right,
+                                                  const std::array<double, 2>& frontRequests,
+                                                  const double lateralAcceleration, const bool braking,
+                                                  const double deltaTime);
+
 export [[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, const BrakeChannel channel,
                                                    AntilockChannelState& state, const WheelSpeedReading& wheel,
                                                    const double wheelRoadSpeed, const double referenceSpeed,

@@ -61,6 +61,7 @@ add_executable(EngineTests
         KerbDiscontinuityProbe.cpp
         LaunchDiagnosticProbe.cpp
         JoltRuntimeTests.cpp
+        JounceStopProbe.cpp
         LookupTableTests.cpp
         MemoryStorageTests.cpp
         PhysicalCameraTests.cpp

@@ -63,6 +63,20 @@ export struct AxleTune
     std::optional<double> stopDamping;
     std::optional<double> stopHysteresis;
 
+    // `stopdynamic 1` installs the sourced jounce-bumper branch on this axle's bump stops —
+    // `jounceBumperCandidate`, a modified Dahl friction element plus five Maxwell elements
+    // transferred from Pech et al.'s measured specimen onto this stop's own static law. Anything
+    // else, including the absent key, leaves the stop exactly as the car states it.
+    //
+    // It is one key rather than twenty because there is nothing here for a driver to tune: the
+    // parameter set is derived from the stop it is installed on, and the two numbers inside it that
+    // the source does not publish are placed and flagged at their own fields. The A/B this exists
+    // for is `front.stopdamping 0` with `front.stopdynamic 1` — the sourced rate-dependent branch
+    // against the placed viscous constant that stands in for it today.
+    //
+    // **Nothing on any car states it and no seat verdict exists on it.**
+    std::optional<double> stopDynamic;
+
     // Lateral-force compliance steer, **degrees per kilonewton** — the unit a K&C rig reports it in
     // and the unit the published figures behind it are quoted in, converted on the way in rather
     // than making a human write radians per newton. Negative is toe-out, which is what a production
@@ -151,6 +165,21 @@ export struct AssistTune
     std::optional<bool> antilock;
     std::optional<TractionMode> traction;
     std::optional<bool> cornering;
+
+    // `assist.yawdelay 0|1` — yaw moment build-up delay, which on a split-friction surface builds
+    // the high-grip front wheel's pressure in stages from the moment the low-grip one first lets
+    // pressure go (`AntilockSetup::yawMomentDelay` carries Limpert's passage). **Off on the car and
+    // off here.** It is on the sheet rather than in car data because the book is explicit that the
+    // feature is "a compromise between good steering response and minimized stopping distance" and
+    // that manufacturers differ — which makes it a driver's setting, like `assist.abs` beside it.
+    std::optional<bool> yawDelay;
+
+    // `assist.yawdelayshare 0.5` — how much of the modulator's own re-apply gradient the staged
+    // build climbs at. **Placed, not sourced**, and it matters more than any other number in the
+    // feature: measured on a split surface at a realistic pedal application, 0.10 costs 76% of the
+    // stopping distance and 0.50 costs 0.9%, for much the same steering benefit (`[.yaw-delay]`).
+    // On the sheet so that the seat can find its own answer without a rebuild.
+    std::optional<double> yawDelayShare;
 };
 
 export struct VehicleTune

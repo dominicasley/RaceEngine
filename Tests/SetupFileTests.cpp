@@ -6,7 +6,10 @@
 
 import raceengine.physics;
 
+using raceengine::AntilockSetup;
 using raceengine::applyVehicleTune;
+using raceengine::golfGtiMk7;
+using raceengine::golfGtiMk7Assists;
 using raceengine::DrivelineSetup;
 using raceengine::parseVehicleTune;
 using raceengine::placeholderDriveline;
@@ -155,6 +158,42 @@ TEST_CASE("applying a tune changes what it names and leaves the rest of the car 
     }
 }
 
+TEST_CASE("the yaw moment build-up delay is a driver's setting and is off until asked for",
+          "[physics][setup]")
+{
+    // On the sheet beside `assist.abs`, because Limpert is explicit that the feature is a
+    // compromise between steering response and stopping distance and that manufacturers differ —
+    // which makes it a choice about the car rather than a defect to fix. **Off on the Golf**, and
+    // this asserts that before it asserts anything else.
+    const auto built = golfGtiMk7();
+    REQUIRE(built.has_value());
+
+    auto assists = golfGtiMk7Assists(built.value());
+    REQUIRE_FALSE(assists.antilock.yawMomentDelay);
+
+    const auto tune = parseVehicleTune("assist.abs 1\nassist.yawdelay 1\nassist.yawdelayshare 0.5\n");
+    REQUIRE(tune.has_value());
+
+    applyVehicleTune(tune.value(), assists);
+
+    REQUIRE(assists.antilock.enabled);
+    REQUIRE(assists.antilock.yawMomentDelay);
+    REQUIRE(assists.antilock.yawDelayApplyShare == Catch::Approx(0.5));
+
+    SECTION("and a sheet that says nothing about it leaves it exactly where the car had it")
+    {
+        auto untouched = golfGtiMk7Assists(built.value());
+        const auto quiet = parseVehicleTune("assist.abs 1\n");
+        REQUIRE(quiet.has_value());
+
+        applyVehicleTune(quiet.value(), untouched);
+
+        REQUIRE_FALSE(untouched.antilock.yawMomentDelay);
+        REQUIRE(untouched.antilock.yawDelayApplyShare ==
+                Catch::Approx(AntilockSetup{}.yawDelayApplyShare));
+    }
+}
+
 TEST_CASE("the bump stop's dissipation is the driver's to restate", "[physics][setup]")
 {
     // `front.stopdamping` and `front.stophysteresis` exist because the shipped 40000 N·s/m is a
@@ -182,6 +221,34 @@ TEST_CASE("the bump stop's dissipation is the driver's to restate", "[physics][s
 
         REQUIRE(car.corners[2].bumpStop.damping == before.corners[2].bumpStop.damping);
         REQUIRE(car.corners[2].bumpStop.hysteresis == 0.0);
+    }
+
+    SECTION("stopdynamic installs the sourced branch on the front bump stops alone")
+    {
+        // The A/B this key exists for is `front.stopdamping 0` with `front.stopdynamic 1`: Pech et
+        // al.'s measured structure against the placed viscous constant that stands in for it. It is
+        // applied after the other two keys, so the line above it is read by the transfer.
+        auto driven = built.value();
+        const auto sourced = parseVehicleTune("front.stopdamping 0\nfront.stopdynamic 1\n");
+        REQUIRE(sourced.has_value());
+
+        applyVehicleTune(sourced.value(), driven);
+
+        REQUIRE(driven.corners[0].bumpStop.statesDynamicBranch());
+        REQUIRE(driven.corners[1].bumpStop.statesDynamicBranch());
+        REQUIRE(driven.corners[0].bumpStop.damping == 0.0);
+        REQUIRE(driven.corners[0].bumpStop.hysteresis == Catch::Approx(0.10));
+
+        // The rear axle and both droop stops are untouched — a branch a driver did not ask for is
+        // a change a driver did not ask for.
+        REQUIRE_FALSE(driven.corners[2].bumpStop.statesDynamicBranch());
+        REQUIRE_FALSE(driven.corners[3].bumpStop.statesDynamicBranch());
+        REQUIRE_FALSE(driven.corners[0].droopStop.statesDynamicBranch());
+
+        // And the static law it was transferred onto is the corner's own, unchanged.
+        REQUIRE(driven.corners[0].bumpStop.gap == before.corners[0].bumpStop.gap);
+        REQUIRE(driven.corners[0].bumpStop.rate == before.corners[0].bumpStop.rate);
+        REQUIRE(driven.corners[0].bumpStop.progression == before.corners[0].bumpStop.progression);
     }
 
     SECTION("the droop stop is a different mechanism and the key does not reach it")
@@ -328,7 +395,7 @@ TEST_CASE("a setup sheet states which electronics are fitted", "[physics][setup]
         const auto built = raceengine::golfGtiMk7();
         REQUIRE(built.has_value());
 
-        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        auto assists = golfGtiMk7Assists(built.value());
         raceengine::applyVehicleTune(tune.value(), assists);
 
         REQUIRE_FALSE(assists.antilock.enabled);
@@ -345,7 +412,7 @@ TEST_CASE("a setup sheet states which electronics are fitted", "[physics][setup]
         const auto built = raceengine::golfGtiMk7();
         REQUIRE(built.has_value());
 
-        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        auto assists = golfGtiMk7Assists(built.value());
         raceengine::applyVehicleTune(tune.value(), assists);
 
         REQUIRE(assists.antilock.enabled);
@@ -374,7 +441,7 @@ TEST_CASE("a setup sheet states which electronics are fitted", "[physics][setup]
         const auto built = raceengine::golfGtiMk7();
         REQUIRE(built.has_value());
 
-        auto assists = raceengine::golfGtiMk7Assists(built.value());
+        auto assists = golfGtiMk7Assists(built.value());
         assists.traction.mode = raceengine::TractionMode::Full;
 
         raceengine::applyVehicleTune(tune.value(), assists);
