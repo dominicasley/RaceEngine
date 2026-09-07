@@ -143,6 +143,25 @@ export struct CreateAmbientOcclusionDTO
     AmbientOcclusion occlusion{};
 };
 
+// What a camera's occlusion culling is made of: one fullscreen shader, and the slack the test runs
+// with. Everything else is the engine's — the grid's resolution is a contract number, the buffer is
+// sized from it, and where the pass runs in the frame is fixed by what it reads.
+//
+// It must be enabled **after** ambient occlusion on the same camera, and says so by failing rather
+// than by convention: the reduction's input is the prepass buffer, and there is no such buffer to
+// name until the prepass exists.
+export struct CreateOcclusionCullingDTO
+{
+    // Reduces the prepass buffer's distance channel to one coarse grid of farthest distances.
+    // Fullscreen, and the only shader here: there is no chain, because a single pass whose
+    // output texel walks its own footprint of the source reads the source exactly once, which is
+    // what a chain's first level costs on its own.
+    Resource<Shader> reduceShader;
+    // The margins the test runs with, defaulted by OcclusionCulling itself; the state fields are
+    // overwritten when it is enabled.
+    OcclusionCulling culling{};
+};
+
 // What a camera's exposure meter is made of. One shader and the dial settings; the chain it reduces
 // through is the engine's to size and to build, because its length has to agree with the level the
 // backend copies back and neither is a game's business.

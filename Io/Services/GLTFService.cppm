@@ -507,6 +507,7 @@ std::expected<Model, std::string> GLTFService::gltfModelToInternal(const std::st
         }
 
         auto material = memoryStorageService.materials.add(Material{
+            .name = tinyGltfMaterial.name,
             .baseColour = glm::vec4(tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[0],
                                     tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[1],
                                     tinyGltfMaterial.pbrMetallicRoughness.baseColorFactor[2],

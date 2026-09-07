@@ -148,6 +148,16 @@ export struct Paint
 
 export struct Material
 {
+    // The asset's own name for this material, carried for the reason `Mesh::name` and
+    // `Texture::name` are: it is the only handle an importer has on *which* material this is, and a
+    // frame diagnostic that can only say "a primitive with no material" names nothing a person can
+    // go and look at. glTF permits it to be empty and this does not invent one.
+    //
+    // **It is also load-bearing outside diagnostics.** Grand City Parkway's collider exports tell a
+    // static hull from a break-away one with `collider_static` against `collider_dynamic` and with
+    // nothing else — the distinction is on the material, and before this it did not survive the
+    // load.
+    std::string name;
     glm::vec4 baseColour;
     float metalness;
     float roughness;

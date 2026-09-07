@@ -47,6 +47,7 @@ import :FrameDiagnostics;
 import :Frustum;
 import :IRenderBackend;
 import :LookupTable;
+import :Occlusion;
 import :PostProcessing;
 import :RenderContract;
 import :SphericalHarmonics;
@@ -407,6 +408,7 @@ static_assert(offsetof(FullscreenPushConstants, weather) == 112);
     switch (format)
     {
     case TextureFormat::R:
+    case TextureFormat::R32F:
         return 1;
     case TextureFormat::RG:
         return 2;
@@ -477,6 +479,12 @@ static_assert(offsetof(FullscreenPushConstants, weather) == 112);
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     case TextureFormat::RGBA32F:
         return VK_FORMAT_R32G32B32A32_SFLOAT;
+    // One full-precision channel. Half would not do for the occlusion grid it exists for: the
+    // distances are world units across a 26,000-unit city, and half floats quantise to sixteen of
+    // them out there — a coarseness that reads as an occluder standing metres in front of where it
+    // is, which is a cull that deletes geometry rather than one that merely misses some.
+    case TextureFormat::R32F:
+        return VK_FORMAT_R32_SFLOAT;
     case TextureFormat::DepthComponent:
     case TextureFormat::DepthComponent32F:
         return VK_FORMAT_D32_SFLOAT;
@@ -1612,7 +1620,7 @@ private:
     // written straight through to the LightProbe because the write happens frames after the copy
     // was recorded, and a pointer into a scene's deque held across those frames would be a
     // pointer into a scene that may have been destroyed. The probe collects it instead.
-    std::array<ShIrradiance, maxIblProbes> probeIrradiance{};
+    std::array<ShIrradiance, probeSpecularSlices> probeIrradiance{};
     // Which submission has to complete before probeReadbackBuffer holds this capture's radiance.
     // Same clock and same rule as the retirement queue: see retire().
     uint64_t probeReadbackReadyAt = 0;
@@ -1628,6 +1636,26 @@ private:
     // camera simply waits its turn rather than needing a second buffer to be deterministic in.
     std::optional<unsigned int> luminanceReadbackOwner{};
     uint64_t luminanceReadbackReadyAt = 0;
+    // The occlusion grid on its way to the CPU: occlusionGridWidth * occlusionGridHeight single
+    // floats, host-visible and permanently mapped, exactly as the two above are. Whole rather than
+    // one texel because the whole of it is the answer — the meter reduces a frame to a number and
+    // this reduces it to a picture, and the picture is what a box is tested against.
+    BufferResource occlusionReadbackBuffer{};
+    void* occlusionReadbackMapped = nullptr;
+    // Which camera's grid the buffer is holding a copy of, and the submission that has to complete
+    // before it holds it. One buffer and one pending copy across every camera that culls, for the
+    // reason the meter has one: the cameras are recorded in a fixed order, so which of them gets
+    // the buffer on which frame is a function of the frame number rather than a race.
+    std::optional<unsigned int> occlusionReadbackOwner{};
+    uint64_t occlusionReadbackReadyAt = 0;
+    // The view the pending copy was rasterised through, held from the frame the copy was recorded
+    // until the frame it lands. It has to be carried rather than read off the camera when the copy
+    // arrives: by then the camera has moved, and a grid tested against the wrong matrices is a cull
+    // that deletes whatever the eye has turned towards.
+    glm::mat4 occlusionReadbackViewProjection{1.0f};
+    glm::mat4 occlusionReadbackView{1.0f};
+    glm::vec3 occlusionReadbackEye{0.0f};
+    float occlusionReadbackNear = 0.0f;
     unsigned int dummyTextureId = 0;
     unsigned int neutralLookupTableId = 0;
     unsigned int dummyCubeMapId = 0;
@@ -1653,6 +1681,11 @@ private:
     // Not a diagnostic: the one-shot info line that says the backend reached a recorded scene
     // pass, which the smoke gate reads. Nothing is skipped when it fires.
     bool drawSummaryLogged = false;
+    // Whether "the culler is live and this is what it rejects" has been said. Once per process, on
+    // the first shading pass that had a grid to test against — the number moves with where the
+    // camera is pointing, so a line per frame would be a wall of noise and a line at shutdown would
+    // be a number from wherever the car finished.
+    bool occlusionSummaryLogged = false;
 
 public:
     explicit VulkanRenderer(spdlog::logger& logger, FrameDiagnostics& diagnostics, IWindow& window,
@@ -1714,6 +1747,13 @@ private:
     // probe's is: it holds one texel whatever the chain in front of it looks like, and a buffer
     // created on the first metering frame would be a buffer allocated inside a recorded frame.
     void createExposureResources();
+    void createOcclusionResources();
+    // The two halves of the occlusion grid's deferred readback, split because they belong at
+    // opposite ends of the prepass rather than beside each other: the collect has to land before
+    // the prepass camera is copied, so that the prepass and the shading pass cull against the same
+    // grid, and the copy has to be recorded after the reduction that filled it.
+    void collectOcclusionGrid(Camera& camera);
+    void queueOcclusionCopy(const Camera& camera);
     // One face of `probe`'s environment, from the probe's own position through a 90-degree
     // frustum, into the scratch cube. A scene pass like any other: it shades, it samples the
     // cascades, and it draws the sky — the difference is that it draws only what the scene marked
@@ -1727,7 +1767,7 @@ private:
     // only once the submission that wrote it has completed, which probeReadbackReadyAt states.
     [[nodiscard]] ShIrradiance projectProbeIrradiance() const;
     // The scene's probes as the frame block carries them, written into `frameData`.
-    void uploadProbes(const Scene& scene, FrameDataUbo& frameData) const;
+    void uploadProbes(const Scene& scene, const glm::vec3& viewPosition, FrameDataUbo& frameData) const;
     // Everything recordSceneBehindCopy needs to suspend the pass, copy the opaque colour into the
     // behind chain and resume: the two image ids, the rendering info to re-begin with, and the
     // attachment structs it names — whose load ops become LOAD, because the resumed pass continues
@@ -2028,6 +2068,10 @@ VulkanRenderer::~VulkanRenderer()
     {
         vmaDestroyBuffer(allocator, luminanceReadbackBuffer.buffer, luminanceReadbackBuffer.allocation);
     }
+    if (occlusionReadbackBuffer.buffer != VK_NULL_HANDLE)
+    {
+        vmaDestroyBuffer(allocator, occlusionReadbackBuffer.buffer, occlusionReadbackBuffer.allocation);
+    }
     if (probePrefilterPipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device, probePrefilterPipeline, nullptr);
@@ -2194,6 +2238,7 @@ std::expected<void, std::string> VulkanRenderer::init()
         createDescriptorInfrastructure();
         createProbeResources();
         createExposureResources();
+        createOcclusionResources();
 #if defined(RACEENGINE_HAS_TRACY)
         // The context's constructor records its own calibration into this buffer, submits it and
         // waits; the pool is reset before the first frame records, so borrowing it here is safe.
@@ -3698,7 +3743,7 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
 
-    uploadProbes(scene, frameData);
+    uploadProbes(scene, camera.position, frameData);
     uploadFog(scene.fog, frameData);
     // The rain through this view's own scale — a sheltered view (Camera::rainScale) shades its
     // surfaces dry while the weather push constant below stays the scene's, so the streaks outside
@@ -4203,6 +4248,10 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
     // has gone stale — a model unloaded while its renderable is still in the scene — is skipped
     // here, not chased into a recycled slot.
     auto recordedDraws = 0u;
+    // Per pass, for the one line below. Primitives rather than draws: a primitive rejected here
+    // never reaches recordDraw, so it never becomes one.
+    auto occlusionTested = 0u;
+    auto occlusionRejected = 0u;
 
     // This view's own clip volume, extracted once. Every pass this function serves — the four
     // cascades, the occlusion prepass, the shading pass and a probe face — arrives here with its
@@ -4210,6 +4259,37 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
     // own (:Frustum states why, including why the cascade case is the one that looks like it needs
     // special handling and does not).
     const auto viewPlanes = frustumPlanes(camera.modelViewProjectionMatrix);
+
+    // The occlusion grid this view culls against, resolved once for the same reason the planes are.
+    // Null is every view that does not have one, and that is most of them:
+    //
+    //   - a cascade and a probe face look from somewhere else entirely, and a grid is a photograph
+    //     of one eye's view. Neither has a prepass to build one from either;
+    //   - an orthographic view has no `w` to divide by and no distance in front of an eye to
+    //     compare against, so the projection half of the test does not apply to it;
+    //   - a shading camera that gathers no ambient occlusion has no prepass, and without a prepass
+    //     there are no occluders.
+    //
+    // What is left is the shading view and the prepass that runs immediately before it, and those
+    // two share the grid deliberately: recordAmbientOcclusion collects the readback *before* it
+    // copies this camera, so both walk with the same grid and reject the same primitives. If they
+    // could disagree, the prepass writing depth for something the shading pass skipped would leave
+    // the clear colour on screen where the geometry should have been.
+    const auto* occlusionGrid =
+        camera.occlusionCulling.enabled && camera.occlusionCulling.readback != nullptr &&
+                camera.projection == CameraProjection::Perspective &&
+                (camera.role == CameraRole::Scene || camera.role == CameraRole::DepthNormalPrepass)
+            ? camera.occlusionCulling.readback.get()
+            : nullptr;
+
+    // How far the eye has travelled since that grid was photographed, plus the camera's own stated
+    // lead, as a distance every tested box is grown by. Growing the box is the standard bound on
+    // what a translation can uncover: it is monotone in the right direction rather than a proof,
+    // and it is the whole of what pays for the lag, because rotation cannot disocclude anything.
+    const auto occlusionDilation =
+        occlusionGrid != nullptr
+            ? glm::length(camera.position - occlusionGrid->eye) + std::max(camera.occlusionCulling.travelSlack, 0.0f)
+            : 0.0f;
 
     // Likewise view-constant. `*` associates left to right, so folding the correction in here gives
     // every draw below the same `(clipCorrection() * mvp) * model` it computed for itself before.
@@ -4426,11 +4506,35 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 // palette and the entity's own draw callbacks are side effects a view owes whether
                 // or not this primitive is visible, and skipping them would make what is on screen
                 // depend on what was on screen last frame.
-                if (joints.empty() && glm::all(glm::greaterThan(primitive.boundsHalfExtent, glm::vec3(0.0f))) &&
-                    aabbOutsideFrustum(viewPlanes, entityModelMatrix, primitive.boundsCentre,
-                                       primitive.boundsHalfExtent))
+                const auto bounded =
+                    joints.empty() && glm::all(glm::greaterThan(primitive.boundsHalfExtent, glm::vec3(0.0f)));
+
+                if (bounded && aabbOutsideFrustum(viewPlanes, entityModelMatrix, primitive.boundsCentre,
+                                                  primitive.boundsHalfExtent))
                 {
                     continue;
+                }
+
+                // In front of this view and behind something it has already drawn. The same two
+                // exemptions the frustum test takes — a skinned draw and a primitive whose accessor
+                // declared no bounds — and for the same reasons, which is why they are one flag.
+                //
+                // **This is the one visibility test in the frame that is not exact**, and what it
+                // trades is stated in Graphics/Api/Occlusion.cppm: the grid is a frame or two old,
+                // so an eye that has just driven past the end of a wall can reject something for a
+                // frame that is now visible. The dilation above is what bounds that;
+                // `OSR_OCCLUSION=off` is the A/B.
+                if (bounded && occlusionGrid != nullptr)
+                {
+                    occlusionTested++;
+
+                    if (aabbOccluded(*occlusionGrid, entityModelMatrix, primitive.boundsCentre,
+                                     primitive.boundsHalfExtent, occlusionDilation,
+                                     camera.occlusionCulling.cellMargin))
+                    {
+                        occlusionRejected++;
+                        continue;
+                    }
                 }
 
                 // Depth-only and prepass views have no blending to order — they write data, and
@@ -4518,6 +4622,15 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                    camera, clipCorrectedViewProjection, *deferred.joints, deferred.paintOffset, colorFormat,
                    depthFormat, shadowDescriptors, staticOnly, false);
         recordedDraws++;
+    }
+
+    if (!occlusionSummaryLogged && camera.role == CameraRole::Scene && occlusionTested > 0)
+    {
+        logger.info("Occlusion culling live: {} of {} bounded primitive(s) rejected in this view as hidden, against a "
+                    "grid photographed {:.1f} unit(s) ago",
+                    occlusionRejected, occlusionTested,
+                    static_cast<double>(glm::length(camera.position - occlusionGrid->eye)));
+        occlusionSummaryLogged = true;
     }
 
     return recordedDraws;
@@ -4937,7 +5050,7 @@ void VulkanRenderer::createProbeResources()
     // named by every frame's descriptor, and black is the only value that reads as "no probe here"
     // rather than as whatever the allocator handed over.
     probeSpecularImageId = createProbeImage(
-        probeCubeResolution, probeSpecularMipCount, 6 * maxIblProbes, radianceFormat,
+        probeCubeResolution, probeSpecularMipCount, 6 * probeSpecularSlices, radianceFormat,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT, true);
 
@@ -4946,8 +5059,8 @@ void VulkanRenderer::createProbeResources()
         probeRadianceFaceViews[face] = createLevelView(probeRadianceImageId, 0, face);
     }
 
-    probeSpecularFaceViews.reserve(static_cast<size_t>(maxIblProbes) * probeSpecularMipCount * 6);
-    for (auto slice = 0u; slice < maxIblProbes; slice++)
+    probeSpecularFaceViews.reserve(static_cast<size_t>(probeSpecularSlices) * probeSpecularMipCount * 6);
+    for (auto slice = 0u; slice < probeSpecularSlices; slice++)
     {
         for (auto mip = 0u; mip < probeSpecularMipCount; mip++)
         {
@@ -5197,6 +5310,134 @@ void VulkanRenderer::createExposureResources()
     luminanceReadbackMapped = mappedInfo.pMappedData;
 }
 
+void VulkanRenderer::createOcclusionResources()
+{
+    // The whole grid, one float per cell. A buffer image copy transfers whole texels and the grid's
+    // texels are single floats, so this is the transfer's own width with nothing padded.
+    constexpr VkDeviceSize occlusionReadbackBytes =
+        static_cast<VkDeviceSize>(occlusionGridWidth) * occlusionGridHeight * sizeof(float);
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = occlusionReadbackBytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    VmaAllocationInfo mappedInfo{};
+    ensure(vmaCreateBuffer(allocator, &bufferInfo, &allocationInfo, &occlusionReadbackBuffer.buffer,
+                           &occlusionReadbackBuffer.allocation, &mappedInfo),
+           "vmaCreateBuffer");
+    occlusionReadbackMapped = mappedInfo.pMappedData;
+}
+
+// The collect half. Publishes the last completed copy onto the camera, where the draw walk reads it
+// — and nowhere else: this runs before the prepass camera is built out of a copy of this one, which
+// is what makes the two passes cull identically. Two passes that disagreed would not merely waste a
+// draw; the prepass writing depth for geometry the shading pass then skipped is a hole in the frame.
+void VulkanRenderer::collectOcclusionGrid(Camera& camera)
+{
+    auto& culling = camera.occlusionCulling;
+
+    if (!culling.enabled || !culling.grid.issued() || occlusionReadbackMapped == nullptr)
+    {
+        return;
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(culling.grid);
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value())
+    {
+        return;
+    }
+
+    if (occlusionReadbackOwner != attachment->gpuResourceId.value() || occlusionReadbackReadyAt > submittedFrames)
+    {
+        return;
+    }
+
+    ensure(vmaInvalidateAllocation(allocator, occlusionReadbackBuffer.allocation, 0, VK_WHOLE_SIZE),
+           "vmaInvalidateAllocation");
+
+    auto grid = std::make_shared<OcclusionGrid>();
+    grid->width = occlusionGridWidth;
+    grid->height = occlusionGridHeight;
+    grid->farthest.resize(static_cast<size_t>(occlusionGridWidth) * occlusionGridHeight);
+    // The matrices the *copy* was recorded with, not the camera's now. The camera has moved since,
+    // and how far it has moved is precisely what the test pays for as slack — it cannot also be
+    // silently folded into the projection.
+    grid->viewProjection = occlusionReadbackViewProjection;
+    grid->view = occlusionReadbackView;
+    grid->eye = occlusionReadbackEye;
+    grid->nearPlane = occlusionReadbackNear;
+
+    const auto* cells = static_cast<const float*>(occlusionReadbackMapped);
+    std::copy(cells, cells + grid->farthest.size(), grid->farthest.begin());
+
+    culling.readback = std::move(grid);
+    occlusionReadbackOwner.reset();
+}
+
+// The copy half. Recorded after the reduction that filled the grid, which is the tail of the prepass
+// camera's own post chain, so what it copies is this frame's geometry — and what it reaches the CPU
+// as is a fixed number of submissions later, never this one.
+void VulkanRenderer::queueOcclusionCopy(const Camera& camera)
+{
+    const auto& culling = camera.occlusionCulling;
+
+    if (!frameOpen || !culling.enabled || !culling.grid.issued() || occlusionReadbackMapped == nullptr)
+    {
+        return;
+    }
+
+    // Another camera's copy is still in flight. It will be collected on the frame it is ready and
+    // this camera queues its own on the one after — a fixed rotation, not a race.
+    if (occlusionReadbackOwner.has_value())
+    {
+        return;
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(culling.grid);
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value())
+    {
+        return;
+    }
+
+    const auto imageId = attachment->gpuResourceId.value();
+    const auto image = imageResources.find(imageId);
+    if (image == imageResources.end())
+    {
+        return;
+    }
+
+    const auto& frame = frames[frameIndex];
+
+    transitionTrackedLevel(frame.commandBuffer, imageId, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    VkBufferImageCopy readback{};
+    readback.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    readback.imageExtent = VkExtent3D{occlusionGridWidth, occlusionGridHeight, 1};
+    vkCmdCopyImageToBuffer(frame.commandBuffer, image->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           occlusionReadbackBuffer.buffer, 1, &readback);
+
+    // Back to where the next frame's pass expects to find it, so that frame's barrier is the one the
+    // post-process path already emits rather than one derived from a transfer layout.
+    transitionTrackedLevel(frame.commandBuffer, imageId, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // The view this grid is a photograph of, held until the copy lands.
+    occlusionReadbackViewProjection = camera.modelViewProjectionMatrix;
+    occlusionReadbackView = camera.modelViewMatrix;
+    occlusionReadbackEye = camera.position;
+    occlusionReadbackNear = camera.nearClippingPlane;
+
+    // Same arithmetic as retire(): the copy is a command in a frame that has not been submitted, so
+    // the buffer holds this grid only once that submission has completed.
+    occlusionReadbackOwner = imageId;
+    occlusionReadbackReadyAt = submittedFrames + framesInFlight + 1;
+}
+
 // The image a shading view samples its occlusion from. A camera that gathers none — or one whose
 // buffer has gone out from under it — reads the 1x1 white image, which is a visibility term of one
 // everywhere and therefore no occlusion at all.
@@ -5257,6 +5498,11 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
         return;
     }
 
+    // Before the copy below, and that ordering is the whole of how the two passes stay honest with
+    // each other: what lands here is what the prepass camera carries away, so the prepass and the
+    // shading pass reject exactly the same primitives.
+    collectOcclusionGrid(camera);
+
     Camera prepass = camera;
     prepass.role = CameraRole::DepthNormalPrepass;
     prepass.debugName = camera.debugName.empty() ? std::string("ao prepass") : camera.debugName + " prepass";
@@ -5266,6 +5512,11 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
     // view that shades, and this one has not shaded anything. The occlusion settings stay on the
     // copy because the gather reads its radius and strength out of them.
     prepass.postProcesses = occlusion.passes;
+    // The occlusion grid's reduction rides the same chain, after the gather that shares its input.
+    // It belongs to the prepass rather than to the shading view because what it reduces is the
+    // prepass's own attachment, and a pass recorded before its producer reads the frame before.
+    prepass.postProcesses.insert(prepass.postProcesses.end(), camera.occlusionCulling.passes.begin(),
+                                 camera.occlusionCulling.passes.end());
     // **Every layer, whatever this camera's own mask says.** The prepass records the geometry the
     // frame is made of so the gather can measure how much sky each pixel sees, and under a layered
     // frame one gather serves every layer's shading — so a prepass that drew only its own camera's
@@ -5287,6 +5538,9 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
     prepass.clearColour.reset();
 
     recordScenePass(scene, prepass, delta);
+
+    // After the reduction that filled it, which was the tail of the chain above.
+    queueOcclusionCopy(camera);
 }
 
 // The meter's half of the deferred-readback pattern the probe path established: collect the copy
@@ -5395,15 +5649,23 @@ void VulkanRenderer::recordProbeCapture(Scene& scene, LightProbe& probe)
 
     if (!probe.arraySlice.has_value())
     {
-        if (probeSlicesUsed >= maxIblProbes)
-        {
-            diagnostics.record(FrameDiagnostic::ProbeLimitExceeded, [&] { return "probe '" + probe.name + "'"; });
-
-            probe.state = LightProbeState::Ready;
-            return;
-        }
-
-        probe.arraySlice = probeSlicesUsed++;
+        // A slice of its own while the pool has one, and the scratch slice once it does not.
+        //
+        // **A probe past the pool is captured, not refused.** It draws its six faces and prefilters
+        // them exactly as any other probe does; what it does not do is keep the result. The
+        // projection below takes the irradiance off the scratch slice and then hands the slice
+        // back, so the probe ends up with the diffuse half of a real photograph and no reflection
+        // of its own. That is what lets a city carry a probe every sixty metres of street against
+        // a pool of eight: the half that costs a megabyte is rationed and the half that costs a
+        // hundred and forty-four bytes is not.
+        //
+        // **One probe borrows the scratch slice at a time, and that is guaranteed rather than
+        // hoped for.** `Engine::recordProbeCaptures` advances the *first* probe that is not Ready
+        // and then returns, and a probe stays not-Ready from its first face until its irradiance
+        // has been projected — so the first not-Ready probe is always the one already in flight.
+        // Nothing else can reach this line while a capture is waiting on its readback. The single
+        // readback buffer and `probeReadbackReadyAt` have always rested on the same guarantee.
+        probe.arraySlice = probeSlicesUsed < maxIblProbes ? probeSlicesUsed++ : probeScratchSlice;
     }
 
     // Waiting on the readback that the last call queued. It is the *only* thing this call does,
@@ -5418,13 +5680,18 @@ void VulkanRenderer::recordProbeCapture(Scene& scene, LightProbe& probe)
 
         probeIrradiance[probe.arraySlice.value()] = projectProbeIrradiance();
         probe.irradiance = probeIrradiance[probe.arraySlice.value()];
+        probe.irradianceReady = true;
         probe.state = LightProbeState::Ready;
 
         // Once per probe rather than once per process: a probe's mean irradiance is the one number
         // that says the capture saw anything at all, and a scene where one probe is dark and the
         // rest are not is the case worth being able to read straight off the log. Re-captures are
         // silent — a time-of-day change would otherwise print the whole graph every few seconds.
-        if (!probe.captureLogged)
+        //
+        // A probe that borrowed the scratch slice says nothing at all, and that is not tidiness: a
+        // city places hundreds of them, and a line each would bury every other thing the startup
+        // log has to say under a wall of near-identical irradiances.
+        if (!probe.captureLogged && probe.arraySlice.value() != probeScratchSlice)
         {
             // Upwards, because that is the direction most of a scene's surfaces face and so the
             // one whose value can be read straight off against what the sky looks like.
@@ -5433,6 +5700,15 @@ void VulkanRenderer::recordProbeCapture(Scene& scene, LightProbe& probe)
                         "irradiance facing up {:.3f} {:.3f} {:.3f}",
                         probe.name, probe.arraySlice.value(), probeSpecularMipCount, upward.r, upward.g, upward.b);
             probe.captureLogged = true;
+        }
+
+        // The scratch slice goes back the moment its irradiance has been read out of it. The next
+        // probe overwrites it, so nothing may be left pointing at it — which is exactly what
+        // clearing the handle says, and what makes `arraySlice` mean "this probe can be reflected
+        // in" rather than "this probe was captured somewhere".
+        if (probe.arraySlice.value() == probeScratchSlice)
+        {
+            probe.arraySlice.reset();
         }
 
         return;
@@ -5793,29 +6069,97 @@ ShIrradiance VulkanRenderer::projectProbeIrradiance() const
     return projectCubeToIrradiance(std::span<const std::span<const glm::vec3>, 6>(faces), extent);
 }
 
-void VulkanRenderer::uploadProbes(const Scene& scene, FrameDataUbo& frameData) const
+void VulkanRenderer::uploadProbes(const Scene& scene, const glm::vec3& viewPosition, FrameDataUbo& frameData) const
 {
-    auto uploaded = 0u;
+    // Which probes this view shades from, and it is a *selection* rather than the first eight the
+    // scene happens to list — because a city carries hundreds and the frame block holds eight.
+    //
+    // Two rules, and the first one is not an optimisation. **The global probe is kept whatever the
+    // distance**: it is what every fragment outside every local volume falls back on, so a view
+    // that dropped it because the car had driven a kilometre from where it stands would light that
+    // kilometre with nothing at all. The rest of the budget goes to the local probes nearest this
+    // view, which is where a local probe is worth having.
+    //
+    // **A scene that already fits keeps its own order exactly.** Everything is chosen, and the
+    // chosen are uploaded in the order the scene declares them, so for a scene of eight probes or
+    // fewer this function does what it always did, in the same order, to the last bit. That is what
+    // keeps both frame gates still.
+    struct Chosen
+    {
+        const LightProbe* probe = nullptr;
+        size_t order = 0;
+        // Distance squared from the view, and -1 for the global probe so it sorts ahead of
+        // everything and is never the one evicted.
+        float rank = 0.0f;
+    };
+
+    std::array<Chosen, maxIblProbes> chosen{};
+    auto count = size_t{0};
+    auto order = size_t{0};
 
     for (const auto& probe : scene.probes)
     {
-        // A probe with no slice never captured — the array was full — and one that has not
-        // reached Ready holds either nothing or a partial environment. Neither may shade: a
-        // half-captured probe lights the world from whichever faces happened to finish.
-        if (uploaded >= maxIblProbes || !probe.arraySlice.has_value() || probe.state == LightProbeState::Capturing)
+        const auto here = order++;
+
+        // A probe that has never been captured has nothing to hand over: its irradiance is the
+        // zero it was constructed with, and uploading that is a black probe rather than an absent
+        // one. `irradianceReady` and not `arraySlice`, because a probe past the specular pool has
+        // a real photograph and no slice — see recordProbeCapture.
+        if (!probe.irradianceReady)
         {
             continue;
         }
 
-        auto& target = frameData.probes[uploaded];
+        const auto offset = probe.position - viewPosition;
+        const auto rank = probe.global ? -1.0f : glm::dot(offset, offset);
+
+        if (count < chosen.size())
+        {
+            chosen[count++] = Chosen{&probe, here, rank};
+            continue;
+        }
+
+        auto worst = size_t{0};
+        for (auto index = size_t{1}; index < chosen.size(); index++)
+        {
+            if (chosen[index].rank > chosen[worst].rank)
+            {
+                worst = index;
+            }
+        }
+
+        if (rank < chosen[worst].rank)
+        {
+            chosen[worst] = Chosen{&probe, here, rank};
+        }
+    }
+
+    std::sort(chosen.begin(), chosen.begin() + static_cast<std::ptrdiff_t>(count),
+              [](const Chosen& left, const Chosen& right) { return left.order < right.order; });
+
+    for (auto index = size_t{0}; index < count; index++)
+    {
+        const auto& probe = *chosen[index].probe;
+        auto& target = frameData.probes[index];
+
+        // The slice, or -1 for "this probe has no reflection of its own". Two probes get that: one
+        // past the specular pool, which never kept a slice, and one part-way through a re-capture,
+        // whose slice is being overwritten as this frame is recorded. Both keep shading their
+        // diffuse — the previous irradiance in the second case, which is what makes a re-capture a
+        // slide rather than a flash to black — and both take their reflection from the global
+        // probe, which is what a fragment outside every local volume already does.
+        const auto reflects =
+            probe.arraySlice.has_value() && probe.arraySlice.value() != probeScratchSlice &&
+            probe.state != LightProbeState::Capturing;
+
         target.irradiance = probe.irradiance;
         target.boxMin = glm::vec4(probe.position - probe.halfExtents, probe.blendDistance);
         target.boxMax = glm::vec4(probe.position + probe.halfExtents, probe.global ? 1.0f : 0.0f);
-        target.position = glm::vec4(probe.position, static_cast<float>(probe.arraySlice.value()));
-        uploaded++;
+        target.position =
+            glm::vec4(probe.position, reflects ? static_cast<float>(probe.arraySlice.value()) : -1.0f);
     }
 
-    frameData.probeParams = glm::ivec4(static_cast<int>(uploaded), 0, 0, 0);
+    frameData.probeParams = glm::ivec4(static_cast<int>(count), 0, 0, 0);
 }
 
 bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBinding> inputs,

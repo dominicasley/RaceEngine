@@ -179,6 +179,10 @@ namespace
             {
                 axle.damperFriction = *number;
             }
+            else if (field == "frictionshape")
+            {
+                axle.frictionShape = *number;
+            }
             else if (field == "stopdamping")
             {
                 axle.stopDamping = *number;
@@ -304,8 +308,8 @@ namespace
     const auto axle = [](const AxleTune& sheet)
     {
         return sheet.springRate || sheet.bumpRate || sheet.reboundRate || sheet.antiRollRate || sheet.brakeTorque ||
-               sheet.damperFriction || sheet.stopDamping || sheet.stopHysteresis || sheet.stopDynamic ||
-               sheet.complianceSteer || sheet.complianceCamber || sheet.recession;
+               sheet.damperFriction || sheet.frictionShape || sheet.stopDamping || sheet.stopHysteresis ||
+               sheet.stopDynamic || sheet.complianceSteer || sheet.complianceCamber || sheet.recession;
     };
 
     return axle(tune.front) || axle(tune.rear) || tune.differential.preload || tune.differential.powerRamp ||
@@ -352,6 +356,14 @@ void applyVehicleTune(const VehicleTune& tune, VehicleSetup& vehicle)
         if (sheet.damperFriction)
         {
             corner.damperFriction = *sheet.damperFriction;
+        }
+
+        // Applied after the magnitude, so a sheet stating both gets its own magnitude shaped rather
+        // than the car's. Anything non-zero installs the one sourced shape there is; zero and the
+        // absent key both leave the corner on the flat law, which is what every car states.
+        if (sheet.frictionShape && *sheet.frictionShape != 0.0)
+        {
+            corner.damperFrictionShape = macPhersonStrutFrictionShape();
         }
 
         // The bump stop only. The droop stop is the damper topping out — a different mechanism —

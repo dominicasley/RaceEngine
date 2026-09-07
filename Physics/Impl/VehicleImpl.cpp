@@ -163,6 +163,66 @@ void seedTyreGasPressures(const VehicleSetup& setup, VehicleState& state)
     return DamperSolution{.length = evaluated.length, .lengthPerAngle = evaluated.lengthPerAngle};
 }
 
+double damperFrictionShapeAt(const Curve& shape, const double speed)
+{
+    // A corner that states no shape has no velocity dependence, and the answer is exactly one — not
+    // `Curve::at`'s empty-curve zero, which would delete the friction rather than leave it alone.
+    return shape.points.empty() ? 1.0 : shape.at(speed);
+}
+
+Curve macPhersonStrutFrictionShape()
+{
+    // Deubel et al., Tribology International 215 (2026) 111328, Fig. 4, design-deflection panel,
+    // the side-force column whose 0.5 mm/s value is the shipped 107 N (≈500 N of side force).
+    // Newtons as read: 107 at 0.5 mm/s, then 140, 136, 126, 118, 109, 99, 92, 84, 80, 77, 74 at
+    // 5, 10, 20, 30, 50, 75, 100, 150, 200, 250 and 300 mm/s. Divided by the 107 and written to
+    // three places, which is finer than the reading and coarser than nothing — the figures below
+    // are ratios of two readings from one plot, so the third place carries no claim.
+    //
+    // Both ends are held rather than extrapolated (`Curve::at`), and both are deliberate: below
+    // 0.5 mm/s the source measures no sliding at all and the regularisation owns the answer, and
+    // above 300 mm/s the source stops because *"the maximum velocity was limited to 300 mm/s, based
+    // on the analysis of real SA stroke data, which is regarded sufficient for analysing vertical
+    // dynamics on good- and medium-conditioned roads"*. A suspension crossing a kerb goes faster
+    // than that and this curve says the last measured thing about it, which is the honest answer and
+    // not a good one.
+    return Curve{.points = {glm::dvec2(0.0005, 1.000), glm::dvec2(0.005, 1.308), glm::dvec2(0.010, 1.271),
+                            glm::dvec2(0.020, 1.178), glm::dvec2(0.030, 1.103), glm::dvec2(0.050, 1.019),
+                            glm::dvec2(0.075, 0.925), glm::dvec2(0.100, 0.860), glm::dvec2(0.150, 0.785),
+                            glm::dvec2(0.200, 0.748), glm::dvec2(0.250, 0.720), glm::dvec2(0.300, 0.692)}};
+}
+
+namespace
+{
+
+// The whole friction-carrying damper force, in the three expressions the data selects between. The
+// first two are the shipped ones and are written out character for character; the third is the
+// velocity shape, which no car states.
+[[nodiscard]] double damperForceWithFriction(const CornerSetup& corner, const double viscous, const double velocity)
+{
+    if (corner.damperFriction <= 0.0)
+    {
+        return viscous;
+    }
+
+    if (corner.damperFrictionShape.points.empty())
+    {
+        return viscous + corner.damperFriction * std::tanh(velocity / std::max(corner.damperFrictionSpeed, 1e-9));
+    }
+
+    // Magnitude times shape times direction, and the direction factor is the *same* regularised
+    // `tanh` the shipped law uses. Keeping it is not conservatism: the shape is a steady-state
+    // sliding measurement that says nothing about the presliding regime, so something still has to
+    // carry the force through zero, and this is the term whose numerical behaviour at 360 Hz this
+    // project has already accepted. The shape reads `|velocity|`, so a symmetric shape gives a
+    // symmetric force — which is what the source licenses, its rebound-to-compression eccentricity
+    // being *"not exceeding 12 % in absolute means"*.
+    return viscous + corner.damperFriction * damperFrictionShapeAt(corner.damperFrictionShape, std::abs(velocity)) *
+                         std::tanh(velocity / std::max(corner.damperFrictionSpeed, 1e-9));
+}
+
+} // namespace
+
 [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& corner, const SuspensionState& suspension,
                                                    const double wishboneRate)
 {
@@ -180,11 +240,13 @@ void seedTyreGasPressures(const VehicleSetup& setup, VehicleState& state)
                                //
                                // Branched rather than added, so a car with no friction stated runs the expression it
                                // always ran and not one that happens to add a zero to it. Every car here states none.
-                               .force =
-                                   corner.damperFriction > 0.0
-                                       ? viscous + corner.damperFriction *
-                                                       std::tanh(velocity / std::max(corner.damperFrictionSpeed, 1e-9))
-                                       : viscous};
+                               //
+                               // The third branch is the velocity shape (`CornerSetup::damperFrictionShape`), and it is
+                               // branched for the same reason and to the same standard: **no car states one**, so every
+                               // car in this project takes one of the two expressions above, unchanged. The magnitude
+                               // does not scale with velocity; the shape says how the *measured* magnitude does, and
+                               // the two are separate because their sources are.
+                               .force = damperForceWithFriction(corner, viscous, velocity)};
 }
 
 [[nodiscard]] double damperShaftCompression(const CornerSetup& corner, const DamperForceSolution& damper)
@@ -632,7 +694,8 @@ TravelStop jounceBumperCandidate(const TravelStop& stop, const double cutoff)
     // element carries over the whole reference deflection".
     //
     // Read from Figure 16: contact points at 2.0, 38.0, 49.0, 63.5 and 69.0 mm against a reference
-    // deflection of 71 mm, and segment gradients of 6.11, 17.27, 23.45, 109.09 and 280.0 N/mm,
+    // deflection of 71 mm — **an inference, not a printed displacement-at-9-kN figure; see
+    // `TravelStop::dahlReference`** — and segment gradients of 6.11, 17.27, 23.45, 109.09 and 280.0 N/mm,
     // differenced into per-element stiffnesses. Summed at the reference deflection these carry
     // 1.91 kN of dynamic stiffening against the figure's own envelope of about 2.0 kN there and
     // the paper's stated 2.8 kN peak at full stroke, which is the arithmetic checking out.
@@ -697,8 +760,35 @@ TravelStop jounceBumperCandidate(const TravelStop& stop, const double cutoff)
     const auto shaped = std::tanh(damper.velocity / smoothing);
     const auto frictionSlope = (corner.damperFriction / smoothing) * (1.0 - shaped * shaped);
 
+    if (corner.damperFrictionShape.points.empty())
+    {
+        return damper.lengthPerAngle * damper.lengthPerAngle *
+               std::max(0.0, curveSlopeAt(corner.damper, damper.velocity) + frictionSlope);
+    }
+
+    // With a shape stated the friction is `f · s(|v|) · tanh(v/w)`, so the product rule gives two
+    // terms and **the first of them can be negative**:
+    //
+    //     d/dv = f · [ s'(|v|)·sgn(v)·tanh(v/w) + s(|v|)·(1/w)·sech²(v/w) ]
+    //
+    // Negative because the source's curve *falls* with speed above its maximum, which is velocity
+    // weakening and is a real destabilising slope rather than an artefact — friction that drops as
+    // the shaft speeds up is what makes stick-slip possible. It is written here rather than left
+    // out precisely because the integration must see it: the `std::max(0.0, ...)` below is the same
+    // floor the shipped path has always had, so a corner whose total slope goes negative is stepped
+    // explicitly through that tick rather than being handed a negative implicit divisor.
+    //
+    // The speed derivative is differenced off the shape curve at the same step every other curve
+    // here is differenced at. That step is 0.1 mm/s, a fifth of the first knot's spacing, so unlike
+    // the `tanh` term this one is resolvable by differencing and does not need writing out.
+    const auto speed = std::abs(damper.velocity);
+    const auto direction = damper.velocity < 0.0 ? -1.0 : 1.0;
+    const auto shape = damperFrictionShapeAt(corner.damperFrictionShape, speed);
+    const auto shapeSlope = curveSlopeAt(corner.damperFrictionShape, speed) * direction * shaped;
+
     return damper.lengthPerAngle * damper.lengthPerAngle *
-           std::max(0.0, curveSlopeAt(corner.damper, damper.velocity) + frictionSlope);
+           std::max(0.0, curveSlopeAt(corner.damper, damper.velocity) + shape * frictionSlope +
+                             corner.damperFriction * shapeSlope);
 }
 
 namespace
@@ -1748,6 +1838,14 @@ stepVehicle(const VehicleSetup& setup, VehicleState& state, const VehicleInput& 
     // a rigid constraint underneath them would be fighting a carefully shaped force with something
     // that knows nothing about slip.
     result.contacts = collideBody(world, state.chassis, setup.body);
+
+    // Whatever the bodywork is about to hit, decided **before** it is resolved. A prop is bolted
+    // down, so the solver below would otherwise put the car's whole momentum into an anchor that is
+    // about to give way — right for a bollard, and for a wheelie bin it is both a car stopped dead
+    // and, once the anchor did break, a bin handed an impulse sized to stop a car. This asks first.
+    // Nothing happens here on a track with no street furniture on it.
+    releaseBrokenProps(state.chassis, result.contacts, deltaTime);
+
     resolveContacts(state.chassis, result.contacts, setup.contact, deltaTime);
 
     integrate(state.chassis, chassisForces, deltaTime);

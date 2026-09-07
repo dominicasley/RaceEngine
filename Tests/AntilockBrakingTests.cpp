@@ -140,6 +140,12 @@ struct StopResult
     bool onPlate = true;
     bool grounded = true;
 
+    // Additive read-only channels for the `[.abs-ledger]` ensembles at the foot of this file, and
+    // nothing written before 2026-09-06 reads them. `grounded` above is the same fact as a boolean
+    // and is what every criterion in this file uses; these say how long and how far down.
+    std::size_t rearAirborneTicks = 0;
+    double minimumRearLoad = 1e9;
+
     // How long the yaw moment build-up delay was engaged for, seconds, and the lowest ceiling it
     // held the high front channel at. **Zero on every shipped car**, because the feature is off —
     // and reported at all because a feature that measures as inert has to say whether it never
@@ -301,6 +307,20 @@ void settle(const VehicleSetup& setup, VehicleState& state, const PhysicsWorld& 
             }
 
             result.grounded = result.grounded && lastStep.telemetry.wheels[index].inContact;
+        }
+
+        {
+            auto rearOff = false;
+            auto rearLoad = 0.0;
+
+            for (auto index = std::size_t{2}; index < cornerCount; index++)
+            {
+                rearOff = rearOff || !lastStep.telemetry.wheels[index].inContact;
+                rearLoad += lastStep.telemetry.wheels[index].verticalLoad;
+            }
+
+            result.rearAirborneTicks += rearOff ? 1 : 0;
+            result.minimumRearLoad = std::min(result.minimumRearLoad, rearLoad);
         }
 
         if (std::abs(state.chassis.position.x) > 0.5 * plateWidth - 2.0 || state.chassis.position.z > plateLength - 5.0)
@@ -2487,4 +2507,526 @@ TEST_CASE("yaw moment build-up delay is off everywhere, and does what the book s
         REQUIRE(advanceYawMomentDelay(setup, state, low, high, requests, -5.0, true, 0.001) == 0.0);
         REQUIRE_FALSE(state.engaged);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The criteria of this file, re-measured on the standard braking ensemble.
+// `./EngineTests "[.abs-ledger]"`.
+//
+// **Every case below is a characterisation probe and asserts nothing about the car.** Not one
+// acceptance criterion in this file is changed, loosened or re-derived here; what these cases do is
+// say what each criterion's own number looks like when the fixture is rolled across its own settling
+// tolerance instead of being read once. `BrakingUtilisationProbe.cpp`'s `[.brake-ledger]` holds the
+// dry ledger and the oracles; this holds the criteria's own fixture, because a red has to be
+// re-measured on the fixture that reports it and not on a neighbouring one.
+//
+// The ensemble is the same protocol in both files: a deterministic uniform sweep of entry speed
+// across +/-0.7%, odd count, no random number anywhere in it. `steeringEnsemble` above is the
+// fifteen-member special case the two steering criteria already assert on.
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+constexpr auto ensembleBand = 0.007;
+
+[[nodiscard]] double memberEntry(const std::size_t index, const std::size_t count)
+{
+    const auto offset = count <= 1 ? 0.0
+                                   : -ensembleBand + 2.0 * ensembleBand * static_cast<double>(index) /
+                                                         static_cast<double>(count - 1);
+
+    return hundred * (1.0 + offset);
+}
+
+[[nodiscard]] std::vector<StopResult> entryEnsemble(const VehicleSetup& setup, const PhysicsWorld& world,
+                                                    const AssistSetup& assists, const double pedal,
+                                                    const double steering, const std::size_t count)
+{
+    auto runs = std::vector<StopResult>{};
+    runs.reserve(count);
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        runs.push_back(stop(setup, world, assists, memberEntry(index, count), pedal, steering));
+    }
+
+    return runs;
+}
+
+// The same nine statistics `BrakingUtilisationProbe.cpp` reports, deliberately duplicated rather
+// than shared: these are two plain translation units in a modules project with no first-party
+// headers, and the alternative is putting a test concern into a production module. The percentile
+// definition must match, and does -- R's type 7, numpy's default, median on the middle member.
+struct Distribution
+{
+    std::size_t n = 0;
+    double minimum = 0.0;
+    double p10 = 0.0;
+    double p25 = 0.0;
+    double median = 0.0;
+    double mean = 0.0;
+    double p75 = 0.0;
+    double p90 = 0.0;
+    double maximum = 0.0;
+    double deviation = 0.0;
+};
+
+[[nodiscard]] double percentile(const std::vector<double>& sorted, const double fraction)
+{
+    const auto position = fraction * static_cast<double>(sorted.size() - 1);
+    const auto lower = static_cast<std::size_t>(position);
+    const auto upper = std::min(lower + 1, sorted.size() - 1);
+
+    return sorted[lower] + (position - static_cast<double>(lower)) * (sorted[upper] - sorted[lower]);
+}
+
+[[nodiscard]] Distribution distributionOf(std::vector<double> values)
+{
+    if (values.empty())
+    {
+        return Distribution{};
+    }
+
+    std::sort(values.begin(), values.end());
+
+    auto sum = 0.0;
+    for (const auto value : values)
+    {
+        sum += value;
+    }
+
+    const auto count = static_cast<double>(values.size());
+    const auto mean = sum / count;
+
+    auto squared = 0.0;
+    for (const auto value : values)
+    {
+        squared += (value - mean) * (value - mean);
+    }
+
+    return Distribution{.n = values.size(),
+                        .minimum = values.front(),
+                        .p10 = percentile(values, 0.10),
+                        .p25 = percentile(values, 0.25),
+                        .median = percentile(values, 0.50),
+                        .mean = mean,
+                        .p75 = percentile(values, 0.75),
+                        .p90 = percentile(values, 0.90),
+                        .maximum = values.back(),
+                        .deviation = values.size() > 1 ? std::sqrt(squared / (count - 1.0)) : 0.0};
+}
+
+template <typename Projection>
+[[nodiscard]] std::vector<double> project(const std::vector<StopResult>& runs, Projection projection)
+{
+    auto values = std::vector<double>{};
+    values.reserve(runs.size());
+
+    for (const auto& run : runs)
+    {
+        values.push_back(projection(run));
+    }
+
+    return values;
+}
+
+void ledgerHeader(const char* what)
+{
+    std::printf("\n  %-30s   n      min      P10      P25   MEDIAN     mean      P75      P90      max      sd\n",
+                what);
+}
+
+void ledgerRow(const char* name, const Distribution& value)
+{
+    std::printf("  %-30s %3zu  %7.3f  %7.3f  %7.3f  %7.3f  %7.3f  %7.3f  %7.3f  %7.3f  %6.3f\n", name, value.n,
+                value.minimum, value.p10, value.p25, value.median, value.mean, value.p75, value.p90, value.maximum,
+                value.deviation);
+}
+
+// How many members are on each side of zero. On a bimodal arm this is the statistic a median hides,
+// and "the anti-lock system is worth 7% on dry tarmac" turned out to be one member of a set that
+// contains members where it is worth less than nothing.
+struct Sign
+{
+    std::size_t positive = 0;
+    std::size_t negative = 0;
+};
+
+[[nodiscard]] Sign signOf(const std::vector<double>& values)
+{
+    auto sign = Sign{};
+
+    for (const auto value : values)
+    {
+        sign.positive += value > 0.0 ? 1 : 0;
+        sign.negative += value < 0.0 ? 1 : 0;
+    }
+
+    return sign;
+}
+
+// The pedal sweep the two dry criteria measure their driver against, as a union of both their
+// lists, so one sweep per member answers both. Criterion 2's first case sweeps the FINE list (27
+// pedals) and its second case the COARSE one (12) -- and the published 4.92% and 4.0% penalties came
+// off the coarse one, so a supersession has to be computed against the same list it was.
+struct SweepPedal
+{
+    double pedal;
+    bool fine;
+    bool coarse;
+};
+
+[[nodiscard]] std::vector<SweepPedal> driverSweep()
+{
+    return std::vector<SweepPedal>{
+        {0.20, true, true},   {0.22, true, false},  {0.24, true, false},  {0.25, false, true},
+        {0.26, true, false},  {0.28, true, false},  {0.30, true, true},   {0.31, true, false},
+        {0.32, true, false},  {0.33, true, false},  {0.34, true, false},  {0.35, true, true},
+        {0.36, true, false},  {0.37, true, false},  {0.38, true, false},  {0.39, true, false},
+        {0.40, true, true},   {0.41, true, false},  {0.42, true, false},  {0.44, true, false},
+        {0.45, false, true},  {0.46, true, false},  {0.48, true, false},  {0.50, true, true},
+        {0.55, true, false},  {0.60, true, true},   {0.70, true, true},   {0.80, true, true},
+        {0.90, false, true},  {1.00, true, true}};
+}
+
+// The published reference, a SCALAR: amS Supertest, kalt, verified at source 2026-08-25. Nothing
+// below invents a distribution around it.
+constexpr auto publishedStop = 35.50;
+
+} // namespace
+
+TEST_CASE("the dry 100-0 red and what the anti-lock system is worth, on the standard ensemble", "[.abs-ledger]")
+{
+    // **Sections 9 and 10 of the 2026-09-06 ledger rebuild, on the criteria's own fixture.**
+    //
+    // Three arms, twenty-nine members each, paired member by member: the production anti-lock stop,
+    // the same car with the electronics off and the pedal on the floor, and the best constant pedal
+    // a perfect threshold-braking driver could hold -- swept per member, because where the optimum
+    // sits moves with everything and a sweep ranged for one entry speed measures the others off it.
+    //
+    // **Nothing here changes a criterion.** `the imported car stops from 100 km/h in the distance the
+    // real one does` keeps its 36.0 m bound and its `[!shouldfail]`; what this says is whether that
+    // red is robust across the whole ensemble or is a property of one roll.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0, 1.0));
+    REQUIRE(world.has_value());
+
+    const auto plain = golfGtiMk7Assists(setup.value());
+    const auto count = std::size_t{29};
+
+    const auto assisted = entryEnsemble(setup.value(), world.value(), withAntilock(setup.value()), 1.0, 0.0, count);
+    const auto locked = entryEnsemble(setup.value(), world.value(), plain, 1.0, 0.0, count);
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        REQUIRE(assisted[index].stopped);
+        REQUIRE(assisted[index].onPlate);
+        REQUIRE(locked[index].stopped);
+        REQUIRE(locked[index].onPlate);
+    }
+
+    // The driver, per member. Two bests off one sweep: the fine list criterion 2's first case uses
+    // and the coarse list its second case and every published penalty figure use.
+    const auto sweep = driverSweep();
+    auto bestFine = std::vector<double>{};
+    auto bestCoarse = std::vector<double>{};
+    auto bestFinePedal = std::vector<double>{};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        const auto entry = memberEntry(index, count);
+        auto fine = 1e9;
+        auto coarse = 1e9;
+        auto finePedal = 0.0;
+
+        for (const auto& candidate : sweep)
+        {
+            const auto run = stop(setup.value(), world.value(), plain, entry, candidate.pedal);
+            REQUIRE(run.stopped);
+            REQUIRE(run.onPlate);
+
+            if (candidate.fine && run.distance < fine)
+            {
+                fine = run.distance;
+                finePedal = candidate.pedal;
+            }
+
+            if (candidate.coarse && run.distance < coarse)
+            {
+                coarse = run.distance;
+            }
+        }
+
+        bestFine.push_back(fine);
+        bestCoarse.push_back(coarse);
+        bestFinePedal.push_back(finePedal);
+    }
+
+    std::printf("\n=== the dry 100-0, three arms, %zu members, +/-%.1f%% entry band ===\n", count,
+                100.0 * ensembleBand);
+    std::printf("  fixture: AntilockBrakingTests.cpp `stop()`, the one the criteria themselves run on.\n");
+
+    const auto assistedStop = distributionOf(project(assisted, [](const StopResult& r) { return r.distance; }));
+    const auto lockedStop = distributionOf(project(locked, [](const StopResult& r) { return r.distance; }));
+
+    ledgerHeader("stopping distance [m]");
+    ledgerRow("production ABS, pedal 1.00", assistedStop);
+    ledgerRow("no electronics, pedal 1.00", lockedStop);
+    ledgerRow("best constant pedal (fine)", distributionOf(bestFine));
+    ledgerRow("best constant pedal (coarse)", distributionOf(bestCoarse));
+    ledgerRow("the winning fine pedal []", distributionOf(bestFinePedal));
+
+    // --- section 9: the 100-0 red ---
+
+    std::printf("\n=== the 100-0 validation against the published %.2f m ===\n", publishedStop);
+    std::printf("  criterion   `the imported car stops from 100 km/h in the distance the real one does`\n");
+    std::printf("  bound       distance < 36.00 m, [!shouldfail]. UNCHANGED by this probe.\n");
+    std::printf("\n  best member    %7.3f m   %+7.2f%% against the reference\n", assistedStop.minimum,
+                100.0 * (assistedStop.minimum - publishedStop) / publishedStop);
+    std::printf("  median         %7.3f m   %+7.2f%%\n", assistedStop.median,
+                100.0 * (assistedStop.median - publishedStop) / publishedStop);
+    std::printf("  worst member   %7.3f m   %+7.2f%%\n", assistedStop.maximum,
+                100.0 * (assistedStop.maximum - publishedStop) / publishedStop);
+    std::printf("  error of the median  %+.3f m;  error range %+.3f to %+.3f m\n", assistedStop.median - publishedStop,
+                assistedStop.minimum - publishedStop, assistedStop.maximum - publishedStop);
+
+    auto passing = std::size_t{0};
+    for (const auto& run : assisted)
+    {
+        passing += run.distance < 36.0 ? 1 : 0;
+    }
+
+    std::printf("\n  members inside the 36.00 m bound: %zu of %zu\n", passing, count);
+    std::printf("  the red is %s\n", passing == 0 ? "ROBUST -- every member fails, by 7.9 m or more"
+                                                  : "MEMBER-DEPENDENT -- read the count above");
+
+    // --- section 10: what the anti-lock system is worth ---
+
+    auto worthLocked = std::vector<double>{};
+    auto penaltyFine = std::vector<double>{};
+    auto penaltyCoarse = std::vector<double>{};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        worthLocked.push_back(100.0 * (locked[index].distance - assisted[index].distance) / locked[index].distance);
+        penaltyFine.push_back(100.0 * (assisted[index].distance - bestFine[index]) / bestFine[index]);
+        penaltyCoarse.push_back(100.0 * (assisted[index].distance - bestCoarse[index]) / bestCoarse[index]);
+    }
+
+    std::printf("\n=== what the anti-lock system is worth, PAIRED member by member ===\n");
+    ledgerHeader("percent");
+    ledgerRow("worth vs locked wheels [%]", distributionOf(worthLocked));
+    ledgerRow("penalty vs driver, fine [%]", distributionOf(penaltyFine));
+    ledgerRow("penalty vs driver, coarse [%]", distributionOf(penaltyCoarse));
+
+    const auto worthSign = signOf(worthLocked);
+    const auto fineSign = signOf(penaltyFine);
+
+    std::printf("\n  worth vs locked wheels    %zu of %zu members POSITIVE, %zu NEGATIVE\n", worthSign.positive, count,
+                worthSign.negative);
+    std::printf("  penalty vs the fine driver %zu of %zu members POSITIVE (ABS longer), %zu NEGATIVE (ABS shorter)\n",
+                fineSign.positive, count, fineSign.negative);
+    std::printf("\n  A positive `worth` is the anti-lock system stopping the car shorter than locked wheels.\n");
+    std::printf("  A positive `penalty` is the anti-lock system stopping the car LONGER than the driver.\n");
+    std::printf("  Criterion 2's two bounds are penalty > -6%% (the cheating watch, fine sweep) and\n");
+    std::printf("  penalty < +6%% (the hunting bound, coarse sweep). Both are UNCHANGED by this probe;\n");
+    std::printf("  what is printed is where every member sits inside them.\n");
+
+    auto insideCheat = std::size_t{0};
+    auto insideHunt = std::size_t{0};
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        insideCheat += penaltyFine[index] > -6.0 ? 1 : 0;
+        insideHunt += penaltyCoarse[index] < 6.0 ? 1 : 0;
+    }
+
+    std::printf("\n  members inside penalty > -6%% : %zu of %zu\n", insideCheat, count);
+    std::printf("  members inside penalty < +6%% : %zu of %zu\n", insideHunt, count);
+
+    // **The member table, and it is the point of the whole case.** A criterion that reads one stop
+    // reads the member marked `<<` below, and on a bimodal arm that member is not a summary of
+    // anything. Printed in full so a future reader can see exactly where the shipped figure sits in
+    // its own distribution rather than being told.
+    std::printf("\n  --- every member, with the fixture's own nominal entry marked ---\n");
+    std::printf("\n     entry km/h      ABS m    locked m   driver m   worth %%   pen fine %%  pen coarse %%\n");
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        std::printf("     %9.3f  %9.3f   %9.3f  %9.3f  %8.3f   %9.3f    %9.3f  %s\n",
+                    3.6 * memberEntry(index, count), assisted[index].distance, locked[index].distance, bestFine[index],
+                    worthLocked[index], penaltyFine[index], penaltyCoarse[index],
+                    index == count / 2 ? "<<  the single stop every criterion reads" : "");
+    }
+}
+
+TEST_CASE("the low-mu and split-mu criteria on the standard ensemble", "[.abs-ledger]")
+{
+    // **Section 12 and section 13 of the ledger rebuild, and they are kept apart on purpose.** A
+    // low-mu distribution and a dry one are not comparable and are never pooled here; the split-mu
+    // arm is a third surface again. No causal investigation is re-run: what these two tables say is
+    // whether each criterion's published figure is one member of a spread or a stable statistic.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto count = std::size_t{29};
+    const auto plain = golfGtiMk7Assists(setup.value());
+
+    // --- low mu, the whole plate at 0.35 ---
+
+    const auto slippery = PhysicsWorld::create(gripPlate(0.35, 0.35));
+    REQUIRE(slippery.has_value());
+
+    const auto lowLocked = entryEnsemble(setup.value(), slippery.value(), plain, 1.0, 0.0, count);
+    const auto lowAssisted = entryEnsemble(setup.value(), slippery.value(), withAntilock(setup.value()), 1.0, 0.0,
+                                           count);
+
+    auto lowWorth = std::vector<double>{};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        REQUIRE(lowLocked[index].stopped);
+        REQUIRE(lowAssisted[index].stopped);
+        // The precondition the criterion itself asserts: without the electronics the wheels really
+        // do lock, or the comparison is between two things that are not what they are called.
+        REQUIRE(lowLocked[index].meanTrueSlip > 0.8);
+
+        lowWorth.push_back(100.0 * (lowLocked[index].distance - lowAssisted[index].distance) /
+                           lowLocked[index].distance);
+    }
+
+    std::printf("\n=== low mu (0.35 everywhere), %zu members, +/-%.1f%% entry band ===\n", count,
+                100.0 * ensembleBand);
+    std::printf("  criterion `anti-lock braking is worth something on a uniformly slippery surface`\n");
+    std::printf("  bound     assisted < 0.90 x locked, [!shouldfail]. UNCHANGED by this probe.\n");
+
+    ledgerHeader("low mu");
+    ledgerRow("locked wheels [m]", distributionOf(project(lowLocked, [](const StopResult& r) { return r.distance; })));
+    ledgerRow("anti-lock [m]",
+              distributionOf(project(lowAssisted, [](const StopResult& r) { return r.distance; })));
+    ledgerRow("ABS worth [%]", distributionOf(lowWorth));
+
+    const auto lowSign = signOf(lowWorth);
+    auto lowPassing = std::size_t{0};
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        lowPassing += lowAssisted[index].distance < 0.9 * lowLocked[index].distance ? 1 : 0;
+    }
+
+    std::printf("\n  %zu of %zu members POSITIVE worth, %zu NEGATIVE; %zu of %zu inside the 10%% bound\n",
+                lowSign.positive, count, lowSign.negative, lowPassing, count);
+    std::printf("  Low-mu and dry distributions are NOT pooled anywhere. The low-mu red's documented\n");
+    std::printf("  structural cause -- the tyre's longitudinal peak moving with surface grip -- stands.\n");
+
+    // --- split mu, tarmac left and 0.35 right ---
+
+    const auto split = PhysicsWorld::create(gripPlate(1.00, 0.35));
+    REQUIRE(split.has_value());
+
+    const auto splitPlain = entryEnsemble(setup.value(), split.value(), plain, 1.0, 0.0, count);
+    const auto splitAssisted = entryEnsemble(setup.value(), split.value(), withAntilock(setup.value()), 1.0, 0.0,
+                                             count);
+
+    auto shorter = std::vector<double>{};
+    auto yawShare = std::vector<double>{};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        REQUIRE(splitPlain[index].stopped);
+        REQUIRE(splitAssisted[index].stopped);
+
+        shorter.push_back(100.0 * (splitPlain[index].distance - splitAssisted[index].distance) /
+                          splitPlain[index].distance);
+        yawShare.push_back(std::abs(splitAssisted[index].finalYaw) / std::abs(splitPlain[index].finalYaw));
+    }
+
+    std::printf("\n=== split mu (1.00 left, 0.35 right), %zu members, +/-%.1f%% entry band ===\n", count,
+                100.0 * ensembleBand);
+    std::printf("  criteria  `keeps the car straight on a split surface` (three sections) and\n");
+    std::printf("            `on a split surface it stays inside a quarter turn`. Both UNCHANGED.\n");
+    std::printf("  published 80.03 -> 56.67 m, yaw 107.3 -> 12.2 deg (physics-and-tyre-model-report, one member)\n");
+
+    ledgerHeader("split mu");
+    ledgerRow("no electronics [m]",
+              distributionOf(project(splitPlain, [](const StopResult& r) { return r.distance; })));
+    ledgerRow("anti-lock [m]",
+              distributionOf(project(splitAssisted, [](const StopResult& r) { return r.distance; })));
+    ledgerRow("shorter with ABS [%]", distributionOf(shorter));
+    ledgerRow("no electronics, yaw [deg]",
+              distributionOf(project(splitPlain, [](const StopResult& r) { return std::abs(r.finalYaw) * degrees; })));
+    ledgerRow("anti-lock, yaw [deg]",
+              distributionOf(
+                  project(splitAssisted, [](const StopResult& r) { return std::abs(r.finalYaw) * degrees; })));
+    ledgerRow("assisted yaw / plain yaw []", distributionOf(yawShare));
+
+    auto quarterTurn = std::size_t{0};
+    auto plainSpins = std::size_t{0};
+    auto muchShorter = std::size_t{0};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        quarterTurn += std::abs(splitAssisted[index].finalYaw) < 45.0 / degrees ? 1 : 0;
+        plainSpins += std::abs(splitPlain[index].finalYaw) > 45.0 / degrees ? 1 : 0;
+        muchShorter += splitAssisted[index].distance < 0.85 * splitPlain[index].distance ? 1 : 0;
+    }
+
+    std::printf("\n  members inside the 45 deg quarter turn (assisted): %zu of %zu\n", quarterTurn, count);
+    std::printf("  members where the UNASSISTED car passes 45 deg      : %zu of %zu\n", plainSpins, count);
+    std::printf("  members where assisted < 0.85 x plain distance      : %zu of %zu\n", muchShorter, count);
+}
+
+TEST_CASE("the half-pedal four-wheels criterion on the standard ensemble", "[.abs-ledger]")
+{
+    // **Section 11 of the ledger rebuild, and it is deliberately kept SEPARATE from the full-pedal
+    // ledger.** The two are different fixtures answering different questions: the full-pedal
+    // anti-lock distribution is about the controller, and this is a half-pedal stop with the
+    // electronics OFF, which is about the car. The 2026-09-06 decomposition established that they
+    // expose the same underlying rear-load collapse; that finding is not re-derived here and the
+    // criterion is not touched.
+    const auto guard = JoltGuard{};
+
+    const auto setup = golfGtiMk7();
+    REQUIRE(setup.has_value());
+
+    const auto world = PhysicsWorld::create(gripPlate(1.0, 1.0));
+    REQUIRE(world.has_value());
+
+    const auto count = std::size_t{29};
+    const auto runs =
+        entryEnsemble(setup.value(), world.value(), golfGtiMk7Assists(setup.value()), 0.50, 0.0, count);
+
+    auto grounded = std::size_t{0};
+    auto airborne = std::vector<double>{};
+    auto lowest = std::vector<double>{};
+
+    for (const auto& run : runs)
+    {
+        REQUIRE(run.stopped);
+        REQUIRE(run.onPlate);
+
+        grounded += run.grounded ? 1 : 0;
+        airborne.push_back(static_cast<double>(run.rearAirborneTicks));
+        lowest.push_back(run.minimumRearLoad);
+    }
+
+    std::printf("\n=== the half-pedal four-wheels criterion, %zu members, +/-%.1f%% entry band ===\n", count,
+                100.0 * ensembleBand);
+    std::printf("  criterion `the car keeps all four wheels on the ground through a hard stop`\n");
+    std::printf("  fixture   pedal 0.50, electronics OFF, dry. UNCHANGED by this probe.\n");
+    std::printf("  NOT the same fixture as the full-pedal anti-lock ledger, and never pooled with it.\n");
+
+    ledgerHeader("half pedal, no electronics");
+    ledgerRow("stopping distance [m]", distributionOf(project(runs, [](const StopResult& r) { return r.distance; })));
+    ledgerRow("rear-off ticks", distributionOf(airborne));
+    ledgerRow("minimum rear-axle load [N]", distributionOf(lowest));
+
+    std::printf("\n  members with all four wheels down for the whole stop: %zu of %zu\n", grounded, count);
+    std::printf("  the red is %s\n",
+                grounded == 0 ? "ROBUST -- every member lifts a rear wheel" : "MEMBER-DEPENDENT -- read the count");
 }

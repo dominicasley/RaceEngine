@@ -671,7 +671,15 @@ TEST_CASE("the imported car's skidpad has an understeer gradient and a limit", "
         // So the car's peak is **0.9011 g** and the old list reported the value at 0.30 instead. On
         // the 0.02 lattice now in the sweep it reads **0.9009**.
         //
-        // **Read the margin before trusting this pass. It is 0.1%** — 0.9009 against a 0.90 floor.
+        // **That table is 2026-08-27's car and the peak has since moved — re-measured 2026-09-05.**
+        // The mechanisms stated on the Golf after it (the tyre's road-area fraction, longitudinal
+        // recession, the pressure model switching on) moved both the value and its location: the
+        // peak now sits at **0.34** rather than 0.37, and this criterion's own sixteen angles read
+        // **0.9002 g**, with a dense 0.01/0.02 scan across 0.30-0.45 agreeing to four figures. So
+        // the margin is **0.02%**, not 0.1% — 0.0002 g. `docs/known-red.md` carries it as a watch
+        // item. Nothing was changed to produce that number and nothing here is tuned to it.
+        //
+        // **Read the margin before trusting this pass. It is 0.02%** — 0.9002 against a 0.90 floor.
         // That is the honest state of the car and not a comfortable green: this car sits at the very
         // bottom of the real Mk7's 0.90-0.95 range, and a physics change worth one part in a thousand
         // puts it back in `docs/known-red.md`. The balance question is unchanged by any of this.

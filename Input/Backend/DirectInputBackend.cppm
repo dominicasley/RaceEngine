@@ -22,6 +22,7 @@ module;
 module raceengine.input:DirectInputBackend;
 
 import :DirectInputContract;
+import :DriverInput;
 import :InputBackend;
 
 namespace raceengine
@@ -175,6 +176,12 @@ BOOL CALLBACK collectDevice(const DIDEVICEINSTANCE* instance, void* context)
     description.identity = *identity;
     description.name = std::string(instance->tszInstanceName);
     description.address = "directinput";
+    // Stated rather than left to be inferred, and stated as a wheel because that is what a
+    // DirectInput device with this axis layout is: the roles above are the wheel's DIJOYSTATE
+    // members, and an Xbox pad on Windows is an XInput device that DirectInput shows with its two
+    // triggers summed onto one axis — which is a different backend and not a layout to guess at
+    // here. A pad plugged into Windows drives on the keyboard's shaping until that backend exists.
+    description.kind = InputSourceKind::Wheel;
 
     for (auto index = std::size_t{0}; index < inputAxisCount; index++)
     {

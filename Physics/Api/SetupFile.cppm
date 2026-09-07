@@ -53,6 +53,20 @@ export struct AxleTune
     // sheet beside the bump and rebound rates it sits on top of.
     std::optional<double> damperFriction;
 
+    // `frictionshape 1` installs the sourced velocity dependence of that friction on this axle —
+    // `macPhersonStrutFrictionShape()`, read off Deubel et al.'s steady-state Stribeck curves for
+    // the same Passat B8 strut the front's 107 N comes from. Anything else, including the absent
+    // key, leaves the friction flat above the regularisation width, which is what every car states.
+    //
+    // One key rather than a curve, because there is nothing here for a driver to tune: the shape is
+    // a measurement, normalised at the velocity the magnitude is quoted at, and `friction` beside it
+    // is the magnitude. **It is a FRONT STRUT shape** — no rear equivalent is published anywhere
+    // reachable — so `rear.frictionshape 1` states the front's measurement on the rear axle, which
+    // is a thing to do knowingly and not by symmetry.
+    //
+    // **Nothing on any car states it and no seat verdict exists on it.**
+    std::optional<double> frictionShape;
+
     // The **bump** stop's viscous damping, N·s/m on the shaft, and its rate-independent hysteresis
     // as a fraction of its own elastic force (`TravelStop::hysteresis` carries the sourcing). On the
     // sheet because the shipped 40000 N·s/m is a placed number — about five times the front

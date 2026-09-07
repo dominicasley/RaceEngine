@@ -219,6 +219,13 @@ export struct TravelStop
 
     // The deflection the source's whole measurement programme is scaled by: on their specimen the
     // displacement at 9 kN, 71 mm. Metres. Only the Dahl's displacement dependence reads it.
+    //
+    // **The 71 mm is an inference and the paper never prints it** (corrected 2026-09-05). What the
+    // paper states is a 68 mm figure and a 10 % displacement margin, which put the deflection at
+    // 9 kN nearer 74.8 mm; 71 mm is the *hysteresis-monotonicity* limit, which its next sentence
+    // places just below the turnaround. Carried because every fraction in `jounceBumperCandidate`
+    // is a fraction of whatever this is, so changing it rescales the whole transferred element
+    // table — a decision, not a typo fix.
     double dahlReference = 0.0;
 
     std::array<JounceElement, jounceElementCount> elements{};
@@ -331,7 +338,36 @@ export struct CornerSetup
     // `friction · tanh(velocity / this)` rather than `friction · sign(velocity)`, because a hard sign
     // term at 360 Hz makes a limit cycle rather than a dead band. Small enough to look like friction,
     // large enough that one tick cannot step across it.
+    //
+    // **It is not small against the measured friction's own structure, and that is worth knowing
+    // before it is read as pure numerics** (2026-09-05). Deubel et al.'s steady-state curves put the
+    // friction *maximum* of this class of strut at roughly 5 mm/s — half this width — so at the
+    // velocities where a real damper's friction peaks, this `tanh` is still on its way up and is
+    // delivering under half of `damperFriction`. The regularisation and the physics overlap.
+    // `[.damper-friction-velocity]` measures it.
     double damperFrictionSpeed = 0.01;
+
+    // **How that friction varies with shaft speed, normalised, against `|velocity|` in metres per
+    // second.** Empty is the shipped law to the bit — the multiplier is exactly 1.0 at every
+    // velocity and `solveDamperForce` runs the expression it always ran — and empty is what every
+    // car in this project states.
+    //
+    // The magnitude above and this shape are kept apart deliberately, because their provenance is
+    // not the same. `damperFriction` is one number per axle from one measurement (the front's is a
+    // Passat B8 strut's quasi-static sliding friction, the rear's a compact-class monotube's
+    // midstroke friction — two different papers and two different quantities). The shape is the
+    // *steady-state velocity dependence* of the front strut alone, and there is **no rear
+    // measurement of it at all**. Burying the two in one fitted curve would state a rear velocity
+    // dependence that nobody has measured.
+    //
+    // The normalisation is stated rather than implied: the curve is 1.0 at
+    // `damperFrictionReferenceSpeed`, which is the velocity `damperFriction` is quoted at. So
+    // stating a shape does not restate the magnitude, and `macPhersonStrutFrictionShape()` is the
+    // one sourced candidate. `Curve::at` holds its end values rather than extrapolating, which is
+    // the wanted behaviour at both ends: below the source's slowest measured sliding velocity the
+    // `tanh` above owns the answer, and above its 300 mm/s cap the model has no measurement and
+    // must not invent a trend.
+    Curve damperFrictionShape;
 
     TravelStop bumpStop;
     TravelStop droopStop;
@@ -932,6 +968,48 @@ export [[nodiscard]] DamperForceSolution solveDamperForce(const CornerSetup& cor
 // the same expression the integration always solved against, now stated on `DamperForceSolution`
 // so the coefficient reads the damper's element and a test can hold it to the old bits.
 export [[nodiscard]] double damperDampingCoefficient(const CornerSetup& corner, const DamperForceSolution& damper);
+
+// --- damper friction against shaft speed -------------------------------------------------------
+//
+// The shaft speed `CornerSetup::damperFriction` is quoted at, metres per second: **0.5 mm/s**, which
+// is the source's own definition of quasi-static sliding friction — *"Quasi-static friction
+// represents sliding friction at low velocities (typically at 0.5 mm/s)"* — and the slowest velocity
+// its steady-state programme measures. A normalised shape is 1.0 here, so the magnitude keeps
+// meaning exactly what the measurement it came from means.
+export inline constexpr double damperFrictionReferenceSpeed = 0.0005;
+
+// The normalised velocity factor a corner's stated shape gives at a shaft speed, metres per second,
+// **speed and not velocity** — the sign is the regularised `tanh`'s job and this must not carry one.
+// A corner that states no shape gets exactly 1.0, which is what makes the shipped law bit-identical.
+export [[nodiscard]] double damperFrictionShapeAt(const Curve& shape, double speed);
+
+// **A candidate velocity shape for a MacPherson front strut, and the one thing in this file sourced
+// from a steady-state friction measurement.**
+//
+// Deubel, Dittrich, Meinck and Prokop, *Experimental analysis and modelling of friction in a
+// MacPherson strut shock absorber under side load*, Tribology International **215 (2026) 111328**,
+// their Fig. 4 — steady-state Stribeck curves of a **VW Passat B8 front strut**, the same specimen
+// and the same paper the shipped 107 N comes from. Read off the design-deflection panel (`K0_SA`,
+// the middle of five) at the side force whose quasi-static value **is** that 107 N, which is about
+// 500 N. Normalised by its own 0.5 mm/s value, so this is a shape and not a second magnitude.
+//
+// The shape it states, and none of it is smoothed: friction **rises** from the quasi-static value to
+// a maximum of about 1.31× it near 5 mm/s, then **falls monotonically** to 0.69× at the source's
+// 300 mm/s cap. The paper's own words for why that is not the textbook Stribeck curve: it *"differs
+// from the typical Stribeck curve in the sense that there is no higher static or boundary friction
+// compared to higher velocities"*.
+//
+// **The grades, stated first.** (1) Every knot is read off a printed figure, ±5 N on a separated
+// line and worse through the near-vertical rise, whose line width alone is about 7 mm/s — so the
+// peak's *value* is well determined and its *velocity* is bounded only to 1–10 mm/s. (2) The shape
+// is not invariant across the figure: at 250 N of side force the peak is 1.45× and the 300 mm/s tail
+// 0.85×, at 750 N they are 1.22× and 0.67×, so picking the column is picking a cornering condition.
+// (3) It is a **front strut** shape and there is no rear equivalent published anywhere reachable —
+// see `docs/suspension-fidelity-brief.md`, the 2026-09-05 entry, for the fetch log.
+//
+// **Nothing installs it.** No car in this project states a shape; `front.frictionshape 1` on a setup
+// sheet installs this on that axle for one session, and no seat verdict exists on it.
+export [[nodiscard]] Curve macPhersonStrutFrictionShape();
 
 // The anti-roll bar at one corner: its force, and the Jacobian that force rides.
 //

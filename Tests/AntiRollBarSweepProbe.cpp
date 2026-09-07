@@ -183,8 +183,10 @@ SteadyState hold(const VehicleSetup& setup, const PhysicsWorld& world, const dou
 }
 
 // The peak of the criterion's sweep, over the steering range that brackets it. The full criterion
-// runs twelve angles from 0.02 to 1.00 because it also asserts the shape of the gradient; the peak
-// itself sits between 0.30 and 0.45 on the shipped car, so five angles around it read the same
+// runs **sixteen** angles from 0.02 to 1.00 because it also asserts the shape of the gradient — it
+// was twelve until 2026-08-27, when `0.34, 0.36, 0.38, 0.40` were added to resolve the maximum
+// (`GolfGtiTests.cpp`, and the block at the bottom of this file measures what that was worth). The
+// peak itself sits between 0.30 and 0.45 on the shipped car, so five angles around it read the same
 // maximum for a fifth of the time.
 struct Sample
 {
@@ -297,8 +299,17 @@ TEST_CASE("what the anti-roll bars are worth on the skidpad", "[.bar-sweep]")
 
     std::printf("\n=== the criterion's grid against a finer one, on the shipped car ===\n");
 
-    // `GolfGtiTests.cpp`'s own list, character for character.
-    const auto coarse = peakOver("the criterion's twelve angles",
+    // **The criterion's list as it stands today**, character for character out of `GolfGtiTests.cpp`
+    // — sixteen angles since 2026-08-27. This row is what the red in `docs/known-red.md` is measured
+    // on, and it was missing from this probe while the row below still called itself the criterion's.
+    const auto criterion =
+        peakOver("the criterion's sixteen angles (current)", {0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.34,
+                                                             0.36, 0.38, 0.40, 0.45, 0.60, 0.80, 1.00});
+
+    // And the twelve it ran before that refinement, kept because the difference between the two IS
+    // the grid bias this block exists to size. Labelled `former` since 2026-09-05: it was labelled
+    // "the criterion's twelve angles" for eight days after the criterion stopped using it.
+    const auto coarse = peakOver("the criterion's FORMER twelve angles (pre-2026-08-27)",
                                  {0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.22, 0.30, 0.45, 0.60, 0.80, 1.00});
 
     // **Every sample printed, not just the maximum**, because how thin the pass is depends on how
@@ -308,7 +319,9 @@ TEST_CASE("what the anti-roll bars are worth on the skidpad", "[.bar-sweep]")
     const auto fine = peakOver("a dense scan across the peak",
                                {0.30, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.42, 0.45});
 
-    std::printf("\n  criterion %.4f g at %.2f, dense %.4f g at %.2f.\n", coarse.first, coarse.second, fine.first,
-                fine.second);
-    std::printf("  The gap between those two is the grid's bias, not the car's grip.\n");
+    std::printf("\n  criterion (16) %.4f g at %.2f, former (12) %.4f g at %.2f, dense %.4f g at %.2f.\n",
+                criterion.first, criterion.second, coarse.first, coarse.second, fine.first, fine.second);
+    std::printf("  The gap between the former grid and the dense scan is the grid's bias, not the car's\n");
+    std::printf("  grip. The gap between the criterion's current grid and the dense scan is what is left\n");
+    std::printf("  of that bias — and it is what the 0.90 g criterion's margin is measured against.\n");
 }

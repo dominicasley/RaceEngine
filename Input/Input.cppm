@@ -13,6 +13,9 @@ export import :RackTorque;
 export import :ForceMapping;
 export import :PedalFeedback;
 export import :PedalMotors;
+// The evdev ABI's numbers, on the same terms: axis codes, the three layouts a driving device comes
+// in and the role each one gives a code, with <linux/input.h> nowhere near them.
+export import :EvdevContract;
 // The DirectInput ABI's numbers, but not DirectInput: this partition names no Windows type and
 // carries no Windows header, which is what lets the Windows backend's conversions be compiled and
 // tested on a machine that will never run them.

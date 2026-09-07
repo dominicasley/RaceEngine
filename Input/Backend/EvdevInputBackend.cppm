@@ -19,6 +19,7 @@ module;
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,6 +31,11 @@ module;
 // factory is the only way anybody obtains one.
 module raceengine.input:EvdevInputBackend;
 
+// The axis codes, the layouts and the role mapping are next door in :EvdevContract, where they are
+// numbers rather than kernel macros and a test can reach them without a device. What stays here is
+// everything that is a syscall.
+import :DriverInput;
+import :EvdevContract;
 import :InputBackend;
 
 namespace raceengine
@@ -61,6 +67,10 @@ class EvdevInputBackend final : public IInputBackend
     // Button codes in ascending order, so a profile's bit index is a stable name for a button on
     // this device rather than a raw evdev code the other platform has never heard of.
     std::vector<std::uint16_t> buttonCodes;
+    // Which axis carries which role on the device that is open, decided once when it was opened. A
+    // per-event decision would have to re-derive it from the node's bitmap on every report, and a
+    // per-engine constant is what put the pedals in the wrong order twice.
+    EvdevAxisLayout layout = EvdevAxisLayout::Wheel;
     DeviceSample current{};
     std::int16_t effect = -1;
     double lastReportSeconds = 0.0;
@@ -129,49 +139,6 @@ template <class T> [[nodiscard]] bool control(const int fileDescriptor, const un
 [[nodiscard]] bool bitSet(const std::uint8_t* bits, const std::size_t index)
 {
     return ((bits[index / 8] >> (index % 8)) & 1u) != 0u;
-}
-
-// evdev names an axis by its own code; the game names it by what the driver does with it. On this
-// base steering is ABS_X and the three pedals are the base's own 16-bit Y, Z and RZ — they are not
-// a second USB device and there is no ABS_GAS or ABS_BRAKE anywhere on it.
-//
-// Which of the three is which is platform knowledge and it lives here, not in a profile: the
-// profile carries calibration keyed on the *role*, so it travels to a platform that names the same
-// physical axis something else. Getting the order wrong is one line here rather than a file
-// everybody's wheel has to have rewritten.
-//
-// **Z is the throttle, RZ is the brake and Y is the clutch** on this rig, measured by pressing them.
-// It is not the order the names suggest and it was wrong here twice before it was measured: the
-// symptom is worth knowing, because it is not "the pedals are swapped". Every calibration prompt
-// watches one axis, so asking for the throttle while the throttle pedal drives a different code reads
-// as *no travel at all* — which was diagnosed first as a disconnected pedal and then as the USB
-// drop-outs, and was neither.
-//
-// **This order should not be hardcoded here at all**, and the fact that it has been wrong twice is
-// the argument: the calibration tool watches every axis while a pedal is pressed, so it already knows
-// which one moved and could simply say so. Until the profile can carry that, this is a per-rig
-// constant sitting in a place a rig cannot reach.
-[[nodiscard]] bool axisRole(const std::uint16_t code, InputAxis& role)
-{
-    switch (code)
-    {
-    case ABS_X:
-        role = InputAxis::Steering;
-        return true;
-    case ABS_Y:
-        role = InputAxis::Clutch;
-        return true;
-    case ABS_Z:
-        role = InputAxis::Throttle;
-        return true;
-    case ABS_RZ:
-        role = InputAxis::Brake;
-        return true;
-    default:
-        break;
-    }
-
-    return false;
 }
 
 [[nodiscard]] std::string readAttribute(const std::filesystem::path& path)
@@ -364,6 +331,7 @@ struct NodeDetail
 {
     DeviceDescription description;
     std::vector<std::uint16_t> buttons;
+    EvdevAxisLayout layout = EvdevAxisLayout::Wheel;
     bool usable = false;
 };
 
@@ -400,10 +368,36 @@ struct NodeDetail
     detail.description.identity = DeviceIdentity{.vendor = identifier.vendor, .product = identifier.product};
     detail.description.address = node;
 
+    // **The sysfs probe runs here, above the layout, and the order is load-bearing.** It used to sit
+    // below the axis loop, which left the layout to be decided by the axis bitmap alone — and a
+    // wheel base advertising ABS_RX and ABS_RY for its spare inputs was then read as a pad, whose Z
+    // and RZ carry the pedals the other way round. Rotation range and constant force are the two
+    // facts that say "wheel" outright, and a decision that cannot see them is guessing at something
+    // it could have known.
+    const auto hidDevice = sysfsForNode(node);
+    detail.description.capabilities = probeCapabilities(fileDescriptor, hidDevice, writable);
+    detail.description.rotationDegrees = readNumericAttribute(hidDevice / "range");
+
+    // The layout is settled from the whole bitmap before any one axis is asked about, because that
+    // is the only order in which it can be settled at all: ABS_Z is a throttle on a wheel, a brake
+    // on a wired pad and a right stick on a pad over Bluetooth, and which of the three it is here is
+    // a property of what else the node carries.
+    detail.layout = evdevAxisLayout(EvdevAxisPresence{
+        .namedPedals = bitSet(absoluteBits.data(), evdevAxisGas) || bitSet(absoluteBits.data(), evdevAxisBrake),
+        .rightStick = bitSet(absoluteBits.data(), evdevAxisRx) && bitSet(absoluteBits.data(), evdevAxisRy),
+        .statesRotation = detail.description.rotationDegrees > 0.0 ||
+                          detail.description.capabilities.has(DeviceCapability::ReadRotationRange),
+        .takesConstantForce = detail.description.capabilities.has(DeviceCapability::ConstantForce)});
+
     for (auto code = std::uint16_t{0}; code <= ABS_MAX; code++)
     {
-        auto role = InputAxis::Steering;
-        if (!bitSet(absoluteBits.data(), code) || !axisRole(code, role))
+        if (!bitSet(absoluteBits.data(), code))
+        {
+            continue;
+        }
+
+        const auto role = evdevAxisRole(detail.layout, code);
+        if (!role)
         {
             continue;
         }
@@ -414,7 +408,7 @@ struct NodeDetail
             continue;
         }
 
-        detail.description.axes[axisIndex(role)] =
+        detail.description.axes[axisIndex(*role)] =
             AxisBounds{.minimum = information.minimum, .maximum = information.maximum, .present = true};
     }
 
@@ -430,9 +424,18 @@ struct NodeDetail
         }
     }
 
-    const auto hidDevice = sysfsForNode(node);
-    detail.description.capabilities = probeCapabilities(fileDescriptor, hidDevice, writable);
-    detail.description.rotationDegrees = readNumericAttribute(hidDevice / "range");
+    detail.description.kind =
+        evdevSourceKind(detail.layout,
+                        detail.description.rotationDegrees > 0.0 ||
+                            detail.description.capabilities.has(DeviceCapability::ReadRotationRange),
+                        detail.description.capabilities.has(DeviceCapability::ConstantForce));
+
+    // Only a pad is suggested a binding, and only because the kernel is the one naming its face.
+    if (detail.description.kind == InputSourceKind::Gamepad)
+    {
+        detail.description.suggestedButtons = evdevGamepadActions(detail.buttons);
+    }
+
     detail.usable = true;
 
     return detail;
@@ -533,6 +536,7 @@ std::expected<DeviceDescription, std::string> EvdevInputBackend::open(const Devi
         deviceCapabilities = detail.description.capabilities;
         bounds = detail.description.axes;
         buttonCodes = std::move(detail.buttons);
+        layout = detail.layout;
         current = DeviceSample{};
         effect = -1;
         measuredHz = 0.0;
@@ -558,21 +562,24 @@ std::expected<DeviceDescription, std::string> EvdevInputBackend::open(const Devi
 
         // Whatever the axes are resting at is what the first sample says, so a profile seeded from
         // it is seeded from the device at rest rather than from zeroes.
-        for (auto index = std::size_t{0}; index < inputAxisCount; index++)
+        //
+        // Walked forwards, code to role, and never backwards from a role to the code it is expected
+        // on. The inverse was written out by hand here and had the wheel's own three pedals one
+        // place out — the throttle seeded from the clutch's axis, the brake from the throttle's —
+        // which was invisible on a base whose three pedals all rest at the same 65535, and would
+        // not have been on a pad, whose triggers rest at nought and whose sticks rest at centre.
+        for (auto code = std::uint16_t{0}; code <= ABS_MAX; code++)
         {
-            if (!bounds[index].present)
+            const auto role = evdevAxisRole(layout, code);
+            if (!role || !bounds[axisIndex(*role)].present)
             {
                 continue;
             }
 
             auto information = input_absinfo{};
-            const auto code = static_cast<std::uint16_t>(index == axisIndex(InputAxis::Steering)   ? ABS_X
-                                                         : index == axisIndex(InputAxis::Throttle) ? ABS_Y
-                                                         : index == axisIndex(InputAxis::Brake)    ? ABS_Z
-                                                                                                   : ABS_RZ);
             if (control(device, EVIOCGABS(code), &information))
             {
-                current.axes[index] = information.value;
+                current.axes[axisIndex(*role)] = information.value;
             }
         }
 
@@ -616,6 +623,7 @@ void EvdevInputBackend::close()
     writable = false;
     deviceCapabilities = DeviceCapabilities{};
     buttonCodes.clear();
+    layout = EvdevAxisLayout::Wheel;
 }
 
 std::expected<DeviceSample, std::string> EvdevInputBackend::read(const std::chrono::milliseconds timeout)
@@ -661,10 +669,9 @@ std::expected<DeviceSample, std::string> EvdevInputBackend::read(const std::chro
 
             if (event.type == EV_ABS)
             {
-                auto role = InputAxis::Steering;
-                if (axisRole(event.code, role))
+                if (const auto role = evdevAxisRole(layout, event.code); role)
                 {
-                    current.axes[axisIndex(role)] = event.value;
+                    current.axes[axisIndex(*role)] = event.value;
                 }
 
                 continue;

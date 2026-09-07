@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -33,10 +35,17 @@ using raceengine::directInputAxisRole;
 using raceengine::directInputMagnitude;
 using raceengine::DriverAction;
 using raceengine::DriverInput;
+using raceengine::EvdevAxisLayout;
+using raceengine::evdevAxisLayout;
+using raceengine::EvdevAxisPresence;
+using raceengine::evdevAxisRole;
+using raceengine::evdevGamepadActions;
+using raceengine::evdevSourceKind;
 using raceengine::identityFromJoystickGuid;
 using raceengine::identityFromProductGuid;
 using raceengine::InputAxis;
 using raceengine::inputAxisFromName;
+using raceengine::InputSourceKind;
 using raceengine::KeyboardDemand;
 using raceengine::keyboardDriverInput;
 using raceengine::normaliseBipolar;
@@ -509,4 +518,167 @@ TEST_CASE("DirectInput's axis offsets carry the same roles evdev's codes do", "[
     // portable between the two.
     REQUIRE(inputAxisFromName("brake") == InputAxis::Brake);
     REQUIRE(!inputAxisFromName("rudder"));
+}
+
+TEST_CASE("a node's layout is chosen from the whole axis set and not one code at a time", "[input][evdev]")
+{
+    // A wheel base: steering, three pedals, no second stick and no axis that names itself.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{}) == EvdevAxisLayout::Wheel);
+    // A wired Xbox controller through `xpad`: two sticks and two triggers on Z and RZ.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.rightStick = true}) == EvdevAxisLayout::Gamepad);
+    // The same pad over Bluetooth through `hid-generic`, which names its triggers and puts the right
+    // stick on Z and RZ. A device that says what a pedal is, is believed whatever else it carries.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.namedPedals = true}) == EvdevAxisLayout::Named);
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.namedPedals = true, .rightStick = true}) == EvdevAxisLayout::Named);
+}
+
+TEST_CASE("a wheel keeps the wheel layout whatever spare axes it advertises", "[input][evdev]")
+{
+    // **The regression this exists for**: a base advertising ABS_RX and ABS_RY for whatever is
+    // plugged into it — a shifter, a handbrake, clutch paddles — read as a pad, and a pad's Z and RZ
+    // carry the two pedals the other way round. On the rig that is a throttle that brakes and a
+    // brake that accelerates, with the steering, the calibration and the force feedback all normal,
+    // because the *kind* was being decided next door by the two facts this now reads first.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.rightStick = true, .statesRotation = true}) ==
+            EvdevAxisLayout::Wheel);
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.rightStick = true, .takesConstantForce = true}) ==
+            EvdevAxisLayout::Wheel);
+
+    // And a base that names its pedals is still a wheel, which is the other way the axis bitmap
+    // alone could have taken one: read as `Named`, its three real pedals on Y, Z and RZ drive
+    // nothing and two axes nothing is standing on become the throttle and the brake.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.namedPedals = true, .statesRotation = true}) ==
+            EvdevAxisLayout::Wheel);
+
+    // A pad states neither, so nothing above it moves: it has no lock to report and takes a rumble
+    // rather than a signed torque.
+    REQUIRE(evdevAxisLayout(EvdevAxisPresence{.rightStick = true}) == EvdevAxisLayout::Gamepad);
+}
+
+TEST_CASE("one evdev code carries three different roles and the layout is what says which", "[input][evdev]")
+{
+    // Steering is X on all three, which is the one thing a rim and two kinds of stick agree about.
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Wheel, raceengine::evdevAxisX) == InputAxis::Steering);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Gamepad, raceengine::evdevAxisX) == InputAxis::Steering);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Named, raceengine::evdevAxisX) == InputAxis::Steering);
+
+    // The measured ClubSport order, unchanged: Z is the throttle and RZ the brake, which is not the
+    // order the names suggest and is the thing this file exists to keep from drifting.
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Wheel, raceengine::evdevAxisY) == InputAxis::Clutch);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Wheel, raceengine::evdevAxisZ) == InputAxis::Throttle);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Wheel, raceengine::evdevAxisRz) == InputAxis::Brake);
+
+    // ...and the pad's is the other way round, because a trigger's side is fixed by the hand on it.
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Gamepad, raceengine::evdevAxisZ) == InputAxis::Brake);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Gamepad, raceengine::evdevAxisRz) == InputAxis::Throttle);
+    // A pad's left stick vertical drives nothing, and nothing is a real answer: mapped to the clutch
+    // the way a wheel's Y is, a thumb resting on the stick would ride the clutch all lap.
+    REQUIRE(!evdevAxisRole(EvdevAxisLayout::Gamepad, raceengine::evdevAxisY));
+    REQUIRE(!evdevAxisRole(EvdevAxisLayout::Gamepad, raceengine::evdevAxisRx));
+
+    // Over Bluetooth the same two pedals are named, and Z and RZ are the right stick and must drive
+    // nothing at all. Read as a wheel, this pad's right stick is its throttle and its brake.
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Named, raceengine::evdevAxisGas) == InputAxis::Throttle);
+    REQUIRE(evdevAxisRole(EvdevAxisLayout::Named, raceengine::evdevAxisBrake) == InputAxis::Brake);
+    REQUIRE(!evdevAxisRole(EvdevAxisLayout::Named, raceengine::evdevAxisZ));
+    REQUIRE(!evdevAxisRole(EvdevAxisLayout::Named, raceengine::evdevAxisRz));
+}
+
+TEST_CASE("a wheel is what it does rather than what it is called", "[input][evdev]")
+{
+    // Either wheel fact settles it whatever the axes look like.
+    REQUIRE(evdevSourceKind(EvdevAxisLayout::Gamepad, true, false) == InputSourceKind::Wheel);
+    REQUIRE(evdevSourceKind(EvdevAxisLayout::Named, false, true) == InputSourceKind::Wheel);
+    // Failing both, the axes decide, and an unrecognised device with a steering axis is a wheel:
+    // a pad handed a rim's shaping has no rate limit and no speed-sensitive range.
+    REQUIRE(evdevSourceKind(EvdevAxisLayout::Gamepad, false, false) == InputSourceKind::Gamepad);
+    REQUIRE(evdevSourceKind(EvdevAxisLayout::Named, false, false) == InputSourceKind::Gamepad);
+    REQUIRE(evdevSourceKind(EvdevAxisLayout::Wheel, false, false) == InputSourceKind::Wheel);
+}
+
+TEST_CASE("a pad arrives with gears because the kernel names its face", "[input][evdev]")
+{
+    // What `xpad` reports, in the ascending order the backend packs its bitmap in: A, B, X, Y, the
+    // two shoulders, back, start, the guide and the two stick clicks. The bit a profile binds is the
+    // position in this list and not the code.
+    const auto codes =
+        std::vector<std::uint16_t>{0x130, 0x131, 0x133, 0x134, 0x136, 0x137, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e};
+    const auto actions = evdevGamepadActions(codes);
+
+    REQUIRE(actions[static_cast<std::size_t>(DriverAction::Upshift)] == 5);
+    REQUIRE(actions[static_cast<std::size_t>(DriverAction::Downshift)] == 4);
+    REQUIRE(actions[static_cast<std::size_t>(DriverAction::Handbrake)] == 0);
+
+    // A device missing one of them binds the rest and leaves that one alone rather than binding
+    // whatever is nearest.
+    REQUIRE(evdevGamepadActions({0x130})[static_cast<std::size_t>(DriverAction::Upshift)] == -1);
+    REQUIRE(evdevGamepadActions({})[static_cast<std::size_t>(DriverAction::Handbrake)] == -1);
+}
+
+TEST_CASE("a seeded pad is a stick and two triggers rather than a rim and a load cell", "[input][profile]")
+{
+    // A wired Xbox controller as `xpad` states it: sticks over the signed 16-bit range resting at
+    // centre, triggers 0..1023 resting released.
+    auto description = DeviceDescription{};
+    description.identity = DeviceIdentity{.vendor = 0x045e, .product = 0x02ea};
+    description.kind = InputSourceKind::Gamepad;
+    description.axes[axisIndex(InputAxis::Steering)] = AxisBounds{.minimum = -32768, .maximum = 32767, .present = true};
+    description.axes[axisIndex(InputAxis::Throttle)] = AxisBounds{.minimum = 0, .maximum = 1023, .present = true};
+    description.axes[axisIndex(InputAxis::Brake)] = AxisBounds{.minimum = 0, .maximum = 1023, .present = true};
+    description.suggestedButtons[static_cast<std::size_t>(DriverAction::Upshift)] = 5;
+    description.suggestedButtons[static_cast<std::size_t>(DriverAction::Downshift)] = 4;
+    description.suggestedButtons[static_cast<std::size_t>(DriverAction::Handbrake)] = 0;
+
+    const auto seeded = seedDeviceProfile(description, DeviceSample{});
+
+    // A stick does not rest where it was left, so its centre is trimmed and a rim's is not.
+    REQUIRE(seeded.axes[axisIndex(InputAxis::Steering)].deadzone == Approx(7849.0 / 32767.0));
+    REQUIRE(normaliseBipolar(seeded.axes[axisIndex(InputAxis::Steering)], 0.0) == Approx(0.0));
+    REQUIRE(normaliseBipolar(seeded.axes[axisIndex(InputAxis::Steering)], 32767.0) == Approx(1.0));
+    // Full lock is still reachable: the deadzone is taken off and what is left is stretched back
+    // over the whole range.
+    REQUIRE(normaliseBipolar(seeded.axes[axisIndex(InputAxis::Steering)], -32768.0) == Approx(-1.0));
+
+    // A trigger measures where it is, not how hard it is held. Through the load cell's own curve —
+    // 900 N of sensor against a 450 N maximum — half a trigger would be full brake pressure.
+    const auto halfTravel = normaliseUnipolar(seeded.axes[axisIndex(InputAxis::Brake)], 512.0);
+    REQUIRE(halfTravel == Approx(0.5).margin(0.001));
+    REQUIRE(brakePressure(seeded.brake, halfTravel) == Approx(0.5).margin(0.001));
+    REQUIRE(brakePressure(seeded.brake, 1.0) == Approx(1.0));
+
+    // Released is released and pulled is pulled, with nobody stating a polarity.
+    REQUIRE(normaliseUnipolar(seeded.axes[axisIndex(InputAxis::Throttle)], 0.0) == Approx(0.0));
+    REQUIRE(normaliseUnipolar(seeded.axes[axisIndex(InputAxis::Throttle)], 1023.0) == Approx(1.0));
+
+    REQUIRE(seeded.buttons[static_cast<std::size_t>(DriverAction::Upshift)] == 5);
+    REQUIRE(seeded.buttons[static_cast<std::size_t>(DriverAction::Handbrake)] == 0);
+}
+
+TEST_CASE("a seeded wheel keeps its untrimmed centre and its unbound buttons", "[input][profile]")
+{
+    // The change a pad brings must stop at the pad: a deadzone on a rim is what makes small
+    // corrections feel like nothing, and a default binding on a base that reports a hundred and
+    // eight unnamed buttons shifts the car when an unrelated one is pressed.
+    auto description = DeviceDescription{};
+    description.kind = InputSourceKind::Wheel;
+    description.axes[axisIndex(InputAxis::Steering)] = AxisBounds{.minimum = 0, .maximum = 65535, .present = true};
+
+    const auto seeded = seedDeviceProfile(description, DeviceSample{});
+
+    REQUIRE(seeded.axes[axisIndex(InputAxis::Steering)].deadzone == Approx(0.0));
+    REQUIRE(seeded.brake.sensorFullScale == Approx(900.0));
+    REQUIRE(seeded.buttons[static_cast<std::size_t>(DriverAction::Upshift)] == -1);
+}
+
+TEST_CASE("a pad's stick reaches this car's lock and not a wheel's", "[input][mapping]")
+{
+    // A pad states no travel of its own, so the service makes the two travels equal and the ratio
+    // one. Left at a wheel's 900 against a 540-degree car, full deflection would be reached at
+    // three fifths of the stick and everything past it would be lock the driver cannot use.
+    const auto geared = SteeringGeometry{.deviceDegrees = 900.0, .vehicleDegrees = 540.0};
+    const auto stick = SteeringGeometry{.deviceDegrees = 540.0, .vehicleDegrees = 540.0};
+
+    REQUIRE(rackFromRim(geared, 0.6) == Approx(1.0));
+    REQUIRE(rackFromRim(stick, 0.6) == Approx(0.6));
+    REQUIRE(rackFromRim(stick, 1.0) == Approx(1.0));
 }

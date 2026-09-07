@@ -298,6 +298,14 @@ public:
     {
         options.vehicleRotationDegrees = degrees;
         view.geometry.vehicleDegrees = degrees;
+
+        // A car swapped for one with a different lock moves a stick's travel with it, because the
+        // stick's travel *is* the car's. A wheel's is the wheel's and is left alone.
+        if (view.kind != InputSourceKind::Wheel)
+        {
+            view.geometry.deviceDegrees = degrees;
+        }
+
         // The reader thread consumes this at the next attach, so it crosses threads as an atomic
         // snapshot rather than through the options struct the tick side owns.
         wantedRotationDegrees.store(degrees);
@@ -382,6 +390,37 @@ namespace
     const auto* value = std::getenv(name);
 
     return value == nullptr ? std::string() : std::string(value);
+}
+
+// Which of the connected devices is the one driving.
+//
+// It was the first node the directory walk found, which was fine while a rig had one thing plugged
+// into it. A pad left connected beside the wheel is the ordinary case now, and the two are not
+// interchangeable: whichever the driver reaches for, the wheel is the device with the force feedback
+// and the one this rig is calibrated against, so it wins. A pad only drives when it is the only
+// thing there.
+//
+// It deliberately does not resolve two wheels — the backend does not either, and keying that on a
+// serial number Linux exposes and DirectInput does not is the mistake this layer keeps not making.
+[[nodiscard]] const DeviceDescription& preferredDevice(const std::vector<DeviceDescription>& devices)
+{
+    for (const auto& device : devices)
+    {
+        if (device.kind == InputSourceKind::Wheel && device.capabilities.has(DeviceCapability::ConstantForce))
+        {
+            return device;
+        }
+    }
+
+    for (const auto& device : devices)
+    {
+        if (device.kind == InputSourceKind::Wheel)
+        {
+            return device;
+        }
+    }
+
+    return devices.front();
 }
 
 } // namespace
@@ -489,7 +528,12 @@ void InputService::refresh()
     if (const auto generation = profileGeneration.load(std::memory_order_acquire); generation != takenGeneration)
     {
         view.profile = publishedProfile;
-        view.geometry.deviceDegrees = publishedProfile.rotationDegrees;
+        // A stick is geared to nothing, so its full deflection is this car's full lock whatever that
+        // lock is: the rim-against-car ratio `rackFromRim` applies is one, stated by making the two
+        // travels equal. A profile's rotation figure describes a wheel, and a pad's is whatever the
+        // file happened to be seeded with.
+        view.geometry.deviceDegrees =
+            view.kind == InputSourceKind::Wheel ? publishedProfile.rotationDegrees : options.vehicleRotationDegrees;
         view.geometry.vehicleDegrees = options.vehicleRotationDegrees;
         takenGeneration = generation;
     }
@@ -623,7 +667,7 @@ void InputService::attach()
         return;
     }
 
-    const auto opened = backend.open(devices.front().identity);
+    const auto opened = backend.open(preferredDevice(devices).identity);
     if (!opened)
     {
         if (!announcedAbsence)
@@ -672,12 +716,11 @@ void InputService::attach()
         profile.rotationDegrees = description.rotationDegrees;
     }
 
-    // A wheel says what it is turned to and a pad does not, which is the one thing that separates
-    // them without a table of product ids nobody can keep current.
-    const auto kind =
-        description.capabilities.has(DeviceCapability::ReadRotationRange) || description.rotationDegrees > 0.0
-            ? InputSourceKind::Wheel
-            : InputSourceKind::Gamepad;
+    // What the backend said it is. It used to be inferred here from whether the device would state a
+    // rotation range, which is one of the facts that settles it and not the only one: a wheel with no
+    // range attribute came out as a pad, and so did every device on the other platform, wheels
+    // included, because DirectInput states no range for anything at all.
+    const auto kind = description.kind;
 
     const auto rate = backend.updateRate();
 

@@ -69,6 +69,7 @@ add_library (Engine STATIC
         Audio/Impl/SoundBankImpl.cpp
         Audio/Impl/TyreLayersImpl.cpp
         Graphics/Impl/AmbientOcclusionServiceImpl.cpp
+        Graphics/Impl/OcclusionCullingServiceImpl.cpp
         Graphics/Impl/AssetServiceImpl.cpp
         Graphics/Impl/AutoExposureServiceImpl.cpp
         Graphics/Impl/BloomServiceImpl.cpp
@@ -129,6 +130,7 @@ target_sources(Engine PUBLIC
         Graphics/Models/Dto.cppm
         Graphics/Models/Fbo.cppm
         Graphics/Models/LightProbe.cppm
+        Graphics/Models/OcclusionGrid.cppm
         Graphics/Models/Material.cppm
         Graphics/Models/Mesh.cppm
         Graphics/Models/Scene.cppm
@@ -139,6 +141,7 @@ target_sources(Engine PUBLIC
         Graphics/Api/SphericalHarmonics.cppm
         Graphics/Api/ShadowCascades.cppm
         Graphics/Api/Frustum.cppm
+        Graphics/Api/Occlusion.cppm
         Graphics/Api/PostProcessing.cppm
         Graphics/Api/VolumetricFog.cppm
         Graphics/Api/LookupTable.cppm
@@ -165,6 +168,7 @@ target_sources(Engine PUBLIC
         Graphics/Services/PostProcessService.cppm
         Graphics/Services/AutoExposureService.cppm
         Graphics/Services/AmbientOcclusionService.cppm
+        Graphics/Services/OcclusionCullingService.cppm
         Graphics/Services/BloomService.cppm
         Graphics/Services/ColourGradeService.cppm
         Graphics/Services/SceneService.cppm
@@ -217,6 +221,7 @@ target_sources(Engine PUBLIC
         Input/Api/ForceMapping.cppm
         Input/Api/PedalFeedback.cppm
         Input/Api/PedalMotors.cppm
+        Input/Api/EvdevContract.cppm
         Input/Api/DirectInputContract.cppm
         Input/Api/InputBackendFactory.cppm
         # Implementation partitions, on the renderer's rule: both are built on both platforms so

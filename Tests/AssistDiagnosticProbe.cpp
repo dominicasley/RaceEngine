@@ -316,7 +316,9 @@ TEST_CASE("what this car's brakes can actually do", "[.assist-probe]")
     }
 
     std::printf("  best constant-pressure stop: %.2f m at pedal %.2f\n", best, bestPedal);
-    std::printf("  published Mk7 GTI Performance 100-0: 34.6-35.1 m (Auto Bild Sportscars)\n");
+    std::printf("  published Mk7 GTI Performance 100-0: 35.5 m *kalt* (auto motor und sport Supertest,\n");
+    std::printf("  verified at source 2026-08-25). Auto Bild Sportscars' 34.6-35.1 m, which this probe\n");
+    std::printf("  quoted before, did NOT survive verification and must not be used.\n");
 }
 
 TEST_CASE("what the electronics do to a stop", "[.assist-probe]")
@@ -941,7 +943,9 @@ TEST_CASE("what corrected brake data would be worth", "[.assist-probe]")
         double frontShare;
     };
 
-    std::printf("\n=== 100-0 against Auto Bild Sportscars' 34.6 and 35.1 m for a Mk7 GTI Performance ===\n");
+    std::printf("\n=== 100-0 against auto motor und sport's 35.5 m *kalt* for a Mk7 GTI Performance ===\n");
+    std::printf("  (the Auto Bild Sportscars 34.6-35.1 m this block used to name did not survive\n");
+    std::printf("   verification; the amS Supertest figure was verified at source on 2026-08-25)\n");
     std::printf("  total  front   per-wheel F/R      best pedal stop      ABS stop     lowest omega F / R\n");
 
     for (const auto candidate : {Candidate{4200.0, 0.75}, Candidate{4800.0, 0.82}, Candidate{5200.0, 0.82},
@@ -1002,7 +1006,7 @@ TEST_CASE("does the longitudinal peak have to answer to two references at once",
     REQUIRE(world.has_value());
 
     std::printf("\n=== mu_x swept against BOTH published references ===\n");
-    std::printf("  0-100 published 6.4-6.7 s (DSG, no launch control) | 100-0 published 34.6-35.1 m\n");
+    std::printf("  0-100 published 6.4-6.7 s (DSG, no launch control) | 100-0 published 35.5 m *kalt* (amS)\n");
     std::printf("  mu_x   DX_REF scale   0-100      best 100-0   (brakes at 9000 N.m so they cannot cap it)\n");
 
     for (const auto muX : {1.131, 1.170, 1.210, 1.250})

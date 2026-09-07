@@ -7,5 +7,6 @@ export import :Material;
 export import :Mesh;
 export import :Fbo;
 export import :LightProbe;
+export import :OcclusionGrid;
 export import :Scene;
 export import :Dto;

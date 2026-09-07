@@ -111,6 +111,10 @@ private:
     // the meter above, minus the camera service, because it only ever writes the camera it is
     // handed rather than adding passes to that camera's own chain.
     AmbientOcclusionService ambientOcclusionService;
+    // Builds the one grid a camera culls against, off the prepass the service above built. Declared
+    // after it because the ordering is real rather than alphabetical: the grid's reduction reads the
+    // prepass's colour attachment, so a camera has to have gathered before it can cull.
+    OcclusionCullingService occlusionCullingService;
     // Builds the two chains a camera's highlights spill down and back up. Same dependencies as the
     // meter, and for the same reason: buffers, passes, and the camera the passes hang on.
     BloomService bloomService;
@@ -308,6 +312,11 @@ public:
     [[nodiscard]] AmbientOcclusionService& ambientOcclusion()
     {
         return ambientOcclusionService;
+    }
+
+    [[nodiscard]] OcclusionCullingService& occlusionCulling()
+    {
+        return occlusionCullingService;
     }
 
     [[nodiscard]] BloomService& bloom()

@@ -171,6 +171,7 @@ Engine::Engine() :
     cameraService(memoryStorageService, fboService, glfwWindow),
     autoExposureService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
     ambientOcclusionService(*logger, memoryStorageService, fboService, postProcessService),
+    occlusionCullingService(*logger, memoryStorageService, fboService, postProcessService),
     bloomService(*logger, memoryStorageService, fboService, postProcessService, cameraService),
     colourGradeService(*logger, memoryStorageService),
     shadowService(cameraService),

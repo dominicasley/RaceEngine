@@ -14,6 +14,9 @@ module;
 
 export module raceengine.input:DeviceProfile;
 
+// :DriverInput for the source kind a description states, which is what decides whether the steering
+// axis being seeded is a rim or a thumb.
+import :DriverInput;
 import :InputBackend;
 
 namespace raceengine
@@ -122,6 +125,10 @@ export struct AxisCalibration
     // Fraction of travel ignored at the resting end — either side of `centre` for a bipolar axis.
     // Zero here and zero on purpose: the driver already zeroes fuzz and flat on this device, and a
     // deadzone on a wheel is the thing that makes small corrections feel like nothing at all.
+    //
+    // A thumbstick is the case that wants one, because it does not rest where it was left. That is
+    // seeded rather than defaulted — see `gamepadStickDeadzone` — so the number a wheel gets stays
+    // this zero.
     double deadzone = 0.0;
     // Fraction of travel at the far end that already counts as the maximum. What a pedal needs when
     // its last few millimetres are stiffer than a leg will push.
@@ -212,6 +219,30 @@ export struct BrakeCurve
     double shape = 1.0;
 };
 
+// The curve for a device that measures where a pedal is rather than how hard it is held.
+//
+// It is the identity, and it has to be stated rather than left at the default: the default describes
+// this rig's load cell, 900 N of sensor read against a 450 N maximum, and a trigger fed through it
+// reaches full brake pressure at half its travel. The two numbers are equal here so that they cancel
+// — a trigger has no force to convert, so the fraction it asks for is the fraction it gets.
+export [[nodiscard]] inline BrakeCurve travelBrakeCurve()
+{
+    return BrakeCurve{.sensorFullScale = 1.0, .maximumForce = 1.0, .shape = 1.0};
+}
+
+// What a thumbstick's centre needs taken out of it, as a fraction of one half of its travel.
+//
+// A stick does not rest where it was left: it rests somewhere near centre, and where that is moves
+// with wear, with temperature and with how hard the last driver leaned on it. A rim rests where it
+// is put, which is why the calibration above defaults this to zero and says so.
+//
+// The figure is Microsoft's own — XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, 7849 of 32767 — and it is
+// **transferred rather than measured**: XInput states it as a radius on the stick's two axes taken
+// together, and this engine takes one axis, so a stick pushed diagonally crosses this engine's
+// deadzone slightly sooner than it crosses XInput's. It is a driver's preference and it is written
+// into the profile file, so a driver who wants less of it edits one number rather than a build.
+export inline constexpr double gamepadStickDeadzone = 7849.0 / 32767.0;
+
 // Force at the pedal face, newtons, for a [0, 1] axis travel.
 export [[nodiscard]] inline double pedalForce(const BrakeCurve& curve, const double travel)
 {
@@ -260,29 +291,6 @@ export [[nodiscard]] inline double rackFromRim(const SteeringGeometry& geometry,
     const auto scale = std::max(1.0, geometry.deviceDegrees / geometry.vehicleDegrees);
 
     return std::clamp(rimFraction * scale, -1.0, 1.0);
-}
-
-// A button, named by what it does rather than by where it is. Persisted as an index into the
-// device's own button bitmap, which is the one part of a profile that is genuinely per-device.
-export enum class DriverAction : std::uint8_t { Upshift, Downshift, Handbrake, Count };
-
-export inline constexpr std::size_t driverActionCount = 3;
-
-export [[nodiscard]] constexpr const char* driverActionName(const DriverAction action)
-{
-    switch (action)
-    {
-    case DriverAction::Upshift:
-        return "upshift";
-    case DriverAction::Downshift:
-        return "downshift";
-    case DriverAction::Handbrake:
-        return "handbrake";
-    case DriverAction::Count:
-        break;
-    }
-
-    return "nothing";
 }
 
 // The whole of what is remembered about one device, and the whole of what is written to disk.
@@ -562,10 +570,22 @@ export [[nodiscard]] inline DeviceProfile seedDeviceProfile(const DeviceDescript
     auto profile = DeviceProfile{};
     profile.identity = description.identity;
     profile.name = description.name;
+    // Whatever the backend could suggest, which for a wheel is three times -1 and for a pad is the
+    // two shoulders and the A button. Copied rather than merged: a profile read from disk never
+    // reaches here, so there is nothing of the driver's to overwrite.
+    profile.buttons = description.suggestedButtons;
 
     if (description.rotationDegrees > 0.0)
     {
         profile.rotationDegrees = description.rotationDegrees;
+    }
+
+    // A thumb rather than a rim and a leg, which changes two of the numbers below and nothing else.
+    const auto stick = description.kind == InputSourceKind::Gamepad;
+
+    if (stick)
+    {
+        profile.brake = travelBrakeCurve();
     }
 
     for (auto index = std::size_t{0}; index < inputAxisCount; index++)
@@ -586,6 +606,7 @@ export [[nodiscard]] inline DeviceProfile seedDeviceProfile(const DeviceDescript
             calibration.minimum = low;
             calibration.maximum = high;
             calibration.centre = resting;
+            calibration.deadzone = stick ? gamepadStickDeadzone : 0.0;
             continue;
         }
 

@@ -13,6 +13,8 @@ module;
 
 export module raceengine.input:InputBackend;
 
+import :DriverInput;
+
 namespace raceengine
 {
 
@@ -80,6 +82,33 @@ export [[nodiscard]] constexpr std::optional<InputAxis> inputAxisFromName(const 
     }
 
     return std::nullopt;
+}
+
+// A button, named by what it does rather than by where it is. Persisted as an index into the
+// device's own button bitmap, which is the one part of a profile that is genuinely per-device.
+//
+// Beside `InputAxis` rather than beside the profile that stores one, because a description is what
+// suggests a binding and a description is stated here: the roles a device can carry are a fact
+// about devices, and the calibration keyed on them is a fact about a driver.
+export enum class DriverAction : std::uint8_t { Upshift, Downshift, Handbrake, Count };
+
+export inline constexpr std::size_t driverActionCount = 3;
+
+export [[nodiscard]] constexpr const char* driverActionName(const DriverAction action)
+{
+    switch (action)
+    {
+    case DriverAction::Upshift:
+        return "upshift";
+    case DriverAction::Downshift:
+        return "downshift";
+    case DriverAction::Handbrake:
+        return "handbrake";
+    case DriverAction::Count:
+        break;
+    }
+
+    return "nothing";
 }
 
 // What the device says an axis can read, in its own units. `present` is separate from a zero span
@@ -280,6 +309,20 @@ export struct DeviceDescription
     // not say, which is a real answer and not a missing one: a game must then use the range the
     // player states rather than a number it invented.
     double rotationDegrees = 0.0;
+    // A wheel or a pad, and the backend's answer rather than a guess made above it. Every fact that
+    // separates the two — which axis codes the node carries, whether it states a rotation range,
+    // whether it takes a signed torque — is platform knowledge, so a service inferring it from the
+    // one field that crosses the seam gets a wheel with no range file wrong in both directions.
+    //
+    // Wheel is the default because that is what an unrecognised device with a steering axis most
+    // often is, and because a pad handed a wheel's shaping is the worse of the two mistakes: it
+    // gives a thumb full lock at motorway speed.
+    InputSourceKind kind = InputSourceKind::Wheel;
+    // Bit indices into `DeviceSample::buttons` for the three actions, or -1 where the backend has
+    // nothing to suggest — which is the usual answer, and the right one for a wheel whose hundred
+    // and eight buttons are named by nobody. A pad's face is named by the kernel, so a pad arrives
+    // with gears.
+    std::array<std::int32_t, driverActionCount> suggestedButtons{{-1, -1, -1}};
 };
 
 // The platform seam. Two implementations, written together rather than one now and one later,

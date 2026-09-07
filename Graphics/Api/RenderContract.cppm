@@ -73,6 +73,22 @@ export inline constexpr uint32_t shadowDistanceFadePercent = 10;
 // open stretch, its shadowed side and a couple of interiors.
 export inline constexpr uint32_t maxIblProbes = 8;
 
+// How many slices of prefiltered specular radiance the backend keeps, and which of them is the
+// scratch one.
+//
+// **This is deliberately one more than the frame can shade from, and that extra slice is what lets
+// a scene carry more probes than eight.** A probe's photograph has two halves and they cost three
+// orders of magnitude apart: the diffuse half is nine spherical harmonic coefficients — 144 bytes,
+// kept on the probe itself and good anywhere — while the specular half is a prefiltered cube that
+// has to live in this array at about a megabyte each. So a scene that wants a probe every sixty
+// metres of city street can have the diffuse half everywhere and the specular half only where it
+// is being looked at: a probe past the pool's capacity is captured *through* the scratch slice,
+// projected to irradiance, and then hands the slice straight back. It shades diffuse from then on
+// and takes its reflection from the global probe, which is what every fragment outside a local
+// volume already does.
+export inline constexpr uint32_t probeSpecularSlices = maxIblProbes + 1;
+export inline constexpr uint32_t probeScratchSlice = maxIblProbes;
+
 // The edge length of a probe's captured environment, and how many roughness levels its prefiltered
 // chain holds. 128 is where a mirror reflection of a building still reads as a building; six mips
 // take that down to 4x4, which is rough enough that the last level is indistinguishable from the
@@ -300,6 +316,18 @@ export inline constexpr float luminanceFloor = 0.0001f;
 // the window changed would be metering a corner of the frame. 512 is nine halvings to that texel,
 // and its four taps per level still cover 1920x1080 densely at the top.
 export inline constexpr uint32_t exposureMeterResolution = 512;
+
+// The grid the occlusion culler tests against, in cells. Fixed rather than derived from the window
+// for the reason the exposure meter's square is fixed: the buffer, the readback allocation and the
+// copy are all sized once, and a grid that changed shape under a resize would be a grid the pending
+// copy no longer fits. It is not square — 16:9 is what puts a roughly square cell on the screens
+// this game is played on — and nothing about the test needs it to be, because a cell is addressed
+// through clip space and not through pixels.
+//
+// 256x144 puts a cell at about 7.5 x 7.5 pixels of a 1080p frame. Finer culls more and costs a
+// bigger copy; coarser refuses more silhouettes, because a cell touched by sky can never occlude.
+export inline constexpr uint32_t occlusionGridWidth = 256;
+export inline constexpr uint32_t occlusionGridHeight = 144;
 
 export struct ShaderMacro
 {

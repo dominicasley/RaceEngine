@@ -86,6 +86,16 @@ export struct LightProbe
     // Read by the frame's uniform upload every view; written by the backend once per capture.
     ShIrradiance irradiance{};
 
+    // Whether `irradiance` is a photograph rather than the zero it starts as.
+    //
+    // Separate from `arraySlice` because the two halves of a probe no longer come and go together:
+    // past the specular pool's capacity a probe is captured through the scratch slice and hands it
+    // back, so it ends up with a real irradiance and no slice at all. "Has been captured" is this
+    // flag; "can be reflected in" is `arraySlice`. A probe may also be handed its irradiance from
+    // a cache on disk without ever being captured, which is the other reason this cannot be read
+    // off the slice.
+    bool irradianceReady = false;
+
     // Marks the environment this probe recorded as no longer true — the sun moved, a door opened,
     // the time of day changed. The next scheduler pass re-draws all six faces. It does *not*
     // clear the irradiance: the stale answer keeps shading the frame until the new one lands,

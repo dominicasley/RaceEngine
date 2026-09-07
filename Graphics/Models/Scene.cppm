@@ -28,6 +28,7 @@ export module raceengine.graphics.models:Scene;
 import raceengine.resource;
 import :Fbo;
 import :LightProbe;
+import :OcclusionGrid;
 import :Material;
 import :Mesh;
 import :Shader;
@@ -252,6 +253,53 @@ export struct AmbientOcclusion
     bool shareDepth = false;
 };
 
+// Occlusion culling: the draw walk skipping geometry that the frame's own prepass has already
+// proved is behind something.
+//
+// It rides on ambient occlusion's prepass and cannot be enabled without it. That is not a
+// convenience — the prepass is the one pass that rasterises this whole view before anything shades
+// it, writing distance in front of the eye per pixel, so the occluders are already paid for and
+// what this adds is one small fullscreen reduction of them plus a copy to the CPU. Everything about
+// the copy is the exposure meter's pattern: a fixed number of submissions of lag, scheduled by
+// frame number rather than by wall time, so a capture is reproducible.
+//
+// **The grid it culls against is always a frame or two old, and that is the whole trade.** The test
+// itself is stated and pinned in Graphics/Api/Occlusion.cppm; what belongs here are the two numbers
+// that pay for the staleness and the one that says how sharp the grid is.
+export struct OcclusionCulling
+{
+    // Off is the renderer with none of this in it: no buffer, no pass, no copy, and a draw walk
+    // whose only visibility test is the frustum's.
+    bool enabled = false;
+    // How many cells of slack the tested rectangle is widened by on each side. One is the default,
+    // and what it pays for is the seam between the CPU's clip-space rectangle and the shader's
+    // integer division of the source into cells — not camera movement, which the measured travel
+    // below covers, and not rotation, which cannot disocclude anything at all.
+    unsigned int cellMargin = 1;
+    // A floor under the travel the box is grown by, in world units, on top of how far the eye has
+    // actually moved since the grid was photographed.
+    //
+    // The measured distance is the part that matters and it is small: at 200 km/h and 100 fps, two
+    // frames of lag is about eleven world units. This exists because the decision is acted on a
+    // frame *after* it is taken — the eye keeps moving between recording the draw and presenting
+    // it — so a little lead is owed. Ten units is one metre, which is a couple of frames' worth at
+    // any speed this car reaches. Raising it far past that does not make the culler safer so much
+    // as switch it off: every box grows, and a grown box reaches an open cell or the edge of the
+    // screen, both of which mean "draw it".
+    float travelSlack = 10.0f;
+    // The reduction's target and the pass that fills it, written by OcclusionCullingService. The
+    // pass runs at the tail of the prepass camera's own post chain, which is where the geometry it
+    // reduces has just been written.
+    Resource<FboAttachment> grid{};
+    std::vector<Resource<PostProcess>> passes{};
+    // What the CPU actually has: the last completed copy, or null until the first one lands. Shared
+    // rather than held by value because the backend copies a whole Camera to build the prepass view
+    // and both must cull against the *same* grid — if the two disagreed, the prepass would write
+    // depth for geometry the shading pass skipped, which is a hole in the frame rather than a
+    // saving. A shared handle makes that copy a refcount instead of a grid.
+    std::shared_ptr<const OcclusionGrid> readback{};
+};
+
 // The light a bright thing spills onto everything around it — a lens and an eye both do it, and a
 // frame without it reads as though nothing in it is actually bright, because a display cannot be.
 //
@@ -406,6 +454,9 @@ export struct Camera
     AutoExposure autoExposure{};
     // Whether this view gathers its own ambient occlusion before it shades.
     AmbientOcclusion ambientOcclusion{};
+    // Whether this view's draw walk skips geometry the prepass proved is hidden. Rides on the
+    // prepass above and is inert without it.
+    OcclusionCulling occlusionCulling{};
     // Whether the bright parts of this view spill into the rest of it before the tone curve.
     Bloom bloom{};
     float fieldOfView;

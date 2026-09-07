@@ -2,7 +2,9 @@ module;
 
 #include <algorithm>
 #include <cstddef>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 
@@ -57,6 +59,35 @@ public:
 
     // How many of this scene's probes the frame will actually shade from.
     [[nodiscard]] unsigned int activeProbeCount(const Scene& scene) const;
+
+    // The diffuse half of every probe in the scene, in the scene's own order.
+    //
+    // This is the half worth keeping between runs. It is nine coefficients — 144 bytes a probe —
+    // and it is good from anywhere, where the specular half is a megabyte of prefiltered cube that
+    // only exists for the handful of probes the frame can reflect in. A game that places hundreds
+    // of probes spends most of its startup photographing them; taking this once and handing it
+    // back on the next run is what turns that into a first-run cost.
+    [[nodiscard]] std::vector<ShIrradiance> irradianceSnapshot(const Scene& scene) const;
+
+    // Hands a snapshot back to the scene's probes, and answers whether it took.
+    //
+    // **Refused unless the snapshot is exactly as long as the probe list.** A snapshot taken
+    // against a different layout would light every street with a different street's bounce, and
+    // that is the kind of wrong nobody traces back to a cache file. It is the caller's job to
+    // refuse it for the other reason too — a snapshot taken under a different sun is the same
+    // fault and this cannot see the sun.
+    //
+    // The first `maxIblProbes` probes are handed their irradiance and left **Dirty** anyway: they
+    // are the ones that will hold a specular slice, a snapshot carries no specular, and so they
+    // have to be photographed whatever this file says. They shade from the restored irradiance
+    // while they wait, so nothing starts black. Every probe past them is restored outright and is
+    // never captured at all, which is the whole of the saving.
+    [[nodiscard]] bool restoreIrradiance(Scene& scene, std::span<const ShIrradiance> snapshot) const;
+
+    // Whether every probe in the scene now holds a photograph. This is what says a snapshot is
+    // worth writing out: taken early it would record the probes that had not been reached yet as
+    // black, and black is a value a cache cannot tell from a dark street.
+    [[nodiscard]] bool everyProbeCaptured(const Scene& scene) const;
 };
 
 } // namespace raceengine

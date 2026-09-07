@@ -18,10 +18,12 @@ add_executable(EngineTests
         BackendParityTests.cpp
         BodyAttitudeProbe.cpp
         BrakeHardwareTests.cpp
+        BreakablePropTests.cpp
         BrakeModelProbe.cpp
         BrakeThermalProbe.cpp
         BrakeThermalTests.cpp
         BrakingUtilisationProbe.cpp
+        BumpStopStaticProbe.cpp
         CameraServiceTests.cpp
         CarAudioTests.cpp
         ClutchTests.cpp
@@ -29,12 +31,16 @@ add_executable(EngineTests
         ComplianceTests.cpp
         ContactPatchChamferProbe.cpp
         ContactPatchTests.cpp
+        ContactSolverTests.cpp
         CreepDiagnosticProbe.cpp
         CreepTests.cpp
         CriteriaGripSweepProbe.cpp
         CouplingTests.cpp
         DamperFrictionProbe.cpp
+        DamperFrictionVelocityProbe.cpp
+        DamperFrictionVelocityTests.cpp
         DifferentialTests.cpp
+        DroopStopProbe.cpp
         DrivelinePathProbe.cpp
         DrivelineTests.cpp
         EngineCurveValidationProbe.cpp
@@ -64,6 +70,7 @@ add_executable(EngineTests
         JounceStopProbe.cpp
         LookupTableTests.cpp
         MemoryStorageTests.cpp
+        OcclusionTests.cpp
         PhysicalCameraTests.cpp
         PedalCueProbe.cpp
         PedalFeedbackTests.cpp
@@ -74,6 +81,8 @@ add_executable(EngineTests
         RackTorqueTests.cpp
         RackSignTests.cpp
         RackTraceCornerTests.cpp
+        RearDamperProbe.cpp
+        RearHopForensicProbe.cpp
         RecessionSweepProbe.cpp
         RendererSeamTests.cpp
         RigidBodyTests.cpp
