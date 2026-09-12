@@ -774,6 +774,11 @@ export struct Scene
     // Zero is bit-for-bit the sky before it existed. The skybox shader alone reads it, as the gain
     // 2^-stops in the frame block's cloudParams.z, written one in a capture.
     float skyEyeStops = 0.0f;
+    // Whether a local probe's reflection is re-aimed against the distance cube its capture wrote
+    // (2026-09-13, docs/probe-parallax-brief.md) or against its influence box, which is what every
+    // reflection did until then. False is the box, bit for bit. Reaches the shaders as
+    // probeParams.y; the backend writes zero whatever this says when it has no distance pipeline.
+    bool probeDistanceMarch = false;
     // The dome map those clouds are marched into — written at the end of the world camera's chain,
     // composited by the skybox and photographed by the probes. Stated on the scene rather than
     // found by the backend because which attachment is the cloud map is the game's to say, exactly

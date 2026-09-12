@@ -168,6 +168,11 @@ std::expected<void, std::string> SceneService::setSkyEyeStops(Scene& scene, cons
     return {};
 }
 
+void SceneService::setProbeDistanceMarch(Scene& scene, const bool march) const
+{
+    scene.probeDistanceMarch = march;
+}
+
 void SceneService::setCloudMap(Scene& scene, const Resource<FboAttachment>& cloudMap) const
 {
     scene.cloudMap = cloudMap;

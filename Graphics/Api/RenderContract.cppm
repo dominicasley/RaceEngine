@@ -256,6 +256,14 @@ export inline constexpr uint32_t bloomMaxLevels = 6;
 // does constantly.
 export inline constexpr uint32_t probeSpecularBinding = 1;
 
+// Every pool slice's captured *distance*, the same shape as the radiance beside it (layers 6i..6i+5
+// are slice i, one mip, R32F): the radial distance from the capture point to the first surface
+// along each direction, which is what lets a reflection be re-aimed at the wall it actually hits
+// rather than at a box (2026-09-13, docs/probe-parallax-brief.md). Written by the capture after each
+// face from that face's depth; read on a nearest sampler, because a filtered distance across a
+// building's edge against the sky is a surface that does not exist.
+export inline constexpr uint32_t probeDistanceBinding = 2;
+
 // Fullscreen passes — every post-process and the presenter — bind a set of their own, and it
 // carries the images they read. One binding holding an array of `postProcessInputCount` combined
 // image samplers rather than that many bindings, for exactly the reason the cascades are one
@@ -355,7 +363,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 56;
+export inline constexpr size_t shaderContractMacroCount = 57;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -416,6 +424,7 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"MAX_IBL_PROBES", maxIblProbes},
         {"SH_COEFFICIENTS", shCoefficientCount},
         {"PROBE_SPECULAR_BINDING", probeSpecularBinding},
+        {"PROBE_DISTANCE_BINDING", probeDistanceBinding},
         {"PROBE_SPECULAR_MIPS", probeSpecularMipCount},
         {"PROBE_CUBE_RESOLUTION", probeCubeResolution},
         {"SET_POST_PROCESS", postProcessDescriptorSet},

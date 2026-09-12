@@ -75,8 +75,11 @@ export struct LightProbe
     // full scene passes in one frame is a visible hitch — so a probe carries its own progress.
     unsigned int captureFace = 0;
     // The slice of the backend's probe array this probe's prefiltered radiance lives in.
-    // Assigned on first capture and held for the probe's life, which is what lets a re-capture
-    // overwrite in place rather than shuffling every other probe's index.
+    // Assigned by the backend on first capture while the pool has one to give, and moved by the
+    // engine's scheduler (EngineImpl.cpp, `handOverSlice`, 2026-09-13) from the probe a view wants
+    // least to one it wants and that holds none — the newcomer re-captures into it. A re-capture
+    // overwrites in place, so no other probe's index moves; a probe that gave its slice up keeps
+    // its irradiance and reflects the global probe, as a probe past the pool always has.
     std::optional<unsigned int> arraySlice{};
 
     // Whether this probe's first capture has been reported. Per probe rather than per backend so

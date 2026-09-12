@@ -305,7 +305,11 @@ TEST_CASE("the corridor: a box in the road in front of a unit is seen by the ray
 
     auto router = PursuitRouter(town.network(), nullptr);
 
-    auto director = PursuitDirector{};
+    // Below the ram level: a ramming unit is capped for nothing beyond the player (docs/police-driving-brief.md
+    // §13), and this box is beyond the player. The corridor's rays are what is under test here.
+    auto noRam = PursuitOptions{};
+    noRam.ramLevel = 6;
+    auto director = PursuitDirector{noRam};
     director.setRouter(&router);
     auto clock = 0.0;
 
@@ -532,6 +536,7 @@ TEST_CASE("the corridor's traffic on a chase: a unit with a car ahead is capped 
     const auto& options = director.settings();
     auto sawTraffic = false;
     auto shifted = false;
+    auto lastApplied = std::vector<double>(town.agents().size(), 0.0);
 
     for (auto step = 0; step < 4 * 360; step++)
     {
@@ -539,6 +544,21 @@ TEST_CASE("the corridor's traffic on a chase: a unit with a car ahead is capped 
 
         for (const auto& unit : director.units())
         {
+            // The shift the aim carries is blended: never more than the rate's step in a tick, and
+            // never past the offset that crabs the car at the rate (docs/police-driving-brief.md §13).
+            // The speed is the one the director reads, the velocity's flat length; and the ceiling
+            // shrinks as the car accelerates through eleven metres a second, so an offset above it is
+            // allowed while it comes down at the rate.
+            const auto& velocity = town.agents()[unit.agent].velocityMetresPerSecond;
+            const auto speed = glm::length(glm::dvec3(velocity.x, 0.0, velocity.z));
+            const auto lookAhead = std::max(options.routeLookAheadMetres, options.routeLookAheadSeconds * speed);
+            const auto blendStep = options.laneShiftRateMetresPerSecond * tick;
+            const auto ceiling = options.laneShiftRateMetresPerSecond * lookAhead / std::max(speed, 1.0);
+            REQUIRE(std::abs(unit.laneShiftAppliedMetres - lastApplied[unit.agent]) <= blendStep + 1e-9);
+            REQUIRE(std::abs(unit.laneShiftAppliedMetres) <=
+                    std::max(ceiling, std::abs(lastApplied[unit.agent]) - blendStep) + 1e-9);
+            lastApplied[unit.agent] = unit.laneShiftAppliedMetres;
+
             REQUIRE(unit.corridorCapMetresPerSecond <= options.maximumUnitSpeedMetresPerSecond + 1e-9);
 
             if (!unit.trafficAhead)
@@ -837,7 +857,63 @@ TEST_CASE("turning round in a narrow street: the room is measured, a three-point
     REQUIRE(about);
 }
 
-TEST_CASE("the PIT: from the ram level the tail lines up on the rear quarter and steers into it",
+TEST_CASE("turning round with a wall on the aim's side: the unit turns the other way, where the arc fits, and never touches it",
+          "[police][police-corridor]")
+{
+    const JoltGuard jolt;
+
+    // A wall six metres to the left of the lane and nothing on the right: the arc needs fourteen, the
+    // left has six, the right sixteen. The aim is behind and to the left — the side of the wall.
+    // On 2026-09-12 a unit joined a chase with the player 39 m behind it, read 6.6 m on its left and
+    // 16 on its right, and turned left into the wall (docs/police-driving-brief.md §14).
+    auto town = city(oneLane(700.0, 14.0), 3.0, 1.0);
+    const auto* front = frontCar(town);
+    REQUIRE(front != nullptr);
+    const auto z = front->positionMetres.z;
+    const auto id = front->id;
+
+    const auto world = plate(700.0, 60.0, {box(6.0, 7.0, 20.0, 680.0, 1.5)});
+
+    auto director = PursuitDirector{};
+    auto clock = 0.0;
+
+    const auto player = playerAt(glm::dvec3(3.0, 0.0, z - 40.0), 0.0);
+    run(director, town, world, player, 0.1, clock);
+    director.setLevel(3);
+
+    auto sideChosen = 0;
+    auto sawBacking = false;
+    auto about = false;
+    auto furthestLeft = -100.0;
+    for (auto step = 0; step < 20 * 360 && !about; step++)
+    {
+        run(director, town, world, player, tick, clock);
+
+        const auto* unit = director.unit(id);
+        if (unit == nullptr)
+        {
+            continue;
+        }
+
+        if (unit->turnSide != 0 && sideChosen == 0)
+        {
+            sideChosen = unit->turnSide;
+        }
+        sawBacking = sawBacking || unit->turnPhase == 2;
+
+        const auto& agent = town.agents()[id];
+        furthestLeft = std::max(furthestLeft, agent.positionMetres.x);
+        about = glm::dot(agent.heading, glm::dvec3(0.0, 0.0, -1.0)) > 0.7 && unit->turnPhase == 0;
+    }
+
+    // Turned right, in one arc, came about, and its centre never came within a body's width of the wall.
+    REQUIRE(sideChosen == -1);
+    REQUIRE_FALSE(sawBacking);
+    REQUIRE(about);
+    REQUIRE(furthestLeft < 4.0);
+}
+
+TEST_CASE("the tail rams: from the ram level a tail behind a moving player drives into it at the maximum, and never brakes",
           "[police][police-corridor]")
 {
     const JoltGuard jolt;
@@ -861,42 +937,107 @@ TEST_CASE("the PIT: from the ram level the tail lines up on the rear quarter and
     auto director = PursuitDirector{};
     auto clock = 0.0;
 
-    // The player forty metres ahead, driving on up the road at twenty: the unit is the tail, ramming
-    // from the first level, and comes up beside the rear quarter.
+    // The player forty metres ahead, driving on up the road at twenty: the unit is the tail. Before
+    // 2026-09-12 later the tail on a moving player went for the rear quarter instead (the PIT,
+    // retired, docs/police-driving-brief.md §13), and a routing tail did neither; now it rams like
+    // every other unit, at the maximum, whatever the player's speed.
     auto player = playerAt(glm::dvec3(0.0, 0.0, z + 40.0), 20.0);
 
-    // The side the tail goes for is chosen once and held: it must not flip on the way in.
-    auto pitted = false;
-    auto sideSeen = 0;
-    auto sideFlips = 0;
-    for (auto step = 0; step < 15 * 360 && !pitted && player.positionMetres.z < 640.0; step++)
+    auto rammedAsTail = false;
+    auto slowest = 100.0;
+    for (auto step = 0; step < 15 * 360 && player.positionMetres.z < 640.0; step++)
     {
         run(director, town, world, player, tick, clock);
         player.positionMetres += player.velocityMetresPerSecond * tick;
 
         const auto* unit = director.unit(id);
-        pitted = unit != nullptr && unit->pitting;
-
-        if (unit != nullptr && unit->pitSide != 0)
+        if (unit == nullptr || !unit->ramming || unit->role != raceengine::PursuitRole::Tail)
         {
-            sideFlips += (sideSeen != 0 && unit->pitSide != sideSeen) ? 1 : 0;
-            sideSeen = unit->pitSide;
+            continue;
+        }
+
+        rammedAsTail = true;
+        if (!unit->trafficAhead && !unit->corridorHit)
+        {
+            slowest = std::min(slowest, unit->wantedSpeedMetresPerSecond);
         }
     }
-    REQUIRE(sideFlips == 0);
 
     REQUIRE(director.status().active);
     REQUIRE(director.status().level >= director.settings().ramLevel);
-    REQUIRE(pitted);
+    REQUIRE(rammedAsTail);
+    // The maximum, never the station's pace behind the player.
+    REQUIRE(slowest > 60.0);
 
-    // The aim, once striking, is across the unit's line toward the player's centreline.
-    const auto* unit = director.unit(id);
-    REQUIRE(unit != nullptr);
-    const auto& agent = town.agents()[id];
-    const auto left = glm::normalize(glm::cross(glm::dvec3(0.0, 1.0, 0.0), player.forward));
-    const auto unitAcross = glm::dot(agent.positionMetres - player.positionMetres, left);
-    const auto aimAcross = glm::dot(unit->aimMetres - player.positionMetres, left);
-    REQUIRE(std::abs(aimAcross) < std::abs(unitAcross));
+    // The full model's driver on a ramming unit: the player twenty-five degrees off the nose — the
+    // car crossed up — is not a corner to brake for. The pedal is the throttle alone; the same aim
+    // on a unit that is not ramming is slowed for.
+    auto unit = PursuitUnit{};
+    unit.ramming = true;
+    unit.wantedSpeedMetresPerSecond = director.settings().maximumUnitSpeedMetresPerSecond;
+    unit.aimMetres = glm::dvec3(6.0, 0.0, 113.0);
+
+    auto pose = raceengine::PursuitCarPose{};
+    pose.positionMetres = glm::dvec3(0.0, 0.0, 100.0);
+    pose.velocityMetresPerSecond = glm::dvec3(0.0, 0.0, 23.0);
+    pose.wheelbaseMetres = 3.053;
+    pose.lockRadians = 0.462;
+    pose.corneringLimitG = 0.85;
+
+    const auto drive = director.drive(unit, pose);
+    REQUIRE(drive.brake == 0.0);
+    REQUIRE(drive.throttle > 0.9);
+
+    unit.ramming = false;
+    REQUIRE(director.drive(unit, pose).brake > 0.0);
+}
+
+TEST_CASE("the driver counter-steers a slide with the slip itself, whichever side the aim is on",
+          "[police][police-corridor]")
+{
+    auto director = PursuitDirector{};
+    const auto& options = director.settings();
+
+    // Twenty-three metres a second up the road with the nose nine degrees to the left of the
+    // velocity — the car yawing left on its own, as unit 335 was on 2026-09-12 — and the aim on the
+    // road ahead, to the right of the nose: the counter-steer is the slip, plus the pursuit's wheel
+    // toward the aim at no more than the grip angle.
+    const auto yaw = glm::radians(9.0);
+    auto pose = raceengine::PursuitCarPose{};
+    pose.positionMetres = glm::dvec3(0.0, 0.0, 100.0);
+    pose.orientation = glm::dquat(std::cos(0.5 * yaw), 0.0, std::sin(0.5 * yaw), 0.0);
+    pose.velocityMetresPerSecond = glm::dvec3(0.0, 0.0, 23.0);
+    pose.wheelbaseMetres = 3.053;
+    pose.lockRadians = 0.462;
+    pose.corneringLimitG = 0.85;
+
+    auto unit = PursuitUnit{};
+    unit.wantedSpeedMetresPerSecond = 23.0;
+    unit.aimMetres = glm::dvec3(-6.0, 0.0, 113.0);
+
+    const auto gripWheel = std::atan(pose.wheelbaseMetres * 0.85 * 9.80665 / (23.0 * 23.0));
+    REQUIRE(yaw >= 2.0 * options.slideSlipRadians);
+
+    const auto counter = director.drive(unit, pose);
+    // A right turn is a positive demand: the slip's eight degrees plus the pursuit's grip angle.
+    REQUIRE(counter.steering > 0.0);
+    REQUIRE(counter.steering >= yaw / pose.lockRadians - 1e-6);
+    REQUIRE(counter.steering <= (yaw + gripWheel) / pose.lockRadians + 1e-9);
+
+    // The aim on the other side, into the yaw: still a counter-steer, the slip less the grip angle.
+    unit.aimMetres = glm::dvec3(8.0, 0.0, 113.0);
+    const auto into = director.drive(unit, pose);
+    REQUIRE(into.steering > 0.0);
+    REQUIRE(into.steering >= (yaw - gripWheel) / pose.lockRadians - 1e-6);
+    REQUIRE(into.steering < counter.steering);
+
+    // Half way into the band the counter-steer is half in.
+    const auto half = 1.5 * options.slideSlipRadians;
+    pose.orientation = glm::dquat(std::cos(0.5 * half), 0.0, std::sin(0.5 * half), 0.0);
+    unit.aimMetres = glm::dvec3(-6.0, 0.0, 113.0);
+    const auto partial = director.drive(unit, pose);
+    REQUIRE(partial.steering > gripWheel / pose.lockRadians);
+    REQUIRE(partial.steering < (0.5 * half + gripWheel) / pose.lockRadians + 1e-6);
 }
 
 namespace

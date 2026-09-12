@@ -8,6 +8,8 @@
 module;
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <expected>
 #include <functional>
@@ -15,6 +17,8 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <glm/glm.hpp>
 
 #include <spdlog/async.h>
 #include <spdlog/logger.h>
@@ -555,6 +559,234 @@ void Engine::step()
 //
 // A probe already Ready is skipped, so a settled scene does no capture work at all and a
 // time-of-day change costs six frames per probe until the scene has settled again.
+namespace
+{
+
+// ---- The probe scheduler ------------------------------------------------------------------------
+//
+// Which probe the backend advances this frame, and which probes hold the specular pool. Both are
+// decided against one view — the scene's first Scene camera — because a city carries hundreds of
+// probes against a pool of `maxIblProbes` slices, and the slices that matter are the ones nearest
+// the eye.
+//
+// The pool used to be handed out once, to the first eight probes captured, and held for the
+// probe's life. On a city whose probes are ordered outwards from the grid slot that was the global
+// probe and the seven street probes nearest spawn, so every reflection more than a few stands from
+// the start was the sky over the start line: the buildings were in every probe's photograph and
+// in no car's paint (2026-09-13, the seat: "cars are just using the default probe"). Now a pool
+// slice follows the view — when a probe the view wants holds none and a probe it does not want
+// holds one, the slice changes hands and the newcomer re-captures into it.
+//
+// Three rules keep the backend's guarantees, and each is load-bearing:
+// - **A capture in flight is always the probe advanced, and the pool does not change while one
+//   is.** The backend has one readback buffer and one scratch slice, and "the probe in flight is
+//   the next one advanced" is what makes both safe (recordProbeCapture).
+// - **At most one slice changes hands a frame, and the probe that received it is the probe
+//   advanced.** Its first face puts it in Capturing before any view of this frame is recorded, and
+//   uploadProbes reads no reflection off a Capturing probe, so the frame never reflects a slice
+//   whose photograph belongs to another street.
+// - **A scene that fits the pool is scheduled exactly as before**: the first not-Ready probe in
+//   scene order, every probe keeping the slice its first capture gave it. That is what keeps both
+//   frame gates still — the apron places three probes and the circuit one.
+
+// A probe's standing with a view: distance squared, and -1 for the global probe so it is wanted
+// before everything and evicted never. The same rank uploadProbes uses to choose a frame's eight.
+[[nodiscard]] float probeRank(const LightProbe& probe, const glm::vec3& viewPosition)
+{
+    if (probe.global)
+    {
+        return -1.0f;
+    }
+
+    const auto offset = probe.position - viewPosition;
+    return glm::dot(offset, offset);
+}
+
+// The probes a view shades from: the global one and the nearest locals up to the pool's size,
+// nearest first. Unlike uploadProbes this does not skip a probe that has never been captured — a
+// probe the view wants and has no photograph of is exactly the one to capture next.
+struct WantedProbes
+{
+    std::array<LightProbe*, maxIblProbes> probes{};
+    std::array<float, maxIblProbes> ranks{};
+    std::size_t count = 0;
+
+    [[nodiscard]] bool contains(const LightProbe& probe) const
+    {
+        for (auto index = std::size_t{0}; index < count; index++)
+        {
+            if (probes[index] == &probe)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+};
+
+[[nodiscard]] WantedProbes wantedProbes(Scene& scene, const glm::vec3& viewPosition)
+{
+    auto wanted = WantedProbes{};
+
+    for (auto& probe : scene.probes)
+    {
+        const auto rank = probeRank(probe, viewPosition);
+
+        if (wanted.count < wanted.probes.size())
+        {
+            wanted.probes[wanted.count] = &probe;
+            wanted.ranks[wanted.count] = rank;
+            wanted.count++;
+            continue;
+        }
+
+        auto worst = std::size_t{0};
+        for (auto index = std::size_t{1}; index < wanted.count; index++)
+        {
+            if (wanted.ranks[index] > wanted.ranks[worst])
+            {
+                worst = index;
+            }
+        }
+
+        if (rank < wanted.ranks[worst])
+        {
+            wanted.probes[worst] = &probe;
+            wanted.ranks[worst] = rank;
+        }
+    }
+
+    // Nearest first, so the street the car is standing in is the first one photographed — on a
+    // cold bake, and again after a time-of-day change dirties the whole graph.
+    for (auto outer = std::size_t{1}; outer < wanted.count; outer++)
+    {
+        for (auto inner = outer; inner > 0 && wanted.ranks[inner] < wanted.ranks[inner - 1]; inner--)
+        {
+            std::swap(wanted.probes[inner], wanted.probes[inner - 1]);
+            std::swap(wanted.ranks[inner], wanted.ranks[inner - 1]);
+        }
+    }
+
+    return wanted;
+}
+
+// How much nearer than the holder a newcomer must stand before a slice changes hands, as a ratio
+// of distance squared: 0.64 is a fifth of the holder's distance. Without it a car parked between
+// two stands would trade the same slice back and forth, eight frames of capture each way, for as
+// long as it sat there. The stands are sixty metres apart and the pool's furthest member on a
+// straight street is three stands out, so a fifth is a dozen metres of travel — under a second.
+constexpr auto sliceHandoverRankRatio = 0.64f;
+
+// Moves one pool slice from the probe the view wants least to a probe it wants and that holds
+// none, and returns the newcomer; nullptr when nothing moved. Only a probe outside the wanted set
+// gives its slice up, so a scene that fits the pool never moves one, and a wanted probe with no
+// slice while the pool still has spares is left alone: it is Dirty or will be captured in its
+// turn, and the backend hands a fresh slice to a capture while it has any.
+[[nodiscard]] LightProbe* handOverSlice(Scene& scene, const WantedProbes& wanted, const glm::vec3& viewPosition)
+{
+    for (auto index = std::size_t{0}; index < wanted.count; index++)
+    {
+        auto& newcomer = *wanted.probes[index];
+        if (newcomer.arraySlice.has_value())
+        {
+            continue;
+        }
+
+        LightProbe* holder = nullptr;
+        auto holderRank = 0.0f;
+        for (auto& probe : scene.probes)
+        {
+            // Nothing is in flight here, so a held slice is a pool slice and never the scratch.
+            if (!probe.arraySlice.has_value() || wanted.contains(probe))
+            {
+                continue;
+            }
+
+            const auto rank = probeRank(probe, viewPosition);
+            if (holder == nullptr || rank > holderRank)
+            {
+                holder = &probe;
+                holderRank = rank;
+            }
+        }
+
+        if (holder == nullptr)
+        {
+            return nullptr;
+        }
+
+        if (wanted.ranks[index] > holderRank * sliceHandoverRankRatio)
+        {
+            continue;
+        }
+
+        // The holder keeps its irradiance and its state: it shades diffuse as it did, and takes its
+        // reflection from the global probe as a probe past the pool always has. The newcomer keeps
+        // its irradiance too — the cache's or its last capture's — and re-photographs into the slice.
+        newcomer.arraySlice = holder->arraySlice;
+        holder->arraySlice.reset();
+        newcomer.invalidate();
+        return &newcomer;
+    }
+
+    return nullptr;
+}
+
+// The probe to advance this frame, or nullptr when the scene's graph is settled.
+[[nodiscard]] LightProbe* nextProbeCapture(Scene& scene, const Camera* view)
+{
+    for (auto& probe : scene.probes)
+    {
+        if (probe.state == LightProbeState::Capturing || probe.state == LightProbeState::Projecting)
+        {
+            return &probe;
+        }
+    }
+
+    // A scene the pool holds whole, or a scene with no view to follow: the first not-Ready probe in
+    // scene order, which is the rule there has always been.
+    if (view == nullptr || scene.probes.size() <= maxIblProbes)
+    {
+        for (auto& probe : scene.probes)
+        {
+            if (probe.state != LightProbeState::Ready)
+            {
+                return &probe;
+            }
+        }
+
+        return nullptr;
+    }
+
+    const auto wanted = wantedProbes(scene, view->position);
+
+    if (auto* newcomer = handOverSlice(scene, wanted, view->position); newcomer != nullptr)
+    {
+        return newcomer;
+    }
+
+    for (auto index = std::size_t{0}; index < wanted.count; index++)
+    {
+        if (wanted.probes[index]->state != LightProbeState::Ready)
+        {
+            return wanted.probes[index];
+        }
+    }
+
+    for (auto& probe : scene.probes)
+    {
+        if (probe.state != LightProbeState::Ready)
+        {
+            return &probe;
+        }
+    }
+
+    return nullptr;
+}
+
+} // namespace
+
 void Engine::recordProbeCaptures()
 {
     RACEENGINE_ZONE_N("record probe capture");
@@ -566,17 +798,28 @@ void Engine::recordProbeCaptures()
             continue;
         }
 
-        for (auto& probe : scenePtr->probes)
+        // The view the pool follows: the scene's first Scene camera. In the layered frame that is
+        // the world camera, and the car and frame cameras share its pose; the mirror camera stands
+        // at the driver's eye, two metres from it, which no stand can tell apart.
+        const Camera* view = nullptr;
+        for (const auto& camera : scenePtr->cameras)
         {
-            if (probe.state == LightProbeState::Ready)
+            if (camera.role == CameraRole::Scene)
             {
-                continue;
+                view = &camera;
+                break;
             }
-
-            renderer->recordProbeCapture(*scenePtr, probe);
-
-            return;
         }
+
+        auto* probe = nextProbeCapture(*scenePtr, view);
+        if (probe == nullptr)
+        {
+            continue;
+        }
+
+        renderer->recordProbeCapture(*scenePtr, *probe);
+
+        return;
     }
 }
 

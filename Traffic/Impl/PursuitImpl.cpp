@@ -45,6 +45,41 @@ constexpr auto standardGravity = 9.80665;
 }
 
 // Left of a heading, in this engine's frame: cross(up, forward) is +x, and +x is the car's left.
+// The heading a full-lock turn has swung through when the leading front corner reaches a wall `room`
+// to the turn's side (docs/police-driving-brief.md §14): the turning centre moves R (1 − cos θ) toward
+// the wall, the corner sits half the body ahead and half the width out, so its reach is
+// R + (w/2 − R) cos θ + (L/2) sin θ — rising to a peak past a quarter turn. Half a turn when the corner
+// never gets there.
+[[nodiscard]] double cornerSweepRadians(const double room, const double radius, const double length, const double width)
+{
+    constexpr auto pi = 3.14159265358979323846;
+
+    const auto reach = [&](const double theta)
+    { return radius + (0.5 * width - radius) * std::cos(theta) + 0.5 * length * std::sin(theta); };
+
+    if (reach(0.0) >= room)
+    {
+        return 0.0;
+    }
+
+    // The reach peaks where its slope is zero: tan θ = −(L/2) / (R − w/2), past a quarter turn.
+    const auto peak = pi - std::atan2(0.5 * length, std::max(radius - 0.5 * width, 1e-6));
+    if (reach(peak) < room)
+    {
+        return pi;
+    }
+
+    auto low = 0.0;
+    auto high = peak;
+    for (auto step = 0; step < 40; step++)
+    {
+        const auto mid = 0.5 * (low + high);
+        (reach(mid) < room ? low : high) = mid;
+    }
+
+    return low;
+}
+
 [[nodiscard]] glm::dvec3 leftOf(const glm::dvec3& forward)
 {
     return glm::normalize(glm::cross(worldUp, forward));
@@ -566,7 +601,9 @@ void PursuitDirector::readTraffic(PursuitUnit& unit, const TrafficAgent& agent, 
 
     const auto lines = std::span<const TrafficLine>(corridor.lines.data(), corridor.lineCount);
     const auto& own = lines[0];
-    const auto mayShift = (unit.role == PursuitRole::Chase || unit.routing) && !unit.reversing && unit.turnPhase == 0;
+    const auto aligned = std::abs(glm::dot(heading, corridor.direction)) > options.laneShiftAlignment;
+    const auto mayShift =
+        (unit.role == PursuitRole::Chase || unit.routing) && !unit.reversing && unit.turnPhase == 0 && aligned;
     const TrafficLine* chosen = &own;
 
     // The line being held, found again by its name.
@@ -582,8 +619,24 @@ void PursuitDirector::readTraffic(PursuitUnit& unit, const TrafficAgent& agent, 
         }
     }
 
-    if (held != nullptr && held != &own && mayShift &&
-        safe(own.ahead) < safe(held->ahead) - options.laneShiftGainMetresPerSecond)
+    // The merge: the car behind on the line must be further back than what it closes over the
+    // merge, plus the standstill.
+    const auto followerClear = [&](const TrafficLine& line)
+    {
+        const auto closing = line.behind.found ? std::max(line.behind.speedMetresPerSecond - speed, 0.0) : 0.0;
+
+        return !line.behind.found ||
+               line.behind.gapMetres > options.mergeFollowerSeconds * closing + options.followStandstillMetres;
+    };
+
+    // A started shift is held until it is done — the unit within the done distance of the line —
+    // or unsafe: the line worse than the one under the unit, or a car behind on it closing. Judged
+    // every sight tick against the entry margin instead, it was dropped half a lane in when a car
+    // appeared ahead on the line, and the aim snapped a lane's width back with the unit already
+    // yawing for it (docs/police-driving-brief.md §13). Once the unit is nearer the line than any
+    // other it is `own`, and the hold finishes the change onto its centre.
+    if (held != nullptr && mayShift && std::abs(held->offsetMetres) > options.laneShiftDoneMetres &&
+        (held == &own || (safe(held->ahead) >= safe(own.ahead) && followerClear(*held))))
     {
         chosen = held;
         unit.laneShiftMetres = held->offsetMetres;
@@ -600,14 +653,7 @@ void PursuitDirector::readTraffic(PursuitUnit& unit, const TrafficAgent& agent, 
 
             for (const auto& line : lines.subspan(1))
             {
-                // The merge: the car behind on the line must be further back than what it closes
-                // over the merge, plus the standstill.
-                const auto closing = line.behind.found ? std::max(line.behind.speedMetresPerSecond - speed, 0.0) : 0.0;
-                const auto clear =
-                    !line.behind.found ||
-                    line.behind.gapMetres > options.mergeFollowerSeconds * closing + options.followStandstillMetres;
-
-                if (!clear)
+                if (!followerClear(line))
                 {
                     continue;
                 }
@@ -945,7 +991,16 @@ glm::dvec3 PursuitDirector::searchGoalFor(PursuitUnit& unit, const LaneNetwork& 
 
     for (auto attempt = 0; attempt < 8; attempt++)
     {
-        const auto bearing = unit.searchBearingRadians + 0.25 * pi * static_cast<double>(attempt);
+        // The bearing itself, then 45° steps alternating either side of it, the front-going one
+        // first: a side bearing on a road with no side street falls back to a goal ahead, not
+        // behind (it walked round through the rear once the ring had grown past the snap distance —
+        // found by the search fixture on 2026-09-12 later, when a faster turn-round got a unit to
+        // its first goal sooner).
+        const auto steps = static_cast<double>((attempt + 1) / 2);
+        // Front-going: toward a bearing of zero, the bearing read in (−π, π].
+        const auto toward = std::remainder(unit.searchBearingRadians, 2.0 * pi) > 0.0 ? -1.0 : 1.0;
+        const auto sign = attempt % 2 == 1 ? toward : -toward;
+        const auto bearing = unit.searchBearingRadians + sign * 0.25 * pi * steps;
         const auto direction = std::cos(bearing) * heading + std::sin(bearing) * left;
         const auto raw = search.centreMetres + direction * unit.searchRadiusMetres;
 
@@ -1224,13 +1279,6 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
         auto along = 0.0;
         auto across = 0.0;
         auto passSide = 0.0;
-        auto pitSide = 0.0;
-        entry.pitting = false;
-
-        if (entry.role != PursuitRole::Tail)
-        {
-            entry.pitSide = 0;
-        }
 
         switch (entry.role)
         {
@@ -1238,29 +1286,6 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
             break;
         case PursuitRole::Tail:
             along = -(player.lengthMetres + tailGap);
-            // The PIT (docs/police-driving-brief.md §10): from the ram level the tail comes alongside
-            // the player's rear quarter on the side it is already on, and once it is there steers
-            // through the quarter (below).
-            entry.pitCooldownSeconds = std::max(entry.pitCooldownSeconds - deltaTime, 0.0);
-
-            if (ramming && entry.pitCooldownSeconds <= 0.0)
-            {
-                // The side, chosen once per attempt and held: the one the unit was on when it began.
-                if (entry.pitSide == 0)
-                {
-                    entry.pitSide = unitAcross >= 0.0 ? 1 : -1;
-                    entry.pitStrikeSeconds = 0.0;
-                }
-
-                pitSide = static_cast<double>(entry.pitSide);
-                along = -options.pitAlongFraction * player.lengthMetres;
-                across = pitSide * (0.5 * player.widthMetres + 0.5 * options.turnBodyWidthMetres +
-                                    options.pitLateralGapMetres);
-            }
-            else
-            {
-                entry.pitSide = 0;
-            }
             break;
         case PursuitRole::Lead:
             along = player.lengthMetres + leadGap;
@@ -1347,29 +1372,6 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
                 wanted = options.turnAroundSpeedMetresPerSecond;
             }
 
-            // The strike: in position on the rear quarter at the player's pace, the aim goes through
-            // the quarter — the unit steers into it, and the two bodies' contact does the rest.
-            // One strike lasts at most its seconds; then the tail drops back to its plain station for
-            // the cooldown before it goes for the quarter again.
-            const auto ready = pitSide != 0.0 && std::abs(behind) < options.pitReadyAlongMetres &&
-                               std::abs(lateral) < options.pitReadyAcrossMetres &&
-                               std::abs(unitSpeed - playerSpeed) < options.pitReadySpeedMetresPerSecond;
-
-            if (pitSide != 0.0 && (ready || entry.pitStrikeSeconds > 0.0))
-            {
-                entry.pitting = true;
-                entry.pitStrikeSeconds += deltaTime;
-                aim = unitPosition + forward * lookAhead + left * (lateral - pitSide * options.pitPushMetres);
-                wanted = playerSpeed + options.pitSpeedMarginMetresPerSecond;
-
-                if (entry.pitStrikeSeconds >= options.pitStrikeSeconds)
-                {
-                    entry.pitting = false;
-                    entry.pitSide = 0;
-                    entry.pitStrikeSeconds = 0.0;
-                    entry.pitCooldownSeconds = options.pitCooldownSeconds;
-                }
-            }
         }
 
         // --- the route (docs/pursuit-navigation-brief.md, stage 3) ---
@@ -1450,17 +1452,16 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
         // --- the ram (docs/police-driving-brief.md §12) ---
         //
         // From the ram level, a unit inside range with the player in front of it drives into the
-        // player at the maximum, whatever its role and whatever the player is doing — the tail on a
-        // moving player excepted, which does the PIT. Wrecking is the goal; a station is not.
+        // player at the maximum, whatever its role and whatever the player is doing — the tail too,
+        // since 2026-09-12 later (§13): it kept the PIT before, and a routing tail did neither.
+        // Wrecking is the goal; a station is not.
         entry.ramming = false;
 
         {
             const auto toPlayerFlat = playerPosition - unitPosition;
             const auto bearing = entry.distanceMetres > 1e-6 ? glm::dot(toPlayerFlat, unitHeading) / entry.distanceMetres : 1.0;
-            const auto pitInstead = entry.role == PursuitRole::Tail && !boxing;
-
             if (summary.level >= options.ramLevel && !entry.reversing && entry.turnPhase == 0 && !entry.searching &&
-                !pitInstead && entry.distanceMetres < options.ramRangeMetres && bearing > options.ramFacingCosine)
+                entry.distanceMetres < options.ramRangeMetres && bearing > options.ramFacingCosine)
             {
                 entry.ramming = true;
                 aim = playerPosition + velocity * options.ramLeadSeconds;
@@ -1537,30 +1538,48 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
             if (entry.turnPhase == 0 && aimAhead < 0.0 && glm::length(toAimFlat) > 6.0 && !entry.reversing &&
                 unitSpeed < options.turnAroundSpeedMetresPerSecond + 1.0)
             {
-                // The aim's side, unless there is no room for even the nose there and more the other way.
-                auto side = glm::dot(toAimFlat, unitLeft) >= 0.0 ? 1 : -1;
+                // The side is where the full-lock arc fits: the aim's when both do, the roomier when
+                // neither (a three-point turn wants the space). The aim's side regardless put a unit
+                // with 6.6 m on its left and 16 on its right into the left wall (§14).
                 const auto roomOn = [&](const int which)
                 { return which > 0 ? entry.roomLeftMetres : entry.roomRightMetres; };
+                const auto arc = 2.0 * radius + options.turnBodyWidthMetres;
+                const auto fits = [&](const int which) { return roomOn(which) >= arc; };
+                const auto aimSide = glm::dot(toAimFlat, unitLeft) >= 0.0 ? 1 : -1;
 
-                if (roomOn(side) < radius && roomOn(-side) > roomOn(side))
+                auto side = aimSide;
+                if (fits(aimSide) != fits(-aimSide))
                 {
-                    side = -side;
+                    side = fits(aimSide) ? aimSide : -aimSide;
+                }
+                else if (!fits(aimSide) && roomOn(-aimSide) > roomOn(aimSide))
+                {
+                    side = -aimSide;
                 }
 
                 const auto room = roomOn(side);
 
-                if (room < 2.0 * radius + options.turnBodyWidthMetres)
-                {
-                    // The nose reaches the room when R (1 − cos θ) is the room less half the body:
-                    // at least a good part of a quarter turn, at most half a turn.
-                    const auto usable = std::clamp((room - 0.5 * options.turnBodyWidthMetres) / radius, 0.0, 2.0);
+                entry.turnSide = side;
+                entry.turnHeadingRadians = 0.0;
+                entry.turnSeconds = 0.0;
+                entry.turnLastHeading = unitHeading;
 
-                    entry.turnSide = side;
+                if (room < arc)
+                {
+                    // The three-point turn: forward until the leading front corner has used the room,
+                    // less the margin; at least a little, so the turn makes progress.
                     entry.turnPhase = 1;
-                    entry.turnHeadingRadians = 0.0;
-                    entry.turnSeconds = 0.0;
-                    entry.turnLastHeading = unitHeading;
-                    entry.turnGoalRadians = std::clamp(std::acos(1.0 - std::min(usable, 1.0)), 0.5, pi);
+                    entry.turnGoalRadians = std::max(
+                        cornerSweepRadians(room, radius, options.turnBodyLengthMetres, options.turnBodyWidthMetres) -
+                            options.turnCornerMarginRadians,
+                        0.3);
+                }
+                else
+                {
+                    // The arc fits: the drivers' own turn-round, told the side, and over once the aim
+                    // is ahead — the third leg on its own.
+                    entry.turnPhase = 3;
+                    entry.turnGoalRadians = pi;
                 }
             }
 
@@ -1572,8 +1591,10 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
                 entry.turnSeconds += deltaTime;
 
                 const auto side = static_cast<double>(entry.turnSide);
+                // ...or the car has stopped against something: on with the next leg, not the throttle.
+                const auto stopped = entry.turnSeconds > 0.5 && unitSpeed < 0.3;
                 const auto legDone = entry.turnHeadingRadians >= entry.turnGoalRadians ||
-                                     entry.turnSeconds > options.turnPhaseSeconds;
+                                     entry.turnSeconds > options.turnPhaseSeconds || stopped;
 
                 if (entry.turnPhase == 1)
                 {
@@ -1629,7 +1650,12 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
         // far aim's gentle drift into a lane change.
         auto cap = options.maximumUnitSpeedMetresPerSecond;
 
-        if (entry.corridorHit)
+        // A ramming unit is capped for nothing beyond the player: it meets the player first, and that
+        // is the point. The second log had a ram lifted to 24 m/s for a building on the outside of a
+        // bend fifty metres on, with the player pulling away at thirty twenty metres ahead (§13).
+        const auto beyondPlayer = entry.ramming && entry.corridorHitMetres > entry.distanceMetres;
+
+        if (entry.corridorHit && !beyondPlayer)
         {
             cap = std::min(cap, std::sqrt(2.0 * braking *
                                           std::max(entry.corridorHitMetres - options.corridorStopMarginMetres, 0.0)));
@@ -1652,13 +1678,28 @@ void PursuitDirector::aimUnits(const PursuitPlayer& player, TrafficPopulation& p
         entry.corridorCapMetresPerSecond = cap;
         wanted = std::min(wanted, cap);
 
-        if (entry.laneShifting && !entry.reversing && entry.turnPhase == 0 && !entry.blocking)
+        // The shift, blended (docs/police-driving-brief.md §13): the offset the aim carries moves toward
+        // the target the sight tick read — zero once the shift is over — at the shift rate, and is
+        // capped at the offset that crabs the car sideways at that rate through the look-ahead (the
+        // aim a lane's width aside at a 12 m look-ahead asked for three times the tyre's grip at
+        // 22 m/s, and the car turned in at its limit for a lane change). The blend runs on while the
+        // unit reverses, turns or blocks, so the offset is gone by the time it drives on.
         {
             const auto lookAhead = std::max(options.routeLookAheadMetres, options.routeLookAheadSeconds * unitSpeed);
-            const auto toward = flatUnit(aim - unitPosition, unitHeading);
+            const auto ceiling = options.laneShiftRateMetresPerSecond * lookAhead / std::max(unitSpeed, 1.0);
+            const auto target = std::clamp(entry.laneShifting ? entry.laneShiftMetres : 0.0, -ceiling, ceiling);
+            const auto step = options.laneShiftRateMetresPerSecond * deltaTime;
 
-            aim = unitPosition + toward * lookAhead + leftOf(unitHeading) * entry.laneShiftMetres;
-            station = aim;
+            entry.laneShiftAppliedMetres += std::clamp(target - entry.laneShiftAppliedMetres, -step, step);
+
+            if (std::abs(entry.laneShiftAppliedMetres) > 1e-3 && !entry.reversing && entry.turnPhase == 0 &&
+                !entry.blocking)
+            {
+                const auto toward = flatUnit(aim - unitPosition, unitHeading);
+
+                aim = unitPosition + toward * lookAhead + leftOf(unitHeading) * entry.laneShiftAppliedMetres;
+                station = aim;
+            }
         }
 
         // --- backing up ---
@@ -2139,8 +2180,20 @@ PursuitDrive PursuitDirector::drive(const PursuitUnit& unit, const PursuitCarPos
     // (docs/police-driving-brief.md §9). Left positive, and a left turn is a negative demand.
     const auto tyreCurvature = lateralLimit / std::max(speed * speed, 1.0);
     const auto demanded = curvature + unit.curvatureAhead;
-    const auto held = std::clamp(demanded, -tyreCurvature, tyreCurvature);
-    const auto roadWheel = std::atan(pose.wheelbaseMetres * held);
+    const auto gripWheel = std::atan(pose.wheelbaseMetres * tyreCurvature);
+
+    // The slide (docs/police-driving-brief.md §13): the body slip — the velocity's angle off the nose,
+    // left positive — past the threshold says the car is yawing on its own and the tyre is past its
+    // peak. The counter-steer is then **the slip itself**, fed forward under the pursuit's wheel, so
+    // the front wheels point along the velocity whatever the aim asks: blended in from the threshold
+    // to twice it, and bounded by the lock alone. Merely allowing the wheel past the grip angle was
+    // not enough — the pursuit's demand toward the aim is not a counter-steer, and the second log had
+    // a unit yawing at 37°/s with 12° of slip and 4° of wheel (2026-09-12, later).
+    const auto slip = speed > 1.0 ? std::atan2(glm::dot(flat(pose.velocityMetresPerSecond), left), std::max(along, 0.5))
+                                  : 0.0;
+    const auto slideShare = std::clamp((std::abs(slip) - options.slideSlipRadians) / std::max(options.slideSlipRadians, 1e-6), 0.0, 1.0);
+    const auto pursuitWheel = std::clamp(std::atan(pose.wheelbaseMetres * demanded), -gripWheel, gripWheel);
+    const auto roadWheel = std::clamp(pursuitWheel + slideShare * slip, -lock, lock);
 
     drive.steering = std::clamp(-roadWheel / lock, -1.0, 1.0);
 
@@ -2158,8 +2211,21 @@ PursuitDrive PursuitDirector::drive(const PursuitUnit& unit, const PursuitCarPos
             return drive;
         }
 
-        drive.steering = aside > 0.0 ? -1.0 : 1.0;
+        // Full lock toward the side the director chose — where the arc fits — and toward the aim
+        // when it chose none (§14). A left turn is a negative demand.
+        drive.steering = unit.turnSide != 0 ? -static_cast<double>(unit.turnSide) : (aside > 0.0 ? -1.0 : 1.0);
         drive.throttle = 0.4;
+
+        return drive;
+    }
+
+    // The ram (docs/police-driving-brief.md §13): the pedal is the throttle and nothing else. The
+    // corner cap below read a ramming unit's own yaw — the player twenty degrees off its nose because
+    // the car was crossed up — as a hairpin and braked to twelve for it (the police log, 2026-09-12).
+    // A wall the director's corridor capped the wanted speed for is met on a lifted throttle.
+    if (unit.ramming)
+    {
+        drive.throttle = std::clamp((unit.wantedSpeedMetresPerSecond - along) / 4.0, 0.0, 1.0);
 
         return drive;
     }

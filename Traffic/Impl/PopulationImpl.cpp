@@ -2835,6 +2835,13 @@ void TrafficPopulation::drivePursuit(const TrafficAgent& agent, const DisturbedS
     const auto held = std::clamp(pursuitCurvature + agent.pursuitCurvatureAhead, -tyreCurvature, tyreCurvature);
     into.steer = std::clamp(std::atan(wheelbase * held) / options.vehicle.maximumSteerRadians, -1.0, 1.0);
 
+    // Turning round with the aim behind: full lock toward the side the director chose — where the
+    // arc fits — rather than toward the aim (docs/police-driving-brief.md §14). Positive is left.
+    if (ahead < 0.0 && agent.pursuitTurnSide != 0)
+    {
+        into.steer = static_cast<double>(agent.pursuitTurnSide);
+    }
+
     // The speed the director asked for, capped for a corner in the path — the turn-in, and the aim's
     // own bearing only when it is well off the nose: a body that tried to take full lock at 30 m/s
     // would spin, and a spun patrol car is a wreck the director then has to write off; a small

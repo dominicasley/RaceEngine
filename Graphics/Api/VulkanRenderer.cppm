@@ -169,7 +169,9 @@ struct FrameDataUbo
     // the sun's beam reaches a surface as the directional light, and a disc in the capture would
     // hand the same sun to that surface a second time through the probe. See recordProbeFace.
     glm::ivec4 shadowParams;
-    // x = light probes in use (0 = the view has no image-based lighting at all).
+    // x = light probes in use (0 = the view has no image-based lighting at all); y = 1 when a local
+    // probe's reflection is re-aimed against its captured distance cube, 0 against its influence
+    // box (2026-09-13, docs/probe-parallax-brief.md).
     glm::ivec4 probeParams;
     std::array<ProbeUbo, maxIblProbes> probes;
     // The air, appended — and appended rather than inserted for the reason the material block's
@@ -1135,6 +1137,40 @@ constexpr const char* describeCameraRole(const CameraRole role)
 // what the world looks like, and how a captured environment is reduced to a roughness chain is no
 // more its business than the layout of the draw-data ring is. They go through the same shaderc
 // path as everything else, so they receive the same contract macros.
+// The distance pass (2026-09-13, docs/probe-parallax-brief.md): one face of a probe's depth buffer
+// in, the radial distance from the capture point out, so that a reflection can be re-aimed at the
+// wall it actually hits. Runs on the prefilter's own layouts — one sampler, one vec4 of push
+// constants — and its oversized triangle, into one face of the distance cube array.
+constexpr const char* probeDistanceFragmentSource = R"GLSL(#version 450
+
+layout(location = 0) out float fragDistance;
+
+layout(set = 0, binding = 0) uniform sampler2D faceDepth;
+
+layout(push_constant) uniform DistanceParams {
+    // x the near plane, y the far plane, z the face's edge length in texels.
+    vec4 value;
+} params;
+
+void main()
+{
+    ivec2 texel = ivec2(gl_FragCoord.xy);
+    float z = texelFetch(faceDepth, texel, 0).r;
+    float near = params.value.x;
+    float far = params.value.y;
+
+    // The stored depth is the zero-to-one form — the clip correction makes it so whatever GLM's
+    // convention is — and this is that projection inverted: the sky's cleared 1.0 comes back as the
+    // far plane exactly, the near plane as itself.
+    float linear = far * near / (far - z * (far - near));
+
+    // Ninety degrees square: the texel's own ray is (u, v, 1) in the face's frame, and the radial
+    // distance is the depth along the axis scaled by that ray's length.
+    vec2 st = (vec2(texel) + 0.5) / params.value.z * 2.0 - 1.0;
+    fragDistance = linear * length(vec3(st, 1.0));
+}
+)GLSL";
+
 constexpr const char* probePrefilterVertexSource = R"GLSL(#version 450
 
 // The oversized triangle, from gl_VertexIndex: no vertex buffers, no bindings, nothing for a
@@ -1660,6 +1696,15 @@ private:
     VkShaderModule probePrefilterFragmentModule = VK_NULL_HANDLE;
     VkDescriptorSet probeRadianceSet = VK_NULL_HANDLE;
     VkSampler probeSampler = VK_NULL_HANDLE;
+    // The distance cube array beside the specular one (docs/probe-parallax-brief.md): one mip,
+    // R32F, a face per (slice, face) view rendered through by the distance pass, which reads the
+    // scratch depth buffer through `probeDepthSet` on the prefilter's layouts and a nearest sampler.
+    unsigned int probeDistanceImageId = 0;
+    std::vector<VkImageView> probeDistanceFaceViews;
+    VkPipeline probeDistancePipeline = VK_NULL_HANDLE;
+    VkShaderModule probeDistanceFragmentModule = VK_NULL_HANDLE;
+    VkDescriptorSet probeDepthSet = VK_NULL_HANDLE;
+    VkSampler probeDistanceSampler = VK_NULL_HANDLE;
     // Where the irradiance projection reads its radiance from. Host-visible and permanently
     // mapped: it is written by a GPU copy and read by the CPU, once per probe capture.
     BufferResource probeReadbackBuffer{};
@@ -1811,6 +1856,9 @@ private:
     // The scratch cube's six faces are drawn: filter them down the roughness chain into the
     // probe's slice of the array, and copy the mip the irradiance projection reads out to the
     // readback buffer. Returns false if the pass could not be recorded at all.
+    // After each face: that face's depth, linearised and made radial, into the slice's distance
+    // cube — what the shaders march a reflection against (docs/probe-parallax-brief.md).
+    void recordProbeDistance(const LightProbe& probe, unsigned int face);
     bool recordProbePrefilter(const LightProbe& probe);
     // Projects the radiance the readback buffer holds onto the spherical harmonic basis. Valid
     // only once the submission that wrote it has completed, which probeReadbackReadyAt states.
@@ -2150,6 +2198,22 @@ VulkanRenderer::~VulkanRenderer()
     if (probeSampler != VK_NULL_HANDLE)
     {
         vkDestroySampler(device, probeSampler, nullptr);
+    }
+    for (const auto view : probeDistanceFaceViews)
+    {
+        vkDestroyImageView(device, view, nullptr);
+    }
+    if (probeDistancePipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, probeDistancePipeline, nullptr);
+    }
+    if (probeDistanceFragmentModule != VK_NULL_HANDLE)
+    {
+        vkDestroyShaderModule(device, probeDistanceFragmentModule, nullptr);
+    }
+    if (probeDistanceSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(device, probeDistanceSampler, nullptr);
     }
 
     for (const auto& [id, image] : imageResources)
@@ -2996,6 +3060,9 @@ void VulkanRenderer::createDescriptorInfrastructure()
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         VkDescriptorSetLayoutBinding{probeSpecularBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // Binding 2 is every pool slice's captured distance, the same shape, on the same terms.
+        VkDescriptorSetLayoutBinding{probeDistanceBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     frameDataSetLayout = makeSetLayout(frameBindings);
 
@@ -5143,6 +5210,9 @@ void VulkanRenderer::createProbeResources()
 {
     constexpr auto radianceFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     constexpr auto depthFormat = VK_FORMAT_D32_SFLOAT;
+    // One float, at full precision: the far plane times the face diagonal is 95,000 world units,
+    // past what a half carries, and a clamp would make "sky" mean two different numbers.
+    constexpr auto distanceFormat = VK_FORMAT_R32_SFLOAT;
 
     // The scratch cube the capture draws into and the prefilter reads from. Its mip chain is
     // generated by blit and exists for one reason: the prefilter picks a source mip from the
@@ -5153,8 +5223,11 @@ void VulkanRenderer::createProbeResources()
                                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                             VK_IMAGE_ASPECT_COLOR_BIT, true);
 
+    // Sampled as well as written, since 2026-09-13: the distance pass reads each face's depth back
+    // the moment the face is drawn.
     probeDepthImageId = createProbeImage(probeCubeResolution, 1, 1, depthFormat,
-                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, false);
+                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                         VK_IMAGE_ASPECT_DEPTH_BIT, false);
 
     // TRANSFER_DST is for the initial clear alone: a slice no probe has captured yet is still
     // named by every frame's descriptor, and black is the only value that reads as "no probe here"
@@ -5164,9 +5237,26 @@ void VulkanRenderer::createProbeResources()
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT, true);
 
+    // The distance cube array beside the specular one: one mip, because the march reads one
+    // direction at a time and a filtered distance is a surface that does not exist. TRANSFER_DST
+    // for the initial clear, for the specular array's reason.
+    probeDistanceImageId = createProbeImage(probeCubeResolution, 1, 6 * probeSpecularSlices, distanceFormat,
+                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                            VK_IMAGE_ASPECT_COLOR_BIT, true);
+
     for (auto face = 0u; face < 6u; face++)
     {
         probeRadianceFaceViews[face] = createLevelView(probeRadianceImageId, 0, face);
+    }
+
+    probeDistanceFaceViews.reserve(static_cast<size_t>(probeSpecularSlices) * 6);
+    for (auto slice = 0u; slice < probeSpecularSlices; slice++)
+    {
+        for (auto face = 0u; face < 6u; face++)
+        {
+            probeDistanceFaceViews.push_back(createLevelView(probeDistanceImageId, 0, slice * 6u + face));
+        }
     }
 
     probeSpecularFaceViews.reserve(static_cast<size_t>(probeSpecularSlices) * probeSpecularMipCount * 6);
@@ -5193,6 +5283,19 @@ void VulkanRenderer::createProbeResources()
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.maxLod = static_cast<float>(probeSpecularMipCount);
     ensure(vkCreateSampler(device, &samplerInfo, nullptr, &probeSampler), "vkCreateSampler");
+
+    // Nearest for the distances: a filtered distance across a building's edge against the sky is
+    // a surface half way to the horizon that nothing stands on.
+    VkSamplerCreateInfo distanceSamplerInfo{};
+    distanceSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    distanceSamplerInfo.magFilter = VK_FILTER_NEAREST;
+    distanceSamplerInfo.minFilter = VK_FILTER_NEAREST;
+    distanceSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    distanceSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    distanceSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    distanceSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    distanceSamplerInfo.maxLod = 0.0f;
+    ensure(vkCreateSampler(device, &distanceSamplerInfo, nullptr, &probeDistanceSampler), "vkCreateSampler");
 
     // The prefilter's own set layout and pipeline layout: one cube sampler, and a push constant
     // carrying the roughness and the face this invocation is filtering. Push constants rather
@@ -5314,6 +5417,27 @@ void VulkanRenderer::createProbeResources()
     ensure(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &probePrefilterPipeline),
            "vkCreateGraphicsPipelines");
 
+    // The distance pass, on the same layouts and the same triangle: only the fragment stage and
+    // the attachment format differ. A distance pipeline that cannot be built leaves the probes
+    // reflecting against their boxes — uploadProbes writes probeParams.y as zero without one — which
+    // is the picture before 2026-09-13 rather than a march against nothing.
+    const auto distanceSpirv =
+        compileToSpirv(probeDistanceFragmentSource, shaderc_glsl_fragment_shader, "probe distance fragment");
+    if (distanceSpirv)
+    {
+        probeDistanceFragmentModule = createShaderModule(distanceSpirv.value());
+        stages[1].module = probeDistanceFragmentModule;
+        renderingInfo.pColorAttachmentFormats = &distanceFormat;
+        ensure(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &probeDistancePipeline),
+               "vkCreateGraphicsPipelines");
+    }
+    else
+    {
+        // Not a return: the sets and the clears below are the prefilter's too, and a probe that
+        // reflects against its box is a picture where a probe with no set is a dark one.
+        diagnostics.record(FrameDiagnostic::ProbeCaptureSkipped, [&] { return distanceSpirv.error(); });
+    }
+
     // The set the prefilter reads the scratch cube through. One, for the process: the cube is one
     // image and the prefilter is the only thing that samples it.
     VkDescriptorSetAllocateInfo setAllocateInfo{};
@@ -5334,6 +5458,21 @@ void VulkanRenderer::createProbeResources()
     radianceWrite.pImageInfo = &radianceInfo;
     vkUpdateDescriptorSets(device, 1, &radianceWrite, 0, nullptr);
 
+    // The set the distance pass reads the scratch depth through: the prefilter's layout, one image.
+    // The sampler is the nearest one; texelFetch ignores it anyway.
+    ensure(vkAllocateDescriptorSets(device, &setAllocateInfo, &probeDepthSet), "vkAllocateDescriptorSets");
+
+    const VkDescriptorImageInfo depthInfo{probeDistanceSampler, imageResources.at(probeDepthImageId).view,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet depthWrite{};
+    depthWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    depthWrite.dstSet = probeDepthSet;
+    depthWrite.dstBinding = 0;
+    depthWrite.descriptorCount = 1;
+    depthWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    depthWrite.pImageInfo = &depthInfo;
+    vkUpdateDescriptorSets(device, 1, &depthWrite, 0, nullptr);
+
     // The probe array's descriptor, into every frame's set 0. Written once, here, and never
     // again: the image is created at bring-up at a size the contract fixes, so a probe capturing
     // rewrites its *contents* and never the descriptor that names it. That is the whole reason
@@ -5341,16 +5480,24 @@ void VulkanRenderer::createProbeResources()
     // probe in the scene, and a descriptor rewrite per probe per change is what that would cost.
     const VkDescriptorImageInfo specularInfo{probeSampler, imageResources.at(probeSpecularImageId).view,
                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo distanceInfo{probeDistanceSampler, imageResources.at(probeDistanceImageId).view,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     for (const auto& frame : frames)
     {
-        VkWriteDescriptorSet specularWrite{};
-        specularWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        specularWrite.dstSet = frame.frameDataSet;
-        specularWrite.dstBinding = probeSpecularBinding;
-        specularWrite.descriptorCount = 1;
-        specularWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        specularWrite.pImageInfo = &specularInfo;
-        vkUpdateDescriptorSets(device, 1, &specularWrite, 0, nullptr);
+        std::array<VkWriteDescriptorSet, 2> probeWrites{};
+        probeWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        probeWrites[0].dstSet = frame.frameDataSet;
+        probeWrites[0].dstBinding = probeSpecularBinding;
+        probeWrites[0].descriptorCount = 1;
+        probeWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        probeWrites[0].pImageInfo = &specularInfo;
+        probeWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        probeWrites[1].dstSet = frame.frameDataSet;
+        probeWrites[1].dstBinding = probeDistanceBinding;
+        probeWrites[1].descriptorCount = 1;
+        probeWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        probeWrites[1].pImageInfo = &distanceInfo;
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(probeWrites.size()), probeWrites.data(), 0, nullptr);
     }
 
     // The staging buffer the irradiance is projected from. One mip's worth of one cube: at the
@@ -5380,7 +5527,10 @@ void VulkanRenderer::createProbeResources()
     // and "the pipeline statically uses this descriptor" does not care what the shader decides.
     const auto commandBuffer = beginUploadCommands();
     const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
-    for (const auto imageId : {probeRadianceImageId, probeSpecularImageId})
+    // The distance array clears to zero with them: a zero distance reads as "inside" to the march,
+    // which never counts a hit before it has been outside, so a slice nothing captured re-aims
+    // nothing — and no view reflects in a slice nothing captured in any case.
+    for (const auto imageId : {probeRadianceImageId, probeSpecularImageId, probeDistanceImageId})
     {
         transitionTracked(commandBuffer, imageId, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         const auto& resource = imageResources.at(imageId);
@@ -5392,9 +5542,9 @@ void VulkanRenderer::createProbeResources()
     finishUploadCommands(commandBuffer);
 
     logger.info("Vulkan light probe machinery ready: {} slices of a {}x{} cube array, {} roughness levels, "
-                "irradiance projected from mip {} ({}x{})",
+                "irradiance projected from mip {} ({}x{}), a distance cube per slice {}",
                 maxIblProbes, probeCubeResolution, probeCubeResolution, probeSpecularMipCount, probeIrradianceSourceMip,
-                readbackExtent, readbackExtent);
+                readbackExtent, readbackExtent, probeDistancePipeline != VK_NULL_HANDLE ? "written" : "not written");
 }
 
 void VulkanRenderer::createExposureResources()
@@ -6064,6 +6214,71 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
                                        imageResources.at(probeDepthImageId).format, shadowDescriptors, nullptr));
 
     vkCmdEndRendering(frame.commandBuffer);
+
+    recordProbeDistance(probe, face);
+}
+
+void VulkanRenderer::recordProbeDistance(const LightProbe& probe, const unsigned int face)
+{
+    if (probeDistancePipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    auto& frame = frames[frameIndex];
+    const auto slice = probe.arraySlice.value();
+
+    // The face's depth, just written, read back as a texture; the distance array — bound to every
+    // shading view, so in the sampled layout whenever a draw runs — written through one face view.
+    // The next face's draw moves the depth image back to an attachment itself.
+    transitionTracked(frame.commandBuffer, probeDepthImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transitionTracked(frame.commandBuffer, probeDistanceImageId, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    const VkExtent2D extent{probeCubeResolution, probeCubeResolution};
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = probeDistanceFaceViews[static_cast<size_t>(slice) * 6u + face];
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = VkRect2D{VkOffset2D{0, 0}, extent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+
+    vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+
+    // Positive height, as the face and the prefilter: the shader fetches the depth at its own
+    // gl_FragCoord, so framebuffer row 0 has to be the face's first texel row in both images.
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+
+    const VkRect2D scissor{VkOffset2D{0, 0}, extent};
+    vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+
+    vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, probeDistancePipeline);
+    vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, probePrefilterPipelineLayout, 0, 1,
+                            &probeDepthSet, 0, nullptr);
+
+    const auto pushConstants = glm::vec4(probe.nearClippingPlane, probe.farClippingPlane,
+                                         static_cast<float>(probeCubeResolution), 0.0f);
+    vkCmdPushConstants(frame.commandBuffer, probePrefilterPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(pushConstants), &pushConstants);
+
+    vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
+    vkCmdEndRendering(frame.commandBuffer);
+
+    transitionTracked(frame.commandBuffer, probeDistanceImageId, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 bool VulkanRenderer::recordProbePrefilter(const LightProbe& probe)
@@ -6312,7 +6527,11 @@ void VulkanRenderer::uploadProbes(const Scene& scene, const glm::vec3& viewPosit
             glm::vec4(probe.position, reflects ? static_cast<float>(probe.arraySlice.value()) : -1.0f);
     }
 
-    frameData.probeParams = glm::ivec4(static_cast<int>(count), 0, 0, 0);
+    // y: whether a local probe's reflection is re-aimed against its captured distance cube (1) or
+    // its influence box (0). Zero whatever the scene says when the distance pipeline did not build,
+    // so the shaders never march against an array nothing wrote.
+    const auto marchDistance = scene.probeDistanceMarch && probeDistancePipeline != VK_NULL_HANDLE;
+    frameData.probeParams = glm::ivec4(static_cast<int>(count), marchDistance ? 1 : 0, 0, 0);
 }
 
 bool VulkanRenderer::recordFullScreenPass(const std::span<const PostProcessBinding> inputs,

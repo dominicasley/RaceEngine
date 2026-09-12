@@ -214,6 +214,14 @@ export struct PursuitOptions
     // speed, and never by slowing down. Before this the cap read the pure-pursuit demand for a
     // two-metre error at forty metres a second as a corner and held the unit to thirty-two.
     double steeringCapAngleRadians = 0.35;
+    // The slide (docs/police-driving-brief.md §13): the body slip — the velocity's angle off the nose —
+    // past this says the tyre is past its peak and the car is yawing on its own; the full model's
+    // driver then feeds the slip itself forward as the counter-steer, blended in from here to twice
+    // this, so the front wheels point along the velocity whatever the aim asks. Capped at the grip
+    // angle a unit yawing at 35°/s had 2.7° of wheel to catch it with and crossed the road; merely
+    // allowed past it, the pursuit's wheel was 4° against 12° of slip (the police logs, 2026-09-12).
+    // Four degrees.
+    double slideSlipRadians = 0.07;
 
     // --- the radio and the search (docs/pursuit-radio-brief.md) ----------------------------------
     //
@@ -252,28 +260,10 @@ export struct PursuitOptions
     // The fastest a unit threads a seam between two lanes of yielded traffic.
     double seamSpeedMetresPerSecond = 25.0;
 
-    // --- the PIT (docs/police-driving-brief.md §10) ---------------------------------------------
+    // --- the box ---------------------------------------------------------------------------------
     //
-    // From the ram level the tail does not sit behind the player: it comes alongside the player's
-    // rear quarter — this fraction of the player's length behind its centre, on the side it is
-    // already on, its side this far from the player's — and once it is there (inside these along and
-    // across errors, within this much of the player's pace) it steers through the quarter by this
-    // much at this much over the player's speed, and the two bodies' contact does the rest.
-    double pitAlongFraction = 0.3;
-    double pitLateralGapMetres = 0.3;
-    double pitReadyAlongMetres = 1.5;
-    double pitReadyAcrossMetres = 0.8;
-    double pitReadySpeedMetresPerSecond = 4.0;
-    double pitPushMetres = 2.5;
-    double pitSpeedMarginMetresPerSecond = 2.0;
-    // The side is chosen once, when the tail first goes for the quarter, and held: chosen every tick
-    // from which side of the player the unit was on, it flipped as the unit crossed the centreline
-    // and the unit swerved from one station to the other down a straight (Dominic, 2026-09-12: "the
-    // cars swerve side to side and take themselves out even on a straight empty wide road"). A strike
-    // lasts this long at most, and the tail then drops back to its plain station for this long
-    // before it goes for the quarter again.
-    double pitStrikeSeconds = 1.5;
-    double pitCooldownSeconds = 4.0;
+    // The PIT that stood here — the tail alongside the rear quarter, then through it — was retired on
+    // 2026-09-12 later (docs/police-driving-brief.md §13): the tail rams like every other unit.
     // A unit holding a station keeps it at a re-deal until it is this far onto the wrong side of the
     // player for it — a flank hovering on the centreline was dealt the other flank every second and
     // a half, and its aim swapped sides with it.
@@ -284,9 +274,11 @@ export struct PursuitOptions
     // From the ram level a unit inside this range with the player in front of it — the bearing
     // within this cosine of its nose — drives into the player at the maximum, whatever role it holds
     // and whatever the player is doing, in place of a station: a stationary player was approached at
-    // walking pace and boxed, and a unit facing it was turned round by its station line. The tail on
-    // a moving player keeps the PIT. Dominic: "police are still not trying to ram into the player as
-    // hard as they can this is their number on goal".
+    // walking pace and boxed, and a unit facing it was turned round by its station line. The tail too,
+    // since 2026-09-12 later (§13; it kept the PIT before, and a routing tail did neither). Dominic:
+    // "police are still not trying to ram into the player as hard as they can this is their number
+    // on goal"; "if the player slows down the unit should continue accelerating as hard as it can into
+    // the back of it".
     double ramRangeMetres = 60.0;
     double ramFacingCosine = 0.5;
     double ramLeadSeconds = 0.5;
@@ -310,12 +302,20 @@ export struct PursuitOptions
     //
     // A unit whose aim is behind it measures the room to either side first — one ray each way at
     // the line-of-drive height, out to this reach, on the sight tick. The full-lock arc needs twice
-    // this radius plus the body's width; where it fits the driver's own turn-round does it, where it
-    // does not the unit does a three-point turn: forward on full lock toward the turn side until the
-    // nose has used the room, back on the opposite lock through this much more heading, forward
-    // again — each leg timed by the heading turned and capped at this many seconds.
+    // this radius plus the body's width. **The side is where the arc fits** (§14, 2026-09-12 later): the
+    // aim's side when both fit, the roomier side when neither — before this it was the aim's side
+    // unless there was no room for even the nose there, and a unit with 6.6 m on its left and 16 on
+    // its right turned left into the wall. Where the arc fits the drivers' own turn-round does it, told
+    // the side; where it does not the unit does a three-point turn: forward on full lock toward the
+    // turn side until the **leading front corner** has used the room — the heading at which
+    // R (1 − cos θ) + (L/2) sin θ + (w/2) cos θ reaches it, less the margin (the old goal read
+    // R (1 − cos θ) alone and the nose met the wall 30° early) — back on the opposite lock through this
+    // much more heading, forward again; each leg timed by the heading turned, capped at this many
+    // seconds, and ended early once the car has stopped against something.
     double turnRadiusMetres = 6.1;
     double turnBodyWidthMetres = 1.9;
+    double turnBodyLengthMetres = 5.0;
+    double turnCornerMarginRadians = 0.15;
     double turnRoomReachMetres = 16.0;
     double turnReverseRadians = 0.9;
     double turnPhaseSeconds = 4.0;
@@ -343,6 +343,20 @@ export struct PursuitOptions
     double followStandstillMetres = 3.0;
     double mergeFollowerSeconds = 1.5;
     double laneShiftGainMetresPerSecond = 3.0;
+    // The shift is blended (docs/police-driving-brief.md §13): the aim's sideways offset moves toward
+    // the line at this rate, and is capped at the offset that crabs the car sideways at this rate
+    // through the look-ahead, so a lane change is a lane change and not a turn-in at the tyre's
+    // limit — the whole lane's width at a 12 m aim asked for three times the grip at 22 m/s. A started
+    // shift is held until the unit is within the done distance of the line, or the line is worse
+    // than the one under the unit, or a car behind on it is closing; and it is dropped through the
+    // same blend. Re-decided every sight tick, it was dropped half a lane in and the aim snapped back.
+    double laneShiftRateMetresPerSecond = 1.5;
+    double laneShiftDoneMetres = 0.3;
+    // ...and only on a unit driving along the lane, either way, within this cosine of it: the shift
+    // displaces the aim to the left of the heading, which is across the road only when the heading
+    // is along it. A unit turning round in the road held a shift onto its own lane's centre and the
+    // offset ran up the road with it (the fixture, 2026-09-12).
+    double laneShiftAlignment = 0.7;
 
     // --- boxing the player in ------------------------------------------------------------------
 
@@ -356,9 +370,9 @@ export struct PursuitOptions
     double boxedTailGapMetres = 0.6;
     double boxedLeadGapMetres = 0.8;
     double boxedFlankGapMetres = 0.3;
-    // From this felony level the tail unit goes for the player's rear quarter (the PIT above) rather
-    // than sitting behind it. One since 2026-09-12 (docs/police-driving-brief.md §10, Dominic:
-    // "wrecking is the primary goal for police. so aggressiveness should be high"); four before.
+    // From this felony level a unit inside the ram's range drives into the player (the ram below).
+    // One since 2026-09-12 (docs/police-driving-brief.md §10, Dominic: "wrecking is the primary goal
+    // for police. so aggressiveness should be high"); four before.
     int ramLevel = 1;
 
     // --- the arrest ----------------------------------------------------------------------------
@@ -461,13 +475,10 @@ export struct PursuitUnit
     std::size_t laneShiftLane = 0;
     int laneShiftSide = 0;
     double laneShiftMetres = 0.0;
-    // The tail in position on the rear quarter and steering into it (the PIT); the side it went for
-    // (+1 left, −1 right, 0 none yet), held for the attempt; how long the strike has run; and the
-    // cooldown before the next attempt. The side a unit passes the player on, held likewise.
-    bool pitting = false;
-    int pitSide = 0;
-    double pitStrikeSeconds = 0.0;
-    double pitCooldownSeconds = 0.0;
+    // The shift's offset as the aim carries it this tick — blended toward `laneShiftMetres` at the
+    // shift rate and capped by the crab it makes (§13) — and the side a unit passes the player on,
+    // held for the pass.
+    double laneShiftAppliedMetres = 0.0;
     int passSide = 0;
 
     // Driving into the player at the maximum (the ram).

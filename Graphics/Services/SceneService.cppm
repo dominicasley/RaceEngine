@@ -61,6 +61,9 @@ public:
     // How many stops darker the sky is drawn for the eye than for the probes, a per-scene statement
     // like the clouds. Zero is the sky the probes see, bit for bit. See Scene::skyEyeStops.
     [[nodiscard]] std::expected<void, std::string> setSkyEyeStops(Scene& scene, float stops) const;
+    // Whether local probes re-aim their reflections against their captured distance cubes or their
+    // influence boxes. See Scene::probeDistanceMarch.
+    void setProbeDistanceMarch(Scene& scene, bool march) const;
     // Which attachment carries the marched cloud dome map. Stated by whoever built the world
     // camera's chain, because which pass's output is the cloud map is a fact about that chain; the
     // backend binds it to every shading view and to every probe face. See Scene::cloudMap.
