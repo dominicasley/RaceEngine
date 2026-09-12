@@ -110,6 +110,18 @@ struct LightUbo
     glm::vec4 ambientAttenuation;
 };
 
+// A scene light as the block carries it. `position.w` says which kind it is, the way a homogeneous
+// coordinate does: 0 for a directional light, whose xyz is the direction *towards* it, and 1 for a
+// point light, whose xyz is where it stands in world units and whose `attenuation` is its range
+// (Scene.cppm, `Light`). Every shader's light loop branches on it; before 2026-09-11 the field was
+// written 1 for every light and read by nothing.
+[[nodiscard]] LightUbo lightUbo(const Light& light)
+{
+    return LightUbo{glm::vec4(light.position, light.type == LightType::Point ? 1.0f : 0.0f),
+                    glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
+                    glm::vec4(light.ambient, light.attenuation)};
+}
+
 // Set 0 binding 0, the probe half (vulkan-abi.md). One of these per light probe the frame shades
 // from, std140-compatible so the C++ layout is the GPU layout.
 //
@@ -212,35 +224,56 @@ struct FrameDataUbo
     // sky, and every shader's clouds are one branch on it — the contract the rain and the fog
     // already honour. Unlike both of those, a probe capture keeps this field: the clouded sky is
     // exactly what a probe must photograph, since the captures are how clouds become ambient light.
+    // z is the eye's sky gain, 2^-Scene::skyEyeStops (2026-09-12), written ONE in a probe capture:
+    // the probes photograph the true sky and the eye alone sees the graduated filter. w reserved.
     glm::vec4 cloudParams;
+    // The driver's mirror, appended under the same prefix rule: x what the mirror map's radiance is
+    // multiplied by (Scene::mirrorExposureScale — the world's exposure over the frame's under split
+    // metering, one otherwise), y one when this view binds a real mirror map at MIRROR_MAP_BINDING
+    // and zero when it binds the dummy — a scene with no mirror, a probe face, or the mirror view
+    // itself, which must not sample the image it is drawing into — z and w reserved, written zero.
+    // Only the mirror shader declares the block this far.
+    glm::vec4 mirrorParams;
+    // The mirror camera's own view, for a glass that reflects by its curve rather than by its UVs
+    // (Scene::mirrorDirection and the three beside it): xyz where the camera looks, w the tangent
+    // of its half field of view across; then xyz its up, w the tangent of the half field of view
+    // down. Together they turn a reflected direction into a place on the mirror map. Written as
+    // the scene states them, whatever view is being drawn; a probe reads none of it.
+    glm::vec4 mirrorAxis;
+    glm::vec4 mirrorUp;
 };
 
 // Four split distances, four texel sizes and four depth scales ride in one vec4 each, which is
 // what bounds the cascade count rather than any GPU limit.
 static_assert(shadowCascadeCount <= 4);
 static_assert(sizeof(LightUbo) == 64);
-static_assert(sizeof(FrameDataUbo) == 2416);
+// Eight lights since 2026-09-11 (RenderContract::maxLights): everything after `lights` moved 256
+// bytes down on that day, and every figure here and in docs/vulkan-abi.md moved with it.
+static_assert(sizeof(FrameDataUbo) == 2720);
 static_assert(offsetof(FrameDataUbo, lightCount) == 80);
 static_assert(offsetof(FrameDataUbo, lights) == 96);
-static_assert(offsetof(FrameDataUbo, shadowMatrices) == 352);
-static_assert(offsetof(FrameDataUbo, shadowSplits) == 608);
-static_assert(offsetof(FrameDataUbo, shadowTexelWorldSize) == 624);
-static_assert(offsetof(FrameDataUbo, shadowDepthScale) == 640);
-static_assert(offsetof(FrameDataUbo, shadowParams) == 656);
-static_assert(offsetof(FrameDataUbo, probeParams) == 672);
-static_assert(offsetof(FrameDataUbo, probes) == 688);
-static_assert(offsetof(FrameDataUbo, fogDensity) == 2224);
-static_assert(offsetof(FrameDataUbo, fogScatter) == 2240);
-static_assert(offsetof(FrameDataUbo, fogAmbient) == 2256);
-static_assert(offsetof(FrameDataUbo, timeRain) == 2272);
-static_assert(offsetof(FrameDataUbo, rainWind) == 2288);
-static_assert(offsetof(FrameDataUbo, wiperArcA) == 2304);
-static_assert(offsetof(FrameDataUbo, wiperArcB) == 2320);
-static_assert(offsetof(FrameDataUbo, wiperSweep) == 2336);
-static_assert(offsetof(FrameDataUbo, wiperTiming) == 2352);
-static_assert(offsetof(FrameDataUbo, wiperPane) == 2368);
-static_assert(offsetof(FrameDataUbo, rainBody) == 2384);
-static_assert(offsetof(FrameDataUbo, cloudParams) == 2400);
+static_assert(offsetof(FrameDataUbo, shadowMatrices) == 608);
+static_assert(offsetof(FrameDataUbo, shadowSplits) == 864);
+static_assert(offsetof(FrameDataUbo, shadowTexelWorldSize) == 880);
+static_assert(offsetof(FrameDataUbo, shadowDepthScale) == 896);
+static_assert(offsetof(FrameDataUbo, shadowParams) == 912);
+static_assert(offsetof(FrameDataUbo, probeParams) == 928);
+static_assert(offsetof(FrameDataUbo, probes) == 944);
+static_assert(offsetof(FrameDataUbo, fogDensity) == 2480);
+static_assert(offsetof(FrameDataUbo, fogScatter) == 2496);
+static_assert(offsetof(FrameDataUbo, fogAmbient) == 2512);
+static_assert(offsetof(FrameDataUbo, timeRain) == 2528);
+static_assert(offsetof(FrameDataUbo, rainWind) == 2544);
+static_assert(offsetof(FrameDataUbo, wiperArcA) == 2560);
+static_assert(offsetof(FrameDataUbo, wiperArcB) == 2576);
+static_assert(offsetof(FrameDataUbo, wiperSweep) == 2592);
+static_assert(offsetof(FrameDataUbo, wiperTiming) == 2608);
+static_assert(offsetof(FrameDataUbo, wiperPane) == 2624);
+static_assert(offsetof(FrameDataUbo, rainBody) == 2640);
+static_assert(offsetof(FrameDataUbo, cloudParams) == 2656);
+static_assert(offsetof(FrameDataUbo, mirrorParams) == 2672);
+static_assert(offsetof(FrameDataUbo, mirrorAxis) == 2688);
+static_assert(offsetof(FrameDataUbo, mirrorUp) == 2704);
 
 // The scene's air, into the block a shading view is handed. Disabled leaves the three fields at the
 // zero the block was value-initialised to, which is the block this engine uploaded before they
@@ -270,13 +303,19 @@ struct DrawDataUbo
     glm::mat4 localToScreen;
     glm::mat4 normalMatrix;
     glm::ivec4 animated;
+    // The renderable's own four numbers (RenderableModel::signal), appended 2026-09-11 for the
+    // police light bar. Appended, so a vertex stage that declares the block as it was still
+    // declares a prefix of it; the one reader today is the `beacon` fragment stage, which is why
+    // set 2's binding 0 is visible to the fragment stage since the same day.
+    glm::vec4 signal;
 };
 
-static_assert(sizeof(DrawDataUbo) == 272);
-// The per-draw fill writes the two regions directly into the mapped ring slot; the
+static_assert(sizeof(DrawDataUbo) == 288);
+// The per-draw fill writes the three regions directly into the mapped ring slot; the
 // offsets are asserted so the writes cannot drift away from the shader's block layout.
 static_assert(offsetof(DrawDataUbo, localToWorld) == 0);
 static_assert(offsetof(DrawDataUbo, animated) == 256);
+static_assert(offsetof(DrawDataUbo, signal) == 272);
 
 // Set 2 binding JOINT_DATA_BINDING, dynamic-offset, on a ring of its own (vulkan-abi.md). Every
 // draw binds it because the layout declares it; only a draw with `animated.x != 0` allocates a
@@ -340,13 +379,22 @@ struct MaterialDataUbo
     // reads y rather than testing the samplers, because every slot is written whatever the material
     // carries — an unstated layer holds the 1x1 dummy, which is white and would blend as itself.
     glm::vec4 blend;
+    // The curved mirror, appended under the same prefix rule: xyz the glass's centre in the mesh's
+    // own space, w the sphere's radius in world units — zero on every material that is not a curved
+    // mirror, which the mirror shader reads as "sample by the UVs" (Material::mirror).
+    glm::vec4 mirrorGlass;
+    // xy the centre of the glass's UV island on the rear view, the axis its flat centre reflects
+    // the eye along; z and w reserved, written zero. Only the mirror shader declares the block this far.
+    glm::vec4 mirrorAxis;
 };
 
-static_assert(sizeof(MaterialDataUbo) == 176);
+static_assert(sizeof(MaterialDataUbo) == 208);
 static_assert(offsetof(MaterialDataUbo, textureTransform) == 64);
 static_assert(offsetof(MaterialDataUbo, blinnPhong) == 128);
 static_assert(offsetof(MaterialDataUbo, detailTiling) == 144);
 static_assert(offsetof(MaterialDataUbo, blend) == 160);
+static_assert(offsetof(MaterialDataUbo, mirrorGlass) == 176);
+static_assert(offsetof(MaterialDataUbo, mirrorAxis) == 192);
 
 // The fullscreen layout's push constant (vulkan-abi.md). Eight vec4s rather than the one this used
 // to be: the tone curve has a shape as well as a brightness, a pass that walks a mip chain has to be
@@ -1566,6 +1614,7 @@ private:
         unsigned int occlusion;
         unsigned int behind;
         unsigned int cloudMap;
+        unsigned int mirror;
 
         [[nodiscard]] bool operator==(const ShadowSetKey&) const = default;
     };
@@ -1816,7 +1865,7 @@ private:
     void recordDraw(const MeshPrimitive& primitive, const Resource<Material>& materialKey, const Material& material,
                     unsigned int shaderId, const glm::mat4& entityModelMatrix, const Camera& camera,
                     const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
-                    VkDeviceSize paintOffset, VkFormat colorFormat, VkFormat depthFormat,
+                    VkDeviceSize paintOffset, const glm::vec4& signal, VkFormat colorFormat, VkFormat depthFormat,
                     VkDescriptorSet shadowDescriptors, bool doubleSided, bool depthWrite);
     // One slot of the paint ring, filled from a renderable's own paint. Allocated **per renderable
     // per view** rather than per draw, which is the shape the data actually has: paint describes a
@@ -1880,7 +1929,7 @@ private:
     // read it.
     [[nodiscard]] VkDescriptorSet shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
                                             unsigned int occlusionImageId, unsigned int behindImageId,
-                                            unsigned int cloudMapImageId);
+                                            unsigned int cloudMapImageId, unsigned int mirrorMapImageId);
     // The image a shading view samples its occlusion from, or the 1x1 white one when it gathers
     // none. Not const: the fallback is created on first use, as every other dummy here is.
     [[nodiscard]] unsigned int ambientOcclusionImage(const Camera& camera);
@@ -1889,6 +1938,10 @@ private:
     // become ambient light, so a probe binding the dummy while the scene has a real map would
     // photograph a clear sky under a clouded one.
     [[nodiscard]] unsigned int cloudMapImage(const Scene& scene);
+    // The image the scene's mirror map attachment carries, or the 1x1 white one when the scene
+    // states none. Resolved per shading view; the caller swaps the dummy back in for the view that
+    // renders the map, because a descriptor may not name the attachment its own pass is writing.
+    [[nodiscard]] unsigned int mirrorMapImage(const Scene& scene);
     [[nodiscard]] VkDescriptorSet fallbackShadowSet();
     [[nodiscard]] unsigned int dummyShadowMap();
     // The cascades' depth images in cascade order, or nothing if any of them is missing: a
@@ -1909,8 +1962,11 @@ private:
     // Reports shaderc's own message rather than logging it: createShaderObject already has an
     // error channel, and a source that will not compile is the whole reason it has nothing to
     // hand back.
+    // `defines` are the shader's own (ShaderDescriptor::defines), added after the contract's and
+    // keyed into the cache with them; the engine's built-in sources pass none.
     [[nodiscard]] std::expected<std::vector<uint32_t>, std::string>
-    compileToSpirv(const std::string& source, shaderc_shader_kind kind, const char* stageName);
+    compileToSpirv(const std::string& source, shaderc_shader_kind kind, const char* stageName,
+                   const std::vector<std::pair<std::string, std::string>>& defines = {});
     [[nodiscard]] VkShaderModule createShaderModule(const std::vector<uint32_t>& spirv) const;
     [[nodiscard]] VkPipeline buildFullscreenPipeline(VkShaderModule vertexModule, VkShaderModule fragmentModule,
                                                      FullscreenBlend blend, VkFormat colorFormat) const;
@@ -2961,8 +3017,13 @@ void VulkanRenderer::createDescriptorInfrastructure()
     // is thirty times the size of everything else a draw carries and only a skinned draw has one:
     // folded together, a scene's draw ring is sized in units of the largest thing any draw *might*
     // need rather than what its draws actually need.
+    // Binding 0 is visible to the fragment stage as well since 2026-09-11, for `signal`: a fragment
+    // stage that declares the block reads the renderable's own numbers off it, and one that does
+    // not — every shader but the light bar's lens — is unaffected by the flag.
     const std::array drawBindings = {VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
-                                                                  VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+                                                                  VK_SHADER_STAGE_VERTEX_BIT |
+                                                                      VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                                  nullptr},
                                      VkDescriptorSetLayoutBinding{jointDataBinding,
                                                                   VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                                   VK_SHADER_STAGE_VERTEX_BIT, nullptr},
@@ -2999,6 +3060,12 @@ void VulkanRenderer::createDescriptorInfrastructure()
         // compositing it and the probe faces photographing it. A scene with none binds the 1x1
         // white dummy behind the frame block's coverage branch.
         VkDescriptorSetLayoutBinding{cloudMapBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // Binding 4 is the driver's mirror map, on the cloud map's terms exactly: rendered by the
+        // mirror camera's own scene pass earlier in the frame, read only by a view that shades —
+        // and only by the mirror material. A scene with none binds the 1x1 white dummy behind the
+        // frame block's mirrorParams.y.
+        VkDescriptorSetLayoutBinding{mirrorMapBinding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     shadowSetLayout = makeSetLayout(shadowBindings);
 
@@ -3229,9 +3296,16 @@ bool VulkanRenderer::beginFrame(const double simulationTime)
     // the views and draws recorded this frame.
     frame.drawDataSlotsUsed = 0;
     frame.jointDataSlotsUsed = 0;
-    frame.paintDataSlotsUsed = 0;
     frame.frameDataSlotsUsed = 0;
     frame.frameDataOffset = 0;
+
+    // Slot 0 of the paint ring is the block every unpainted draw binds — `writePaintSlot` answers 0
+    // for a renderable that states no paint, and the shader's `painted` is that block's `wear.z` —
+    // so it is written as zeros here and never handed out. Handed out, it went to the first painted
+    // car of the frame, and every carpaint draw that stated no paint then wore that car's colour:
+    // the police Charger drew in whatever the nearest painted traffic car was painted.
+    std::memset(frame.paintDataMapped, 0, static_cast<std::size_t>(paintDataStride));
+    frame.paintDataSlotsUsed = 1;
 
     const auto acquireResult =
         vkAcquireNextImageKHR(device, swapchain, waitForever, frame.imageAvailable, VK_NULL_HANDLE, &currentImageIndex);
@@ -3727,8 +3801,17 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // is a legitimate scene, not a failure, so nothing is logged.
     auto uploadedLights = 0u;
     auto declaredLights = 0u;
+    auto shadowLightSlot = static_cast<int>(scene.shadows.lightIndex);
     for (const auto& light : scene.lights)
     {
+        // A light switched off is not uploaded and costs no fragment an iteration; the slots after
+        // it close up, so the cascades' light is found again by identity rather than by the index
+        // the scene states.
+        if (!light.enabled)
+        {
+            continue;
+        }
+
         declaredLights++;
 
         if (uploadedLights >= maxLights)
@@ -3736,9 +3819,12 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             continue;
         }
 
-        frameData.lights[uploadedLights] =
-            LightUbo{glm::vec4(light.position, 1.0f), glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
-                     glm::vec4(light.ambient, light.attenuation)};
+        if (&light == scene.shadows.light)
+        {
+            shadowLightSlot = static_cast<int>(uploadedLights);
+        }
+
+        frameData.lights[uploadedLights] = lightUbo(light);
         uploadedLights++;
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
@@ -3759,7 +3845,10 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     frameData.wiperTiming = glm::vec4(scene.wipers.cyclePeriod, scene.wipers.sweepSeconds, scene.wipers.cycleStart,
                                       scene.wipers.bladeHalfWidth);
     frameData.wiperPane = glm::vec4(scene.wipers.paneAspect, 0.0f, 0.0f, 0.0f);
-    frameData.cloudParams = glm::vec4(scene.clouds.coverage, scene.clouds.type, 0.0f, 0.0f);
+    // z the eye's sky gain: a stop count of zero is a gain of exactly one, which is bit-for-bit the
+    // sky before it existed.
+    frameData.cloudParams =
+        glm::vec4(scene.clouds.coverage, scene.clouds.type, glm::exp2(-scene.skyEyeStops), 0.0f);
 
     // A cascade is a producer and samples nothing; only the views that shade read the maps, and a
     // cascade sampling its own attachment while rendering into it would be a feedback loop.
@@ -3785,9 +3874,19 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
     // a view that shades, the dummy otherwise. It needs no transition here — the pass that wrote
     // it left it SHADER_READ_ONLY, and the initial clear puts a never-written one there too.
     const auto cloudImage = shading ? cloudMapImage(scene) : dummyTexture();
-    auto shadowDescriptors = cascadeImages.has_value()
-                                 ? shadowSet(cascadeImages.value(), occlusionImage, behindImage, cloudImage)
-                                 : VK_NULL_HANDLE;
+    // The driver's mirror map rides the same set with one more condition than the cloud map: never
+    // for the view that is drawing it. The mirror camera's own colour attachment *is* the map, and
+    // a descriptor naming an image in SHADER_READ_ONLY while the pass writes it as an attachment is
+    // a layout the driver may not honour — so that view binds the dummy, and mirrorParams.y below
+    // tells the mirror shader it has nothing to sample.
+    const auto sceneMirrorImage = shading ? mirrorMapImage(scene) : dummyTexture();
+    const auto mirrorImage =
+        hasColor && sceneMirrorImage == colorImageId.value() ? dummyTexture() : sceneMirrorImage;
+    auto shadowDescriptors =
+        cascadeImages.has_value()
+            ? shadowSet(cascadeImages.value(), occlusionImage, behindImage, cloudImage, mirrorImage)
+            : VK_NULL_HANDLE;
+    auto mirrorBound = false;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -3798,13 +3897,15 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
             const auto& slice = scene.shadows.cascades[cascade];
             const auto index = static_cast<int>(cascade);
             frameData.shadowMatrices[cascade] = correction * slice.camera->modelViewProjectionMatrix;
-            frameData.shadowSplits[index] = slice.splitDistance;
+            // Through this view's own reading of the splits — one for every view sharing the
+            // fitted eye's axis, and bit-identical there; see Camera::shadowSplitScale.
+            frameData.shadowSplits[index] = slice.splitDistance * camera.shadowSplitScale;
             frameData.shadowTexelWorldSize[index] = slice.texelWorldSize;
             frameData.shadowDepthScale[index] = slice.depthPerWorldUnit;
         }
 
-        frameData.shadowParams =
-            glm::ivec4(static_cast<int>(shadowCascadeCount), static_cast<int>(scene.shadows.lightIndex), 0, 0);
+        frameData.shadowParams = glm::ivec4(static_cast<int>(shadowCascadeCount), shadowLightSlot, 0, 0);
+        mirrorBound = mirrorImage != dummyTexture();
     }
     else
     {
@@ -3818,6 +3919,10 @@ void VulkanRenderer::recordScenePass(Scene& scene, Camera& camera, const float d
                                [] { return std::string("no Vulkan depth image for one of the cascades"); });
         }
     }
+
+    frameData.mirrorParams = glm::vec4(scene.mirrorExposureScale, mirrorBound ? 1.0f : 0.0f, 0.0f, 0.0f);
+    frameData.mirrorAxis = glm::vec4(scene.mirrorDirection, scene.mirrorTanHalfWidth);
+    frameData.mirrorUp = glm::vec4(scene.mirrorUp, scene.mirrorTanHalfHeight);
 
     if (declaredLights > maxLights)
     {
@@ -4314,6 +4419,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
         // The slot this renderable's paint was written into, taken once for the whole renderable
         // before its primitives were walked.
         VkDeviceSize paintOffset;
+        // And the renderable's own numbers, copied for the same reason the matrix is.
+        glm::vec4 signal;
         glm::mat4 entityModelMatrix;
         unsigned int shaderId;
         float viewDepth;
@@ -4556,6 +4663,7 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                                                         .materialKey = primitive.material.value(),
                                                         .joints = &joints,
                                                         .paintOffset = paintOffset,
+                                                        .signal = entity.signal,
                                                         .entityModelMatrix = entityModelMatrix,
                                                         .shaderId = primitiveShaderId,
                                                         // The view looks down -z, so the distance
@@ -4575,7 +4683,7 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
                 }
 
                 recordDraw(primitive, primitive.material.value(), *material, primitiveShaderId, entityModelMatrix, camera,
-                           clipCorrectedViewProjection, joints, paintOffset, colorFormat, depthFormat,
+                           clipCorrectedViewProjection, joints, paintOffset, entity.signal, colorFormat, depthFormat,
                            shadowDescriptors, staticOnly, true);
                 recordedDraws++;
             }
@@ -4619,8 +4727,8 @@ unsigned int VulkanRenderer::recordSceneDraws(Scene& scene, const Camera& camera
 
         // No depth write: these are the blended draws, and the sort above is what orders them.
         recordDraw(*deferred.primitive, deferred.materialKey, *material, deferred.shaderId, deferred.entityModelMatrix,
-                   camera, clipCorrectedViewProjection, *deferred.joints, deferred.paintOffset, colorFormat,
-                   depthFormat, shadowDescriptors, staticOnly, false);
+                   camera, clipCorrectedViewProjection, *deferred.joints, deferred.paintOffset, deferred.signal,
+                   colorFormat, depthFormat, shadowDescriptors, staticOnly, false);
         recordedDraws++;
     }
 
@@ -4777,8 +4885,9 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
                                 const Material& material, const unsigned int shaderId,
                                 const glm::mat4& entityModelMatrix, const Camera& camera,
                                 const glm::mat4& clipCorrectedViewProjection, const std::vector<glm::mat4>& joints,
-                                const VkDeviceSize paintOffset, const VkFormat colorFormat, const VkFormat depthFormat,
-                                const VkDescriptorSet shadowDescriptors, const bool doubleSided, const bool depthWrite)
+                                const VkDeviceSize paintOffset, const glm::vec4& signal, const VkFormat colorFormat,
+                                const VkFormat depthFormat, const VkDescriptorSet shadowDescriptors,
+                                const bool doubleSided, const bool depthWrite)
 {
     const auto bound = primitiveBindings.find(primitive.gpuVao.value());
     if (bound == primitiveBindings.end() || !bound->second.drawable)
@@ -4904,6 +5013,7 @@ void VulkanRenderer::recordDraw(const MeshPrimitive& primitive, const Resource<M
 
     const auto animated = glm::ivec4(jointCount > 0 ? 1 : 0, 0, 0, 0);
     std::memcpy(target + offsetof(DrawDataUbo, animated), &animated, sizeof(animated));
+    std::memcpy(target + offsetof(DrawDataUbo, signal), &signal, sizeof(signal));
 
     vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, resolved->pipeline);
 
@@ -5481,6 +5591,26 @@ unsigned int VulkanRenderer::cloudMapImage(const Scene& scene)
     return attachment->gpuResourceId.value();
 }
 
+unsigned int VulkanRenderer::mirrorMapImage(const Scene& scene)
+{
+    if (!scene.mirrorMap.has_value())
+    {
+        return dummyTexture();
+    }
+
+    const auto* attachment = memoryStorageService.bufferAttachments.find(scene.mirrorMap.value());
+    if (attachment == nullptr || !attachment->gpuResourceId.has_value() ||
+        !imageResources.contains(attachment->gpuResourceId.value()))
+    {
+        diagnostics.record(FrameDiagnostic::MirrorMapUnavailable,
+                           [] { return std::string("the scene's mirror map attachment is no longer loaded"); });
+
+        return dummyTexture();
+    }
+
+    return attachment->gpuResourceId.value();
+}
+
 // The view drawn a second time, for what its own geometry hides.
 //
 // A Camera on the stack rather than one the game keeps: every field of it except the target and the
@@ -5517,15 +5647,18 @@ void VulkanRenderer::recordAmbientOcclusion(Scene& scene, Camera& camera, const 
     // prepass's own attachment, and a pass recorded before its producer reads the frame before.
     prepass.postProcesses.insert(prepass.postProcesses.end(), camera.occlusionCulling.passes.begin(),
                                  camera.occlusionCulling.passes.end());
-    // **Every layer, whatever this camera's own mask says.** The prepass records the geometry the
-    // frame is made of so the gather can measure how much sky each pixel sees, and under a layered
-    // frame one gather serves every layer's shading — so a prepass that drew only its own camera's
-    // layer would erase the car from under its own contact shadow: the darkening under a tyre is
-    // exactly the pixel where the two layers meet. This is the same class of decision as the
-    // castsShadow guard in recordSceneDraws, and it is made here for the same reason it was made
-    // there: the prepass is a statement about what exists, not about what this view shades. The
-    // continuity fields reset with it — a prepass opens its own target and keeps nothing.
-    prepass.layerMask = ~0u;
+    // **Every layer, whatever this camera's own mask says** — or the layers the game stated for the
+    // prepass, which defaults to every layer. The prepass records the geometry the frame is made of
+    // so the gather can measure how much sky each pixel sees, and under a layered frame one gather
+    // serves every layer's shading — so a prepass that drew only its own camera's layer would erase
+    // the car from under its own contact shadow: the darkening under a tyre is exactly the pixel
+    // where the two layers meet. This is the same class of decision as the castsShadow guard in
+    // recordSceneDraws, and it is made here for the same reason it was made there: the prepass is
+    // a statement about what exists, not about what this view shades. The game may narrow it for
+    // the one layer that is not a statement about what exists — a stand-in the frame draws only
+    // in a mirror (AmbientOcclusion::layerMask). The continuity fields reset with it — a prepass
+    // opens its own target and keeps nothing.
+    prepass.layerMask = occlusion.layerMask;
     prepass.partition = DrawPartition::All;
     prepass.loadColour = false;
     prepass.loadDepth = false;
@@ -5774,7 +5907,14 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     frameData.viewMatrix = camera.modelViewMatrix;
     frameData.cameraPosition = glm::vec4(camera.position, 1.0f);
 
+    // The directional lights only. A point light is a lamp that moves or flashes — the police light
+    // bars are the ones there are — and a probe is a photograph shaded from for many frames: a flash
+    // baked into it would go on lighting the street from wherever the car was when the capture ran,
+    // the same reason the traffic itself is not drawn into one. Leaving lights out moves the slots
+    // of the ones after them, so the cascades' light is found again by identity rather than by the
+    // index the scene states for the frame's own upload.
     auto uploadedLights = 0u;
+    auto shadowLightSlot = static_cast<int>(scene.shadows.lightIndex);
     for (const auto& light : scene.lights)
     {
         if (uploadedLights >= maxLights)
@@ -5782,9 +5922,17 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
             break;
         }
 
-        frameData.lights[uploadedLights] =
-            LightUbo{glm::vec4(light.position, 1.0f), glm::vec4(light.diffuse, 0.0f), glm::vec4(light.specular, 0.0f),
-                     glm::vec4(light.ambient, light.attenuation)};
+        if (!light.enabled || light.type == LightType::Point)
+        {
+            continue;
+        }
+
+        if (&light == scene.shadows.light)
+        {
+            shadowLightSlot = static_cast<int>(uploadedLights);
+        }
+
+        frameData.lights[uploadedLights] = lightUbo(light);
         uploadedLights++;
     }
     frameData.lightCount = glm::ivec4(static_cast<int>(uploadedLights), 0, 0, 0);
@@ -5792,7 +5940,10 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     // The clouds, alone among the weather, are kept in a capture: the fog and the rain are effects
     // between a surface and the eye, which a photograph must not bake in, but the clouded sky *is*
     // the thing being photographed — the captures are how clouds become the world's ambient light.
-    frameData.cloudParams = glm::vec4(scene.clouds.coverage, scene.clouds.type, 0.0f, 0.0f);
+    // The eye's sky gain is written as one here for the same reason in the other direction: the stop
+    // is the eye's graduated filter, and a probe must photograph the sky that actually lights the
+    // world.
+    frameData.cloudParams = glm::vec4(scene.clouds.coverage, scene.clouds.type, 1.0f, 0.0f);
 
     // No `uploadFog` here, and the omission is the rule rather than an oversight. A probe photographs
     // the world so that a surface can be given the light it cannot see directly; fog baked into that
@@ -5810,9 +5961,12 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
     // the scene's real one, not the dummy — the skybox this face draws composites it, and a probe
     // that photographed a clear sky under a clouded one would light the world for the wrong day.
     const auto cascadeImages = shadowCascadeImages(scene);
-    auto shadowDescriptors = cascadeImages.has_value() ? shadowSet(cascadeImages.value(), dummyTexture(),
-                                                                   dummyTexture(), cloudMapImage(scene))
-                                                       : VK_NULL_HANDLE;
+    // The mirror map stays the dummy here too: a probe photographs the world, which has no mirror
+    // in it, and the car that carries one is not static geometry.
+    auto shadowDescriptors = cascadeImages.has_value()
+                                 ? shadowSet(cascadeImages.value(), dummyTexture(), dummyTexture(),
+                                             cloudMapImage(scene), dummyTexture())
+                                 : VK_NULL_HANDLE;
 
     if (shadowDescriptors != VK_NULL_HANDLE)
     {
@@ -5828,8 +5982,7 @@ void VulkanRenderer::recordProbeFace(Scene& scene, const LightProbe& probe, cons
             frameData.shadowDepthScale[index] = slice.depthPerWorldUnit;
         }
 
-        frameData.shadowParams =
-            glm::ivec4(static_cast<int>(shadowCascadeCount), static_cast<int>(scene.shadows.lightIndex), 0, 0);
+        frameData.shadowParams = glm::ivec4(static_cast<int>(shadowCascadeCount), shadowLightSlot, 0, 0);
     }
     else
     {
@@ -6769,7 +6922,7 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 
     std::array<unsigned int, shadowCascadeCount> images{};
     images.fill(dummyShadowMap());
-    dummyShadowSet = shadowSet(images, dummyTexture(), dummyTexture(), dummyTexture());
+    dummyShadowSet = shadowSet(images, dummyTexture(), dummyTexture(), dummyTexture(), dummyTexture());
 
     return dummyShadowSet;
 }
@@ -6780,9 +6933,9 @@ VkDescriptorSet VulkanRenderer::fallbackShadowSet()
 // in a running game, and the one the fallback added.
 VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowCascadeCount>& imageIds,
                                           const unsigned int occlusionImageId, const unsigned int behindImageId,
-                                          const unsigned int cloudMapImageId)
+                                          const unsigned int cloudMapImageId, const unsigned int mirrorMapImageId)
 {
-    const ShadowSetKey wanted{imageIds, occlusionImageId, behindImageId, cloudMapImageId};
+    const ShadowSetKey wanted{imageIds, occlusionImageId, behindImageId, cloudMapImageId, mirrorMapImageId};
     for (const auto& [key, set] : shadowSets)
     {
         if (key == wanted)
@@ -6862,11 +7015,24 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
         cloudImage->second.sampler != VK_NULL_HANDLE ? cloudImage->second.sampler : cloudMapSampler,
         cloudImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
+    // The mirror map beside them, a plain sampled image on the shared attachment sampler like the
+    // occlusion and the behind copy: the mirror surfaces address it by UV inside (0, 1), so the
+    // clamp is never reached. A scene with none arrives here with the 1x1 white one.
+    const auto mirrorImage = imageResources.find(mirrorMapImageId);
+    if (mirrorImage == imageResources.end())
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    const VkDescriptorImageInfo mirrorInfo{
+        mirrorImage->second.sampler != VK_NULL_HANDLE ? mirrorImage->second.sampler : attachmentSampler,
+        mirrorImage->second.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
     // One write covering the cascade binding's whole array: they are consecutive elements of a
     // single binding, so imageInfos is handed over in one go rather than a write per cascade. The
-    // occlusion, the behind copy and the cloud map are bindings of their own and therefore writes
-    // of their own.
-    std::array<VkWriteDescriptorSet, 4> writes{};
+    // occlusion, the behind copy, the cloud map and the mirror map are bindings of their own and
+    // therefore writes of their own.
+    std::array<VkWriteDescriptorSet, 5> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = shadowMapBinding;
@@ -6898,6 +7064,14 @@ VkDescriptorSet VulkanRenderer::shadowSet(const std::array<unsigned int, shadowC
     writes[3].descriptorCount = 1;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[3].pImageInfo = &cloudInfo;
+
+    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet = set;
+    writes[4].dstBinding = mirrorMapBinding;
+    writes[4].dstArrayElement = 0;
+    writes[4].descriptorCount = 1;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[4].pImageInfo = &mirrorInfo;
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -7036,6 +7210,10 @@ VkDescriptorSet VulkanRenderer::materialSet(const Resource<Material>& materialKe
     materialData.detailTiling =
         glm::vec4(blend.layers[0].tiling, blend.layers[1].tiling, blend.layers[2].tiling, blend.layers[3].tiling);
     materialData.blend = glm::vec4(blend.strength, material.blend.has_value() ? 1.0f : 0.0f, 0.0f, 0.0f);
+
+    const auto mirror = material.mirror.value_or(MirrorGlass{});
+    materialData.mirrorGlass = glm::vec4(mirror.centre, mirror.radius);
+    materialData.mirrorAxis = glm::vec4(mirror.islandCentre, 0.0f, 0.0f);
     std::memcpy(mapped, &materialData, sizeof(materialData));
     ensure(vmaFlushAllocation(allocator, resource.allocation, 0, VK_WHOLE_SIZE), "vmaFlushAllocation");
 
@@ -7611,7 +7789,8 @@ std::optional<VkDeviceSize> VulkanRenderer::allocateFrameDataSlot()
 }
 
 std::expected<std::vector<uint32_t>, std::string>
-VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_kind kind, const char* stageName)
+VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_kind kind, const char* stageName,
+                               const std::vector<std::pair<std::string, std::string>>& defines)
 {
     // The C++ RAII wrapper over the C API: results release themselves, and both stay
     // confined to this translation unit's global module fragment.
@@ -7651,6 +7830,16 @@ VulkanRenderer::compileToSpirv(const std::string& source, const shaderc_shader_k
         auto value = std::to_string(macro.value);
         options.AddMacroDefinition(std::string(macro.name), value);
         cacheKeyMaterial += macro.name;
+        cacheKeyMaterial += '=';
+        cacheKeyMaterial += value;
+        cacheKeyMaterial += ';';
+    }
+    // And the shader's own, last: the same source under a different definition is a different
+    // shader, and the cache has to say so.
+    for (const auto& [name, value] : defines)
+    {
+        options.AddMacroDefinition(name, value);
+        cacheKeyMaterial += name;
         cacheKeyMaterial += '=';
         cacheKeyMaterial += value;
         cacheKeyMaterial += ';';
@@ -7862,15 +8051,15 @@ std::expected<unsigned int, std::string> VulkanRenderer::createShaderObject(cons
                                    "fragmentShaderSource, which this backend cannot substitute");
         }
 
-        const auto vertexSpirv =
-            compileToSpirv(shaderDescriptor.vertexShaderSource, shaderc_glsl_vertex_shader, "vertex");
+        const auto vertexSpirv = compileToSpirv(shaderDescriptor.vertexShaderSource, shaderc_glsl_vertex_shader,
+                                                "vertex", shaderDescriptor.defines);
         if (!vertexSpirv)
         {
             return std::unexpected("the vertex source did not compile to SPIR-V: " + vertexSpirv.error());
         }
 
-        const auto fragmentSpirv =
-            compileToSpirv(shaderDescriptor.fragmentShaderSource, shaderc_glsl_fragment_shader, "fragment");
+        const auto fragmentSpirv = compileToSpirv(shaderDescriptor.fragmentShaderSource, shaderc_glsl_fragment_shader,
+                                                  "fragment", shaderDescriptor.defines);
         if (!fragmentSpirv)
         {
             return std::unexpected("the fragment source did not compile to SPIR-V: " + fragmentSpirv.error());
@@ -8489,15 +8678,16 @@ void VulkanRenderer::destroyImageResource(const unsigned int id) const
                       return true;
                   });
 
-    // A cascade set names up to shadowCascadeCount views and the three images beside them — the
-    // occlusion, the behind copy and the cloud map — so one destroyed image invalidates every set
-    // that mentions it, on the same schedule and for the same reason as the fullscreen set above.
-    // The next frame that asks for a set with a live tuple builds a new one.
+    // A cascade set names up to shadowCascadeCount views and the four images beside them — the
+    // occlusion, the behind copy, the cloud map and the mirror map — so one destroyed image
+    // invalidates every set that mentions it, on the same schedule and for the same reason as the
+    // fullscreen set above. The next frame that asks for a set with a live tuple builds a new one.
     std::erase_if(shadowSets,
                   [&](const auto& entry)
                   {
                       if (std::ranges::find(entry.first.cascades, id) == entry.first.cascades.end() &&
-                          entry.first.occlusion != id && entry.first.behind != id && entry.first.cloudMap != id)
+                          entry.first.occlusion != id && entry.first.behind != id && entry.first.cloudMap != id &&
+                          entry.first.mirror != id)
                       {
                           return false;
                       }

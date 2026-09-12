@@ -4,6 +4,7 @@ module;
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -39,6 +40,14 @@ namespace raceengine
 // would have the tire's carefully shaped force fighting a rigid constraint that knows nothing about
 // slip.
 
+// What a contact reports when it did not land on a moving obstacle, which is every contact with the
+// road, a building and a prop. It is a second id space beside `noProp` rather than a widening of it,
+// because the two are owned by different things: a prop is a body inside the physics world and its
+// index is the world's, and an obstacle is a body the *caller* owns and never handed over. Sharing
+// one space would make an obstacle id and a prop id indistinguishable at the point a velocity is
+// routed back, which is the one place being wrong is silent.
+export inline constexpr std::uint32_t noObstacle = 0xffffffffu;
+
 // The other side of a contact.
 //
 // **Zero inverse mass is an immovable world**, and that is the road, a building, and a prop that has
@@ -54,6 +63,11 @@ export struct ContactBody
     // Which breakable prop this is, or `noProp` for anything that does not move. It is how the
     // velocity the solver gave this body gets back to the thing that owns it.
     std::uint32_t prop = noProp;
+
+    // And which caller-owned moving obstacle it is — a traffic car — or `noObstacle`. Exactly one of
+    // the two ids is set on any body: the world owns props and the caller owns obstacles, and
+    // nothing is both.
+    std::uint32_t obstacle = noObstacle;
 
     double inverseMass = 0.0;
 
@@ -160,6 +174,15 @@ export struct ContactPoint
     double normalImpulse = 0.0;
     double tangentImpulse1 = 0.0;
     double tangentImpulse2 = 0.0;
+
+    // The relative speed the two bodies met at along the normal, **before any impulse was applied**:
+    // positive closing, zero for a pair already separating or at rest against each other. Written by
+    // `resolveContacts` from the same velocity its restitution reads. A damage model reads this and
+    // not the impulses above, because the impulse carries the position correction — on every tick
+    // of a push-out, and on both cars' solves of the same overlap — so a box that has been placed a
+    // hand's width into a kerb reads as a collision that goes on for a dozen ticks with nobody moving
+    // (docs/police-pursuit-brief.md, the second seat).
+    double approachSpeed = 0.0;
 };
 
 export struct ContactManifold
@@ -211,6 +234,65 @@ export struct CollisionBox
     glm::dvec3 centre{0.0};
     glm::dvec3 halfExtents{2.1, 0.6, 0.75};
 };
+
+// A moving solid the caller owns, standing in the world the car is driving through: a traffic car.
+//
+// **It is not in the physics world and that is the whole reason this type exists.** `PhysicsWorld`
+// is immutable once created — that immutability is what makes it safe to query from the simulation
+// thread while the main thread draws — so a body that moves every tick cannot be added to it. What
+// crosses instead is this: a box, its pose, its velocity and its mass properties, handed in for one
+// tick and never stored.
+//
+// It is an oriented box because that is what `CollisionBox` already is and because two boxes have a
+// contact manifold that a face clip produces exactly. A car is not a box; a car's *collider* is one,
+// in this engine and in every driving game that has shipped.
+export struct DynamicObstacle
+{
+    // The caller's own name for this body. Carried through to `ContactBody::obstacle` so the
+    // velocity the solver settled on can be handed back to whatever owns it — the same route a
+    // breakable prop's takes, on a second id space for the reason `noObstacle` states.
+    std::uint32_t id = noObstacle;
+
+    // The box, world frame: where its centre is and which way it is turned.
+    glm::dvec3 centre{0.0};
+    glm::dquat orientation{1.0, 0.0, 0.0, 0.0};
+    glm::dvec3 halfExtents{0.85, 0.72, 2.15};
+
+    // The centre of mass, world, which is **not** the box's centre on any car: a hatchback's is
+    // about half a metre up and the box's centre is nearer three quarters. Kept apart rather than
+    // assumed equal because every impulse arm in the solver is taken about the centre of mass, and
+    // an arm taken about the wrong point turns a square hit into a spin.
+    glm::dvec3 centreOfMass{0.0};
+
+    glm::dvec3 linearVelocity{0.0};
+    glm::dvec3 angularVelocity{0.0};
+
+    // Zero inverse mass is legal and means an obstacle that will not move — a parked car, or one
+    // whose owner has decided it is not to be pushed this tick. It resolves exactly as a building
+    // does, which is the same statement `ContactBody`'s zeros make.
+    double inverseMass = 0.0;
+    // World frame, and held constant across the tick for `ContactBody::inverseInertia`'s reason.
+    glm::dmat3 inverseInertia{0.0};
+};
+
+// Add whatever of `obstacles` the body is overlapping to a manifold `collideBody` has already
+// filled, as points against second bodies the caller owns.
+//
+// **An empty span adds nothing and touches nothing**, which is the safety argument for putting this
+// on the vehicle's hot path at all: a circuit with no traffic on it resolves the manifold it always
+// did, bit for bit, and both frame gates are blessed on a circuit with no traffic on it.
+//
+// The manifold is the same one the world filled, so an obstacle contact and a road contact are
+// solved together in one sequential-impulse pass rather than in two that would each undo the other.
+// `limitPerObstacle` caps the points one box pair may contribute; a face clip of two boxes produces
+// at most four, and the cap is there so a caller handing in a hundred obstacles cannot grow the
+// manifold without bound.
+//
+// The normal of every point added here points **out of the obstacle and into the car**, which is the
+// direction `ContactPoint::normal` already means.
+export void collideObstacles(const RigidBodyState& state, const CollisionBox& box,
+                             std::span<const DynamicObstacle> obstacles, ContactManifold& manifold,
+                             const std::uint32_t limitPerObstacle = 4);
 
 // Ask the world what the body is touching. Up to `limit` points; a box on a triangle mesh rarely
 // produces more than a dozen and the cap is there so a pathological mesh cannot allocate without

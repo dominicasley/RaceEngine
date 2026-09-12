@@ -306,11 +306,12 @@ TEST_CASE("spring kinematics answer spring questions", "[physics][suspension][el
 {
     // The role-specific use each type exists for, exercised end to end: the wheel rate this car's
     // shaft rate implies through the *spring's* ratio must reproduce the at-the-wheel figures the
-    // source states — 35000 front, 57000 rear.
+    // car states — 35000 front, and 28000 rear since 2026-09-08 (the mod's 57000 was restated on the
+    // seat, `docs/rear-spring-sensitivity-brief.md`; this asserts the ledger, not a criterion).
     const auto setup = golfGtiMk7();
     REQUIRE(setup.has_value());
 
-    const auto statedWheelRate = std::array{35000.0, 35000.0, 57000.0, 57000.0};
+    const auto statedWheelRate = std::array{35000.0, 35000.0, 28000.0, 28000.0};
 
     for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
     {
@@ -394,7 +395,8 @@ TEST_CASE("the migrated spring path is the old spring path, exactly", "[physics]
     const auto setup = golfGtiMk7();
     REQUIRE(setup.has_value());
 
-    const auto statedWheelRate = std::array{35000.0, 35000.0, 57000.0, 57000.0};
+    // 28000 rear since 2026-09-08; the contract is bit-identity of the path, whatever the stated rate.
+    const auto statedWheelRate = std::array{35000.0, 35000.0, 28000.0, 28000.0};
 
     for (auto index = std::size_t{0}; index < raceengine::cornerCount; index++)
     {

@@ -1,18 +1,130 @@
 module;
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 module raceengine.assists;
 
 namespace raceengine
 {
 
-double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& state,
-                             const AntilockChannelState& left, const AntilockChannelState& right,
-                             const std::array<double, 2>& frontRequests, const double lateralAcceleration,
-                             const bool braking, const double deltaTime)
+namespace
+{
+
+// How many crossings the road-action ring is actually keeping, bounded by what it can hold.
+[[nodiscard]] std::size_t roadWindow(const AntilockSetup& setup)
+{
+    const auto asked = static_cast<std::size_t>(setup.roadSamples);
+
+    return std::clamp(asked, std::size_t{1}, roadTorqueCapacity);
+}
+
+// One road-action estimate, N.m of spin-up torque, pushed on a tooth crossing and nowhere else.
+//
+// `T_road_hat = T_brake_commanded + I * dOmega/dt - T_drive`. The brake term is the channel's own
+// commanded pressure through its own calibration; the inertial term is the acceleration the sensor
+// just measured at the rim, turned into an angular one by the rolling radius; the drive term is
+// subtracted because a driven wheel is being spun up by two things and only one of them is the road.
+//
+// **The commanded pressure is last period's**, which is correct rather than convenient: the
+// acceleration was measured across the interval that just ended, and last period's pressure is what
+// the caliper held across it. It is also all a real unit has.
+void pushRoadSample(const AntilockSetup& setup, AntilockChannelState& state, const AntilockChannelInputs& inputs)
+{
+    const auto radius = inputs.rollingRadius > 0.0 ? inputs.rollingRadius : 1.0;
+    const auto estimate = state.pressure * inputs.torquePerPressure + setup.wheelInertia * state.acceleration / radius -
+                          inputs.driveTorque;
+
+    const auto window = roadWindow(setup);
+
+    if (state.roadHead >= window)
+    {
+        state.roadHead = 0;
+    }
+
+    state.roadSamples[state.roadHead] = estimate;
+    state.roadHead = static_cast<std::uint32_t>((static_cast<std::size_t>(state.roadHead) + 1) % window);
+    state.roadCount = static_cast<std::uint32_t>(std::min(static_cast<std::size_t>(state.roadCount) + 1, window));
+}
+
+// The ring's median. **Median and not mean**, because the measured error distribution has a tail —
+// 6.67% of steps disagree with the kinematic truth by more than 200 N.m — and a mean is not robust
+// to it. Rotation does not matter to a median, so the used prefix is read directly.
+[[nodiscard]] double roadMedian(const AntilockChannelState& state, const std::size_t count)
+{
+    auto values = std::array<double, roadTorqueCapacity>{};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        values[index] = state.roadSamples[index];
+    }
+
+    std::sort(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(count));
+
+    return count % 2 == 1 ? values[count / 2] : 0.5 * (values[count / 2 - 1] + values[count / 2]);
+}
+
+} // namespace
+
+double advanceStabilitySupervisor(const StabilitySetup& setup, const double referenceSpeed, const bool referenceValid,
+                                  const double steeringWheelAngle, const double yawRate,
+                                  const double lateralAcceleration)
+{
+    // **Every exit before the arithmetic returns zero, and zero retains the protection.** A gate that
+    // withdrew lateral authority because a signal went quiet would turn a sensor fault into a
+    // straight-on, which is the one failure this whole layer exists to prevent.
+    if (!referenceValid || !std::isfinite(steeringWheelAngle) || !std::isfinite(yawRate) ||
+        !std::isfinite(lateralAcceleration))
+    {
+        return 0.0;
+    }
+
+    const auto speed = std::abs(referenceSpeed);
+
+    if (speed < setup.speedFloor)
+    {
+        return 0.0;
+    }
+
+    // What the driver asked for: the steady-state bicycle reference, saturated by what the car can
+    // actually pull. The accelerometer only ever *raises* that saturation — see `lateralCapability`.
+    // **Signed, and the sign is the linkage's rather than a convention this gate gets to pick.** A
+    // rack whose steering arm sits behind the kingpin turns the road wheel the other way, and the
+    // published ratio carries that. It matters little here — where the reference is large enough for
+    // its sign to change the error, the gate has already returned zero — but a magnitude-only ratio
+    // would be a latent fault on the day something else reads this reference.
+    const auto ratio = std::abs(setup.steeringRatio) > 1e-9 ? setup.steeringRatio : 1.0;
+    const auto roadWheel = steeringWheelAngle / ratio;
+    const auto denominator = setup.wheelbase + setup.understeerGradient * speed * speed;
+    const auto capability = std::max(setup.lateralCapability, std::abs(lateralAcceleration));
+    const auto saturation = capability / speed;
+    const auto reference =
+        std::clamp(denominator > 0.0 ? speed * roadWheel / denominator : 0.0, -saturation, saturation);
+
+    // The scale, and it is what makes this gate carry across a fleet: every threshold below is a
+    // share of a yaw rate the car's own speed and a stated lateral acceleration define, so nothing
+    // here is an absolute rad/s measured on one vehicle.
+    const auto scale = setup.lateralReference / speed;
+    const auto significance = std::max(setup.yawShare * scale, 1e-9);
+
+    // **The driver is asking for yaw.** This is the countersteer protection as much as the cornering
+    // one: a driver holding opposite lock has a large reference of the correcting sign, so the gate
+    // collapses to zero and the front keeps its lateral authority at exactly the moment the driver is
+    // using it. It is why the deadband is on the reference and not on the measured yaw rate.
+    if (std::abs(reference) > significance)
+    {
+        return 0.0;
+    }
+
+    return std::clamp((std::abs(yawRate - reference) - significance) / significance, 0.0, 1.0);
+}
+
+double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& state, const AntilockChannelState& left,
+                             const AntilockChannelState& right, const std::array<double, 2>& frontRequests,
+                             const double lateralAcceleration, const bool braking, const double deltaTime)
 {
     // Off, not braking, or in a corner. **The corner case is Limpert's own and is not a guard
     // somebody added**: above 0.4 g the delay is switched off deliberately, because there the big
@@ -49,8 +161,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
     // else, so it is exactly the book's trigger; `Hold` is a threshold being watched and is not a
     // reduction. Using intervention instead would arm this on a wheel that never let any pressure
     // go.
-    const auto reduced =
-        std::array<bool, 2>{left.cycles > state.baseCycles[0], right.cycles > state.baseCycles[1]};
+    const auto reduced = std::array<bool, 2>{left.cycles > state.baseCycles[0], right.cycles > state.baseCycles[1]};
     const auto intervening =
         std::array<bool, 2>{left.phase != ModulatorPhase::Passive, right.phase != ModulatorPhase::Passive};
 
@@ -67,8 +178,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         // the 'low' wheel." One front having let pressure go while the other has not **is** a split
         // surface as far as this unit can tell, and identifying the high wheel that way needs no
         // surface estimate of any kind.
-        if (state.completed || controlling[0] == controlling[1] ||
-            (controlling[0] ? reduced[1] : reduced[0]))
+        if (state.completed || controlling[0] == controlling[1] || (controlling[0] ? reduced[1] : reduced[0]))
         {
             return 0.0;
         }
@@ -189,7 +299,8 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
                                             AntilockChannelState& state, const WheelSpeedReading& wheel,
                                             const double wheelRoadSpeed, const double referenceSpeed,
                                             const double referenceAcceleration, const bool referenceValid,
-                                            const double requestedPressure, const double deltaTime)
+                                            const double requestedPressure, const AntilockChannelInputs& inputs,
+                                            const double deltaTime)
 {
     // The rear outlet is the same valve; the rear INLET is pulsed on its own duty factor in
     // production (the Bosch source at `BrakeModulator::rearReapplyGradient`), and the average of
@@ -209,6 +320,11 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         if (state.lastPulses > 0 && elapsed > 0.0)
         {
             state.acceleration = (wheelRoadSpeed - state.lastSpeed) / elapsed;
+
+            // **The road-action estimate is formed here and nowhere else.** A control step without a
+            // crossing carries no new information about the road, and a filter fed the held value at
+            // the control rate would be a filter whose length in *evidence* changed with speed.
+            pushRoadSample(setup, state, inputs);
         }
 
         state.lastPulses = wheel.pulses;
@@ -222,6 +338,34 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
 
     const auto request = std::max(requestedPressure, 0.0);
 
+    // **The road-action estimate is evaluated before the passive early-out, and only for the trace.**
+    // No control decision reads it here — a passive channel takes no decisions at all — but the
+    // question a seat trace has to answer is *what the road was saying before the unit intervened*,
+    // and a column written only while the channel is already modulating cannot answer it. Inert for
+    // control: neither positive-control arm reads evidence at any pressure, and the supervised arm
+    // returns below without reaching a transition.
+    if (setup.enabled && wheel.valid)
+    {
+        const auto window = roadWindow(setup);
+        const auto radius = inputs.rollingRadius > 0.0 ? inputs.rollingRadius : 1.0;
+
+        state.roadTorque = state.roadCount > 0 ? roadMedian(state, static_cast<std::size_t>(state.roadCount)) : 0.0;
+        state.evidence = RoadEvidence::Unknown;
+
+        const auto noiseFloor = wheel.period > 0.0
+                                    ? (setup.wheelInertia / radius) * (inputs.timerResolution / wheel.period) *
+                                          (std::abs(wheelRoadSpeed) / wheel.period)
+                                    : 0.0;
+
+        if (static_cast<std::size_t>(state.roadCount) >= window &&
+            state.sinceUpdate <= setup.staleShare * std::max(wheel.period, deltaTime) && inputs.driveTorqueKnown)
+        {
+            const auto gate = std::max(setup.roadShare * inputs.peakBrakeTorque, setup.noiseShare * noiseFloor);
+
+            state.evidence = state.roadTorque > gate ? RoadEvidence::Loaded : RoadEvidence::Free;
+        }
+    }
+
     // Nothing to control: no system, no measurement, or no pedal. The channel falls open and the
     // wheel gets exactly what was asked for — the same expression an unassisted car evaluates, so
     // the two agree to the bit rather than to a tolerance.
@@ -230,6 +374,9 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         state.phase = ModulatorPhase::Passive;
         state.pressure = request;
         state.surged = false;
+        state.timeAtFloor = 0.0;
+        state.limited = false;
+        state.banded = false;
 
         return request;
     }
@@ -271,12 +418,69 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
     const auto projectedWheel = std::max(wheelRoadSpeed, state.lastSpeed + referenceAcceleration * state.sinceUpdate);
     const auto guardSlip = referenceValid ? estimatedSlip(referenceSpeed, projectedWheel) : 0.0;
 
-    // The one judgement the slip-aware recovery law adds, and it is a statement about the ECU's own
-    // belief rather than about the tyre: the estimated slip is past the calibrated band. Everything
-    // it gates degrades to the previous law when the reference is invalid — and, just as
-    // deliberately, when the estimator under-reads, which is what it does in exactly the case the
-    // acceleration-only loop exists to survive.
-    const auto pastBand = setup.slipAwareRecovery && referenceValid && guardSlip > setup.slipEnter;
+    // --- the brake-recovery supervisor (2026-09-07) --------------------------------------------
+    //
+    // `pastBand` is the ECU's own belief that the wheel is past the calibrated band, and it is what
+    // the five transition sites below used to read unconditionally. `limitSlip` is what they read
+    // now: the belief is unchanged, and what changed is when it has authority. It still degrades to
+    // the previous loop when the reference is invalid and when the estimator under-reads, which is
+    // the case the acceleration-only loop exists to survive.
+
+    const auto pastBand = referenceValid && guardSlip > setup.slipEnter;
+
+    // **The actuator's own history, and it is the half of the failure a phase cannot see.** The
+    // floor is the pressure one control period of the dump gradient reaches — a bar at this unit's
+    // rates, which is the empty caliper the dry investigation measured the limit cycle living in.
+    // The refill time is what this channel would need to build the request back at its own re-apply
+    // gradient: 181 ms on the rear against a 54 ms dump, so a state machine that transitions in one
+    // control period can be three actuator time constants away from the pressure its phase implies.
+    // Both are derived from the modulator rather than chosen, so neither can drift away from the
+    // hydraulics it describes.
+    const auto emptyPressure = setup.modulator.dumpGradient * deltaTime;
+
+    state.timeAtFloor = state.pressure <= emptyPressure ? state.timeAtFloor + deltaTime : 0.0;
+
+    const auto refillTime = reapplyGradient > 0.0 ? request / reapplyGradient : 0.0;
+    const auto starved = state.timeAtFloor > refillTime && !losing;
+
+    // What the road is doing to the wheel this channel watches, evaluated above so that it reaches
+    // the trace on a passive channel too. **UNKNOWN permits**: refusal needs positive evidence, and a
+    // stale or locked wheel holds an acceleration that reads deeply negative — reading that as "the
+    // tyre is loaded" is precisely the frozen-sensor artefact this design has to be structurally
+    // unable to profit from. The gate it cleared is the larger of a share of this channel's peak
+    // brake torque and a multiple of the sensor's own per-sample quantisation floor, which is of
+    // order 25 N.m at the rear at 100 km/h — the same order as the separation being made.
+
+    // **The forward bias, and it is one statement rather than two rules.** The front axle sits ahead
+    // of the centre of mass and the rear behind it, so a same-sign lateral force at the front holds a
+    // yaw and at the rear reverses it, with the longer arm. Under yaw the driver did not ask for,
+    // longitudinal utilisation is therefore biased forward: the front stops spending capability to
+    // protect a lateral force that is sustaining the rotation, and the rear keeps its restraint
+    // whatever the road evidence says, because its lateral force is the restoring one. It follows
+    // from the *sign* of the two moment arms and not from their size, so it holds for any car whose
+    // centre of mass is between its axles.
+    const auto rear = channel == BrakeChannel::Rear;
+    const auto yawDisturbance = std::clamp(inputs.yawDisturbance, 0.0, 1.0);
+    const auto roadProtect = state.evidence == RoadEvidence::Loaded || (rear && yawDisturbance >= 0.5);
+    const auto axleProtect = rear ? 1.0 : 1.0 - yawDisturbance;
+
+    const auto limitSlip = [&]
+    {
+        switch (setup.recoveryAuthority)
+        {
+        case RecoveryAuthority::Disabled:
+            return false;
+        case RecoveryAuthority::Unconditional:
+            return pastBand;
+        case RecoveryAuthority::Supervised:
+            break;
+        }
+
+        return pastBand && roadProtect && axleProtect > 0.5 && !starved;
+    }();
+
+    state.limited = limitSlip;
+    state.banded = pastBand;
 
     switch (state.phase)
     {
@@ -321,7 +525,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         // 4.8 Hz against a published 4 to 20.
         //
         // **"No longer departing" is not enough on its own while the slip is still past the band**
-        // (the slip-aware recovery law, `AntilockSetup::slipAwareRecovery`). A lightly loaded wheel
+        // (the recovery supervisor's `limitSlip`, `AntilockSetup::recoveryAuthority`). A lightly loaded wheel
         // past the tyre's peak reaches an *equilibrium*: road torque nearly balances brake torque on
         // the shallow far side of the curve, so the wheel tracks the decelerating car at a constant
         // 0.4 slip — not departing, not recovering, just stuck — and a dump that ends there hands the
@@ -340,7 +544,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         // held just past its peak keeps delivering; a dump that insists on a convincing recovery
         // trades that force for slip health at three-to-one against. The barely-creeping exit below
         // is not a timidity to fix — it is where the force is.
-        if (excess > setup.recoveryAcceleration || (!losing && !pastBand))
+        if (excess > setup.recoveryAcceleration || (!losing && !limitSlip))
         {
             state.phase = ModulatorPhase::Recover;
             state.surged = false;
@@ -379,7 +583,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
             state.cycles++;
             state.departurePressure = state.pressure;
         }
-        else if (pastBand && excess < setup.recoveryAcceleration)
+        else if (limitSlip && excess < setup.recoveryAcceleration)
         {
             // **Stuck: neither departing nor coming back, with the slip still past the band.** This
             // is the equilibrium the utilisation instrument found the rear axle living in — the held
@@ -411,7 +615,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
             // back down. The road is winning at this pressure or the wheel would not be climbing, so
             // holding cannot stagnate: the slip falls, crosses the band, and the branch below takes
             // over.
-            if (!pastBand)
+            if (!limitSlip)
             {
                 state.phase = ModulatorPhase::Reapply;
             }
@@ -436,10 +640,10 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         // A wheel already past the band is never in the fast stage whatever the memory says — that
         // is re-pinning, and it is the one thing the whole law exists to stop.
         const auto proximity =
-            setup.slipAwareRecovery && referenceValid
+            setup.recoveryAuthority != RecoveryAuthority::Disabled && referenceValid
                 ? std::clamp((setup.slipEnter - guardSlip) / std::max(setup.slipEnter - setup.slipExit, 1e-9), 0.0, 1.0)
                 : 1.0;
-        const auto fast = state.pressure < state.departurePressure && !pastBand;
+        const auto fast = state.pressure < state.departurePressure && !limitSlip;
 
         state.pressure = std::min(request, state.pressure + reapplyGradient * (fast ? 1.0 : proximity) * deltaTime);
 
@@ -447,7 +651,8 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
         {
             state.phase = ModulatorPhase::Hold;
         }
-        else if (pastBand && excess < -setup.recoveryAcceleration && guardSlip > 2.0 * setup.slipEnter - setup.slipExit)
+        else if (limitSlip && excess < -setup.recoveryAcceleration &&
+                 guardSlip > 2.0 * setup.slipEnter - setup.slipExit)
         {
             // **Stuck in Reapply is a trap without this branch, and it was found locking a front
             // wheel for five seconds** (2026-08-29, the `[.washout-trace]` probe, on the steering
@@ -474,7 +679,7 @@ double advanceYawMomentDelay(const AntilockSetup& setup, YawMomentDelayState& st
             // distance gate. The margin leaves a residual mode — a member of the steering
             // ensemble can still ride ~0.4 slip with late rescues — but a LOCK cannot persist:
             // a locked wheel's frozen pulse-derived acceleration reads deeply negative and keeps
-            // this branch firing. With the law off or the reference invalid `pastBand` is false
+            // this branch firing. With the supervisor disabled or the reference invalid `limitSlip` is false
             // and this branch does not exist, which preserves the estimator-collapse degradation
             // to the bit.
             state.phase = ModulatorPhase::Dump;

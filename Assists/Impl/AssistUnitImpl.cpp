@@ -134,10 +134,18 @@ namespace
             }
         }
 
-        const auto ceiling =
-            advanceYawMomentDelay(setup.antilock, state.antilock.yawDelay, state.antilock.channels[0],
-                                  state.antilock.channels[1], frontRequests, sensors.lateralAcceleration, braking,
-                                  period);
+        const auto ceiling = advanceYawMomentDelay(setup.antilock, state.antilock.yawDelay, state.antilock.channels[0],
+                                                   state.antilock.channels[1], frontRequests,
+                                                   sensors.lateralAcceleration, braking, period);
+
+        // The vehicle-level lateral-authority gate, stepped beside the yaw moment delay and for the
+        // same reason: it is the part of this controller that is not per-channel. **It commands
+        // nothing** — the number it answers reaches an actuator only by deciding whether a channel's
+        // slip limiting has authority, and every failure path in it returns zero, which retains the
+        // protection.
+        const auto yawDisturbance =
+            advanceStabilitySupervisor(setup.antilock.stability, state.reference.speed, state.reference.valid,
+                                       sensors.steeringWheelAngle, sensors.yawRate, sensors.lateralAcceleration);
 
         for (auto index = std::size_t{0}; index < brakeChannelCount; index++)
         {
@@ -167,9 +175,22 @@ namespace
 
             const auto wheelSpeed = std::abs(sensedRoadSpeed(setup.reference, readings[controlWheel]));
 
+            // What the channel cannot work out for itself: its own actuator calibration at the wheel
+            // it is watching, what the driveline is doing to that wheel, and the vehicle-level gate's
+            // answer. **An undriven wheel's drive torque is a known zero** — the signal being absent
+            // only makes the road evidence unknown where the driveline can actually reach.
+            auto inputs = AntilockChannelInputs{};
+            inputs.torquePerPressure = setup.brakeTorquePerPressure[controlWheel];
+            inputs.peakBrakeTorque = peakTorque[controlWheel];
+            inputs.rollingRadius = setup.reference.nominalRadius;
+            inputs.timerResolution = setup.toneRing.timerResolution;
+            inputs.driveTorque = setup.reference.driven[controlWheel] ? sensors.driveTorque[controlWheel] : 0.0;
+            inputs.driveTorqueKnown = sensors.driveTorqueKnown || !setup.reference.driven[controlWheel];
+            inputs.yawDisturbance = yawDisturbance;
+
             const auto pressure = advanceAntilockChannel(
                 setup.antilock, channel, state.antilock.channels[index], readings[controlWheel], wheelSpeed,
-                state.reference.speed, state.reference.rate, state.reference.valid, channelRequest, period);
+                state.reference.speed, state.reference.rate, state.reference.valid, channelRequest, inputs, period);
 
             for (auto wheel = std::size_t{0}; wheel < wheelCount; wheel++)
             {
@@ -234,6 +255,10 @@ namespace
             output.channels.antilockCycles[wheel] = channelState.cycles;
             output.channels.antilockPhase[wheel] = channelState.phase;
             output.channels.sensedWheelAcceleration[wheel] = channelState.acceleration;
+            output.channels.roadTorque[wheel] = channelState.roadTorque;
+            output.channels.roadEvidence[wheel] = channelState.evidence;
+            output.channels.recoveryLimited[wheel] = channelState.limited;
+            output.channels.recoveryBanded[wheel] = channelState.banded;
         }
     }
 
@@ -241,6 +266,9 @@ namespace
     output.channels.referenceValid = state.reference.valid;
     output.channels.referenceCoasting = state.reference.coasting;
     output.channels.referenceAcceleration = state.reference.rate;
+    output.channels.yawDisturbance =
+        advanceStabilitySupervisor(setup.antilock.stability, state.reference.speed, state.reference.valid,
+                                   sensors.steeringWheelAngle, sensors.yawRate, sensors.lateralAcceleration);
     output.channels.engineTorqueReduction = state.traction.engineReduction;
     output.channels.tractionBrakeActive = state.traction.brakeActive;
     output.channels.tractionEngineActive = state.traction.engineActive;

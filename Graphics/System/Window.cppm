@@ -43,6 +43,13 @@ export struct VulkanWindowRequiredExtensions
 };
 
 export enum class Key : int {
+    // The number row. The sandbox sets the police's wanted level with them, one to five, so a level
+    // can be looked at without earning it (docs/police-driving-brief.md §8).
+    One = GLFW_KEY_1,
+    Two = GLFW_KEY_2,
+    Three = GLFW_KEY_3,
+    Four = GLFW_KEY_4,
+    Five = GLFW_KEY_5,
     W = GLFW_KEY_W,
     A = GLFW_KEY_A,
     S = GLFW_KEY_S,
@@ -62,6 +69,10 @@ export enum class Key : int {
     // one: it is a control a driver reaches for *because* of what they are looking at, and a wiper
     // setting chosen before the process started is a wiper setting chosen before the rain.
     V = GLFW_KEY_V,
+    // Restart: the player's car back on its grid slot, the traffic and the police reseeded, the
+    // felony and the damage cleared. A key because a wrecked or an arrested car is a car that
+    // cannot drive anywhere, and the process should not have to be restarted to drive again.
+    R = GLFW_KEY_R,
     Escape = GLFW_KEY_ESCAPE,
     Space = GLFW_KEY_SPACE,
     LeftShift = GLFW_KEY_LEFT_SHIFT,

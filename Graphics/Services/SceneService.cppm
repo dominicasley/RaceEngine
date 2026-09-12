@@ -58,10 +58,26 @@ public:
     // clear sky the renderer has always drawn; type is the stratus-to-cumulus blend and means
     // nothing without coverage. See Scene::clouds.
     [[nodiscard]] std::expected<void, std::string> setClouds(Scene& scene, float coverage, float type) const;
+    // How many stops darker the sky is drawn for the eye than for the probes, a per-scene statement
+    // like the clouds. Zero is the sky the probes see, bit for bit. See Scene::skyEyeStops.
+    [[nodiscard]] std::expected<void, std::string> setSkyEyeStops(Scene& scene, float stops) const;
     // Which attachment carries the marched cloud dome map. Stated by whoever built the world
     // camera's chain, because which pass's output is the cloud map is a fact about that chain; the
     // backend binds it to every shading view and to every probe face. See Scene::cloudMap.
     void setCloudMap(Scene& scene, const Resource<FboAttachment>& cloudMap) const;
+    // Which attachment carries the driver's mirror, on the cloud map's terms: stated by whoever built
+    // the mirror camera, bound by the backend to every shading view. See Scene::mirrorMap.
+    void setMirrorMap(Scene& scene, const Resource<FboAttachment>& mirrorMap) const;
+    // The exposure ratio the mirror's radiance is scaled by, per tick under split metering and one
+    // otherwise. Refused below zero or non-finite. See Scene::mirrorExposureScale.
+    [[nodiscard]] std::expected<void, std::string> setMirrorExposure(Scene& scene, float scale) const;
+    // The mirror camera's view as the curved glass needs it: where it looks and its up, in world
+    // space, and the tangents of its half fields of view across and down. Per tick, after the camera
+    // is aimed. Refused for a direction or an up of no length, a pair that are parallel, or a
+    // tangent that is not positive and finite. See Scene::mirrorDirection.
+    [[nodiscard]] std::expected<void, std::string> setMirrorView(Scene& scene, const glm::vec3& direction,
+                                                                 const glm::vec3& up, float tanHalfWidth,
+                                                                 float tanHalfHeight) const;
     // Where the rain's glass is going: the ground speed in metres per second, the airflow phase —
     // the integral of speed squared, accumulated by the caller a tick at a time — and the car's own
     // two axes in world space, which must be the body's and not the ground's. A per-tick setter

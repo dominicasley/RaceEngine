@@ -45,6 +45,11 @@ extern "C++" void raceengineJoltDestroyWorld(std::uint64_t handle);
 extern "C++" void raceengineJoltCastRays(std::uint64_t handle, const double* origins, const double* directions,
                                          double maxDistance, std::uint32_t count, double* outPoints, double* outNormals,
                                          double* outDistances, std::uint32_t* outSurfaces, unsigned char* outHits);
+extern "C++" void raceengineJoltCollideCylinders(std::uint64_t handle, const double* centres, const double* axes,
+                                                 const double* radii, const double* halfWidths, std::uint32_t count,
+                                                 std::uint32_t maxContacts, std::uint32_t* outCounts, double* outAxes,
+                                                 double* outNormals, double* outDepths, double* outPoints,
+                                                 std::uint32_t* outSurfaces);
 
 namespace raceengine
 {
@@ -59,6 +64,45 @@ export struct SurfaceHit
     // Index into the mesh's material table, which is what carries grip and bumpiness.
     std::uint32_t surface = 0;
     bool hit = false;
+};
+
+// One triangle a wheel-sized cylinder is touching — what the kerb-contact path gets back from
+// `collideCylinders`, one per triangle overlapped.
+//
+// Not a `SurfaceHit`: a ray reports where the road is *below* a point, and this reports which way
+// the road is *pushing* a solid. On flat road the two agree — the axis is up and the depth is the
+// vertical overlap — and the vehicle drops every one of those, because the contact patch already
+// carries them. What survives is the road the rays cannot see: a kerb face, a wall, the top edge of
+// a step. docs/kerb-contact-brief.md.
+export struct ObstacleContact
+{
+    // Unit, pointing out of the road into the tyre: the direction the road pushes.
+    glm::dvec3 axis{0.0, 1.0, 0.0};
+    // The triangle's own face normal at the contact point, unit. The same direction as `axis` for a
+    // contact against the triangle's face, and a different one for a contact against its edge or
+    // vertex — which is how the rule tells a kerb's top edge from a road triangle's edge.
+    glm::dvec3 normal{0.0, 1.0, 0.0};
+    // How far the cylinder is into the triangle along that axis, metres. Zero at first touch.
+    double depth = 0.0;
+    // Where on the road, world frame.
+    glm::dvec3 point{0.0};
+    // Index into the mesh's material table, as `SurfaceHit::surface` is.
+    std::uint32_t surface = 0;
+    // The hand-over weight the vehicle's rule assigns as the axis approaches the wheel plane's up —
+    // 1 clear of the fade band, 0 at the exclusion cone. The query itself reports 1 for every
+    // contact; only the rule writes anything else. docs/kerb-contact-brief.md.
+    double weight = 1.0;
+};
+
+// The tyre as the cylinder query sees it: its own radius and half its section width about its spin
+// axis. Stated as a struct rather than four arrays because four wheels go in per tick and a caller
+// assembling four parallel arrays by hand is the mapping fault the rack trace's tests exist for.
+export struct WheelCylinder
+{
+    glm::dvec3 centre{0.0};
+    glm::dvec3 spinAxis{1.0, 0.0, 0.0};
+    double radius = 0.31;
+    double halfWidth = 0.1;
 };
 
 // One convex collider standing beside the drivable surface: a building, a bench, a lamp column.
@@ -270,6 +314,18 @@ public:
     // can weight by hit without branching into a separate path.
     void castRays(const std::vector<glm::dvec3>& origins, const std::vector<glm::dvec3>& directions,
                   const double maxDistance, std::vector<SurfaceHit>& results) const;
+
+    // Every triangle each cylinder overlaps, batched for `castRays`'s reason: four wheels of them
+    // per tick, against the same broadphase.
+    //
+    // `limit` caps how many a cylinder may report — the raw per-triangle count *before* the
+    // vehicle's exclusion rule, so it has to cover the flat road under the tyre as well as whatever
+    // it has run into. The contacts of cylinder `i` are the `counts[i]` entries of `results`
+    // following those of the cylinders before it, packed with no gaps; a cylinder touching nothing
+    // contributes none. Jolt's own conventions and the two settings that matter are on the backend's
+    // side of the bridge.
+    void collideCylinders(std::span<const WheelCylinder> cylinders, const std::uint32_t limit,
+                          std::vector<ObstacleContact>& results, std::vector<std::uint32_t>& counts) const;
 
     // The backend's own identifier for this world. Exposed because the contact bridge is a second
     // entry point into the same world and has to name it; nothing outside this module's partitions

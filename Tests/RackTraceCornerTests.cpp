@@ -141,6 +141,22 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         wheel.tyrePressurePsi = sentinel(corner, 14);
         // Metres in, millimetres out.
         wheel.recession = sentinel(corner, 15) / 1000.0;
+
+        // The brake-recovery supervisor's four, joined 2026-09-07 with the ABS architecture. Two are
+        // booleans and one is a small unsigned, so they are made distinct per corner by construction
+        // rather than by the alternating sentinel — and the two booleans are given OPPOSITE parities
+        // so that a swap between two corners cannot leave the pair looking unchanged.
+        wheel.roadTorque = sentinel(corner, 16);
+        wheel.roadEvidence = static_cast<std::uint32_t>(corner % 3);
+        wheel.recoveryBanded = corner % 2 == 0;
+        wheel.recoveryLimited = corner % 2 == 1;
+
+        // The kerb-contact path's three, joined 2026-09-07 with the path itself. The count is a
+        // small unsigned and is made distinct per corner by construction; radians in, degrees out
+        // for the elevation.
+        wheel.obstacleContacts = static_cast<std::uint32_t>(2 + corner);
+        wheel.obstacleNormalForce = sentinel(corner, 17);
+        wheel.obstacleAxisElevation = sentinel(corner, 18) / 57.29577951308232;
     }
 
     const auto rows = lines(rackTorqueToCsv({frame}));
@@ -181,7 +197,20 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
     // `Recession` joined on 2026-08-29 with longitudinal recession itself, taking it to nineteen —
     // added WITH the mechanism rather than after a lap could not show it, because it is the only
     // channel the coefficient moves at all.
-    REQUIRE(header.size() == 13 + 9 + 5 + 9 + 19 * tracedCornerCount);
+    //
+    // The brake-recovery supervisor joined on 2026-09-07 with the ABS architecture: `Road Torque`,
+    // `Road Evidence`, `Recovery Banded` and `Recovery Limited` per corner take it to twenty-three,
+    // and `Yaw Disturbance` takes the electronics group from seven to ten. **Added because the first
+    // two seat laps of that architecture could only be read by the pressure signature** — whether the
+    // supervisor refused a recovery, and on what evidence, was not in the file at all, so "it felt
+    // fine" and "the gate never armed" produced identical traces. Same lesson as `ABS Fitted` and the
+    // XDS fitted/active pair, arriving a third time.
+    //
+    // The kerb-contact path joined on 2026-09-07 with `Obstacle Contacts`, `Obstacle Force` and
+    // `Obstacle Elevation` per corner, taking it to twenty-six — added WITH the mechanism, for
+    // `Recession`'s reason: they are the only channels the path moves on a flat lap, and a trace
+    // that cannot say whether the path engaged cannot be read.
+    REQUIRE(header.size() == 13 + 9 + 5 + 10 + 26 * tracedCornerCount);
 
     for (auto corner = std::size_t{0}; corner < tracedCornerCount; corner++)
     {
@@ -216,6 +245,13 @@ TEST_CASE("every per-corner column of the rack trace carries its own corner", "[
         REQUIRE(named("Tyre Temp Gas", "[C]") == Catch::Approx(sentinel(corner, 13)).epsilon(1e-9));
         REQUIRE(named("Tyre Pressure", "[psi]") == Catch::Approx(sentinel(corner, 14)).epsilon(1e-9));
         REQUIRE(named("Recession", "[mm]") == Catch::Approx(sentinel(corner, 15)).epsilon(1e-9));
+        REQUIRE(named("Road Torque", "[Nm]") == Catch::Approx(sentinel(corner, 16)).epsilon(1e-9));
+        REQUIRE(named("Road Evidence", "[]") == Catch::Approx(static_cast<double>(corner % 3)).margin(1e-9));
+        REQUIRE(named("Recovery Banded", "[]") == Catch::Approx(corner % 2 == 0 ? 1.0 : 0.0).margin(1e-9));
+        REQUIRE(named("Recovery Limited", "[]") == Catch::Approx(corner % 2 == 1 ? 1.0 : 0.0).margin(1e-9));
+        REQUIRE(named("Obstacle Contacts", "[]") == Catch::Approx(static_cast<double>(2 + corner)).margin(1e-9));
+        REQUIRE(named("Obstacle Force", "[N]") == Catch::Approx(sentinel(corner, 17)).epsilon(1e-9));
+        REQUIRE(named("Obstacle Elevation", "[deg]") == Catch::Approx(sentinel(corner, 18)).epsilon(1e-6));
     }
 }
 
@@ -275,6 +311,7 @@ TEST_CASE("and the chassis and driver columns carry what they are named", "[inpu
 
     REQUIRE(named("Yaw Delay Fitted []") == Catch::Approx(1.0).margin(1e-9));
     REQUIRE(named("Yaw Delay Active []") == Catch::Approx(0.0).margin(1e-9));
+    REQUIRE(named("Yaw Disturbance []") == Catch::Approx(0.0).margin(1e-9));
     REQUIRE(named("XDS Fitted []") == Catch::Approx(1.0).margin(1e-9));
     REQUIRE(named("XDS Active []") == Catch::Approx(0.0).margin(1e-9));
     REQUIRE(named("Engine Reduction [%]") == Catch::Approx(42.5).epsilon(1e-6));

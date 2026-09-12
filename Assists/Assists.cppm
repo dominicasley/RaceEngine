@@ -38,9 +38,27 @@ export struct AssistSensors
     double yawRate = 0.0;
     double lateralAcceleration = 0.0;
 
-    // The steering angle sensor, radians at the wheel. The cornering brake's kinematics would be
-    // slightly better for reading it; nothing does yet.
+    // The steering angle sensor, radians at the steering wheel. Read by the vehicle-level
+    // lateral-authority gate, which turns it into a road wheel angle through
+    // `StabilitySetup::steeringRatio` and asks how much yaw the driver is asking for.
     double steeringWheelAngle = 0.0;
+
+    // What the driveline is putting on each wheel this tick, N.m.
+    //
+    // **DIRECTLY KNOWN and never estimated.** A car whose ECU commands the driveline knows this
+    // number, and the road-action observable needs it because a driven wheel is being spun up by two
+    // things and only one of them is the road. With the caliper empty the drive term is not a
+    // correction to that estimate — it is the whole of it.
+    std::array<double, wheelCount> driveTorque{};
+
+    // Whether the driveline signal is present at all. **False makes the road evidence UNKNOWN on any
+    // DRIVEN wheel, which permits recovery**; an undriven wheel's zero is a fact rather than a
+    // missing value and is unaffected.
+    //
+    // True by default because the fixtures that populate none of this genuinely have no driveline —
+    // they hand `stepVehicle` a zero torque array — so zero there is the measurement and not an
+    // assumption. The game sets it explicitly beside the array it fills.
+    bool driveTorqueKnown = true;
 };
 
 // What the driver is asking for, before any of it reaches an actuator.
@@ -131,6 +149,21 @@ export struct AssistChannels
     // control steps. The channel that says whether the ECU could see what the wheel was doing.
     std::array<double, wheelCount> sensedWheelAcceleration{};
     std::array<ModulatorPhase, wheelCount> antilockPhase{};
+
+    // --- the brake-recovery supervisor and the lateral-authority gate (2026-09-07) --------------
+    //
+    // The filtered road-action estimate per wheel, N.m of spin-up torque, what the supervisor made of
+    // it, and whether the supervisor is limiting slip on that wheel's channel. A gate nobody can see
+    // in a trace is a gate nobody can report on, which the tyre-pressure switch already cost a lap to
+    // learn.
+    std::array<double, wheelCount> roadTorque{};
+    std::array<RoadEvidence, wheelCount> roadEvidence{};
+    std::array<bool, wheelCount> recoveryLimited{};
+    std::array<bool, wheelCount> recoveryBanded{};
+
+    // How much of the car's yaw the gate believes the driver did not ask for, 0 to 1. Zero on a car
+    // going where it is pointed, and zero on every fallback.
+    double yawDisturbance = 0.0;
 
     // What the actuator ended the tick at, **pascals**, and what each source asked for in N.m.
     std::array<double, wheelCount> pressure{};

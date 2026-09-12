@@ -856,12 +856,15 @@ TEST_CASE("static ride never touches the bump stop", "[.stop-static]")
 
 TEST_CASE("the stop's stiffness against the corner's own integrator", "[.stop-static]")
 {
-    // **The corner integrates the stop EXPLICITLY, both halves of it.** `stepVehicle`'s third pass
-    // solves only the damper curve's slope implicitly (`cornerDamping`); the stop's elastic force
-    // and its viscous term both ride `generalisedForce`, which is stepped forward. So both are
-    // subject to an explicit stability bound and neither is helped by the implicit step.
-    //
-    // Nothing here proposes changing the integrator or softening anything. It reports the margin.
+    // **Until 2026-09-08 the corner integrated the stop EXPLICITLY, both halves of it.**
+    // `stepVehicle`'s velocity step solved only the damper curve's slope implicitly
+    // (`cornerDamping`); the stop's elastic force and its viscous term both rode `generalisedForce`,
+    // which is stepped forward. So both were subject to an explicit stability bound and neither was
+    // helped by the implicit step. **Since 2026-09-08 the viscous term is in the implicit divisor
+    // and scaled by the tangent stiffness** (docs/stop-element-brief.md); the `alpha` rows below are
+    // the bound the OLD scheme sat against, kept because they are the measurement that motivated
+    // the change. The elastic term is still explicit, and the elastic-only rows are still the
+    // margin it has.
     const auto base = golfGtiMk7();
     REQUIRE(base.has_value());
 
@@ -989,7 +992,9 @@ TEST_CASE("the stop's stiffness against the corner's own integrator", "[.stop-st
         CHECK(spectralRadius(usable, false) < 1.0);
     }
 
-    std::printf("\n  **The static law is not the numerical problem and the placed viscous constant is.**\n");
+    std::printf("\n  (The viscous rows describe the scheme before 2026-09-08; the constant is now solved\n");
+    std::printf("  implicitly and scaled by the tangent stiffness — docs/stop-element-brief.md.)\n");
+    std::printf("\n  **The static law is not the numerical problem and the placed viscous constant was.**\n");
     std::printf("  Zero the 40000 N.s/m and the corner's explicit step is inside the unit circle across\n");
     std::printf("  the whole of the reachable travel at both ends of the car — the crossing rows above\n");
     std::printf("  say so. Put it back and both axles leave it well inside their own travel, because an\n");

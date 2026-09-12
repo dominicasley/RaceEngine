@@ -67,6 +67,7 @@ add_library (Engine STATIC
         Audio/Impl/EngineLayersImpl.cpp
         Audio/Impl/SilentAudioBackendImpl.cpp
         Audio/Impl/SoundBankImpl.cpp
+        Audio/Impl/TrafficAudioImpl.cpp
         Audio/Impl/TyreLayersImpl.cpp
         Graphics/Impl/AmbientOcclusionServiceImpl.cpp
         Graphics/Impl/OcclusionCullingServiceImpl.cpp
@@ -116,7 +117,15 @@ add_library (Engine STATIC
         Physics/Impl/SuspensionImpl.cpp
         Physics/Impl/TelemetryImpl.cpp
         Physics/Impl/TyreImpl.cpp
-        Physics/Impl/VehicleImpl.cpp)
+        Physics/Impl/VehicleImpl.cpp
+        Traffic/Impl/ArchetypesImpl.cpp
+        Traffic/Impl/DynamicsImpl.cpp
+        Traffic/Impl/LanesImpl.cpp
+        Traffic/Impl/NavmeshImpl.cpp
+        Traffic/Impl/PopulationImpl.cpp
+        Traffic/Impl/PursuitImpl.cpp
+        Traffic/Impl/PursuitRouteImpl.cpp
+        Traffic/Impl/PursuitPlanImpl.cpp)
 
 target_sources(Engine PUBLIC
         FILE_SET CXX_MODULES
@@ -199,10 +208,23 @@ target_sources(Engine PUBLIC
         Physics/Api/Driveline.cppm
         Physics/Api/PublishedCars.cppm
         Physics/Api/SetupFile.cppm
+        # raceengine.traffic: its own module, and it imports raceengine.physics rather than being a
+        # partition of it. That direction is what keeps the vehicle model unable to see traffic — it
+        # takes a span of obstacles and nothing more — see Traffic/Traffic.cppm.
+        Traffic/Traffic.cppm
+        Traffic/Api/Lanes.cppm
+        Traffic/Api/Archetypes.cppm
+        Traffic/Api/Dynamics.cppm
+        Traffic/Api/Navmesh.cppm
+        Traffic/Api/Population.cppm
+        Traffic/Api/PursuitRoute.cppm
+        Traffic/Api/PursuitPlan.cppm
+        Traffic/Api/Pursuit.cppm
         Audio/Audio.cppm
         Audio/Api/CarAudio.cppm
         Audio/Api/EngineLayers.cppm
         Audio/Api/TyreLayers.cppm
+        Audio/Api/TrafficAudio.cppm
         Audio/Api/SoundBank.cppm
         Audio/Api/AudioBackend.cppm
         Audio/Backend/SilentAudioBackend.cppm

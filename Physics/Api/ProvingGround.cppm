@@ -31,7 +31,14 @@ namespace raceengine
 // a 0.98 road and a 0.95 pit lane onto the same value for nothing. What is worth a *kind* is what
 // something other than the tire will one day branch on: dust off a gravel trap, a wall that is not
 // a surface a car drives on at all.
-export enum class SurfaceKind : std::uint32_t { Tarmac, Kerb, Grass, Gravel, Wall };
+export enum class SurfaceKind : std::uint32_t
+{
+    Tarmac,
+    Kerb,
+    Grass,
+    Gravel,
+    Wall
+};
 
 // What a surface is worth to a tire, separately from where it is. Kept beside the mesh rather than
 // baked into it because the tire model scales its own mu by this at runtime — the seam the deferred
@@ -50,7 +57,8 @@ export struct SurfaceMaterial
     SurfaceKind kind = SurfaceKind::Tarmac;
 };
 
-export enum class FeatureKind : std::uint32_t {
+export enum class FeatureKind : std::uint32_t
+{
     // A raised kerb parallel to the direction of travel, so a wheel can be run onto it at an angle
     // and half-mount it. This is the case single-ray contact gets visibly wrong.
     Kerb,
@@ -69,7 +77,16 @@ export enum class FeatureKind : std::uint32_t {
     // A wall down one side. The only feature that is not a height — a heightfield cannot express a
     // vertical face at all — so it is emitted as its own geometry after the grid, and it is the one
     // thing criterion 2's first half needs: something for a car to rest against.
-    Barrier
+    Barrier,
+    // A vertical step **across** the road at `from`, `stepHeight` tall, with a flat top to `to` and a
+    // vertical back face down again. The GCP kerb, as the kerb-contact path's fixtures need it: a
+    // face the bottom grid cannot see, met head-on. Emitted as a lid of its own geometry over the
+    // grid, for `Barrier`'s reason — the heightfield under it stays flat and is buried.
+    StepAcross,
+    // The same step **along** the road: its face at `kerbInnerEdge` facing the centreline, between
+    // `from` and `to`, its top out to the +x edge, capped at both ends. What a car sliding sideways
+    // meets with its sidewall. docs/kerb-contact-brief.md.
+    StepAlong
 };
 
 export struct Feature
@@ -95,6 +112,9 @@ export struct ProvingGroundDescriptor
     double kerbChamfer = 0.30;
     // Where the kerb's inner edge sits, measured from the centreline towards +x.
     double kerbInnerEdge = 3.0;
+
+    // Height of the vertical step features, metres. GCP's kerbs measured 148-154 mm.
+    double stepHeight = 0.15;
 
     // How far the grass sits below the tarmac at the boundary.
     double boundaryLip = 0.02;

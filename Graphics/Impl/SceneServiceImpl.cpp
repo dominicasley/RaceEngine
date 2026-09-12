@@ -154,9 +154,75 @@ std::expected<void, std::string> SceneService::setClouds(Scene& scene, const flo
     return {};
 }
 
+std::expected<void, std::string> SceneService::setSkyEyeStops(Scene& scene, const float stops) const
+{
+    // Bounded because it is a gain on the frame's brightest thing: four stops either way is a factor
+    // of sixteen, past which it is no longer the sky the probes lit the world with.
+    if (stops < -4.0f || stops > 4.0f)
+    {
+        return std::unexpected("the eye's sky stop is a number of stops and lies between -4 and 4");
+    }
+
+    scene.skyEyeStops = stops;
+
+    return {};
+}
+
 void SceneService::setCloudMap(Scene& scene, const Resource<FboAttachment>& cloudMap) const
 {
     scene.cloudMap = cloudMap;
+}
+
+void SceneService::setMirrorMap(Scene& scene, const Resource<FboAttachment>& mirrorMap) const
+{
+    scene.mirrorMap = mirrorMap;
+}
+
+std::expected<void, std::string> SceneService::setMirrorExposure(Scene& scene, const float scale) const
+{
+    // A ratio of two exposures: non-negative, and finite because the shader multiplies radiance by
+    // it. The negated comparison is what catches a NaN.
+    if (!(scale >= 0.0f) || scale > 1e6f)
+    {
+        return std::unexpected("the mirror exposure scale is a ratio of two exposures and has to be a finite, "
+                               "non-negative number");
+    }
+
+    scene.mirrorExposureScale = scale;
+
+    return {};
+}
+
+std::expected<void, std::string> SceneService::setMirrorView(Scene& scene, const glm::vec3& direction,
+                                                             const glm::vec3& up, const float tanHalfWidth,
+                                                             const float tanHalfHeight) const
+{
+    // The shader normalises the direction, projects the up off it and divides by both tangents, so
+    // each has to be something those operations survive. The negated comparisons catch a NaN.
+    if (!(glm::dot(direction, direction) > 1e-12f) || !(glm::dot(up, up) > 1e-12f))
+    {
+        return std::unexpected("the mirror view's direction and up both need a length");
+    }
+
+    const auto forward = glm::normalize(direction);
+    const auto sideways = up - forward * glm::dot(up, forward);
+
+    if (!(glm::dot(sideways, sideways) > 1e-12f))
+    {
+        return std::unexpected("the mirror view's up lies along its direction");
+    }
+
+    if (!(tanHalfWidth > 0.0f) || tanHalfWidth > 1e3f || !(tanHalfHeight > 0.0f) || tanHalfHeight > 1e3f)
+    {
+        return std::unexpected("the mirror view's half-field tangents have to be positive, finite numbers");
+    }
+
+    scene.mirrorDirection = forward;
+    scene.mirrorUp = glm::normalize(sideways);
+    scene.mirrorTanHalfWidth = tanHalfWidth;
+    scene.mirrorTanHalfHeight = tanHalfHeight;
+
+    return {};
 }
 
 std::expected<void, std::string> SceneService::setRainMotion(Scene& scene, const float groundSpeed,

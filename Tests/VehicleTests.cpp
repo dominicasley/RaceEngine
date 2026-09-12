@@ -124,14 +124,21 @@ TEST_CASE("a travel stop's hysteresis is the loop the material publishes and not
     {
         // The pre-hysteresis force law, written out: adding a literal +0.0 to a non-negative term
         // cannot change a bit, and this is the assertion that keeps that from being folklore.
+        //
+        // The viscous share is `damping` scaled by the stop's own tangent stiffness since
+        // 2026-09-08 (docs/stop-element-brief.md), `(past / gap)^(p−1)`; at zero velocity the law
+        // is the elastic term alone, to the bit, on both sides of that date.
         for (const auto past : {0.001, 0.005, 0.02, 0.04})
         {
             for (const auto velocity : {-0.5, -0.01, 0.0, 0.01, 0.5})
             {
                 const auto elastic = plain.rate * std::pow(past, plain.progression) /
                                      std::pow(std::max(plain.gap, 1e-6), plain.progression - 1.0);
-                REQUIRE(plain.force(past, velocity) == std::max(0.0, elastic + plain.damping * velocity));
+                const auto coefficient = plain.damping * std::pow(past / plain.gap, plain.progression - 1.0);
+                REQUIRE(plain.force(past, velocity) == std::max(0.0, elastic + coefficient * velocity));
             }
+
+            REQUIRE(plain.force(past, 0.0) == plain.elasticForce(past));
         }
     }
 
@@ -166,14 +173,16 @@ TEST_CASE("a travel stop's hysteresis is the loop the material publishes and not
 
     SECTION("it cannot spike on entry and cannot trip the push-only clamp on release")
     {
-        // The viscous term at 0.5 m/s is 10 kN before the stop has stored a single joule; the
-        // hysteresis scales with the elastic force, so it arrives with the material and not with
-        // the impact.
+        // The hysteresis scales with the elastic force, so it arrives with the material and not
+        // with the impact. Until 2026-09-08 the viscous term beside it did not — 10 kN at 0.5 m/s
+        // before the stop had stored a single joule — and this line asserted that contrast. The
+        // viscous share now scales with the stop's tangent stiffness and arrives the same way
+        // (docs/stop-element-brief.md); both are asserted continuous.
         auto pure = TravelStop{.gap = 0.04, .rate = 300000.0, .progression = 2.5, .damping = 0.0};
         pure.hysteresis = 0.07;
 
         REQUIRE(pure.force(1e-9, 0.5) < 1.0);
-        REQUIRE(plain.force(1e-9, 0.5) > 9000.0);
+        REQUIRE(plain.force(1e-9, 0.5) < 1.0);
 
         // Releasing at any speed, the factor is 1 - h and the stop still pushes.
         const auto releasing = pure.force(0.02, -5.0);

@@ -111,6 +111,9 @@ constexpr auto gravity = 9.80665;
         text += ",Tyre Pressure " + tag + " [psi]";
         text += ",Disc Temp " + tag + " [C]";
         text += ",Wheel Temp " + tag + " [C]";
+        text += ",Obstacle Contacts " + tag + " []";
+        text += ",Obstacle Force " + tag + " [N]";
+        text += ",Obstacle Elevation " + tag + " [deg]";
     }
 
     text += "\n";
@@ -242,6 +245,12 @@ constexpr auto gravity = 9.80665;
             appendNumber(text, wheel.discTemperature, 2);
             text += ",";
             appendNumber(text, wheel.wheelTemperature, 2);
+            text += ",";
+            appendInteger(text, static_cast<long long>(wheel.obstacleContacts));
+            text += ",";
+            appendNumber(text, wheel.obstacleNormalForce, 2);
+            text += ",";
+            appendNumber(text, wheel.obstacleAxisElevation * radiansToDegrees, 3);
         }
 
         text += "\n";

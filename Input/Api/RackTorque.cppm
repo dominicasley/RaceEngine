@@ -530,6 +530,34 @@ export struct WheelTrace
     // separates "the driver asked for full pressure" from "the wheel got it".
     double brakePressure = 0.0;
 
+    // --- what the brake-recovery supervisor was doing at this wheel (2026-09-07) -----------------
+    //
+    // **Added because the first two seat laps of the new architecture could only be read by its
+    // pressure signature.** A caliper sitting empty is the *symptom* the dry pathology shows; whether
+    // the supervisor refused the recovery, and on what evidence, was not in the trace at all, so a
+    // report of "it felt fine" and a report of "the gate never armed" looked identical. Same lesson
+    // as `ABS Fitted` and the XDS fitted/active pair, arriving a third time.
+
+    // The filtered road-action estimate, N·m of spin-up torque:
+    // `T_brake_commanded + I·dOmega/dt − T_drive`, median of the last few tooth crossings. Large and
+    // positive means the tyre is taking road force; near zero means it is not, whether because it is
+    // barely slipping or because it is barely loaded.
+    double roadTorque = 0.0;
+
+    // What the supervisor made of that. **0 UNKNOWN, 1 FREE, 2 LOADED** — an integer rather than the
+    // enum because this module is `raceengine.input` and naming `RoadEvidence` here would couple the
+    // trace format to the assist layer for one column. UNKNOWN is a stale or missing sample and it
+    // PERMITS recovery, so a lap full of zeroes here is a sensor story and not a controller one.
+    std::uint32_t roadEvidence = 0;
+
+    // The pair that is the whole point of these columns. `recoveryBanded` is the ECU's own belief
+    // that the wheel is past its slip band — the term that used to act unconditionally.
+    // `recoveryLimited` is whether the supervisor let that belief act. **Banded and not limited is a
+    // decision the architecture changed**, and counting those two columns against each other is how a
+    // lap says what the change did, without a shadow run.
+    bool recoveryBanded = false;
+    bool recoveryLimited = false;
+
     // The tread **core**'s temperature, degrees Celsius, joined 2026-08-28 with the thermal tyre.
     //
     // One column and not the three the telemetry CSV carries, because this file is the *seat's*
@@ -572,6 +600,18 @@ export struct WheelTrace
     // would otherwise write a trace indistinguishable from one without it — the exact defect the
     // gas pair above records. Exactly 0.0 on a car stating no coefficient.
     double recession = 0.0;
+
+    // --- the kerb-contact path (2026-09-07) -------------------------------------------------------
+    //
+    // How many obstacle faces the tyre's cylinder query kept on this wheel after the exclusion
+    // rule, the normal force they delivered in newtons, and the elevation of the largest one's axis
+    // above the horizon in radians. Joined WITH the mechanism, for `recession`'s reason: they are
+    // the only channels the path moves on a flat lap — exactly zero with `OSR_KERB_CONTACT=off`
+    // and on every flat-road tick with it on — so a trace can say whether it engaged, and at what
+    // angle a kerb met the tyre. docs/kerb-contact-brief.md.
+    std::uint32_t obstacleContacts = 0;
+    double obstacleNormalForce = 0.0;
+    double obstacleAxisElevation = 0.0;
 };
 
 export struct VehicleTrace
@@ -641,6 +681,13 @@ export struct VehicleTrace
 
     // 0 with the driver's foot untouched, 1 with the throttle shut.
     double engineTorqueReduction = 0.0;
+
+    // How much of the car's yaw the lateral-authority gate believes the driver did not ask for, 0 to
+    // 1 (2026-09-07). **Car-wide because the gate is**: it is the one part of the anti-lock
+    // controller that is not per-channel. Zero on a car going where it is pointed, and zero on every
+    // one of the gate's fallbacks — so a column of zeroes means "nothing to arbitrate", which on a
+    // uniform surface is the correct and expected reading.
+    double yawDisturbance = 0.0;
 
     std::array<WheelTrace, tracedCornerCount> wheels{};
 };
@@ -769,7 +816,7 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             "Ride Height F [mm],Ride Height R [mm],"
             "Throttle Pos [%],Brake Pos [%],Clutch Pos [%],Gear [],Engine RPM [rpm],"
             "ABS Fitted [],TC Mode [],TC Brake [],TC Engine [],XDS Fitted [],XDS Active [],"
-            "Yaw Delay Fitted [],Yaw Delay Active [],Engine Reduction [%]";
+            "Yaw Delay Fitted [],Yaw Delay Active [],Engine Reduction [%],Yaw Disturbance []";
 
     for (const auto* tag : tracedCornerAbbreviations)
     {
@@ -788,12 +835,19 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += ",ABS Active" + corner + " []";
         text += ",ABS Cycles" + corner + " []";
         text += ",Brake Pressure" + corner + " [bar]";
+        text += ",Road Torque" + corner + " [Nm]";
+        text += ",Road Evidence" + corner + " []";
+        text += ",Recovery Banded" + corner + " []";
+        text += ",Recovery Limited" + corner + " []";
         text += ",Tyre Temp Core" + corner + " [C]";
         text += ",Tyre Temp Gas" + corner + " [C]";
         text += ",Tyre Pressure" + corner + " [psi]";
         text += ",Disc Temp" + corner + " [C]";
         text += ",Wheel Temp" + corner + " [C]";
         text += ",Recession" + corner + " [mm]";
+        text += ",Obstacle Contacts" + corner + " []";
+        text += ",Obstacle Force" + corner + " [N]";
+        text += ",Obstacle Elevation" + corner + " [deg]";
     }
 
     text += "\n";
@@ -881,6 +935,8 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
         text += fitted.yawDelayEnabled ? ",1" : ",0";
         text += car.yawDelayActive ? ",1," : ",0,";
         appendRackNumber(text, car.engineTorqueReduction * 100.0, 3);
+        text += ",";
+        appendRackNumber(text, car.yawDisturbance, 4);
 
         // By index, in the order the header was written. Nothing here names a corner: the loop and
         // the header loop walk the same array, so a mapping fault would have to be a fault in the
@@ -916,6 +972,11 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             // Bar, like every other pressure a person reads. The model carries pascals.
             appendRackNumber(text, wheel.brakePressure / 1.0e5, 3);
             text += ",";
+            appendRackNumber(text, wheel.roadTorque, 2);
+            text += ",";
+            appendRackInteger(text, static_cast<long long>(wheel.roadEvidence));
+            text += wheel.recoveryBanded ? ",1" : ",0";
+            text += wheel.recoveryLimited ? ",1," : ",0,";
             appendRackNumber(text, wheel.treadCoreTemperature, 2);
             text += ",";
             appendRackNumber(text, wheel.gasTemperature, 2);
@@ -927,6 +988,12 @@ export [[nodiscard]] inline std::string rackTorqueToCsv(const std::vector<RackTo
             appendRackNumber(text, wheel.wheelTemperature, 2);
             text += ",";
             appendRackNumber(text, wheel.recession * 1000.0, 3);
+            text += ",";
+            appendRackInteger(text, static_cast<long long>(wheel.obstacleContacts));
+            text += ",";
+            appendRackNumber(text, wheel.obstacleNormalForce, 2);
+            text += ",";
+            appendRackNumber(text, wheel.obstacleAxisElevation * rackRadiansToDegrees, 3);
         }
 
         text += "\n";

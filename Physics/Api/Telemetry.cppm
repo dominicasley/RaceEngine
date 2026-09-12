@@ -161,6 +161,18 @@ export struct WheelTelemetry
     // its own column rather than being inferred, because the whole question stage 3 answers is how
     // much of the disc's heat gets past it, and the answer is a temperature between two others.
     double wheelTemperature = 0.0;
+
+    // --- the kerb-contact path (2026-09-07) ---
+    //
+    // How many obstacle faces the cylinder query kept on this wheel after the exclusion rule, the
+    // normal force they delivered in newtons, and the elevation of the largest one's axis above the
+    // horizon in radians. All three read exactly zero with `VehicleSetup::kerbContact` off and on
+    // every flat-road tick with it on — which is how a trace answers "did it engage", the question
+    // every channel added after its mechanism has been added too late for.
+    // docs/kerb-contact-brief.md.
+    std::uint32_t obstacleContacts = 0;
+    double obstacleNormalForce = 0.0;
+    double obstacleAxisElevation = 0.0;
 };
 
 export struct TelemetryFrame

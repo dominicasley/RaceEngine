@@ -1,7 +1,9 @@
 module;
 
+#include <cstddef>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -11,6 +13,7 @@ module raceengine.audio:SilentAudioBackend;
 import :AudioBackend;
 import :CarAudio;
 import :SoundBank;
+import :TrafficAudio;
 
 namespace raceengine
 {
@@ -53,6 +56,25 @@ public:
     }
 
     [[nodiscard]] std::vector<std::string> declaredParameters() const override
+    {
+        return {};
+    }
+
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    loadTrafficFleet(std::span<const TrafficBank>, std::size_t) override
+    {
+        return std::vector<std::string>{};
+    }
+
+    void updateTraffic(const AudioListener&, std::span<const TrafficVoice>) override
+    {
+    }
+
+    void unloadTrafficFleet() override
+    {
+    }
+
+    [[nodiscard]] std::expected<void, std::string> loadSiren(const std::string&) override
     {
         return {};
     }

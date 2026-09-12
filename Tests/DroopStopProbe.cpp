@@ -574,7 +574,9 @@ TEST_CASE("the droop stop against the corner's own integrator", "[.droop-static]
 
     std::printf("\n=== numerical margin at the droop stop's stiffest reachable point ===\n");
     std::printf("  Same analysis as [.stop-static]'s: the corner steps rate += (F/m) dt then divides\n");
-    std::printf("  by (1 + (c_damper/m) dt), and BOTH halves of the stop ride F explicitly.\n");
+    std::printf("  by (1 + (c_damper/m) dt). Until 2026-09-08 BOTH halves of the stop rode F explicitly;\n");
+    std::printf("  the viscous rows below are that scheme's bound. The viscous term is now in the divisor\n");
+    std::printf("  and scaled by the tangent stiffness (docs/stop-element-brief.md).\n");
 
     for (const auto& axle : axles)
     {

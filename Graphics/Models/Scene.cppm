@@ -61,6 +61,14 @@ export struct SceneNode
 // cascades are fitted against; shading still reads `position` as the direction *towards* the
 // light, exactly as it always has, so the two must be opposites of each other for a shadow to land
 // where the shading says it should.
+//
+// A point light is shaded as one since 2026-09-11 (docs/vulkan-abi.md, *Lights*): `position` is
+// where it stands, in world units; `attenuation` is its range — the radius, in world units, at which
+// its light is exactly zero — and inside that sphere its `diffuse` and `specular` fall off as the
+// inverse square of the distance in world units, so they are stated as the light one world unit
+// away. It casts no shadow and is never the light the cascades follow, and a light probe capture
+// leaves it out: a probe photographs the world, and a lamp that moves or flashes would be baked into
+// an environment shaded from for many frames afterwards.
 export enum class LightType { Point, Directional };
 
 export struct Light
@@ -77,6 +85,10 @@ export struct Light
     float attenuation = 1.0f;
     glm::vec3 color{};
     float strength{};
+    // Off is not uploaded at all: no fragment spends an iteration on it, and the lights after it
+    // close up (the cascades' light is found by identity, never by its index in this deque). It is
+    // how a lamp that flashes costs the frame nothing between flashes.
+    bool enabled = true;
 };
 
 // How a camera turns view space into clip space. Perspective is the default and the only one any
@@ -251,6 +263,14 @@ export struct AmbientOcclusion
     // view's rasteriser, which no sampler handle can prove. False leaves the depth DONT_CARE, which
     // is what it was for as long as nothing but the prepass itself read it.
     bool shareDepth = false;
+    // Which layers the prepass records, tested against RenderableEntity::layers exactly as a
+    // camera's own mask is. Every layer by default, whatever the shading camera's own mask says —
+    // the prepass states what exists, not what one view shades, and under a layered frame one
+    // gather serves every layer (recordAmbientOcclusion carries why). A game narrows it for the one
+    // case "every layer" is wrong: a layer whose contents stand in for something the frame already
+    // draws — the traffic's capped level of detail, drawn by the mirror view alone — would put a
+    // second surface into the shared depth and z-reject the first.
+    unsigned int layerMask = ~0u;
 };
 
 // Occlusion culling: the draw walk skipping geometry that the frame's own prepass has already
@@ -518,6 +538,15 @@ export struct Camera
     // own push constant — the rain falling in the world is visible through the windscreen whatever
     // this view's surfaces shade as.
     float rainScale = 1.0f;
+    // How this view reads the scene's cascade split distances: the shader picks a cascade by the
+    // fragment's depth in front of *this* eye against the splits, and the splits were measured
+    // along the eye the cascades were fitted to. One for that eye and for every view sharing its
+    // axis, which is every camera a layered frame is made of. A view looking the other way — the
+    // driver's mirror — sits inside the same maps, because a frustum slice's bounding sphere reaches
+    // back past the eye by about half its far split, and this scale is what turns its own depth
+    // into a cascade whose map reaches that far (docs/driver-mirrors-brief.md). Read only where the
+    // frame block is filled; a multiply by one is bit-identical.
+    float shadowSplitScale = 1.0f;
 };
 
 export enum class RenderableEntityType {
@@ -592,6 +621,13 @@ export struct RenderableModel : public RenderableEntity
     // so a game recolours a car by writing this on the car it already holds, and two cars built from
     // one model are two colours. Disabled by default, which is every renderable that is not a car.
     Paint paint{};
+    // Four numbers of this renderable's own, handed to every shader that draws it as the per-draw
+    // block's `signal` (docs/vulkan-abi.md, set 2) and read by the shaders that state a meaning for
+    // them; every other shader declares nothing of it. Per renderable for the reason paint is: two
+    // cars from one model must be able to say different things. Today's one reader is the police
+    // light bar (the sandbox's `beacon` shader): x and y are what its red and its blue side are
+    // emitting this frame.
+    glm::vec4 signal{0.0f};
     // The shader this instance was created with. Materials live in shared storage, so the
     // choice cannot be written through to them without one instance rewriting another's.
     Resource<Shader> shader;
@@ -730,12 +766,41 @@ export struct Scene
     // bit-for-bit the renderer that has no clouds in it at all — every shader's clouds are one
     // branch on the frame block's coverage lane.
     Clouds clouds{};
+    // How many stops darker the sky is drawn for the EYE than for the probes (2026-09-12): the
+    // landscape photographer's graduated filter. The meter exposes the street and opens the outdoor
+    // dial over it, which lands a sky that is physically bright — 0.7 of a sunlit grey at the zenith
+    // — past the tone curve's ceiling, where the per-channel curve prints it white. A probe capture
+    // ignores this and photographs the true sky, so the world's ambient light does not move with it.
+    // Zero is bit-for-bit the sky before it existed. The skybox shader alone reads it, as the gain
+    // 2^-stops in the frame block's cloudParams.z, written one in a capture.
+    float skyEyeStops = 0.0f;
     // The dome map those clouds are marched into — written at the end of the world camera's chain,
     // composited by the skybox and photographed by the probes. Stated on the scene rather than
     // found by the backend because which attachment is the cloud map is the game's to say, exactly
     // as a camera's output is. Unset binds the 1x1 white dummy, which the coverage branch above
     // keeps unread.
     std::optional<Resource<FboAttachment>> cloudMap{};
+    // The driver's mirror — the rear-facing mirror camera's colour attachment, drawn into earlier in
+    // the same frame and sampled by the one material that is a mirror, on the terms the cloud map
+    // is: stated by whoever built that camera, bound to every shading view, and the 1x1 white dummy
+    // where unset (the mirror shader reads the frame block's mirrorParams.y before it samples).
+    std::optional<Resource<FboAttachment>> mirrorMap{};
+    // What the mirror's radiance is multiplied by before it reaches the surface, so a mirror in a
+    // cabin exposed by its own meter shows the world at the world's exposure: under split metering
+    // the composite lays the world over the frame at worldExposure / frameExposure, and the mirror
+    // surface — car-layer geometry laid over at one — owes the world seen in it the same ratio. One
+    // is a frame with one meter, which is every view but the cockpit.
+    float mirrorExposureScale = 1.0f;
+    // The mirror camera's view, restated here for the shading views that draw the glass: where it
+    // looks and which way is up for it, in world space, and the tangents of its half fields of view
+    // across and down — the four numbers that turn a direction reflected off a curved glass into a
+    // place on the mirror map (docs/driver-mirrors-brief.md §6). Stated per tick by whoever aims the
+    // camera, on the terms the exposure ratio is; a flat glass reads none of it. The default is a
+    // view along nothing, which is why the shader tests the direction's length before it divides.
+    glm::vec3 mirrorDirection{0.0f};
+    glm::vec3 mirrorUp{0.0f, 1.0f, 0.0f};
+    float mirrorTanHalfWidth = 1.0f;
+    float mirrorTanHalfHeight = 0.5f;
 };
 
 } // namespace raceengine

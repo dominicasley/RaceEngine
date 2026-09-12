@@ -667,6 +667,20 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // and the way back, re-stamped on every setup-sheet reload. docs/tyre-state-brief.md, section 7.
     setup.tyrePressure = true;
 
+    // **The kerb-contact path is ON, since 2026-09-08, on the brief's own rule** — each tyre also
+    // collided against the road as a cylinder so that a kerb *face* can push on it
+    // (docs/kerb-contact-brief.md). It went on the moment the stage 2 inertness fixture showed
+    // flat, banked and 9.46 degree chamfered road **bit-identical** with it on and off, over
+    // 9000 ticks and 368,000 road triangles seen, which is what the switch had to prove first.
+    //
+    // **Both parity gates held with it on (0 of 32400 each), the smoke gate passed, and it was
+    // driven and accepted by Dominic the same day.** If a golden ever moves under it, the exclusion
+    // rule is wrong and this goes back to false — not a bless. What the fixtures say it does at a
+    // 150 mm face at 33 kph is in the brief's 2026-09-08 entry and in docs/known-red.md, and it is
+    // violent: the bump stop is still the amplifier. `OSR_KERB_CONTACT=off` is the control and the
+    // way back, re-stamped on every setup-sheet reload.
+    setup.kerbContact = true;
+
     // car.ini CONTROLS: the steering wheel's lock in degrees each way, and the ratio between it and
     // the road wheel. The travel that produces that angle is solved off the linkage below.
     //
@@ -702,25 +716,33 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     // not attitude. Scaling `springRate` on an already-built car does the opposite, which is how a
     // probe briefly credited this change with fixing the rear wheel lift that it does not fix.
     //
-    // **HELD, NOT ADOPTED — and the reason is the whole argument for holding it.** Fitting the wheel
-    // rates above breaks a criterion that was derived from the real car: the **skidpad falls to
-    // 0.883 g against a 0.90-0.95 band** taken from a Mk7 GTI on OEM tyres, which is the measurement
-    // this car's tyre grip was itself set against (`grip-set-without-circularity`).
+    // **HELD, NOT ADOPTED from 2026-08-24 to 2026-09-08 — then ADOPTED at 28000 on the seat.** The
+    // reason it was held is still true and is written next: fitting a softer rear breaks a criterion
+    // that was derived from the real car — the **skidpad falls below its 0.90-0.95 band** — because
+    // with the anti-roll bars held at AC's numbers the roll-stiffness distribution moves forward, and
+    // a front-drive car with two thirds of its roll couple on the front axle understeers into its
+    // limit. The bars are AC's numbers too and their real rates could not be sourced
+    // (`golf-arb-rates-cannot-be-sourced`), so re-deriving them alongside is not a free move.
     //
-    // The mechanism is not grip, it is balance. Softening the rear by 68% while the anti-roll bars
-    // stay put moves the roll-stiffness distribution from **49.7% front to 67.2%**, and a
-    // front-drive car with two thirds of its roll couple on the front axle understeers into its
-    // limit. The bars are AC's numbers too and would have to be re-derived alongside — which is a
-    // second unverified figure to lean on, not a free move.
+    // **And the rear motion ratio is still the number a Golf value turns on**, and it is still
+    // unsourced (`rear-motion-ratio-cannot-be-sourced`). 28000 is not that value. It is the arm of
+    // `docs/rear-spring-sensitivity-brief.md` (2026-09-08) that Dominic drove and preferred — *"it
+    // felt better fwiw"*, unblinded, one session, not back-to-back with 57 — from a study that swept
+    // the effective rear wheel rate over 57 / 42 / 28 / 20 / 14 kN/m with everything else held and
+    // found a CLEAR INTERIOR REGION of 28-42. At 28 the rear/front ride ratio reaches the road-car
+    // convention (1.15 against the shipped 1.53-1.60), rear seat acceleration on a rough road falls
+    // 18 %, rear tyre-load variation 10 %, braking pitch overshoot 75 -> 46 %. Against that the roll
+    // gradient rises 2.45 -> 2.77 deg/g, the skidpad peak falls 1.9 % to **0.883 g and the criterion
+    // goes red** (`docs/known-red.md`), the rear body mode is damped 0.76 on a damper sized for 57,
+    // the rear droop stop is touched for a second of an ordinary 0.83 g stop, and by the study's
+    // statics a full-throttle launch puts the rear on its bump stop. Those are the coupled families
+    // this number was chosen without — the rear damper, the bars, both stop gaps — and they are the
+    // next work, not this line.
     //
-    // **And the rear motion ratio is the number the whole thing turns on.** At the source's 0.64 the
-    // rear ride frequency comes to 1.39 Hz; at 0.78 it would be 1.70, which is a sporty hatchback
-    // and leaves the balance nearly alone. A 0.14 difference in an unverified motion ratio is the
-    // difference between a car that passes its own skidpad and one that does not.
-    //
-    // So this stays on AC's figures until the rear motion ratio is confirmed, and the ride-frequency
-    // anomaly is recorded rather than acted on. `docs/known-red.md`.
-    const auto wheelRate = std::array{35000.0, 35000.0, 57000.0, 57000.0};
+    // The way back is `OSR_REAR_WHEEL_RATE=57000`, which restates this spring exactly as the study
+    // did; the car it gives is the one every measurement in `docs/` older than 2026-09-08 was taken
+    // on, its rear at 2.26 Hz (`docs/suspension-characterisation-brief.md`).
+    const auto wheelRate = std::array{35000.0, 35000.0, 28000.0, 28000.0};
     const auto bumpRate = std::array{4600.0, 4600.0, 6200.0, 6200.0};
     const auto fastBumpRate = std::array{1834.0, 1834.0, 1842.0, 1842.0};
     const auto bumpKnee = std::array{0.070, 0.070, 0.100, 0.100};
@@ -939,6 +961,30 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
         // and is not modelled here.
         corner.tireVerticalRate = 298926.0;
         corner.tireVerticalDamping = 500.0;
+
+        // --- the kerb-contact path's three numbers (docs/kerb-contact-brief.md, ledger) ---
+        //
+        // **Section width: sourced.** 225/40 R18 is this car's factory fitment and the size every
+        // tyre figure above is quoted for; 225 is its nominal section width in millimetres. It is
+        // the width of the cylinder the path collides against the road, sidewall to sidewall, and
+        // is deliberately not `tyres.ini`'s WIDTH of 0.235, which is the tread band the bottom grid
+        // samples (`setup.sampling.width`).
+        corner.tyreSectionWidth = 0.225;
+
+        // **Lateral carcass rate: PLACEHOLDER.** No lateral measurement of a 225/40 R18 was found
+        // (2026-09-07: one search session, the paywalled and the open sources both). What was
+        // found is one published static measurement of eleven used 12-14 inch tyres (Kulikowski &
+        // Szpica, Eksploatacja i Niezawodnosc 16(1), 2014) averaging lateral 65 N/mm against radial
+        // 180 — a ratio of 0.36 — and that ratio applied to this tyre's own vertical rate is what
+        // stands here. It is a class transfer from a smaller, older tyre and is graded as such;
+        // the sidewall's own contacts are the only thing that reads it.
+        corner.tireLateralRate = 0.36 * 298926.0;
+
+        // **Sidewall friction: PLACEHOLDER.** No measurement of sidewall rubber on concrete was
+        // found; tread rubber on dry concrete slides at 0.6-0.9 in the road-friction literature and
+        // this sits inside that band. The tread's own coefficient on the same path is the
+        // longitudinal peak below times the surface's grip.
+        corner.sidewallFriction = 0.7;
         corner.wheelInertia = 1.45;
         corner.rollingResistance = 0.012;
 
@@ -1439,7 +1485,461 @@ inline constexpr auto rpmToRadiansPerSecond = 0.10471975511965977;
     assists.cornering.frontTrack = golfFrontTrack;
     assists.cornering.rearTrack = golfRearTrack;
 
+    // --- what the brake-recovery supervisor and the lateral-authority gate are calibrated with ---
+    //
+    // **Every one of these is either the car's own authored number or common public data**, which is
+    // the whole fleet claim of `docs/abs-architecture-design.md`: no K&C testing, no damper dyno, no
+    // proprietary OE calibration.
+
+    // The ECU's figure for a wheel's rotational inertia, kg.m^2. Taken from the car that was just
+    // built for the same reason the brake calibration above is — a second statement of a number that
+    // already has an owner is a number that diverges unnoticed. It is ARCHETYPE-ESTIMABLE and
+    // measured to be so: swept from half to twice the plant's value the dry ensemble does not move.
+    const auto inertias = wheelInertias(setup);
+    auto inertia = 0.0;
+    for (const auto corner : inertias)
+    {
+        inertia += corner / static_cast<double>(cornerCount);
+    }
+    assists.antilock.wheelInertia = inertia;
+
+    // The bicycle reference's geometry. The wheelbase is the car's own; the steering ratio is
+    // **AC's `car.ini` CONTROLS `STEER_RATIO` and VW's published overall ratio for this car**, and it
+    // is signed because this linkage's steering arm sits behind the kingpin (see `golfGtiMk7()`).
+    assists.antilock.stability.wheelbase = golfWheelbase;
+    assists.antilock.stability.steeringRatio = -14.1;
+
+    // The speed below which the gate is neutral, **derived and not chosen**: one tooth pitch at the
+    // tyre over the reference estimator's own averaging window. Below it a wheel produces fewer than
+    // one crossing per interval and neither the speed nor the yaw reference means anything.
+    const auto toothPitch = assists.toneRing.teeth > 0
+                                ? 2.0 * 3.14159265358979323846 * assists.reference.nominalRadius /
+                                      static_cast<double>(assists.toneRing.teeth)
+                                : assists.reference.nominalRadius;
+    assists.antilock.stability.speedFloor =
+        assists.reference.rateSmoothing > 0.0 ? toothPitch / assists.reference.rateSmoothing : 0.0;
+
     // One ECU, one clock, as on the car.
+    assists.antilock.controlRate = assists.controlRate;
+    assists.traction.controlRate = assists.controlRate;
+    assists.cornering.controlRate = assists.controlRate;
+
+    return assists;
+}
+
+} // namespace raceengine
+
+// --- the police car (docs/police-pursuit-brief.md) ---------------------------------------------
+//
+// Everything below is `mpw_police_dodge_charger_street`'s own data, read out of the JSON
+// `~/dev/ac-car-data` wrote beside its meshes, and **taken on trust** (2026-09-09). Where the Golf's
+// file says "the Nth number taken away from the mod", this one says nothing, because nothing has
+// been checked against the car: the two things that are not the file's are said so at the line.
+
+namespace raceengine
+{
+
+[[nodiscard]] CornerHardpoints chargerPoliceFrontCorner(const CornerSide side)
+{
+    const auto mirror = outboardSign(side);
+    const auto at = [mirror](const double x, const double y, const double z)
+    {
+        return glm::dvec3(mirror * (0.5 * chargerFrontTrack - x), y + chargerTyreRadius, z + chargerFrontAxle);
+    };
+
+    // suspensions.ini [FRONT], TYPE=STRUT. The strut's lower end is the ball joint, WBTYRE_BOTTOM;
+    // the file's STRUT_TYRE names a point 127 mm above it on the same upright, which this model's
+    // strut — a line from the top mount to the ball joint — does not need.
+    auto corner = CornerHardpoints{};
+    corner.side = side;
+    corner.kind = SuspensionKind::MacPhersonStrut;
+
+    corner.lower = Wishbone{.frontPivot = at(0.47, -0.13, 0.004),
+                            .rearPivot = at(0.47, -0.13, -0.33),
+                            .ballJoint = at(0.055, -0.145, 0.032)};
+    corner.strutTop = at(0.17, 0.5657724, -0.036141);
+    // WBCAR_STEER is the inner tie rod end and WBTYRE_STEER the steering arm — both a tenth of a
+    // metre *ahead* of the wheel centre, so this is a front-steer rack and turns the opposite way to
+    // the Golf's for the same rack travel. `rackTravelForSteer` reads that off the linkage.
+    corner.steeringRackOuter = at(0.47, -0.13, 0.1);
+    corner.steeringArm = at(0.0485, -0.145, 0.1);
+    corner.wheelCentre = at(0.0, 0.0, 0.0);
+    corner.wheelRadius = chargerTyreRadius;
+
+    // The linkage's range, radians of lower arm: generous either way, and outside the stops the
+    // file states below (BUMPSTOP_UP 0.070, BUMPSTOP_DN 0.120), so the stops and not the clamp end
+    // the travel. On a 0.415 m arm these are about 155 mm of droop and 125 of bump at the wheel.
+    corner.droopAngle = -0.38;
+    corner.bumpAngle = 0.30;
+
+    return corner;
+}
+
+[[nodiscard]] CornerHardpoints chargerPoliceRearCorner(const CornerSide side)
+{
+    const auto mirror = outboardSign(side);
+    const auto at = [mirror](const double x, const double y, const double z)
+    {
+        return glm::dvec3(mirror * (0.5 * chargerRearTrack - x), y + chargerTyreRadius, z + chargerRearAxle);
+    };
+
+    // suspensions.ini [REAR], TYPE=AXLE — a live axle on four links, which this model has no element
+    // for. **The double-wishbone points the same file states beside it are read instead**, which is
+    // the one structural liberty taken with this car: AC ignores them for an AXLE, so they are the
+    // author's leftover rather than the author's intent. Their inboard pivots sit half a metre past
+    // the car's centreline — arms 1.1 to 1.4 m long — which is what makes the wheel travel nearly
+    // vertical with little camber change, and that is also what a live axle does in one-wheel bump,
+    // so the leftover is not a bad stand-in. Reported here so nobody reads it as a measured Charger.
+    auto corner = CornerHardpoints{};
+    corner.side = side;
+
+    corner.lower = Wishbone{.frontPivot = at(1.37702, -0.15686, 0.3042),
+                            .rearPivot = at(1.47702, -0.11686, -0.1154),
+                            .ballJoint = at(0.04602, -0.15706, 0.0187)};
+    corner.upper = Wishbone{.frontPivot = at(1.20842, -0.0557, 0.2214),
+                            .rearPivot = at(1.2680, -0.0594, 0.0308),
+                            .ballJoint = at(0.06622, 0.1207, -0.0065)};
+    corner.steeringRackOuter = at(1.47702, -0.11686, -0.1154);
+    corner.steeringArm = at(0.04602, -0.15706, -0.1154);
+    corner.wheelCentre = at(0.0, 0.0, 0.0);
+    corner.wheelRadius = chargerTyreRadius;
+
+    // No damper points for a wishbone, as on the Golf and for the same reason: placed on the ball
+    // joint, straight up, so the motion ratio is about one and the file's at-the-wheel rates pass
+    // through unchanged.
+    corner.damperWishbone = corner.lower.ballJoint;
+    corner.damperChassis = corner.lower.ballJoint + glm::dvec3(0.0, 0.40, 0.0);
+
+    // On a 1.3 m arm these are about 105 mm of droop and 130 of bump at the wheel, outside the
+    // file's stops (BUMPSTOP_UP 0.0945, BUMPSTOP_DN 0.0555).
+    corner.droopAngle = -0.08;
+    corner.bumpAngle = 0.10;
+
+    return corner;
+}
+
+[[nodiscard]] std::expected<VehicleSetup, std::string> dodgeChargerPolice()
+{
+    auto setup = VehicleSetup{};
+
+    setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].hardpoints = chargerPoliceFrontCorner(CornerSide::Left);
+    setup.corners[static_cast<std::size_t>(Corner::FrontRight)].hardpoints = chargerPoliceFrontCorner(CornerSide::Right);
+    setup.corners[static_cast<std::size_t>(Corner::RearLeft)].hardpoints = chargerPoliceRearCorner(CornerSide::Left);
+    setup.corners[static_cast<std::size_t>(Corner::RearRight)].hardpoints = chargerPoliceRearCorner(CornerSide::Right);
+
+    // --- the mass ledger, on the Golf's own construction ---
+    const auto unsprung = 2.0 * chargerFrontHubMass + 2.0 * chargerRearHubMass;
+    const auto sprungMass = chargerTotalMass - unsprung;
+
+    // car.ini GRAPHICS_OFFSET puts the graphics origin 0.56 m below the physics body, so the centre
+    // of gravity stands 0.56 m over the road; suspensions.ini CG_LOCATION 0.515 is the front share.
+    // Both the file's.
+    const auto centreHeight = 0.56;
+    const auto frontFraction = 0.515;
+    const auto centreStation = chargerWheelbase * (frontFraction - 0.5);
+    const auto centre = glm::dvec3(0.0, centreHeight, centreStation);
+    // AC's origin is its centre of gravity, and nothing here has moved it.
+    const auto acOrigin = centre;
+
+    const auto hubMass = [](const std::size_t index)
+    {
+        return index < 2 ? chargerFrontHubMass : chargerRearHubMass;
+    };
+
+    auto unsprungMoment = glm::dvec3(0.0);
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        unsprungMoment += hubMass(index) * setup.corners[index].hardpoints.wheelCentre;
+    }
+
+    const auto sprungCentre = (chargerTotalMass * centre - unsprungMoment) / sprungMass;
+
+    // car.ini INERTIA, the box whose inertia the whole car has: 1.794 x 1.476 x 4.861 m.
+    auto shell = glm::dmat3(0.0);
+    {
+        const auto box = glm::dvec3(1.794, 1.476, 4.861);
+        const auto twelfth = chargerTotalMass / 12.0;
+
+        shell[0][0] = twelfth * (box.y * box.y + box.z * box.z);
+        shell[1][1] = twelfth * (box.x * box.x + box.z * box.z);
+        shell[2][2] = twelfth * (box.x * box.x + box.y * box.y);
+
+        for (auto index = std::size_t{0}; index < cornerCount; index++)
+        {
+            shell -= offsetInertia(hubMass(index), setup.corners[index].hardpoints.wheelCentre - centre);
+        }
+
+        shell -= offsetInertia(sprungMass, sprungCentre - centre);
+    }
+
+    setup.sprung = {MassComponent{.mass = sprungMass, .centre = sprungCentre, .inertia = shell}};
+
+    // tyres.ini WIDTH.
+    setup.sampling.width = 0.245;
+
+    // --- aero, from aero.ini, each surface's table read at the ANGLE the file gives it ---
+    //
+    // BODY: CHORD 1.55 x SPAN 1.8, CD 0.3264 at 2 degrees, no lift. FRONT and REAR: lift only,
+    // CL_GAIN 0.70 and 0.80 on tables reading -0.2145 and -0.188 at 2 degrees — negative is lift in
+    // AC's convention and comes across with its sign turned over. The rear foil at 6 degrees: 0.30
+    // of downforce and 0.108 of drag on a quarter of a square metre. The two side fins are side
+    // drag, which this model has no term for.
+    const auto fromCentre = [&acOrigin](const double x, const double y, const double z)
+    {
+        return acOrigin + glm::dvec3(x, y, z);
+    };
+
+    setup.aero = {
+        AeroSurface{.centre = fromCentre(0.0, 0.2378685, -0.4667039), .dragArea = 0.3264 * 1.55 * 1.8, .liftArea = 0.0},
+        AeroSurface{.centre = fromCentre(0.0, -0.3801818, 2.414126), .dragArea = 0.0, .liftArea = 0.70 * 0.2145 * 1.0 * 1.70},
+        AeroSurface{.centre = fromCentre(0.0, -0.1987369, -2.499354), .dragArea = 0.0, .liftArea = 0.80 * 0.188 * 1.0 * 1.75},
+        AeroSurface{.centre = fromCentre(0.0, 0.6030679, -2.440898),
+                    .dragArea = 0.108 * 0.25 * 1.45,
+                    .liftArea = -0.30 * 0.25 * 1.45}};
+
+    // --- bodywork ---
+    //
+    // colliders.ini COLLIDER_0 is a floor slab 0.1 m thick centred 0.38 m under the centre of
+    // gravity, so its underside is 0.43 m under it: 0.13 m over the road, which is a Charger's sill
+    // — and under Grand City Parkway's 0.15 m kerb tops, so on the second seat (2026-09-09) the body
+    // met every kerb its tyres had already climbed as a wall, and the damage ledger wrote the car off
+    // for it. **The floor is a project placement at the Golf's clearance instead**, 0.25 m under
+    // the centre of gravity: a kerb reaches the tyres, which have their own contact for it, and not
+    // the body. The mod's own 0.43 is the way back. Length and height from the INERTIA box, width
+    // the front track plus a tyre.
+    const auto floor = centreHeight - 0.25;
+    const auto roof = 1.476;
+    setup.body = CollisionBox{.centre = glm::dvec3(0.0, 0.5 * (floor + roof), 0.0),
+                              .halfExtents = glm::dvec3(0.5 * (chargerFrontTrack + 0.245), 0.5 * (roof - floor), 0.5 * 4.861)};
+
+    // Not in the file. A patrol Charger is quoted a little over 130 mm; the same kind of placeholder
+    // as the Golf's.
+    setup.rideHeightReference = 0.135;
+
+    // The model switches, on the Golf's settings for the four it needs and off for the three thermal
+    // models: a patrol car that is a rigid body one moment and a full model the next has no history
+    // for a tread or a disc to carry, and the cheap tier it comes from has neither.
+    setup.geometricLoadPath = true;
+    setup.drivelineReaction = true;
+    setup.tyreThermal = false;
+    setup.brakeThermal = false;
+    setup.tyrePressure = false;
+    setup.kerbContact = true;
+
+    // car.ini CONTROLS: STEER_LOCK 450, STEER_RATIO 17. The rack is ahead of the axle here, so the
+    // ratio's sign is the linkage's to decide below.
+    const auto steerLock = 450.0;
+    const auto steerRatio = 17.0;
+    const auto roadWheelLock = std::abs(steerLock / steerRatio) * (3.14159265358979323846 / 180.0);
+
+    // suspensions.ini: the file's SPRING_RATE read as wheel rates, its dampers with their knees, and
+    // its anti-roll bars — the same reading the Golf's file first got, and the reading the mod was
+    // authored in. 75.5 kN/m on a 440 kg front corner is a 2.1 Hz ride, which is a car set up to be
+    // driven hard.
+    const auto wheelRate = std::array{75550.0, 75550.0, 55000.0, 55000.0};
+    const auto bumpRate = std::array{7500.0, 7500.0, 6000.0, 6000.0};
+    const auto fastBumpRate = std::array{5050.0, 5050.0, 3000.0, 3000.0};
+    const auto bumpKnee = std::array{0.065, 0.065, 0.100, 0.100};
+    const auto reboundRate = std::array{9500.0, 9500.0, 7135.0, 7135.0};
+    const auto fastReboundRate = std::array{10000.0, 10000.0, 4000.0, 4000.0};
+    const auto reboundKnee = std::array{0.110, 0.110, 0.100, 0.100};
+    const auto antiRoll = std::array{12000.0, 12000.0, 2000.0, 2000.0};
+
+    // brakes.ini MAX_TORQUE 3950 and FRONT_SHARE 0.67, read the way AC applies them: per wheel, the
+    // share on each front and its complement on each rear. Stated directly rather than derived from
+    // hardware, because no hardware for this car has been sourced; the hydraulics and the rear valve
+    // stay the model's defaults, which map the pedal linearly onto these.
+    const auto brakeTorque = std::array{3950.0 * 0.67, 3950.0 * 0.67, 3950.0 * 0.33, 3950.0 * 0.33};
+
+    const auto frontSprung = sprungMass * standardGravity * (sprungCentre.z - chargerRearAxle) / chargerWheelbase;
+    const auto rearSprung = sprungMass * standardGravity - frontSprung;
+    const auto sprungLoad = std::array{frontSprung / 2.0, frontSprung / 2.0, rearSprung / 2.0, rearSprung / 2.0};
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        auto& corner = setup.corners[index];
+
+        const auto spring = solveSpringKinematics(corner.hardpoints, springElementOf(corner.hardpoints), 0.0, 0.0);
+        const auto damper = solveDamperKinematics(corner.hardpoints, damperElementOf(corner.hardpoints), 0.0, 0.0);
+        if (!spring || !damper)
+        {
+            return std::unexpected("police charger corner " + std::string(cornerAbbreviation(static_cast<Corner>(index))) +
+                                   ": " + (spring ? damper.error() : spring.error()));
+        }
+
+        const auto springRatio = std::abs(spring->motionRatio);
+        corner.springRate = wheelRate[index] / (springRatio * springRatio);
+        corner.damper = kneedDamper(bumpRate[index], fastBumpRate[index], bumpKnee[index], reboundRate[index],
+                                    fastReboundRate[index], reboundKnee[index], *damper);
+        corner.antiRollRate = antiRoll[index];
+        corner.brakeTorque = brakeTorque[index];
+        corner.unsprungMass = hubMass(index);
+
+        // tyres.ini, the WDT compound the file defaults to: RATE, DAMP, ANGULAR_INERTIA, and
+        // ROLLING_RESISTANCE_0 read as the Golf's is.
+        corner.tireVerticalRate = 302840.0;
+        corner.tireVerticalDamping = 600.0;
+        corner.wheelInertia = 1.4;
+        corner.rollingResistance = 0.012;
+        corner.tyreSectionWidth = 0.245;
+        corner.tireLateralRate = 0.36 * 302840.0;
+        corner.sidewallFriction = 0.7;
+
+        // FZ0, LS_EXPY and LS_EXPX, on the Golf's reading of them.
+        corner.tyre.nominalLoad = 3750.0;
+        corner.tyre.lateralLoadSensitivity = 1.0 - 0.65;
+        corner.tyre.longitudinalLoadSensitivity = 1.0 - 0.70;
+
+        // **DY_REF 1.34 and DX_REF 1.36, scaled by the 0.87 the Golf's AC compound was scaled by —
+        // the one number here that is not the file's.** Both files state track-tyre peaks for road
+        // cars; the Golf's were brought to a published skidpad and this car has no such figure, so
+        // it takes the same scale rather than out-gripping the car it is chasing by a fifth.
+        corner.tyre.lateralPeak = 0.87 * 1.34;
+        corner.tyre.longitudinalPeak = 0.87 * 1.36;
+
+        // The Golf's longitudinal shape, which is the one this project has validated against a
+        // reference; the file states nothing about fall-off.
+        corner.tyre.longitudinalShape = 1.50;
+        corner.tyre.longitudinalCurvature = 0.0;
+        corner.tyre.longitudinalStiffness = 28.0;
+
+        // The thermal and pressure models are off above; their geometry is stated so a car that has
+        // them switched on later starts from the file's own size.
+        corner.tyre.thermal.outerRadius = chargerTyreRadius;
+        corner.tyre.thermal.rimRadius = 0.255;
+        corner.tyre.thermal.treadWidth = 0.245;
+        corner.tyre.pressure.coldPressure = (index < 2 ? 28.0 : 25.0) / psiPerPascal;
+        corner.tyre.pressure.coldReferenceTemperature = 20.0;
+        corner.tyre.pressure.idealPressure = (index < 2 ? 41.0 : 38.0) / psiPerPascal;
+
+        // The stops at the file's gaps — BUMPSTOP_UP / BUMPSTOP_DN, front and rear — on the Golf's
+        // element law, because AC's linear BUMP_STOP_RATE does not map onto this model's progressive
+        // one and the Golf's stop is the one the seat has accepted.
+        corner.bumpStop = TravelStop{.gap = index < 2 ? 0.070 : 0.0945, .rate = 900000.0, .progression = 3.0, .damping = 40000.0};
+        corner.droopStop = TravelStop{.gap = index < 2 ? 0.120 : 0.0555, .rate = 600000.0, .progression = 3.0, .damping = 30000.0};
+
+        const auto restLength = springFreeLengthForLoad(corner, sprungLoad[index]);
+        if (!restLength)
+        {
+            return std::unexpected("police charger: " + restLength.error());
+        }
+
+        corner.springFreeLength = restLength.value();
+
+        if (const auto validated = validateCornerSetup(corner); !validated)
+        {
+            return std::unexpected("police charger corner " + std::string(cornerAbbreviation(static_cast<Corner>(index))) +
+                                   ": " + validated.error());
+        }
+    }
+
+    const auto rackTravel =
+        rackTravelForSteer(setup.corners[static_cast<std::size_t>(Corner::FrontLeft)].hardpoints, roadWheelLock);
+    if (!rackTravel)
+    {
+        return std::unexpected("police charger: " + rackTravel.error());
+    }
+
+    setup.rackTravelPerInput = rackTravel.value();
+    setup.steeringLockToLock = chargerSteeringLockToLock * (3.14159265358979323846 / 180.0);
+
+    return setup;
+}
+
+[[nodiscard]] DrivelineSetup dodgeChargerPoliceDriveline()
+{
+    auto setup = DrivelineSetup{};
+
+    const auto atRpm = [](const double rpm, const double torque)
+    {
+        return glm::dvec2(rpm * rpmToRadiansPerSecond, torque);
+    };
+
+    // power.lut, and it is the final curve: the file states no turbo. 616 N.m at 4200, 436 bhp at
+    // 5700, which is a 6.4 litre HEMI's shape. A subset of the file's forty-seven points, the knees
+    // kept.
+    setup.engine.torque = Curve{.points = {atRpm(0.0, 371.0), atRpm(500.0, 314.0), atRpm(1000.0, 354.1),
+                                           atRpm(1500.0, 455.2), atRpm(2000.0, 517.7), atRpm(2500.0, 555.3),
+                                           atRpm(3000.0, 580.3), atRpm(3500.0, 598.1), atRpm(4000.0, 611.5),
+                                           atRpm(4200.0, 616.0), atRpm(4500.0, 613.2), atRpm(5000.0, 596.3),
+                                           atRpm(5500.0, 561.2), atRpm(5800.0, 535.4), atRpm(6000.0, 507.0),
+                                           atRpm(6500.0, 439.0), atRpm(6605.0, 421.99)}};
+
+    // engine.ini [ENGINE_DATA] and [COAST_REF].
+    setup.engine.inertia = 0.255;
+    setup.engine.idleSpeed = 945.0 * rpmToRadiansPerSecond;
+    setup.engine.limiterSpeed = 6605.0 * rpmToRadiansPerSecond;
+    setup.engine.coastTorque = 55.0;
+
+    // drivetrain.ini [GEARS]: five ratios on one FINAL of 3.5, reverse 2.8 as a magnitude.
+    setup.gearbox.ratios = {3.587, 2.022, 1.384, 1.000, 0.861};
+    setup.gearbox.finalDrive = 3.5;
+    setup.gearbox.finalDrivePerGear = {3.5, 3.5, 3.5, 3.5, 3.5};
+    setup.gearbox.reverseRatio = 2.8;
+
+    // The model's halfshafts through this car's final drive rather than the default's 4.17, on the
+    // Golf's own reasoning: 25000 / 3.5^2.
+    setup.compliance.stiffness = 2041.0;
+
+    // [CLUTCH] MAX_TORQUE 1450: the plate's clamp sized so its capacity is that, through the model's
+    // own 0.30 friction, 0.100 m radius and two faces. The default plate carries 480 N.m and would
+    // slip under this engine in top gear.
+    setup.coupling.kind = DriveCouplingKind::FrictionClutch;
+    setup.coupling.clutch.clampForce = 1450.0 / (0.30 * 0.100 * 2.0);
+
+    setup.autoClutch.launch.enabled = false;
+
+    // [TRACTION] TYPE=RWD and [DIFFERENTIAL] POWER 0.57, COAST 0.35, PRELOAD 10.
+    setup.driven = DrivenAxle::Rear;
+    setup.differential = clutchPackLsd(10.0, 0.57, 0.35);
+
+    return setup;
+}
+
+[[nodiscard]] AssistSetup dodgeChargerPoliceAssists(const VehicleSetup& setup)
+{
+    auto assists = AssistSetup{};
+
+    const auto fullPressure = brakeCircuitPressures(setup, 1.0);
+
+    for (auto index = std::size_t{0}; index < cornerCount; index++)
+    {
+        assists.maximumWheelPressure[index] = fullPressure[index];
+        assists.brakeTorquePerPressure[index] =
+            fullPressure[index] > 0.0 ? setup.corners[index].brakeTorque / fullPressure[index] : 0.0;
+    }
+
+    assists.reference.nominalRadius = chargerTyreRadius;
+
+    // Rear-wheel drive: the front pair is the road speed measurement.
+    const auto driven = std::array{false, false, true, true};
+    assists.reference.driven = driven;
+    assists.traction.driven = driven;
+
+    assists.traction.frontTrack = chargerFrontTrack;
+    assists.traction.rearTrack = chargerRearTrack;
+    assists.cornering.frontTrack = chargerFrontTrack;
+    assists.cornering.rearTrack = chargerRearTrack;
+
+    const auto inertias = wheelInertias(setup);
+    auto inertia = 0.0;
+    for (const auto corner : inertias)
+    {
+        inertia += corner / static_cast<double>(cornerCount);
+    }
+    assists.antilock.wheelInertia = inertia;
+
+    // car.ini STEER_RATIO, positive: this rack sits ahead of the axle (see the front corner).
+    assists.antilock.stability.wheelbase = chargerWheelbase;
+    assists.antilock.stability.steeringRatio = 17.0;
+
+    const auto toothPitch = assists.toneRing.teeth > 0
+                                ? 2.0 * 3.14159265358979323846 * assists.reference.nominalRadius /
+                                      static_cast<double>(assists.toneRing.teeth)
+                                : assists.reference.nominalRadius;
+    assists.antilock.stability.speedFloor =
+        assists.reference.rateSmoothing > 0.0 ? toothPitch / assists.reference.rateSmoothing : 0.0;
+
     assists.antilock.controlRate = assists.controlRate;
     assists.traction.controlRate = assists.controlRate;
     assists.cornering.controlRate = assists.controlRate;

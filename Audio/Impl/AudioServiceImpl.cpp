@@ -6,11 +6,15 @@
 // `raceengine`. Measurements and the rule: docs/build-times.md.
 module;
 
+#include <algorithm>
+#include <cctype>
+#include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +27,7 @@ import :AudioService;
 import :AudioBackend;
 import :CarAudio;
 import :SoundBank;
+import :TrafficAudio;
 
 namespace raceengine
 {
@@ -67,6 +72,7 @@ AudioService::AudioService(spdlog::logger& logger, AudioOptions options) :
 
 AudioService::~AudioService()
 {
+    unloadTrafficFleet();
     unloadCar();
 }
 
@@ -179,12 +185,19 @@ std::expected<void, std::string> AudioService::loadCar(const std::filesystem::pa
 
 void AudioService::update(const CarAudioState& state)
 {
-    if (!backend || !carLoaded)
+    // The fleet counts as something to update too: the backend's own tick lives in this call, and
+    // a city whose player car had no bank still has cars driving past in it.
+    if (!backend || (!carLoaded && !fleetLoaded))
     {
         return;
     }
 
     backend->update(state);
+
+    if (!carLoaded)
+    {
+        return;
+    }
 
     // Once, and only if something was refused. A bank whose parameters are named differently from the
     // ones being written is the single most likely reason a correctly loaded car is still silent, and
@@ -219,6 +232,165 @@ void AudioService::unloadCar()
     }
 
     carLoaded = false;
+}
+
+namespace
+{
+
+// `02_5_EngA_04364` is the exporter's `NN_` in front of the bank's own `5 EngA_04364` with its
+// space turned into an underscore. The ordinal is stripped so the classifier reads the bank's name;
+// the underscore for the space is one the classifier already splits on.
+[[nodiscard]] std::string sampleNameOf(const std::string& stem)
+{
+    const auto underscore = stem.find('_');
+    if (underscore == std::string::npos || underscore == 0)
+    {
+        return stem;
+    }
+
+    const auto ordinal = std::all_of(stem.begin(), stem.begin() + static_cast<std::ptrdiff_t>(underscore),
+                                     [](const unsigned char character) { return std::isdigit(character) != 0; });
+
+    return ordinal ? stem.substr(underscore + 1) : stem;
+}
+
+} // namespace
+
+std::expected<void, std::string> AudioService::loadTrafficFleet(const std::span<const TrafficFleetCar> fleet,
+                                                                const std::size_t voices)
+{
+    if (!backend)
+    {
+        return std::unexpected("no audio backend");
+    }
+
+    unloadTrafficFleet();
+
+    if (fleet.empty())
+    {
+        return std::unexpected("no fleet stated");
+    }
+
+    auto banks = std::vector<TrafficBank>{};
+    banks.reserve(fleet.size());
+
+    auto missing = std::vector<std::string>{};
+    auto recordings = std::size_t{0};
+
+    for (const auto& car : fleet)
+    {
+        auto bank = TrafficBank{.name = car.name, .samples = {}, .idleRpm = car.idleRpm, .limiterRpm = car.limiterRpm};
+
+        auto error = std::error_code{};
+        const auto directory = std::filesystem::path(car.audioDirectory);
+
+        if (car.audioDirectory.empty() || !std::filesystem::is_directory(directory, error))
+        {
+            missing.push_back(car.name + (car.audioDirectory.empty() ? "" : " (" + car.audioDirectory + ")"));
+            banks.push_back(std::move(bank));
+
+            continue;
+        }
+
+        for (const auto& entry : std::filesystem::directory_iterator(directory, error))
+        {
+            if (entry.path().extension() != ".wav")
+            {
+                continue;
+            }
+
+            bank.samples.push_back(
+                TrafficSample{.name = sampleNameOf(entry.path().stem().string()), .path = entry.path().string()});
+        }
+
+        // The directory walk's order is the filesystem's; the exporter's ordinal makes the sorted
+        // order the bank's own, and a stable order is what makes "sample 7" mean the same recording
+        // on every run.
+        std::sort(bank.samples.begin(), bank.samples.end(),
+                  [](const TrafficSample& left, const TrafficSample& right) { return left.path < right.path; });
+
+        recordings += bank.samples.size();
+        banks.push_back(std::move(bank));
+    }
+
+    if (recordings == 0)
+    {
+        return std::unexpected("none of the " + std::to_string(fleet.size()) + " fleet cars has a recordings folder");
+    }
+
+    auto loaded = backend->loadTrafficFleet(banks, voices);
+    if (!loaded)
+    {
+        return std::unexpected(loaded.error());
+    }
+
+    fleetLoaded = true;
+
+    for (const auto& line : loaded.value())
+    {
+        logger.info("Traffic audio: {}", line);
+    }
+
+    if (!missing.empty())
+    {
+        auto joined = std::string{};
+        for (const auto& name : missing)
+        {
+            joined += (joined.empty() ? "" : ", ") + name;
+        }
+
+        logger.info("Traffic audio: no recordings for {}, which drive past silently", joined);
+    }
+
+    return {};
+}
+
+void AudioService::updateTraffic(const AudioListener& listener, const std::span<const TrafficVoice> voices)
+{
+    if (!backend || !fleetLoaded)
+    {
+        return;
+    }
+
+    backend->updateTraffic(listener, voices);
+}
+
+void AudioService::unloadTrafficFleet()
+{
+    if (backend && fleetLoaded)
+    {
+        backend->unloadTrafficFleet();
+    }
+
+    fleetLoaded = false;
+}
+
+std::expected<void, std::string> AudioService::loadSiren(const std::filesystem::path& file)
+{
+    if (!backend)
+    {
+        return std::unexpected("no audio backend");
+    }
+
+    if (!fleetLoaded)
+    {
+        return std::unexpected("no traffic fleet loaded to put a siren on");
+    }
+
+    auto error = std::error_code{};
+    if (!std::filesystem::is_regular_file(file, error))
+    {
+        return std::unexpected("no siren recording at " + file.string());
+    }
+
+    if (const auto loaded = backend->loadSiren(file.string()); !loaded)
+    {
+        return std::unexpected(loaded.error());
+    }
+
+    logger.info("Traffic audio: siren {}", file.string());
+
+    return {};
 }
 
 } // namespace raceengine

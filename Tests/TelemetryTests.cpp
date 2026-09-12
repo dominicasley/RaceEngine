@@ -182,7 +182,9 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
         // input to it: what a reader wants is the disc, the rim and the tread side by side.
         // Twenty-six until `Recession` joined on 2026-08-29 with longitudinal recession — the only
         // channel that coefficient moves at all.
-        REQUIRE(header.size() == 34 + 27 * cornerCount);
+        // Thirty since the kerb-contact path's `Obstacle Contacts`, `Obstacle Force` and
+        // `Obstacle Elevation` joined on 2026-09-07, with the path itself.
+        REQUIRE(header.size() == 34 + 30 * cornerCount);
     }
 
     SECTION("the steering column is the rim's angle, and the demand is beside it")
@@ -238,7 +240,8 @@ TEST_CASE("the CSV carries every channel with its units", "[physics][telemetry]"
             // twenty-three since the brake disc's did, and twenty-four since the wheel's did with
             // stage 3, twenty-six since the gas temperature and pressure pair joined with stage 2,
             // and twenty-seven since `Recession` joined on 2026-08-29.
-            REQUIRE(count == 27);
+            // Thirty since the kerb-contact path's three joined on 2026-09-07.
+            REQUIRE(count == 30);
         }
     }
 
@@ -365,6 +368,10 @@ TEST_CASE("each corner's columns carry that corner's own data", "[physics][telem
         // fixture, so a column carrying the wrong *channel* fails as loudly as one carrying the
         // wrong corner.
         frame.wheels[index].patchDepthSpread = 0.005 * static_cast<double>(index + 1);
+        frame.wheels[index].obstacleContacts = static_cast<std::uint32_t>(index + 2);
+        frame.wheels[index].obstacleNormalForce = 100.0 * static_cast<double>(index + 1);
+        // Radians in, degrees out.
+        frame.wheels[index].obstacleAxisElevation = 0.1 * static_cast<double>(index + 1);
     }
 
     const auto rows = lines(telemetryToCsv({frame}));
@@ -396,6 +403,10 @@ TEST_CASE("each corner's columns carry that corner's own data", "[physics][telem
         REQUIRE(readColumn("In Contact " + tag + " []") == Catch::Approx(index % 2 == 0 ? 1.0 : 0.0));
         REQUIRE(readColumn("Patch Depth Spread " + tag + " [mm]") ==
                 Catch::Approx(5.0 * static_cast<double>(index + 1)));
+        REQUIRE(readColumn("Obstacle Contacts " + tag + " []") == Catch::Approx(static_cast<double>(index + 2)));
+        REQUIRE(readColumn("Obstacle Force " + tag + " [N]") == Catch::Approx(100.0 * static_cast<double>(index + 1)));
+        REQUIRE(readColumn("Obstacle Elevation " + tag + " [deg]") ==
+                Catch::Approx(0.1 * static_cast<double>(index + 1) * 57.29577951308232).epsilon(1e-4));
     }
 
     SECTION("and the four tags are the four corners, in the order the array is indexed")

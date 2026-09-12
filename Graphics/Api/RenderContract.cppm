@@ -18,10 +18,13 @@ namespace raceengine
 
 export inline constexpr uint32_t maxJoints = 128;
 
-// Forward shading loops every light per fragment and spends one vec3 interpolant per light
-// on the direction. Four keeps the vertex stage inside the 60 varying components desktop GL
-// guarantees (12 rows of 15 used) and FrameData at 352 bytes.
-export inline constexpr uint32_t maxLights = 4;
+// Forward shading loops every light per fragment and spends one vec3 interpolant per light on the
+// direction. The loop runs over the lights a scene *uploads*, so a scene with one sun pays for one;
+// this bound is what the frame block and the varying array are sized for. Eight since 2026-09-11:
+// the sun and seven more, which is what the police light bars ask for (docs/police-lights-brief.md)
+// — one point light per patrol car in a chase, for the seven nearest the eye. The four it was
+// before was desktop GL's varying budget, which no longer exists here.
+export inline constexpr uint32_t maxLights = 8;
 
 // The clear colour every colour target of either backend is cleared to.
 export inline constexpr std::array<float, 4> clearColour = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -204,6 +207,14 @@ export inline constexpr uint32_t sceneBehindMipCount = 7;
 // coverage, so the dummy's content is never read.
 export inline constexpr uint32_t cloudMapBinding = 3;
 
+// The driver's mirror, beside the cloud map on its exact terms: one image a scene view rendered
+// earlier in the frame — the rear-facing mirror camera's target — read only by a view that shades,
+// and only by the one material that is a mirror. The mirror surfaces sample it by their own UVs,
+// which is how one wide rear view serves the centre and both door mirrors (docs/driver-mirrors-brief.md).
+// A scene with no mirror map binds the 1x1 white image, and so does the mirror view itself, which
+// must never sample the image it is rendering into; the frame block's mirrorParams.y says which.
+export inline constexpr uint32_t mirrorMapBinding = 4;
+
 // How the occlusion is gathered: directions through the pixel, and steps marched along each. Both
 // sides count them — the shader marches them and the engine reports them once at bring-up — so they
 // are contract numbers rather than literals in the shader. Three by four is the cheap end of GTAO
@@ -344,7 +355,7 @@ export struct ShaderFloatMacro
     float value;
 };
 
-export inline constexpr size_t shaderContractMacroCount = 55;
+export inline constexpr size_t shaderContractMacroCount = 56;
 
 export inline constexpr size_t shaderContractFloatMacroCount = 5;
 
@@ -414,6 +425,7 @@ export [[nodiscard]] constexpr std::array<ShaderMacro, shaderContractMacroCount>
         {"LUT_BINDING", lookupTableBinding},
         {"FOG_MARCH_STEPS", fogMarchSteps},
         {"CLOUD_MAP_BINDING", cloudMapBinding},
+        {"MIRROR_MAP_BINDING", mirrorMapBinding},
         {"CLOUD_BASE_NOISE_BINDING", cloudBaseNoiseBinding},
         {"CLOUD_DETAIL_NOISE_BINDING", cloudDetailNoiseBinding},
         {"CLOUD_MARCH_STEPS", cloudMarchSteps},

@@ -69,6 +69,15 @@ export struct MeshPrimitive
     // than on the centre because a symmetric primitive modelled about its own origin — a wheel, a
     // windscreen — legitimately has a centre of zero.
     glm::vec3 boundsHalfExtent{0.0f};
+    // The range of the primitive's TEXCOORD_0 — the UV island this surface addresses — read off the
+    // vertex data once at load, because glTF makes min/max optional on every accessor but POSITION
+    // and no exporter here writes them for UVs. Both zero, and `uvBoundsKnown` false, where the
+    // primitive carries no float TEXCOORD_0. It is what lets a game say *where on a shared map* one
+    // surface looks: a car's three mirror surfaces share one material and one rear view, and which
+    // part of it each shows is stated by nothing but its UVs (docs/driver-mirrors-brief.md).
+    glm::vec2 uvBoundsMin{0.0f};
+    glm::vec2 uvBoundsMax{0.0f};
+    bool uvBoundsKnown = false;
     std::vector<MeshPrimitiveAttribute> attributes{};
 };
 

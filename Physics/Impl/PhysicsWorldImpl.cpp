@@ -52,6 +52,11 @@ extern "C++" void raceengineJoltDestroyWorld(std::uint64_t handle);
 extern "C++" void raceengineJoltCastRays(std::uint64_t handle, const double* origins, const double* directions,
                                          double maxDistance, std::uint32_t count, double* outPoints, double* outNormals,
                                          double* outDistances, std::uint32_t* outSurfaces, unsigned char* outHits);
+extern "C++" void raceengineJoltCollideCylinders(std::uint64_t handle, const double* centres, const double* axes,
+                                                 const double* radii, const double* halfWidths, std::uint32_t count,
+                                                 std::uint32_t maxContacts, std::uint32_t* outCounts, double* outAxes,
+                                                 double* outNormals, double* outDepths, double* outPoints,
+                                                 std::uint32_t* outSurfaces);
 
 namespace raceengine
 {
@@ -385,6 +390,70 @@ void PhysicsWorld::castRays(const std::vector<glm::dvec3>& origins, const std::v
                        .distance = distances[index],
                        .surface = surfaces[index],
                        .hit = hits[index] != 0};
+    }
+}
+
+void PhysicsWorld::collideCylinders(const std::span<const WheelCylinder> cylinders, const std::uint32_t limit,
+                                    std::vector<ObstacleContact>& results, std::vector<std::uint32_t>& counts) const
+{
+    RACEENGINE_ZONE_N("PhysicsWorld::collideCylinders");
+
+    const auto count = cylinders.size();
+    results.clear();
+    counts.assign(count, 0);
+
+    if (count == 0 || limit == 0)
+    {
+        return;
+    }
+
+    // Flattened for the bridge, which takes fundamental types and arrays of them and nothing else.
+    auto centres = std::vector<double>();
+    auto axes = std::vector<double>();
+    auto radii = std::vector<double>();
+    auto halfWidths = std::vector<double>();
+
+    centres.reserve(count * 3);
+    axes.reserve(count * 3);
+    radii.reserve(count);
+    halfWidths.reserve(count);
+
+    for (const auto& cylinder : cylinders)
+    {
+        centres.insert(centres.end(), {cylinder.centre.x, cylinder.centre.y, cylinder.centre.z});
+        axes.insert(axes.end(), {cylinder.spinAxis.x, cylinder.spinAxis.y, cylinder.spinAxis.z});
+        radii.push_back(cylinder.radius);
+        halfWidths.push_back(cylinder.halfWidth);
+    }
+
+    // Scratch in the bridge's slot layout — `limit` slots per cylinder — sized once per call.
+    const auto slots = count * limit;
+    auto foundCounts = std::vector<std::uint32_t>(count);
+    auto outAxes = std::vector<double>(slots * 3);
+    auto outNormals = std::vector<double>(slots * 3);
+    auto outDepths = std::vector<double>(slots);
+    auto outPoints = std::vector<double>(slots * 3);
+    auto outSurfaces = std::vector<std::uint32_t>(slots);
+
+    raceengineJoltCollideCylinders(world, centres.data(), axes.data(), radii.data(), halfWidths.data(),
+                                   static_cast<std::uint32_t>(count), limit, foundCounts.data(), outAxes.data(),
+                                   outNormals.data(), outDepths.data(), outPoints.data(), outSurfaces.data());
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        counts[index] = foundCounts[index];
+
+        for (auto found = std::uint32_t{0}; found < foundCounts[index]; found++)
+        {
+            const auto slot = index * limit + found;
+
+            results.push_back(ObstacleContact{
+                .axis = glm::dvec3(outAxes[slot * 3], outAxes[slot * 3 + 1], outAxes[slot * 3 + 2]),
+                .normal = glm::dvec3(outNormals[slot * 3], outNormals[slot * 3 + 1], outNormals[slot * 3 + 2]),
+                .depth = outDepths[slot],
+                .point = glm::dvec3(outPoints[slot * 3], outPoints[slot * 3 + 1], outPoints[slot * 3 + 2]),
+                .surface = outSurfaces[slot]});
+        }
     }
 }
 

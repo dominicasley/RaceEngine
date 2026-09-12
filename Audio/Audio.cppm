@@ -10,6 +10,9 @@ export import :EngineLayers;
 // The tyres over it: rolling driven by the tread's own speed, skid by slip and the load under it.
 // Pure for the same reason the engine mix is.
 export import :TyreLayers;
+// The other cars: a fleet bank's classifier, the gearbox a traffic car does not have, and the
+// allocator that decides which handful of four hundred cars are audible. Pure, like the mixers.
+export import :TrafficAudio;
 export import :SoundBank;
 
 // The concrete backends are deliberately absent. `:FmodAudioBackend` carries <fmod_studio.hpp> and

@@ -39,7 +39,14 @@ add_executable(EngineTests
         DamperFrictionProbe.cpp
         DamperFrictionVelocityProbe.cpp
         DamperFrictionVelocityTests.cpp
+        DamperIntegratorTests.cpp
         DifferentialTests.cpp
+        DroopPlacementAuditProbe.cpp
+        ChassisKinematicReactionTests.cpp
+        FrameAccelerationTests.cpp
+        NonlinearGeometryTests.cpp
+        RangeConstraintControl.cpp
+        RangeConstraintTests.cpp
         DroopStopProbe.cpp
         DrivelinePathProbe.cpp
         DrivelineTests.cpp
@@ -64,6 +71,8 @@ add_executable(EngineTests
         InstantAxisCheckProbe.cpp
         InputServiceTests.cpp
         InputTests.cpp
+        KerbContactFixtureTests.cpp
+        KerbContactTests.cpp
         KerbDiscontinuityProbe.cpp
         LaunchDiagnosticProbe.cpp
         JoltRuntimeTests.cpp
@@ -86,6 +95,8 @@ add_executable(EngineTests
         RecessionSweepProbe.cpp
         RendererSeamTests.cpp
         RigidBodyTests.cpp
+        RoadTorqueObservableProbe.cpp
+        RoadTorqueScopeProbe.cpp
         SceneManagerServiceTests.cpp
         SetupFileTests.cpp
         ShiftTests.cpp
@@ -95,10 +106,23 @@ add_executable(EngineTests
         SpringDamperKinematicsProbe.cpp
         SuspensionElementTests.cpp
         SuspensionFidelityTests.cpp
+        SuspensionCharacterisationProbe.cpp
+        StopElementTests.cpp
         SuspensionLoadPathProbe.cpp
         SuspensionLoadPathTests.cpp
         SuspensionSweepProbe.cpp
         SuspensionTests.cpp
+        TrafficLaneTests.cpp
+        TrafficDriverTests.cpp
+        TrafficContactTests.cpp
+        PoliceTests.cpp
+        NavmeshTests.cpp
+        PursuitRouteTests.cpp
+        PursuitPlanTests.cpp
+        PoliceNavigationTests.cpp
+        PoliceRadioTests.cpp
+        PoliceCorridorTests.cpp
+        TrafficAudioTests.cpp
         TelemetryTests.cpp
         TelemetryUnitsProbe.cpp
         TorqueConverterTests.cpp

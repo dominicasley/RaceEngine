@@ -109,6 +109,16 @@ export struct WheelSpeedReading
     // How old the measurement is, seconds. 1.5 ms at 100 km/h on a 48-pole ring, 30 ms at 5 km/h.
     double age = 0.0;
 
+    // The interval between the last two crossings, seconds, as the capture timer measured it — the
+    // measurement `speed` is arithmetic on, handed to the controller rather than kept private.
+    //
+    // **A controller that filters a wheel-derived quantity needs the wheel's own sample interval**,
+    // because the sample rate is proportional to wheel speed: a staleness bound stated in seconds is
+    // a different bound at 100 km/h and at 5, and the tone ring's quantisation error is a function of
+    // this period and of nothing else. Zero while `valid` is false, or while the last two crossings
+    // fell inside one timer count, which is the same "no measurement" state `speed` reports as zero.
+    double period = 0.0;
+
     // False until the first tooth has ever gone past, which is a real state a controller has to
     // handle: a car that has been standing still has no wheel speed measurement at all.
     bool valid = false;

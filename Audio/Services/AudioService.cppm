@@ -1,10 +1,12 @@
 module;
 
+#include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,6 +18,7 @@ export module raceengine.audio:AudioService;
 import :AudioBackend;
 import :CarAudio;
 import :SoundBank;
+import :TrafficAudio;
 
 namespace raceengine
 {
@@ -36,6 +39,17 @@ export struct AudioOptions
     std::string capturePath;
 };
 
+// One body shape of the traffic fleet, as a game states it: a folder of the recordings the exporter
+// wrote out of the car's bank, and the two engine speeds nothing in that folder states. A string
+// rather than a path so a game unit can state one without `<filesystem>` in its fragment.
+export struct TrafficFleetCar
+{
+    std::string name;
+    std::string audioDirectory;
+    double idleRpm = 800.0;
+    double limiterRpm = 6500.0;
+};
+
 // What a game holds. One backend, one car's bank at a time, and a state written once per tick.
 //
 // It owns no thread. FMOD has its own and its `update` must be called from one thread only — this
@@ -48,6 +62,7 @@ export class AudioService
 
     std::unique_ptr<IAudioBackend> backend;
     bool carLoaded = false;
+    bool fleetLoaded = false;
     bool reportedUnmatched = false;
 
 public:
@@ -70,9 +85,29 @@ public:
 
     void unloadCar();
 
+    // The traffic fleet's recordings, one folder per body shape **in the order the caller indexes
+    // bodies by** — a car with no folder still takes its place in the order, silently. Fallible for
+    // the reason `loadCar` is; a fleet with no recordings at all is a refusal and not a silence.
+    [[nodiscard]] std::expected<void, std::string> loadTrafficFleet(std::span<const TrafficFleetCar> fleet,
+                                                                    std::size_t voices);
+
+    // Once per tick, from whoever knows where the ear and the cars are.
+    void updateTraffic(const AudioListener& listener, std::span<const TrafficVoice> voices);
+
+    void unloadTrafficFleet();
+
+    // The patrol cars' siren, one file, after the fleet. A fleet with no siren is a fleet whose
+    // police chase silently, said once.
+    [[nodiscard]] std::expected<void, std::string> loadSiren(const std::filesystem::path& file);
+
     [[nodiscard]] bool active() const
     {
         return carLoaded;
+    }
+
+    [[nodiscard]] bool trafficActive() const
+    {
+        return fleetLoaded;
     }
 
     [[nodiscard]] std::string_view platform() const

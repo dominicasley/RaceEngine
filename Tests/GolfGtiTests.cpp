@@ -364,14 +364,16 @@ TEST_CASE("every corner of the imported car validates", "[physics][golf]")
 
         // AC states its spring rates *at the wheel*, and the model wants them along the spring's
         // own element. The conversion is the spring motion ratio squared, so multiplying back must
-        // recover the file's own number exactly — this is the check that the conversion is a
-        // conversion and not a guess.
+        // recover the stated number exactly — this is the check that the conversion is a
+        // conversion and not a guess. **The rear's stated number is 28000 since 2026-09-08**, adopted
+        // on the seat (`docs/rear-spring-sensitivity-brief.md`); the mod's 57000 is the way back
+        // through `OSR_REAR_WHEEL_RATE`. This line asserts the ledger, not a criterion.
         const auto spring =
             raceengine::solveSpringKinematics(corner.hardpoints, raceengine::springElementOf(corner.hardpoints), 0.0);
         REQUIRE(spring.has_value());
 
         const auto wheelRate = corner.springRate * spring->motionRatio * spring->motionRatio;
-        REQUIRE(wheelRate == Catch::Approx(index < 2 ? 35000.0 : 57000.0).epsilon(1e-9));
+        REQUIRE(wheelRate == Catch::Approx(index < 2 ? 35000.0 : 28000.0).epsilon(1e-9));
 
         // suspensions.ini [ARB], straight from the file.
         REQUIRE(corner.antiRollRate == Catch::Approx(index < 2 ? 34000.0 : 15000.0));

@@ -370,6 +370,38 @@ std::expected<void, std::string> GLTFService::processNode(Model& model, const ti
                                        static_cast<float>(accessor.maxValues[2] - accessor.minValues[2]))) *
                     0.5f;
             }
+
+            // TEXCOORD_0 declares no bounds — glTF does not ask it to and this exporter writes none —
+            // so the UV island a surface addresses is read off the data, once, here where the
+            // buffer still is. Float UVs only: the reader copies bytes, and a normalised integer
+            // UV would need converting, which no asset here carries. A range that cannot be read
+            // is not a failed load; the primitive keeps `uvBoundsKnown` false and draws as ever.
+            if (attribute.first == "TEXCOORD_0" && accessor.type == TINYGLTF_TYPE_VEC2 &&
+                accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && accessor.count > 0)
+            {
+                const auto uvs = AccessorUtility::get<std::vector<float>>(tinyGltfModel, accessor);
+
+                if (!uvs)
+                {
+                    logger.warn("The UV range of mesh {} could not be read: {}", tinyGltfMesh.name, uvs.error());
+                }
+                else
+                {
+                    auto low = glm::vec2((*uvs)[0], (*uvs)[1]);
+                    auto high = low;
+
+                    for (size_t i = 2; i + 1 < uvs->size(); i += 2)
+                    {
+                        const auto uv = glm::vec2((*uvs)[i], (*uvs)[i + 1]);
+                        low = glm::min(low, uv);
+                        high = glm::max(high, uv);
+                    }
+
+                    meshPrimitive.uvBoundsMin = low;
+                    meshPrimitive.uvBoundsMax = high;
+                    meshPrimitive.uvBoundsKnown = true;
+                }
+            }
         }
 
         mesh.meshPrimitives.push_back(meshPrimitive);

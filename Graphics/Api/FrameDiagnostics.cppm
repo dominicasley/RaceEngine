@@ -62,9 +62,10 @@ export enum class FrameDiagnostic : size_t {
     PostProcessVolumesExceeded,
     VolumeInputUnavailable,
     CloudMapUnavailable,
+    MirrorMapUnavailable,
 };
 
-export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::CloudMapUnavailable) + 1;
+export inline constexpr size_t frameDiagnosticCount = static_cast<size_t>(FrameDiagnostic::MirrorMapUnavailable) + 1;
 
 // Reads as the tail of "<n> …", so every phrase is a countable noun.
 export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagnostic)
@@ -139,6 +140,8 @@ export [[nodiscard]] constexpr const char* describe(const FrameDiagnostic diagno
         return "volume slot(s) bound as the neutral table, the texture they name being unloaded";
     case FrameDiagnostic::CloudMapUnavailable:
         return "view(s) shaded under a white cloud map, the scene's attachment having no image to sample";
+    case FrameDiagnostic::MirrorMapUnavailable:
+        return "view(s) shaded with a white mirror map, the scene's attachment having no image to sample";
     }
 
     return "skipped item(s) of an unnamed kind";

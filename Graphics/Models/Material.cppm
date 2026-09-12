@@ -146,6 +146,25 @@ export struct Paint
     float dirt = 0.0f;
 };
 
+// A mirror surface with a curve to it: a car's door mirrors, whose glass is a convex sphere where
+// the centre mirror's is flat. On the *material* because the material is the one thing the draw
+// path resolves per primitive — so a car whose three mirror surfaces share one material gets three
+// materials for exactly this, which is the game's doing (CircuitScene, docs/driver-mirrors-brief.md
+// §6) and not the importer's: the importer knows a mirror from nothing else.
+export struct MirrorGlass
+{
+    // The glass's centre in the mesh's own space — the primitive's bounds centre — which the shader
+    // carries to world space through the draw's own matrix, so it rides with the car.
+    glm::vec3 centre{0.0f};
+    // Where on the shared rear view the flat glass looks: the centre of its UV island in the map's
+    // (0, 1) square, which is the axis the modder aimed the mirror along. The glass's *centre*
+    // reflects the eye along that axis and its curve decides the rest.
+    glm::vec2 islandCentre{0.5f};
+    // The sphere's radius in world units, positive for a glass convex towards the viewer. Zero is a
+    // flat glass drawn by its island's UVs alone — exactly the surface before this existed.
+    float radius = 0.0f;
+};
+
 export struct Material
 {
     // The asset's own name for this material, carried for the reason `Mesh::name` and
@@ -180,6 +199,9 @@ export struct Material
     // Set only where the asset states detail layers. Absent means the base colour is the whole of
     // this surface's colour, which is every ordinary material.
     std::optional<MaterialBlend> blend{};
+    // Set only on a surface that is a curved mirror. Absent is every other material, the flat
+    // mirror included, and uploads as a zero radius the mirror shader reads as "by the UVs".
+    std::optional<MirrorGlass> mirror{};
     std::optional<Resource<Shader>> shader{};
     // The shader this material asked for **by name**, out of the asset's own `extras.shader`, and
     // empty for the overwhelming majority of materials that ask for nothing.

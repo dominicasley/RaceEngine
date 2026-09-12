@@ -14,17 +14,18 @@ import raceengine.physics;
 using raceengine::advanceAntilockChannel;
 using raceengine::advanceReferenceSpeed;
 using raceengine::advanceYawMomentDelay;
+using raceengine::AntilockChannelInputs;
+using raceengine::AntilockChannelState;
 using raceengine::antilockControlWheel;
 using raceengine::antilockDrivesWheel;
-using raceengine::AntilockChannelState;
 using raceengine::AntilockSetup;
 using raceengine::AssistSensors;
 using raceengine::AssistSetup;
 using raceengine::AssistState;
-using raceengine::brakeChannelCount;
 using raceengine::BrakeChannel;
-using raceengine::BrakeCommand;
+using raceengine::brakeChannelCount;
 using raceengine::brakeCircuitPressures;
+using raceengine::BrakeCommand;
 using raceengine::bringUpJolt;
 using raceengine::cornerCount;
 using raceengine::estimatedSlip;
@@ -36,6 +37,7 @@ using raceengine::ModulatorPhase;
 using raceengine::noDriveTorque;
 using raceengine::PhysicsWorld;
 using raceengine::ProvingGroundDescriptor;
+using raceengine::RecoveryAuthority;
 using raceengine::sampleWheelSensors;
 using raceengine::sensedRoadSpeed;
 using raceengine::stepVehicle;
@@ -104,9 +106,9 @@ constexpr auto noBrakePressure = std::array<double, cornerCount>{};
 
 [[nodiscard]] double memberEntry(const std::size_t index, const std::size_t count)
 {
-    const auto offset = count <= 1 ? 0.0
-                                   : -ensembleBand + 2.0 * ensembleBand * static_cast<double>(index) /
-                                                         static_cast<double>(count - 1);
+    const auto offset =
+        count <= 1 ? 0.0
+                   : -ensembleBand + 2.0 * ensembleBand * static_cast<double>(index) / static_cast<double>(count - 1);
 
     return hundred * (1.0 + offset);
 }
@@ -341,10 +343,9 @@ struct ShadowState
         const auto requested = driverPressure;
 
         auto frontRequests = std::array<double, 2>{requested[0], requested[1]};
-        const auto ceiling =
-            advanceYawMomentDelay(setup.antilock, state.antilock.yawDelay, state.antilock.channels[0],
-                                  state.antilock.channels[1], frontRequests, sensors.lateralAcceleration, braking,
-                                  period);
+        const auto ceiling = advanceYawMomentDelay(setup.antilock, state.antilock.yawDelay, state.antilock.channels[0],
+                                                   state.antilock.channels[1], frontRequests,
+                                                   sensors.lateralAcceleration, braking, period);
 
         for (auto index = std::size_t{0}; index < brakeChannelCount; index++)
         {
@@ -372,9 +373,9 @@ struct ShadowState
             auto& channelState = state.antilock.channels[index];
             const auto snapshot = channelState;
 
-            auto pressure = advanceAntilockChannel(setup.antilock, channel, channelState, readings[controlWheel],
-                                                   wheelSpeed, state.reference.speed, state.reference.rate,
-                                                   state.reference.valid, channelRequest, period);
+            auto pressure = advanceAntilockChannel(
+                setup.antilock, channel, channelState, readings[controlWheel], wheelSpeed, state.reference.speed,
+                state.reference.rate, state.reference.valid, channelRequest, AntilockChannelInputs{}, period);
 
             const auto rear = index == 2;
             auto gated = false;
@@ -391,10 +392,9 @@ struct ShadowState
                 {
                 case RearMode::ContactGate:
                 {
-                    const auto blocked = oracle.useContactFlag
-                                             ? (!truth.contact[0] || !truth.contact[1])
-                                             : std::min(truth.load[0], truth.load[1]) <=
-                                                   oracle.loadFraction * truth.staticWheelLoad;
+                    const auto blocked = oracle.useContactFlag ? (!truth.contact[0] || !truth.contact[1])
+                                                               : std::min(truth.load[0], truth.load[1]) <=
+                                                                     oracle.loadFraction * truth.staticWheelLoad;
                     if (blocked && pressure > snapshot.pressure)
                     {
                         pressure = snapshot.pressure;
@@ -480,8 +480,8 @@ struct ShadowState
                 record.guardSlip = state.reference.valid ? estimatedSlip(state.reference.speed, projected) : 0.0;
                 record.losing = channelState.acceleration < setup.antilock.lockDeceleration;
                 record.surging = record.excess > setup.antilock.recoverySurge;
-                record.pastBand = setup.antilock.slipAwareRecovery && state.reference.valid &&
-                                  record.guardSlip > setup.antilock.slipEnter;
+                record.pastBand = (setup.antilock.recoveryAuthority != RecoveryAuthority::Disabled) &&
+                                  state.reference.valid && record.guardSlip > setup.antilock.slipEnter;
                 record.gated = gated;
                 record.truthLoadMin = std::min(truth.load[0], truth.load[1]);
                 record.truthContact = truth.contact[0] && truth.contact[1];
@@ -516,8 +516,9 @@ struct ShadowState
 
     for (auto index = std::size_t{0}; index < brakeChannelCount; index++)
     {
-        const auto channel = index == 0 ? BrakeChannel::FrontLeft : index == 1 ? BrakeChannel::FrontRight
-                                                                               : BrakeChannel::Rear;
+        const auto channel = index == 0   ? BrakeChannel::FrontLeft
+                             : index == 1 ? BrakeChannel::FrontRight
+                                          : BrakeChannel::Rear;
         for (auto wheel = std::size_t{0}; wheel < cornerCount; wheel++)
         {
             if (antilockDrivesWheel(channel, wheel))
@@ -660,9 +661,8 @@ constexpr auto oracleTrim = 0.5;
 
     for (auto step = 0; step < 180; step++)
     {
-        const auto command =
-            shadowUpdate(assists, shadow, sense(), 0.0, noBrakePressure, tick, passive, truth, noOracleTorque,
-                         nullptr, 0.0);
+        const auto command = shadowUpdate(assists, shadow, sense(), 0.0, noBrakePressure, tick, passive, truth,
+                                          noOracleTorque, nullptr, 0.0);
         const auto stepped = stepVehicle(setup, state, VehicleInput{}, noDriveTorque, world, tick, command);
         REQUIRE(stepped.has_value());
         lastStep = stepped.value();
@@ -680,8 +680,8 @@ constexpr auto oracleTrim = 0.5;
     // The static rear wheel load the oracle's normalised threshold is a fraction of, taken from the
     // settled roll rather than stated: it is the car's own, so the same fraction means the same
     // thing on a different vehicle [borrowed-numbers-need-a-platform-match].
-    truth.staticWheelLoad = std::max(1.0, 0.5 * (lastStep.corners[2].forces.tireVertical +
-                                                 lastStep.corners[3].forces.tireVertical));
+    truth.staticWheelLoad =
+        std::max(1.0, 0.5 * (lastStep.corners[2].forces.tireVertical + lastStep.corners[3].forces.tireVertical));
 
     auto run = Run{};
     run.entrySpeed = state.chassis.linearVelocity.z;
@@ -1171,6 +1171,10 @@ TEST_CASE("the shadow controller is the production controller, to the bit, on ev
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto oracle = RearOracle{};
 
@@ -1194,8 +1198,8 @@ TEST_CASE("the shadow controller is the production controller, to the bit, on ev
 
         if (index % 7 == 0 || !same)
         {
-            std::printf("   %6zu   %12.4f   %10.6f   %14.6f   %s\n", index, 3.6 * entry, mine.distance,
-                        theirs.distance, same ? "yes" : "NO");
+            std::printf("   %6zu   %12.4f   %10.6f   %14.6f   %s\n", index, 3.6 * entry, mine.distance, theirs.distance,
+                        same ? "yes" : "NO");
         }
 
         REQUIRE(mine.distance == theirs.distance);
@@ -1224,6 +1228,10 @@ TEST_CASE("the three representative members: recovered, stranded, and the neares
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto members = ensembleOf(setup.value(), world.value(), assists, 1.0, RearOracle{});
 
@@ -1235,8 +1243,8 @@ TEST_CASE("the three representative members: recovered, stranded, and the neares
     {
         std::printf("   %3zu   %12.4f   %8.3f   %9.4f  %10.4f   %7zu  %8zu  %7zu  %8zu   %9.1f   %s\n", member.index,
                     3.6 * member.entry, member.distance, member.rearUtilisation, member.frontUtilisation,
-                    member.rearAirborne, member.landings, member.rearCycles, member.frontCycles,
-                    member.minimumRearLoad, member.stranded() ? "STRANDED" : "recovered");
+                    member.rearAirborne, member.landings, member.rearCycles, member.frontCycles, member.minimumRearLoad,
+                    member.stranded() ? "STRANDED" : "recovered");
 
         REQUIRE(member.stopped);
     }
@@ -1324,6 +1332,10 @@ TEST_CASE("every rear-channel transition the production state machine actually t
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto members = ensembleOf(setup.value(), world.value(), assists, 1.0, RearOracle{});
     auto stranded = std::size_t{0};
@@ -1407,7 +1419,8 @@ TEST_CASE("every rear-channel transition the production state machine actually t
         for (auto phase = std::size_t{0}; phase < 5; phase++)
         {
             std::printf("  %s %zu (%.1f%%)", names[phase], dwell[phase],
-                        100.0 * static_cast<double>(dwell[phase]) / static_cast<double>(std::max(steps, std::size_t{1})));
+                        100.0 * static_cast<double>(dwell[phase]) /
+                            static_cast<double>(std::max(steps, std::size_t{1})));
         }
         std::printf("\n");
 
@@ -1448,6 +1461,10 @@ TEST_CASE("the rear actuator: how long a decision takes to reach the caliper", "
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto pressures = brakeCircuitPressures(setup.value(), 1.0);
     const auto& modulator = assists.antilock.modulator;
@@ -1462,7 +1479,7 @@ TEST_CASE("the rear actuator: how long a decision takes to reach the caliper", "
     std::printf("  re-apply gradient, REAR    %.3e Pa/s  (%.0f bar/s)   %s\n", modulator.rearReapplyGradient,
                 modulator.rearReapplyGradient / bar,
                 modulator.rearReapplyGradient == modulator.reapplyGradient ? "-- ships at the front's rate"
-                                                                          : "-- metered separately");
+                                                                           : "-- metered separately");
 
     for (auto index = std::size_t{0}; index < cornerCount; index++)
     {
@@ -1572,9 +1589,8 @@ TEST_CASE("the rear actuator: how long a decision takes to reach the caliper", "
                 1000.0 * dumpDuration.maximum, dumpDuration.median / period, dumpDuration.maximum / period);
     std::printf("  ...pressure left at exit, as a fraction of entry: min %.3f median %.3f max %.3f\n",
                 dumpDepth.minimum, dumpDepth.median, dumpDepth.maximum);
-    std::printf("  rear re-apply episodes %3zu   duration ms  min %6.2f  median %6.2f  max %7.2f\n",
-                reapplyDuration.n, 1000.0 * reapplyDuration.minimum, 1000.0 * reapplyDuration.median,
-                1000.0 * reapplyDuration.maximum);
+    std::printf("  rear re-apply episodes %3zu   duration ms  min %6.2f  median %6.2f  max %7.2f\n", reapplyDuration.n,
+                1000.0 * reapplyDuration.minimum, 1000.0 * reapplyDuration.median, 1000.0 * reapplyDuration.maximum);
     std::printf("  ...bar regained per re-apply episode: min %+7.2f median %+7.2f max %+7.2f\n", regained.minimum,
                 regained.median, regained.maximum);
 }
@@ -1678,6 +1694,10 @@ TEST_CASE("one sustained hop cycle, event by event", "[.rear-hop]")
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
     const auto run = record(setup.value(), world.value(), assists, 1.0, RearOracle{},
@@ -1833,6 +1853,10 @@ TEST_CASE("recovered against stranded, aligned on the first rear unload", "[.rea
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
 
@@ -1928,8 +1952,8 @@ TEST_CASE("recovered against stranded, aligned on the first rear unload", "[.rea
         const auto& sa = a.samples[lossA + offset];
         const auto& sb = b.samples[lossB + offset];
 
-        std::printf("     %6zu | %14.0f  %6.3f  %-7s %5.1f %6.2f  %3s | %13.0f  %6.3f  %-7s %5.1f %6.2f  %3s\n",
-                    offset, sa.rearAxleLoad, sa.wheels[2].slipRatio, modulatorName(sa.wheels[2].phase),
+        std::printf("     %6zu | %14.0f  %6.3f  %-7s %5.1f %6.2f  %3s | %13.0f  %6.3f  %-7s %5.1f %6.2f  %3s\n", offset,
+                    sa.rearAxleLoad, sa.wheels[2].slipRatio, modulatorName(sa.wheels[2].phase),
                     sa.wheels[2].pressure / bar, sa.wheels[2].wheelSpeed, sa.rearContact ? "on" : "OFF",
                     sb.rearAxleLoad, sb.wheels[2].slipRatio, modulatorName(sb.wheels[2].phase),
                     sb.wheels[2].pressure / bar, sb.wheels[2].wheelSpeed, sb.rearContact ? "on" : "OFF");
@@ -1951,6 +1975,10 @@ TEST_CASE("the boundary pair, where the plant difference is one ensemble step", 
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
     const auto& lower = found.members[found.boundaryLower];
@@ -2083,6 +2111,10 @@ TEST_CASE("what the rear channel knows when it decides to re-apply", "[.rear-hop
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
 
@@ -2145,7 +2177,8 @@ TEST_CASE("what the rear channel knows when it decides to re-apply", "[.rear-hop
     {
         std::printf("\n  --- %s: %zu rear re-apply entries, %zu of them with a rear wheel OFF THE ROAD (%.1f%%) ---\n",
                     label, entries.total, entries.airborne,
-                    100.0 * static_cast<double>(entries.airborne) / static_cast<double>(std::max(entries.total, std::size_t{1})));
+                    100.0 * static_cast<double>(entries.airborne) /
+                        static_cast<double>(std::max(entries.total, std::size_t{1})));
 
         const auto row = [](const char* name, const std::vector<double>& values, const char* unit)
         {
@@ -2210,6 +2243,10 @@ TEST_CASE("what the production controller can and cannot see about rear contact"
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
     const auto inertia = raceengine::wheelInertias(setup.value());
@@ -2331,6 +2368,10 @@ TEST_CASE("the diagnostic oracles, on the full ensemble", "[.rear-hop]")
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     struct Arm
     {
@@ -2411,6 +2452,10 @@ TEST_CASE("the actuator against the state decision", "[.rear-hop]")
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     struct Arm
     {
@@ -2418,12 +2463,11 @@ TEST_CASE("the actuator against the state decision", "[.rear-hop]")
         RearOracle oracle;
     };
 
-    const auto arms = std::vector<Arm>{{"production (control)", RearOracle{}},
-                                       {"13a rear actuator IDEAL", RearOracle{.mode = RearMode::IdealActuator}},
-                                       {"13b rear DECISION ideal, real valve",
-                                        RearOracle{.mode = RearMode::OracleThroughValve}},
-                                       {"A1 gate: Fz <= 0 (for reference)",
-                                        RearOracle{.mode = RearMode::ContactGate, .loadFraction = 0.0}}};
+    const auto arms = std::vector<Arm>{
+        {"production (control)", RearOracle{}},
+        {"13a rear actuator IDEAL", RearOracle{.mode = RearMode::IdealActuator}},
+        {"13b rear DECISION ideal, real valve", RearOracle{.mode = RearMode::OracleThroughValve}},
+        {"A1 gate: Fz <= 0 (for reference)", RearOracle{.mode = RearMode::ContactGate, .loadFraction = 0.0}}};
 
     std::printf("\n=== actuator lag against state decision ===\n");
     printArmHeader();
@@ -2449,6 +2493,10 @@ TEST_CASE("the front channel while the rear is held by an oracle", "[.rear-hop]"
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto arms = std::array<std::pair<const char*, RearOracle>, 2>{
         std::pair<const char*, RearOracle>{"production", RearOracle{}},
@@ -2495,9 +2543,8 @@ TEST_CASE("the front channel while the rear is held by an oracle", "[.rear-hop]"
         }
 
         std::printf("  %-24s  %10.4f  %10.4f  %12.1f %12.1f  %19.4f  %9.3f\n", arm.first,
-                    distributionOf(frontUse).median, distributionOf(rearUse).median,
-                    distributionOf(frontCycles).median, distributionOf(rearCycles).median,
-                    distributionOf(share).median, distributionOf(stops).median);
+                    distributionOf(frontUse).median, distributionOf(rearUse).median, distributionOf(frontCycles).median,
+                    distributionOf(rearCycles).median, distributionOf(share).median, distributionOf(stops).median);
     }
 
     std::printf("\n  Every figure is the ensemble median over %zu members. The front controller is production\n",
@@ -2530,10 +2577,10 @@ TEST_CASE("the half-pedal four-wheels red, against the same oracle", "[.rear-hop
         RearOracle oracle;
     };
 
-    const auto arms = std::vector<Arm>{{"criterion's own fixture: electronics OFF", &off, RearOracle{}},
-                                       {"anti-lock ON, production rear", &on, RearOracle{}},
-                                       {"anti-lock ON, rear gated on Fz <= 0", &on,
-                                        RearOracle{.mode = RearMode::ContactGate, .loadFraction = 0.0}}};
+    const auto arms = std::vector<Arm>{
+        {"criterion's own fixture: electronics OFF", &off, RearOracle{}},
+        {"anti-lock ON, production rear", &on, RearOracle{}},
+        {"anti-lock ON, rear gated on Fz <= 0", &on, RearOracle{.mode = RearMode::ContactGate, .loadFraction = 0.0}}};
 
     std::printf("\n=== the half-pedal four-wheels criterion, pedal 0.50, %zu members ===\n", ensembleCount);
     std::printf("\n  %-42s  four down   min rear Fz [N]   rear off ticks   stop [m]\n", "arm");
@@ -2584,6 +2631,10 @@ TEST_CASE("does the controller add energy to the hop, or fail to take it out", "
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
 
@@ -2623,8 +2674,8 @@ TEST_CASE("does the controller add energy to the hop, or fail to take it out", "
             }
         }
 
-        std::printf("\n  --- %s member %zu: %zu upward crossings of %.1f N (a tenth of the static %.1f N) ---\n",
-                    label, member, crossings.size(), level, staticAxle);
+        std::printf("\n  --- %s member %zu: %zu upward crossings of %.1f N (a tenth of the static %.1f N) ---\n", label,
+                    member, crossings.size(), level, staticAxle);
 
         if (crossings.size() < 2)
         {
@@ -2680,8 +2731,8 @@ TEST_CASE("does the controller add energy to the hop, or fail to take it out", "
                 {
                     const auto& now = sample.wheels[wheel];
                     const auto travelRate = (now.suspensionTravel - previous.wheels[wheel].suspensionTravel) / tick;
-                    const auto ratio = std::abs(now.travelPerAngle) > 1e-9 ? now.patchPerAngleZ / now.travelPerAngle
-                                                                           : 0.0;
+                    const auto ratio =
+                        std::abs(now.travelPerAngle) > 1e-9 ? now.patchPerAngleZ / now.travelPerAngle : 0.0;
 
                     cycle.damperWork += now.damperForce * travelRate * tick;
                     cycle.brakeForceWork += now.forceLongitudinal * ratio * travelRate * tick;
@@ -2801,9 +2852,9 @@ TEST_CASE("does the controller add energy to the hop, or fail to take it out", "
 
         for (auto wheel = std::size_t{2}; wheel < cornerCount; wheel++)
         {
-            const auto rate = (sample.wheels[wheel].suspensionTravel -
-                               control.samples[index - 1].wheels[wheel].suspensionTravel) /
-                              tick;
+            const auto rate =
+                (sample.wheels[wheel].suspensionTravel - control.samples[index - 1].wheels[wheel].suspensionTravel) /
+                tick;
             damperWork += sample.wheels[wheel].damperForce * rate * tick;
         }
 
@@ -2825,8 +2876,8 @@ TEST_CASE("does the controller add energy to the hop, or fail to take it out", "
     std::printf("\n  --- the SIGN CONTROL: electronics off, pedal 0.38, the pitch ring-down 0.05-1.50 s ---\n");
     std::printf("    rear travel swing 0.05-0.60 s: %.2f mm;  0.60-1.50 s: %.2f mm   (%s)\n", 1000.0 * earlySwing,
                 1000.0 * lateSwing, lateSwing < earlySwing ? "the mode DECAYS" : "the mode does not decay");
-    std::printf("    damper work over the window: %+.2f J   pitch work: %+.2f J per metre of CG height\n",
-                damperWork, pitchWork);
+    std::printf("    damper work over the window: %+.2f J   pitch work: %+.2f J per metre of CG height\n", damperWork,
+                pitchWork);
     std::printf("    stop %.3f m, rear off %zu ticks, four wheels down: %s\n", control.distance,
                 control.rearAirborneTicks, control.grounded ? "yes" : "NO");
     std::printf("    Read the arms above against this row's SIGNS, not against zero.\n");
@@ -2860,6 +2911,10 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     const auto found = representativesOf(setup.value(), world.value(), assists);
 
@@ -2927,8 +2982,8 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
                 bucket.pastBandRolling += (step->pastBand && std::abs(sample.wheels[2].slipRatio) < 0.05) ? 1 : 0;
             }
 
-            const auto dark = sample.wheels[2].pressure < 1.0 * bar && sample.rearContact &&
-                              sample.rearAxleLoad > 0.5 * staticAxle;
+            const auto dark =
+                sample.wheels[2].pressure < 1.0 * bar && sample.rearContact && sample.rearAxleLoad > 0.5 * staticAxle;
 
             if (dark)
             {
@@ -2945,8 +3000,7 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
             {
                 stuck.trueSlip.push_back(std::abs(sample.wheels[2].slipRatio));
                 stuck.guardSlip.push_back(step->guardSlip);
-                stuck.referenceError.push_back((sample.referenceSpeed - sample.speed) /
-                                               std::max(sample.speed, 1e-6));
+                stuck.referenceError.push_back((sample.referenceSpeed - sample.speed) / std::max(sample.speed, 1e-6));
                 stuck.load.push_back(sample.rearAxleLoad);
                 stuck.pressure.push_back(step->pressureBefore / bar);
             }
@@ -2975,7 +3029,8 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
         std::printf("    pastBand true: %zu ticks (%.1f%%);  of those, %zu (%.1f%% of all ticks) had a REAL slip"
                     " below 0.05\n",
                     bucket.pastBand,
-                    100.0 * static_cast<double>(bucket.pastBand) / static_cast<double>(std::max(bucket.ticks, std::size_t{1})),
+                    100.0 * static_cast<double>(bucket.pastBand) /
+                        static_cast<double>(std::max(bucket.ticks, std::size_t{1})),
                     bucket.pastBandRolling,
                     100.0 * static_cast<double>(bucket.pastBandRolling) /
                         static_cast<double>(std::max(bucket.ticks, std::size_t{1})));
@@ -2993,8 +3048,8 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
     {
         const auto distribution = distributionOf(values);
         std::printf("    %-30s  min %9.4f   P10 %9.4f   MEDIAN %9.4f   P90 %9.4f   max %9.4f  %s\n", name,
-                    distribution.minimum, distribution.p10, distribution.median, distribution.p90,
-                    distribution.maximum, unit);
+                    distribution.minimum, distribution.p10, distribution.median, distribution.p90, distribution.maximum,
+                    unit);
     };
 
     row("the tyre's REAL slip", stuck.trueSlip, "-");
@@ -3033,17 +3088,17 @@ TEST_CASE("what the rear channel believes after the axle lands", "[.rear-hop]")
         auto total = 0.0;
         for (const auto& sample : run.samples)
         {
-            total += sample.wheels[2].pressure < 1.0 * bar && sample.rearContact &&
-                             sample.rearAxleLoad > 0.5 * staticAxle
-                         ? tick
-                         : 0.0;
+            total +=
+                sample.wheels[2].pressure < 1.0 * bar && sample.rearContact && sample.rearAxleLoad > 0.5 * staticAxle
+                    ? tick
+                    : 0.0;
         }
 
         darkTotals.push_back(1000.0 * total);
         stops.push_back(member.distance);
 
-        std::printf("     %3zu   %15.1f   %9.4f   %8.3f   %s\n", member.index, 1000.0 * total,
-                    member.rearUtilisation, member.distance, member.stranded() ? "STRANDED" : "recovered");
+        std::printf("     %3zu   %15.1f   %9.4f   %8.3f   %s\n", member.index, 1000.0 * total, member.rearUtilisation,
+                    member.distance, member.stranded() ? "STRANDED" : "recovered");
     }
 
     auto meanDark = 0.0;
@@ -3095,10 +3150,14 @@ TEST_CASE("where the reference speed error comes from, and what it costs", "[.re
 
     auto assists = golfGtiMk7Assists(setup.value());
     assists.antilock.enabled = true;
+    // **Pinned to the pre-2026-09-07 controller** (`docs/abs-architecture-design.md`). This probe is
+    // a record of a closed investigation into that controller, so it keeps measuring it rather than
+    // silently becoming a measurement of its replacement.
+    assists.antilock.recoveryAuthority = RecoveryAuthority::Unconditional;
 
     std::printf("\n=== the reference speed's inputs, and the error the hop puts into it ===\n");
-    std::printf("  fall limit %.3f m/s^2, rise limit %.3f m/s^2, rate smoothing %.3f s\n",
-                assists.reference.fallLimit, assists.reference.riseLimit, assists.reference.rateSmoothing);
+    std::printf("  fall limit %.3f m/s^2, rise limit %.3f m/s^2, rate smoothing %.3f s\n", assists.reference.fallLimit,
+                assists.reference.riseLimit, assists.reference.rateSmoothing);
     std::printf("  under braking the estimate may not fall below the fastest sensed wheel, nor faster than\n");
     std::printf("  the fall limit. A car stopping at ~0.95 g therefore sheds an error at ~3 m/s^2 at best.\n");
 
@@ -3259,7 +3318,7 @@ TEST_CASE("which single term the loop needs: the guards, or the rear re-apply ra
     shipped.antilock.enabled = true;
 
     auto noGuards = shipped;
-    noGuards.antilock.slipAwareRecovery = false;
+    noGuards.antilock.recoveryAuthority = RecoveryAuthority::Disabled;
 
     struct Arm
     {
@@ -3267,8 +3326,8 @@ TEST_CASE("which single term the loop needs: the guards, or the rear re-apply ra
         AssistSetup assists;
     };
 
-    auto arms = std::vector<Arm>{{"production (control)", shipped},
-                                {"G  slipAwareRecovery OFF (all channels)", noGuards}};
+    auto arms =
+        std::vector<Arm>{{"production (control)", shipped}, {"G  slipAwareRecovery OFF (all channels)", noGuards}};
 
     for (const auto factor : std::array<double, 4>{2.0, 4.0, 10.0, 100.0})
     {
@@ -3297,8 +3356,8 @@ TEST_CASE("which single term the loop needs: the guards, or the rear re-apply ra
         {
             label += std::to_string(static_cast<int>(factors[index - 2]));
             label += "  (";
-            label += std::to_string(
-                static_cast<int>(factors[index - 2] * shipped.antilock.modulator.reapplyGradient / bar));
+            label +=
+                std::to_string(static_cast<int>(factors[index - 2] * shipped.antilock.modulator.reapplyGradient / bar));
             label += " bar/s)";
         }
 

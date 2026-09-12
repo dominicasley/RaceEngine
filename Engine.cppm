@@ -34,6 +34,10 @@ export import raceengine.input;
 // which the graphics closure already brings. Jolt stays where it is: it is reached through
 // `extern "C++"` free functions taking fundamental types, so its -mavx2 never touches a BMI.
 export import raceengine.physics;
+// City traffic, which imports physics and is imported by nothing in it. Re-exported for the reason
+// every module above it is: a game that had to import a second module to reach half the engine is a
+// seam this file exists to close.
+export import raceengine.traffic;
 // The sound, and the same shape again: `raceengine.audio` exports what the car is doing and the seam
 // that consumes it, and keeps <fmod_studio.hpp> in an implementation partition nobody importing this
 // pays for.

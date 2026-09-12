@@ -1895,7 +1895,8 @@ TEST_CASE("the fixture the braking ledger is measured on, frozen and printed", "
     std::printf("  traction ctrl  mode %d (0 = off)\n", static_cast<int>(assists.traction.mode));
     std::printf("  cornering brake %s\n", assists.cornering.enabled ? "ON" : "off");
     std::printf("  yaw delay      %s\n", assists.antilock.yawMomentDelay ? "ON" : "off");
-    std::printf("  slip-aware law %s\n", assists.antilock.slipAwareRecovery ? "ON" : "off");
+    std::printf("  recovery       authority %d (0 unconditional, 1 supervised, 2 disabled)\n",
+                static_cast<int>(assists.antilock.recoveryAuthority));
     std::printf("  rear metering  reapply %.3e vs rear %.3e bar/s-equivalent (bit-inert)\n",
                 assists.antilock.modulator.reapplyGradient, assists.antilock.modulator.rearReapplyGradient);
 
@@ -1980,8 +1981,8 @@ TEST_CASE("the current ledger, and the historical one restated like-for-like", "
                 ledger.assisted.distance - ledger.slew.distance);
     std::printf("\n  Like-for-like, G(clamped) moved 4.82 -> %.2f m, which is %+.2f m and not %+.2f m.\n",
                 gapOf(ledger), gapOf(ledger) - 4.82, gapOf(ledger) - 2.99);
-    std::printf("  The report's `2.99 -> 6.04, doubled` is %.2f m of denominator swap plus %.2f m of\n",
-                4.82 - 2.99, gapOf(ledger) - 4.82);
+    std::printf("  The report's `2.99 -> 6.04, doubled` is %.2f m of denominator swap plus %.2f m of\n", 4.82 - 2.99,
+                gapOf(ledger) - 4.82);
     std::printf("  real movement. Correct it forward; do not restate the old numbers.\n");
 }
 
@@ -2237,9 +2238,9 @@ TEST_CASE("what the controller and its estimator were doing at every stage", "[.
     p0b.name = "P0b +droop 40mm";
     p0b.droop40 = true;
 
-    const auto arms = std::vector<Arm>{{"P0  2026-08-24 plant", stageP0()}, {"P0b +droop 40mm", p0b},
-                                       {"P1  +load path", p1},             {"P2  +thermal", p2},
-                                       {"P3  +camber,seal,gas", p3},       {"P4  (today)", Plant{}}};
+    const auto arms = std::vector<Arm>{
+        {"P0  2026-08-24 plant", stageP0()}, {"P0b +droop 40mm", p0b}, {"P1  +load path", p1}, {"P2  +thermal", p2},
+        {"P3  +camber,seal,gas", p3},        {"P4  (today)", Plant{}}};
 
     std::printf("\n=== the controller, per stage: duty, cycling, and where the grip went ===\n");
     std::printf("\n  stage                   first ABS   slip@1st   duty FL/RL     dumps FL/RL   "
@@ -2320,9 +2321,9 @@ TEST_CASE("what the controller and its estimator were doing at every stage", "[.
         const auto& first = run.samples.front().wheels[0];
         const auto& last = run.samples.back().wheels[0];
 
-        std::printf("  %-22s  %7.3f/%7.3f      %7.3f/%7.3f      %7.2f/%7.2f\n", arms[index].name,
-                    first.coreTemperature, last.coreTemperature, first.gasPressurePsi, last.gasPressurePsi,
-                    first.discTemperature, last.discTemperature);
+        std::printf("  %-22s  %7.3f/%7.3f      %7.3f/%7.3f      %7.2f/%7.2f\n", arms[index].name, first.coreTemperature,
+                    last.coreTemperature, first.gasPressurePsi, last.gasPressurePsi, first.discTemperature,
+                    last.discTemperature);
     }
 }
 
@@ -2373,7 +2374,13 @@ TEST_CASE("the two anti-lock reds at every stage, and the low-mu one", "[.brake-
                                        {"P2  +thermal", p2},
                                        {"P3  +camber,seal,gas", p3},
                                        {"P4  (today)", Plant{}},
-                                       {"P4 minus load path", [] { auto p = Plant{}; p.loadPath = false; return p; }()},
+                                       {"P4 minus load path",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.loadPath = false;
+                                            return p;
+                                        }()},
                                        {"P4 minus compliance",
                                         []
                                         {
@@ -2383,10 +2390,26 @@ TEST_CASE("the two anti-lock reds at every stage, and the low-mu one", "[.brake-
                                             p.recession = false;
                                             return p;
                                         }()},
-                                       {"P4 minus thermal", [] { auto p = Plant{}; p.thermal = false; return p; }()},
-                                       {"P4 minus pressure", [] { auto p = Plant{}; p.pressure = false; return p; }()},
-                                       {"P4 minus droop 40mm",
-                                        [] { auto p = Plant{}; p.droop40 = false; return p; }()}};
+                                       {"P4 minus thermal",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.thermal = false;
+                                            return p;
+                                        }()},
+                                       {"P4 minus pressure",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.pressure = false;
+                                            return p;
+                                        }()},
+                                       {"P4 minus droop 40mm", []
+                                        {
+                                            auto p = Plant{};
+                                            p.droop40 = false;
+                                            return p;
+                                        }()}};
 
     std::printf("\n=== red 387, `all four wheels on the ground through a hard stop` ===\n");
     std::printf("  its fixture: half pedal, electronics OFF, dry. Reported here as the minimum REAR\n");
@@ -2440,21 +2463,45 @@ TEST_CASE("the two anti-lock reds at every stage, and the low-mu one", "[.brake-
     const auto slippery = PhysicsWorld::create(gripPlate(0.35));
     REQUIRE(slippery.has_value());
 
-    const auto lowMuArms = std::vector<Arm>{
-        {"P4 (today)", Plant{}},
-        {"P4 minus compliance", []
-         {
-             auto p = Plant{};
-             p.complianceSteer = false;
-             p.complianceCamber = false;
-             p.recession = false;
-             return p;
-         }()},
-        {"P4 minus recession only", [] { auto p = Plant{}; p.recession = false; return p; }()},
-        {"P4 minus driveline reaction", [] { auto p = Plant{}; p.drivelineReaction = false; return p; }()},
-        {"P4 minus load path", [] { auto p = Plant{}; p.loadPath = false; return p; }()},
-        {"P4 minus thermal", [] { auto p = Plant{}; p.thermal = false; return p; }()},
-        {"P0 (2026-08-24 plant)", stageP0()}};
+    const auto lowMuArms = std::vector<Arm>{{"P4 (today)", Plant{}},
+                                            {"P4 minus compliance",
+                                             []
+                                             {
+                                                 auto p = Plant{};
+                                                 p.complianceSteer = false;
+                                                 p.complianceCamber = false;
+                                                 p.recession = false;
+                                                 return p;
+                                             }()},
+                                            {"P4 minus recession only",
+                                             []
+                                             {
+                                                 auto p = Plant{};
+                                                 p.recession = false;
+                                                 return p;
+                                             }()},
+                                            {"P4 minus driveline reaction",
+                                             []
+                                             {
+                                                 auto p = Plant{};
+                                                 p.drivelineReaction = false;
+                                                 return p;
+                                             }()},
+                                            {"P4 minus load path",
+                                             []
+                                             {
+                                                 auto p = Plant{};
+                                                 p.loadPath = false;
+                                                 return p;
+                                             }()},
+                                            {"P4 minus thermal",
+                                             []
+                                             {
+                                                 auto p = Plant{};
+                                                 p.thermal = false;
+                                                 return p;
+                                             }()},
+                                            {"P0 (2026-08-24 plant)", stageP0()}};
 
     for (const auto& arm : lowMuArms)
     {
@@ -2464,10 +2511,9 @@ TEST_CASE("the two anti-lock reds at every stage, and the low-mu one", "[.brake-
         REQUIRE(ledger.floored.stopped);
         REQUIRE(ledger.assisted.stopped);
 
-        std::printf("  %-22s  %9.2f  %9.2f   %+9.2f%%  %7.2f\n", arm.name, ledger.floored.distance,
-                    ledger.assisted.distance, 100.0 * (ledger.floored.distance - ledger.assisted.distance) /
-                                                  ledger.floored.distance,
-                    gapOf(ledger));
+        std::printf(
+            "  %-22s  %9.2f  %9.2f   %+9.2f%%  %7.2f\n", arm.name, ledger.floored.distance, ledger.assisted.distance,
+            100.0 * (ledger.floored.distance - ledger.assisted.distance) / ledger.floored.distance, gapOf(ledger));
     }
 }
 
@@ -2609,8 +2655,8 @@ TEST_CASE("is a single floored anti-lock stop a measurement at all", "[.brake-ga
         std::printf("     %9.3f   %9.3f   %9.3f  %8.3f  %8zu  %8.3f  %5.3f/%5.3f  %4zu/%4zu\n",
                     3.6 * hundred * (1.0 + 0.001 * static_cast<double>(k)), ensemble.assisted[index],
                     ensemble.bounded[index], ensemble.gap[index], ensemble.airborne[index],
-                    ensemble.underUtilised[index], ensemble.frontUtilisation[index],
-                    ensemble.rearUtilisation[index], ensemble.frontDumps[index], ensemble.rearDumps[index]);
+                    ensemble.underUtilised[index], ensemble.frontUtilisation[index], ensemble.rearUtilisation[index],
+                    ensemble.frontDumps[index], ensemble.rearDumps[index]);
     }
 
     std::printf("\n  ABS      median %.3f, span %.3f to %.3f  (%.3f m wide)\n", ensemble.medianAssisted,
@@ -2706,24 +2752,64 @@ TEST_CASE("the decomposition again, on ensemble medians", "[.brake-gap]")
         Plant plant;
     };
 
-    const auto arms = std::vector<Arm>{
-        {"P4 (today)", Plant{}},
-        {"minus geometric load path", [] { auto p = Plant{}; p.loadPath = false; return p; }()},
-        {"minus compliance (all three)",
-         []
-         {
-             auto p = Plant{};
-             p.complianceSteer = false;
-             p.complianceCamber = false;
-             p.recession = false;
-             return p;
-         }()},
-        {"minus thermal tyre", [] { auto p = Plant{}; p.thermal = false; return p; }()},
-        {"minus cavity air / pressure", [] { auto p = Plant{}; p.pressure = false; return p; }()},
-        {"[x] minus driveline reaction", [] { auto p = Plant{}; p.drivelineReaction = false; return p; }()},
-        {"[x] minus thermal brake", [] { auto p = Plant{}; p.brakeThermal = false; return p; }()},
-        {"[x] minus 25 N rear seal (107)", [] { auto p = Plant{}; p.rearSealFriction25 = false; return p; }()},
-        {"[x] minus 40 mm droop (20 mm)", [] { auto p = Plant{}; p.droop40 = false; return p; }()}};
+    const auto arms = std::vector<Arm>{{"P4 (today)", Plant{}},
+                                       {"minus geometric load path",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.loadPath = false;
+                                            return p;
+                                        }()},
+                                       {"minus compliance (all three)",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.complianceSteer = false;
+                                            p.complianceCamber = false;
+                                            p.recession = false;
+                                            return p;
+                                        }()},
+                                       {"minus thermal tyre",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.thermal = false;
+                                            return p;
+                                        }()},
+                                       {"minus cavity air / pressure",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.pressure = false;
+                                            return p;
+                                        }()},
+                                       {"[x] minus driveline reaction",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.drivelineReaction = false;
+                                            return p;
+                                        }()},
+                                       {"[x] minus thermal brake",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.brakeThermal = false;
+                                            return p;
+                                        }()},
+                                       {"[x] minus 25 N rear seal (107)",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.rearSealFriction25 = false;
+                                            return p;
+                                        }()},
+                                       {"[x] minus 40 mm droop (20 mm)", []
+                                        {
+                                            auto p = Plant{};
+                                            p.droop40 = false;
+                                            return p;
+                                        }()}};
 
     std::printf("\n=== leave-one-out from today's plant, ENSEMBLE MEDIANS ===\n");
     std::printf("\n  arm                              G med   G mean  dG_LOO med  dG_LOO mean  G span stranded\n");
@@ -2758,8 +2844,8 @@ TEST_CASE("the decomposition again, on ensemble medians", "[.brake-gap]")
         }
     }
 
-    std::printf("\n  the four NAMED leave-one-out contributions sum to %+.3f m (median) / %+.3f m (mean)\n",
-                namedSum, namedMeanSum);
+    std::printf("\n  the four NAMED leave-one-out contributions sum to %+.3f m (median) / %+.3f m (mean)\n", namedSum,
+                namedMeanSum);
     std::printf("  against a chronological total dG of %+.3f m (median) / %+.3f m (mean).\n",
                 gaps.back() - gaps.front(), means.back() - means.front());
     std::printf("  Read every one of these against the G span in the last-but-one column: a dG_LOO\n");
@@ -2844,18 +2930,23 @@ TEST_CASE("how much of the decomposition survives a finer ensemble", "[.brake-ga
         Plant plant;
     };
 
-    const auto arms = std::vector<Arm>{
-        {"P4 (today)", Plant{}},
-        {"P0 (2026-08-24 plant)", stageP0()},
-        {"P4 minus compliance", []
-         {
-             auto p = Plant{};
-             p.complianceSteer = false;
-             p.complianceCamber = false;
-             p.recession = false;
-             return p;
-         }()},
-        {"P4 minus driveline reaction", [] { auto p = Plant{}; p.drivelineReaction = false; return p; }()}};
+    const auto arms = std::vector<Arm>{{"P4 (today)", Plant{}},
+                                       {"P0 (2026-08-24 plant)", stageP0()},
+                                       {"P4 minus compliance",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.complianceSteer = false;
+                                            p.complianceCamber = false;
+                                            p.recession = false;
+                                            return p;
+                                        }()},
+                                       {"P4 minus driveline reaction", []
+                                        {
+                                            auto p = Plant{};
+                                            p.drivelineReaction = false;
+                                            return p;
+                                        }()}};
 
     std::printf("\n=== is the median resolved? the same arms at three ensemble sizes ===\n");
     std::printf("  band is +/-0.7%% of entry speed in every case; only the sampling density changes.\n");
@@ -2869,9 +2960,8 @@ TEST_CASE("how much of the decomposition survives a finer ensemble", "[.brake-ga
         {
             const auto resolution = resolutionOf(setup, world.value(), half);
 
-            std::printf("  %-28s %3zu    %8.3f  %8.3f                    %6.3f\n",
-                        half == 7 ? arm.name : "", resolution.members, resolution.medianGap, resolution.meanGap,
-                        resolution.strandedFraction);
+            std::printf("  %-28s %3zu    %8.3f  %8.3f                    %6.3f\n", half == 7 ? arm.name : "",
+                        resolution.members, resolution.medianGap, resolution.meanGap, resolution.strandedFraction);
         }
     }
 
@@ -2935,33 +3025,74 @@ TEST_CASE("the resolved summary: the stranded-rear fraction at every arm", "[.br
         Plant plant;
     };
 
-    const auto arms = std::vector<Arm>{
-        {"P0   2026-08-24 plant", stageP0()},
-        {"P0b  +droop 40 mm", p0b},
-        {"P0b  +load path only", p1PathOnly},
-        {"P0b  +driveline reaction only", p1ReactionOnly},
-        {"P1   +load path (whole commit)", p1},
-        {"P2   +thermal tyre and brake", p2},
-        {"P2   +compliance camber only", p2Camber},
-        {"P2   +25 N rear seal only", p2Seal},
-        {"P2   +cavity air only", p2Gas},
-        {"P3   +camber, seal, gas", p3},
-        {"P4   +recession  (TODAY)", Plant{}},
-        {"P4   minus load path", [] { auto p = Plant{}; p.loadPath = false; return p; }()},
-        {"P4   minus compliance (all 3)", []
-         {
-             auto p = Plant{};
-             p.complianceSteer = false;
-             p.complianceCamber = false;
-             p.recession = false;
-             return p;
-         }()},
-        {"P4   minus thermal tyre", [] { auto p = Plant{}; p.thermal = false; return p; }()},
-        {"P4   minus cavity air", [] { auto p = Plant{}; p.pressure = false; return p; }()},
-        {"P4   minus driveline reaction", [] { auto p = Plant{}; p.drivelineReaction = false; return p; }()},
-        {"P4   minus 25 N rear seal", [] { auto p = Plant{}; p.rearSealFriction25 = false; return p; }()},
-        {"P4   minus 40 mm droop", [] { auto p = Plant{}; p.droop40 = false; return p; }()},
-        {"P4   minus recession", [] { auto p = Plant{}; p.recession = false; return p; }()}};
+    const auto arms = std::vector<Arm>{{"P0   2026-08-24 plant", stageP0()},
+                                       {"P0b  +droop 40 mm", p0b},
+                                       {"P0b  +load path only", p1PathOnly},
+                                       {"P0b  +driveline reaction only", p1ReactionOnly},
+                                       {"P1   +load path (whole commit)", p1},
+                                       {"P2   +thermal tyre and brake", p2},
+                                       {"P2   +compliance camber only", p2Camber},
+                                       {"P2   +25 N rear seal only", p2Seal},
+                                       {"P2   +cavity air only", p2Gas},
+                                       {"P3   +camber, seal, gas", p3},
+                                       {"P4   +recession  (TODAY)", Plant{}},
+                                       {"P4   minus load path",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.loadPath = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus compliance (all 3)",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.complianceSteer = false;
+                                            p.complianceCamber = false;
+                                            p.recession = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus thermal tyre",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.thermal = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus cavity air",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.pressure = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus driveline reaction",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.drivelineReaction = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus 25 N rear seal",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.rearSealFriction25 = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus 40 mm droop",
+                                        []
+                                        {
+                                            auto p = Plant{};
+                                            p.droop40 = false;
+                                            return p;
+                                        }()},
+                                       {"P4   minus recession", []
+                                        {
+                                            auto p = Plant{};
+                                            p.recession = false;
+                                            return p;
+                                        }()}};
 
     std::printf("\n=== the resolved summary: 29 members, +/-0.7%% entry band ===\n");
     std::printf("\n  arm                                G median   G mean   stranded rear fraction\n");
@@ -2995,10 +3126,10 @@ TEST_CASE("what actually strands the rear axle: two members of the same ensemble
     auto antilock = golfGtiMk7Assists(setup.value());
     antilock.antilock.enabled = true;
 
-    const auto stranded = record(setup.value(), world.value(), antilock, 1.0, Actuator::Driver, 0.0, false,
-                                 hundred * (1.0 - 0.005));
-    const auto recovered = record(setup.value(), world.value(), antilock, 1.0, Actuator::Driver, 0.0, false,
-                                  hundred * (1.0 - 0.004));
+    const auto stranded =
+        record(setup.value(), world.value(), antilock, 1.0, Actuator::Driver, 0.0, false, hundred * (1.0 - 0.005));
+    const auto recovered =
+        record(setup.value(), world.value(), antilock, 1.0, Actuator::Driver, 0.0, false, hundred * (1.0 - 0.004));
 
     REQUIRE(stranded.stopped);
     REQUIRE(recovered.stopped);
@@ -3091,9 +3222,9 @@ constexpr auto ensembleBand = 0.007;
 // own -0.007 + 0.001k to the bit, which is what makes the two sections comparable.
 [[nodiscard]] double memberEntry(const std::size_t index, const std::size_t count)
 {
-    const auto offset = count <= 1 ? 0.0
-                                   : -ensembleBand + 2.0 * ensembleBand * static_cast<double>(index) /
-                                                         static_cast<double>(count - 1);
+    const auto offset =
+        count <= 1 ? 0.0
+                   : -ensembleBand + 2.0 * ensembleBand * static_cast<double>(index) / static_cast<double>(count - 1);
 
     return hundred * (1.0 + offset);
 }
@@ -3351,8 +3482,8 @@ TEST_CASE("how many members the standard braking ensemble needs, and what they c
     std::printf("\n    n   ABS med   ABS mean   ABS sd  ABS P10-P90   clamp med  clamp sd    G med   G mean"
                 "  stranded   seconds\n");
 
-    for (const auto count : {std::size_t{9}, std::size_t{15}, std::size_t{21}, std::size_t{29}, std::size_t{43},
-                             std::size_t{57}})
+    for (const auto count :
+         {std::size_t{9}, std::size_t{15}, std::size_t{21}, std::size_t{29}, std::size_t{43}, std::size_t{57}})
     {
         const auto began = std::chrono::steady_clock::now();
 
@@ -3415,8 +3546,8 @@ TEST_CASE("the current dry braking ledger, its gaps and its two clusters", "[.br
 
     for (const auto& arm : arms)
     {
-        ensembles.push_back(armEnsemble(setup.value(), world.value(), arm.antilock ? antilock : plain, arm.pedal,
-                                        arm.actuator, count));
+        ensembles.push_back(
+            armEnsemble(setup.value(), world.value(), arm.antilock ? antilock : plain, arm.pedal, arm.actuator, count));
 
         for (const auto& member : ensembles.back())
         {
@@ -3450,8 +3581,8 @@ TEST_CASE("the current dry braking ledger, its gaps and its two clusters", "[.br
         const auto front = distributionOf(project(members, [](const Member& m) { return m.frontUtilisation; }));
         const auto rear = distributionOf(project(members, [](const Member& m) { return m.rearUtilisation; }));
 
-        std::printf("  %-30s %8.3f  %7.3f  %7.3f   %8.3f   %8.3f  %8.3f  ", arms[index].name, stop.median,
-                    meanG.median, peakG.median, util.median, front.median, rear.median);
+        std::printf("  %-30s %8.3f  %7.3f  %7.3f   %8.3f   %8.3f  %8.3f  ", arms[index].name, stop.median, meanG.median,
+                    peakG.median, util.median, front.median, rear.median);
 
         if (arms[index].clustered)
         {
@@ -3500,7 +3631,9 @@ TEST_CASE("the current dry braking ledger, its gaps and its two clusters", "[.br
     printDistributionRow("ABS worth vs locked [%]", distributionOf(worth));
 
     const auto stopOf = [&](const std::size_t arm)
-    { return distributionOf(project(ensembles[arm], [](const Member& m) { return m.distance; })); };
+    {
+        return distributionOf(project(ensembles[arm], [](const Member& m) { return m.distance; }));
+    };
 
     std::printf("\n  --- and the same four as DIFFERENCES OF MEDIANS, which is a different quantity ---\n");
     std::printf("  ABS - slew            paired median %7.3f    difference of medians %7.3f\n",

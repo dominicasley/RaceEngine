@@ -7,11 +7,14 @@
 module;
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <limits>
+#include <span>
 #include <vector>
 
 module raceengine.physics;
@@ -247,6 +250,397 @@ TangentBasis tangentBasis(const glm::dvec3& normal)
     return manifold;
 }
 
+namespace
+{
+
+// One box standing in the world, as the separating-axis test wants it. The axes are the **columns**
+// of the matrix, which is what `glm::mat3_cast` hands back for an orientation, so nothing here has
+// to transpose anything.
+struct OrientedBox
+{
+    glm::dvec3 centre{0.0};
+    glm::dmat3 axes{1.0};
+    glm::dvec3 half{1.0};
+};
+
+// How far the box reaches from its own centre along a unit direction.
+[[nodiscard]] double projectedRadius(const OrientedBox& box, const glm::dvec3& axis)
+{
+    return box.half.x * std::abs(glm::dot(axis, box.axes[0])) + box.half.y * std::abs(glm::dot(axis, box.axes[1])) +
+           box.half.z * std::abs(glm::dot(axis, box.axes[2]));
+}
+
+// The corner of the box furthest along a direction.
+[[nodiscard]] glm::dvec3 supportPoint(const OrientedBox& box, const glm::dvec3& direction)
+{
+    auto point = box.centre;
+
+    for (auto index = 0; index < 3; index++)
+    {
+        const auto reach = glm::dot(direction, box.axes[index]) >= 0.0 ? box.half[index] : -box.half[index];
+
+        point += reach * box.axes[index];
+    }
+
+    return point;
+}
+
+// Which axis two boxes are least apart on, and by how much.
+//
+// **The face axes are preferred over the edge ones by a bias, and that is not a tidy-up.** Two cars
+// meeting nose to tail are very nearly face to face, and the fifteen candidate axes then include
+// several within rounding of each other. Picking a cross-product axis on one tick and a face axis on
+// the next moves the contact from a four-point patch to a single point and back, which reads as a
+// car buzzing against a bumper. A millimetre of bias settles it on the face, which is also the
+// answer that produces a manifold rather than a point.
+struct BoxSeparation
+{
+    bool touching = false;
+    // Unit, pointing out of the first box and into the second.
+    glm::dvec3 axis{0.0, 1.0, 0.0};
+    double penetration = 0.0;
+    // 0..2 name a face of the first box, 3..5 a face of the second, and 6 is an edge against an edge.
+    int kind = 6;
+};
+
+[[nodiscard]] BoxSeparation separateBoxes(const OrientedBox& first, const OrientedBox& second)
+{
+    // A millimetre, in the units everything below Physics works in. Small against any real overlap
+    // between two cars and large against the rounding that makes two near-equal axes trade places.
+    constexpr auto edgeBias = 0.001;
+
+    const auto between = second.centre - first.centre;
+
+    auto best = BoxSeparation{};
+    auto bestScore = -std::numeric_limits<double>::max();
+    auto separated = false;
+
+    const auto test = [&](const glm::dvec3& candidate, const int kind)
+    {
+        if (separated)
+        {
+            return;
+        }
+
+        const auto lengthSquared = glm::dot(candidate, candidate);
+
+        // A cross product of two parallel edges. It is not an axis at all, and the pair of face
+        // axes it came from already covers whatever it would have said.
+        if (lengthSquared < 1e-12)
+        {
+            return;
+        }
+
+        const auto axis = candidate / std::sqrt(lengthSquared);
+        const auto gap =
+            std::abs(glm::dot(between, axis)) - projectedRadius(first, axis) - projectedRadius(second, axis);
+
+        if (gap > 0.0)
+        {
+            separated = true;
+
+            return;
+        }
+
+        const auto score = kind == 6 ? gap - edgeBias : gap;
+        if (score <= bestScore)
+        {
+            return;
+        }
+
+        bestScore = score;
+        best.axis = glm::dot(between, axis) < 0.0 ? -axis : axis;
+        best.penetration = -gap;
+        best.kind = kind;
+    };
+
+    for (auto index = 0; index < 3; index++)
+    {
+        test(first.axes[index], index);
+    }
+
+    for (auto index = 0; index < 3; index++)
+    {
+        test(second.axes[index], index + 3);
+    }
+
+    for (auto own = 0; own < 3; own++)
+    {
+        for (auto other = 0; other < 3; other++)
+        {
+            test(glm::cross(first.axes[own], second.axes[other]), 6);
+        }
+    }
+
+    best.touching = !separated;
+
+    return best;
+}
+
+// The four corners of the face of `box` most square-on to `normal` and facing back along it.
+void incidentFace(const OrientedBox& box, const glm::dvec3& normal, std::array<glm::dvec3, 4>& into)
+{
+    auto axisIndex = 0;
+    auto strongest = -1.0;
+
+    for (auto index = 0; index < 3; index++)
+    {
+        if (const auto alignment = std::abs(glm::dot(box.axes[index], normal)); alignment > strongest)
+        {
+            strongest = alignment;
+            axisIndex = index;
+        }
+    }
+
+    const auto facing = glm::dot(box.axes[axisIndex], normal) > 0.0 ? -1.0 : 1.0;
+    const auto centre = box.centre + facing * box.half[axisIndex] * box.axes[axisIndex];
+
+    const auto first = (axisIndex + 1) % 3;
+    const auto second = (axisIndex + 2) % 3;
+    const auto alongFirst = box.half[first] * box.axes[first];
+    const auto alongSecond = box.half[second] * box.axes[second];
+
+    into[0] = centre - alongFirst - alongSecond;
+    into[1] = centre + alongFirst - alongSecond;
+    into[2] = centre + alongFirst + alongSecond;
+    into[3] = centre - alongFirst + alongSecond;
+}
+
+// Sutherland-Hodgman against one half space, keeping what is on the inside of the plane. Fixed
+// buffers rather than vectors: this runs inside the tick, a quad clipped by four planes never
+// exceeds eight vertices, and an allocation per contact per tick is a cost with nothing to show
+// for it.
+[[nodiscard]] std::size_t clipToPlane(const std::array<glm::dvec3, 8>& input, const std::size_t count,
+                                      const glm::dvec3& planePoint, const glm::dvec3& planeNormal,
+                                      std::array<glm::dvec3, 8>& output)
+{
+    auto kept = std::size_t{0};
+
+    for (auto index = std::size_t{0}; index < count; index++)
+    {
+        const auto& current = input[index];
+        const auto& previous = input[(index + count - 1) % count];
+
+        const auto currentSide = glm::dot(current - planePoint, planeNormal);
+        const auto previousSide = glm::dot(previous - planePoint, planeNormal);
+
+        if (currentSide * previousSide < 0.0 && kept < output.size())
+        {
+            // The edge crosses the plane, so the crossing point joins the polygon before whichever
+            // of its two ends is inside.
+            const auto span = previousSide - currentSide;
+            const auto along = std::abs(span) > 1e-12 ? previousSide / span : 0.0;
+
+            output[kept] = previous + (current - previous) * along;
+            kept++;
+        }
+
+        if (currentSide <= 0.0 && kept < output.size())
+        {
+            output[kept] = current;
+            kept++;
+        }
+    }
+
+    return kept;
+}
+
+// The contact patch between two oriented boxes, with the normal pointing out of `first` and into
+// `second` — the direction `ContactPoint::normal` means.
+//
+// A face clip rather than a single deepest point, and that is what makes a car rest against another
+// car instead of pivoting on one corner: a sequential-impulse solver needs several points on the
+// same plane before it can hold an orientation at all.
+[[nodiscard]] std::size_t collideOrientedBoxes(const OrientedBox& first, const OrientedBox& second,
+                                               std::array<glm::dvec3, 4>& positions,
+                                               std::array<double, 4>& penetrations, glm::dvec3& normal)
+{
+    const auto separation = separateBoxes(first, second);
+    if (!separation.touching)
+    {
+        return 0;
+    }
+
+    normal = separation.axis;
+
+    if (separation.kind == 6)
+    {
+        // Edge against edge: a corner or a wing mirror's worth of contact, and there is one point in
+        // it. Midway between the two support points, which is where the two edges cross.
+        positions[0] = 0.5 * (supportPoint(first, normal) + supportPoint(second, -normal));
+        penetrations[0] = separation.penetration;
+
+        return 1;
+    }
+
+    const auto referenceIsFirst = separation.kind < 3;
+    const auto& reference = referenceIsFirst ? first : second;
+    const auto& incident = referenceIsFirst ? second : first;
+
+    // Outward from the reference box, pointing at the incident one. The separating axis already *is*
+    // that face's normal, so the face centre is one half extent along it and no sign has to be
+    // recovered.
+    const auto referenceNormal = referenceIsFirst ? normal : -normal;
+    const auto axisIndex = referenceIsFirst ? separation.kind : separation.kind - 3;
+    const auto faceCentre = reference.centre + reference.half[axisIndex] * referenceNormal;
+
+    auto corners = std::array<glm::dvec3, 4>{};
+    incidentFace(incident, referenceNormal, corners);
+
+    auto polygon = std::array<glm::dvec3, 8>{};
+    auto scratch = std::array<glm::dvec3, 8>{};
+    for (auto index = std::size_t{0}; index < corners.size(); index++)
+    {
+        polygon[index] = corners[index];
+    }
+
+    auto count = corners.size();
+
+    const auto firstSide = (axisIndex + 1) % 3;
+    const auto secondSide = (axisIndex + 2) % 3;
+
+    const auto clip = [&](const int side)
+    {
+        const auto edge = reference.half[side] * reference.axes[side];
+
+        count = clipToPlane(polygon, count, faceCentre + edge, reference.axes[side], scratch);
+        polygon = scratch;
+
+        count = clipToPlane(polygon, count, faceCentre - edge, -reference.axes[side], scratch);
+        polygon = scratch;
+    };
+
+    clip(firstSide);
+    clip(secondSide);
+
+    auto found = std::size_t{0};
+
+    for (auto index = std::size_t{0}; index < count && found < positions.size(); index++)
+    {
+        const auto depth = -glm::dot(polygon[index] - faceCentre, referenceNormal);
+        if (depth < 0.0)
+        {
+            // Clipped into the face's footprint but not behind it. It is not touching.
+            continue;
+        }
+
+        positions[found] = polygon[index];
+        penetrations[found] = depth;
+        found++;
+    }
+
+    if (found == 0)
+    {
+        // The clip left nothing — a grazing pass the axis test called an overlap. One point at the
+        // deepest corner rather than nothing, so a contact the test found is a contact the solver
+        // sees.
+        positions[0] = supportPoint(incident, -referenceNormal);
+        penetrations[0] = separation.penetration;
+
+        return 1;
+    }
+
+    return found;
+}
+
+} // namespace
+
+void collideObstacles(const RigidBodyState& state, const CollisionBox& box,
+                      std::span<const DynamicObstacle> obstacles, ContactManifold& manifold,
+                      const std::uint32_t limitPerObstacle)
+{
+    // **The whole of the byte-inertness argument.** A world with no traffic in it hands an empty
+    // span, this returns before touching the manifold, and what the solver then resolves is exactly
+    // what `collideBody` produced — the same points, the same table, the same arithmetic. Both frame
+    // gates are blessed on a circuit that has no traffic lanes at all.
+    if (obstacles.empty() || limitPerObstacle == 0)
+    {
+        return;
+    }
+
+    auto car = OrientedBox{};
+    car.centre = bodyToWorld(state, box.centre);
+    car.axes = glm::mat3_cast(state.orientation);
+    car.half = box.halfExtents;
+
+    // A bounding-sphere rejection ahead of the fifteen axes. Most obstacles handed in on any tick
+    // are the ones a car is driving past rather than into, and this is the test that says so in
+    // three multiplies.
+    const auto carReach = glm::length(car.half);
+
+    for (const auto& obstacle : obstacles)
+    {
+        auto solid = OrientedBox{};
+        solid.centre = obstacle.centre;
+        solid.axes = glm::mat3_cast(obstacle.orientation);
+        solid.half = obstacle.halfExtents;
+
+        const auto between = car.centre - solid.centre;
+        const auto reach = carReach + glm::length(solid.half);
+
+        if (glm::dot(between, between) > reach * reach)
+        {
+            continue;
+        }
+
+        auto positions = std::array<glm::dvec3, 4>{};
+        auto penetrations = std::array<double, 4>{};
+        auto normal = glm::dvec3(0.0, 1.0, 0.0);
+
+        const auto found = collideOrientedBoxes(solid, car, positions, penetrations, normal);
+        if (found == 0)
+        {
+            continue;
+        }
+
+        // The immovable world, created on first need — the same rule `collideBody` keeps, and it has
+        // to be kept here too because a car that touches an obstacle and nothing else arrives with
+        // an empty table.
+        if (manifold.bodies.empty())
+        {
+            manifold.bodies.push_back(ContactBody{});
+        }
+
+        // One body per obstacle, appended rather than looked up. `bodyIndexFor` matches on `prop`,
+        // and every obstacle carries `noProp` — so a lookup would hand every one of them the
+        // immovable world's own entry.
+        const auto body = manifold.bodies.size();
+
+        manifold.bodies.push_back(ContactBody{.prop = noProp,
+                                              .obstacle = obstacle.id,
+                                              .inverseMass = obstacle.inverseMass,
+                                              .inverseInertia = obstacle.inverseInertia,
+                                              .centre = obstacle.centreOfMass,
+                                              .linearVelocity = obstacle.linearVelocity,
+                                              .angularVelocity = obstacle.angularVelocity});
+
+        const auto kept = std::min(static_cast<std::size_t>(limitPerObstacle), found);
+
+        // Deepest first when the cap bites, so what is dropped is the shallowest corner rather than
+        // whichever one the clip happened to emit last.
+        for (auto slot = std::size_t{0}; slot < kept; slot++)
+        {
+            auto deepest = slot;
+            for (auto index = slot + 1; index < found; index++)
+            {
+                if (penetrations[index] > penetrations[deepest])
+                {
+                    deepest = index;
+                }
+            }
+
+            std::swap(positions[slot], positions[deepest]);
+            std::swap(penetrations[slot], penetrations[deepest]);
+
+            manifold.points.push_back(ContactPoint{.position = positions[slot],
+                                                   .normal = normal,
+                                                   .penetration = penetrations[slot],
+                                                   .prop = noProp,
+                                                   .body = body});
+        }
+    }
+}
+
 void releaseBrokenProps(const RigidBodyState& state, ContactManifold& manifold, const double deltaTime)
 {
     if (manifold.bodies.size() <= 1 || deltaTime <= 0.0)
@@ -402,10 +796,14 @@ void resolveContacts(RigidBodyState& state, ContactManifold& manifold, const Con
     auto restitutionTargets = std::vector<double>(manifold.points.size(), 0.0);
     for (auto index = std::size_t{0}; index < manifold.points.size(); index++)
     {
-        const auto& point = manifold.points[index];
+        auto& point = manifold.points[index];
         const auto closing = glm::dot(velocityAt(point.position, bodyOf(point.body)), point.normal);
 
         restitutionTargets[index] = closing < -material.restitutionThreshold ? -material.restitution * closing : 0.0;
+
+        // The hit as it arrived, for whoever keeps a damage ledger: the same number restitution
+        // reads, kept on the point because nothing after this line can recover it.
+        point.approachSpeed = std::max(0.0, -closing);
     }
 
     for (auto iteration = std::uint32_t{0}; iteration < iterations; iteration++)

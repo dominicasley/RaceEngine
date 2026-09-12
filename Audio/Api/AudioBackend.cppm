@@ -1,7 +1,9 @@
 module;
 
+#include <cstddef>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -9,6 +11,7 @@ export module raceengine.audio:AudioBackend;
 
 import :CarAudio;
 import :SoundBank;
+import :TrafficAudio;
 
 namespace raceengine
 {
@@ -59,6 +62,26 @@ public:
     // them is to ask. Without it, "the car is silent" and "this bank calls rpm something else" look
     // identical from every layer above.
     [[nodiscard]] virtual std::vector<std::string> declaredParameters() const = 0;
+
+    // The other cars. One bank per body shape, in the order the caller indexes bodies by, and the
+    // number of cars that may be heard at once. What comes back is one line per bank saying what
+    // classified — the same fact `declaredParameters` states for the player's car, for the same
+    // reason: a fleet car whose recordings did not classify drives past silently with nothing
+    // anywhere to say why.
+    [[nodiscard]] virtual std::expected<std::vector<std::string>, std::string>
+    loadTrafficFleet(std::span<const TrafficBank> banks, std::size_t voices) = 0;
+
+    // Once per tick: where the ear is and where each audible car is. A voice that is not live is
+    // stopped; one that changed car is restarted on the other car's bank; the rest are moved and
+    // mixed. Never blocks, for the reason `update` never does.
+    virtual void updateTraffic(const AudioListener& listener, std::span<const TrafficVoice> voices) = 0;
+
+    virtual void unloadTrafficFleet() = 0;
+
+    // The siren: one recording for the whole fleet, looped and placed on every voice whose car has
+    // its siren on, with the car's own velocity so it drops through a pass. Lives with the fleet —
+    // after `loadTrafficFleet`, closed by `unloadTrafficFleet`.
+    [[nodiscard]] virtual std::expected<void, std::string> loadSiren(const std::string& path) = 0;
 };
 
 // A backend that makes no sound and refuses nothing.

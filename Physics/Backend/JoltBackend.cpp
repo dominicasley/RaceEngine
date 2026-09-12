@@ -42,6 +42,7 @@
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/CylinderShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -846,6 +847,153 @@ std::uint32_t raceengineJoltCollideBox(const std::uint64_t handle, const double*
     }
 
     return found;
+}
+
+// Every triangle a wheel-sized cylinder is touching, for the kerb-contact path.
+//
+// The third thing Jolt is asked for, after the broadphase and the bodywork's manifolds: the tyre's
+// **side view** of the road. The contact patch samples the road with vertical rays and cannot see a
+// face steeper than its own grid — GCP's 150 mm kerbs arrive as a one-tick road step under the
+// leading samples (docs/kerb-contact-brief.md). A cylinder of the tyre's own radius and width,
+// collided against the same mesh, reports every triangle it overlaps with the shortest push-out for
+// each: on a kerb face that is the contact the rays miss, and on flat road it is the contact the
+// rays already carry. Telling those two apart is the caller's exclusion rule, not this function's.
+//
+// `axes` are the spin axes. Jolt's cylinder stands on Y, so each is rotated onto its own axis.
+//
+// **Active-edge mode is the default, `CollideOnlyWithActive`, and it is kept deliberately.** The
+// road's internal triangle edges are inactive — coplanar neighbours, under the mesh's own five
+// degree threshold — so a contact whose closest feature is one of them comes back with its
+// triangle's face normal rather than a phantom edge normal, and a wheel rolling over the seam
+// between two flat triangles reads flat road. A kerb's top edge is active (ninety degrees) and
+// keeps the diagonal push-out a round tyre meeting an edge really has. Back faces are ignored, as
+// they are for the bodywork. **Results are per triangle**, so a face split in two reports twice
+// with the same axis and depth; merging those is the caller's as well.
+//
+// The convex radius is Jolt's default 5 cm, lowered where a stated extent is smaller than it, and
+// it rounds the cylinder's two rims — which is what a tyre's shoulders are. The radius and the
+// half-width are the stated extents regardless: Jolt keeps the outer surface where it was told to
+// and rounds inward.
+//
+// Slots are `index * maxContacts + n`, and `outCounts[index]` says how many of a cylinder's slots
+// were written. A cylinder that touches nothing writes none.
+void raceengineJoltCollideCylinders(const std::uint64_t handle, const double* centres, const double* axes,
+                                    const double* radii, const double* halfWidths, const std::uint32_t count,
+                                    const std::uint32_t maxContacts, std::uint32_t* outCounts, double* outAxes,
+                                    double* outNormals, double* outDepths, double* outPoints,
+                                    std::uint32_t* outSurfaces)
+{
+    auto* world = worldFor(handle);
+
+    for (auto index = std::uint32_t{0}; index < count; index++)
+    {
+        outCounts[index] = 0;
+    }
+
+    if (world == nullptr || maxContacts == 0)
+    {
+        return;
+    }
+
+    JPH::CollideShapeSettings settings;
+    settings.mBackFaceMode = JPH::EBackFaceMode::IgnoreBackFaces;
+    settings.mMaxSeparationDistance = 0.0f;
+
+    for (auto index = std::uint32_t{0}; index < count; index++)
+    {
+        const auto radius = static_cast<float>(radii[index]);
+        const auto halfWidth = static_cast<float>(halfWidths[index]);
+        if (!(radius > 0.0f) || !(halfWidth > 0.0f))
+        {
+            continue;
+        }
+
+        auto axis = JPH::Vec3(static_cast<float>(axes[index * 3 + 0]), static_cast<float>(axes[index * 3 + 1]),
+                              static_cast<float>(axes[index * 3 + 2]));
+        if (!(axis.LengthSq() > 0.0f))
+        {
+            continue;
+        }
+        axis = axis.Normalized();
+
+        // Jolt's default convex radius, 5 cm, restated as a literal because the physics module's
+        // `obstacleConvexRadius` has to be the same number and cannot see this file: the rule on
+        // that side rebuilds this cylinder's support point from it. Jolt refuses a convex radius
+        // larger than either extent, so a very small stated cylinder gets a correspondingly small
+        // rounding rather than a refusal.
+        const auto convexRadius = std::min({0.05f, radius, halfWidth});
+
+        JPH::CylinderShape cylinder(halfWidth, radius, convexRadius);
+        cylinder.SetEmbedded();
+
+        const auto rotation = JPH::Quat::sFromTo(JPH::Vec3::sAxisY(), axis);
+        const JPH::RVec3 position(static_cast<float>(centres[index * 3 + 0]),
+                                  static_cast<float>(centres[index * 3 + 1]),
+                                  static_cast<float>(centres[index * 3 + 2]));
+
+        JPH::AllHitCollisionCollector<JPH::CollideShapeCollector> collector;
+        world->system.GetNarrowPhaseQuery().CollideShape(&cylinder, JPH::Vec3::sReplicate(1.0f),
+                                                         JPH::RMat44::sRotationTranslation(rotation, position),
+                                                         settings, JPH::RVec3::sZero(), collector);
+
+        auto written = std::uint32_t{0};
+        for (const auto& hit : collector.mHits)
+        {
+            if (written >= maxContacts)
+            {
+                break;
+            }
+
+            // Jolt's penetration axis points from the cylinder towards the road and is not
+            // normalised. What is wanted is the direction the road pushes the tyre, which is the
+            // other way — the same turn the bodywork's contacts take.
+            const auto length = hit.mPenetrationAxis.Length();
+            if (!(length > 0.0f))
+            {
+                continue;
+            }
+
+            const auto normal = -hit.mPenetrationAxis / length;
+
+            // The triangle's own face normal at the contact point, beside the push-out — which are
+            // the same direction for a face contact and not for an edge or vertex one. The rule on
+            // the far side reads the difference: a contact against a triangle the bottom grid already
+            // carries is the grid's whatever its edges do to the push-out.
+            auto surface = std::uint32_t{0};
+            auto faceNormal = normal;
+            {
+                JPH::BodyLockRead lock(world->system.GetBodyLockInterface(), hit.mBodyID2);
+                if (lock.Succeeded())
+                {
+                    const auto& body = lock.GetBody();
+                    const auto* material = body.GetShape()->GetMaterial(hit.mSubShapeID2);
+                    surface = world->surfaceOf(material);
+                    faceNormal = body.GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, hit.mContactPointOn2);
+                }
+            }
+
+            const auto slot = static_cast<std::size_t>(index) * maxContacts + written;
+
+            outAxes[slot * 3 + 0] = static_cast<double>(normal.GetX());
+            outAxes[slot * 3 + 1] = static_cast<double>(normal.GetY());
+            outAxes[slot * 3 + 2] = static_cast<double>(normal.GetZ());
+
+            outNormals[slot * 3 + 0] = static_cast<double>(faceNormal.GetX());
+            outNormals[slot * 3 + 1] = static_cast<double>(faceNormal.GetY());
+            outNormals[slot * 3 + 2] = static_cast<double>(faceNormal.GetZ());
+
+            outPoints[slot * 3 + 0] = static_cast<double>(hit.mContactPointOn2.GetX());
+            outPoints[slot * 3 + 1] = static_cast<double>(hit.mContactPointOn2.GetY());
+            outPoints[slot * 3 + 2] = static_cast<double>(hit.mContactPointOn2.GetZ());
+
+            outDepths[slot] = static_cast<double>(hit.mPenetrationDepth);
+            outSurfaces[slot] = surface;
+
+            written++;
+        }
+
+        outCounts[index] = written;
+    }
 }
 
 // The dynamics of the props a manifold named, plus the anchor holding each one down.

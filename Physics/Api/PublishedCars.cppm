@@ -201,4 +201,49 @@ export [[nodiscard]] DrivelineSetup golfGtiMk7Driveline();
 // all. A game or a test that wants the systems says so, once, at the call.
 export [[nodiscard]] AssistSetup golfGtiMk7Assists(const VehicleSetup& setup);
 
+// --- the police car (docs/police-pursuit-brief.md) ---------------------------------------------
+//
+// A 2019 Dodge Charger patrol car, from a publicly distributed Assetto Corsa model
+// (`mpw_police_dodge_charger_street`, MPW ColTeH / Brucektrain, v2.0), unpacked by Content Manager
+// and read by `~/dev/ac-car-data` into the JSON beside its exported meshes.
+//
+// **Every number is the mod's own and is taken on trust, on Dominic's word (2026-09-09: "trust it
+// for now")** — none of the corrections the Golf earned over three weeks has been done here. The
+// two departures are stated where they are made: the tyre peaks carry the same 0.87 the Golf's AC
+// compound was scaled by, because the alternative is a patrol car that out-grips the player's car by
+// a fifth; and the rear's `AXLE` type, which this model has no element for, is read as the double
+// wishbone the same file states beside it.
+//
+// The same frame and the same conversion as the Golf's: +x the car's left, origin midway between the
+// axles at road level, pickup points converted from AC's wheel-relative statement.
+
+inline constexpr auto chargerWheelbase = 3.053;
+inline constexpr auto chargerFrontAxle = 0.5 * chargerWheelbase;
+inline constexpr auto chargerRearAxle = -0.5 * chargerWheelbase;
+inline constexpr auto chargerFrontTrack = 1.610;
+inline constexpr auto chargerRearTrack = 1.615;
+// tyres.ini RADIUS, the file's own.
+inline constexpr auto chargerTyreRadius = 0.350;
+// car.ini TOTALMASS, the file's own.
+inline constexpr auto chargerTotalMass = 1975.0;
+// suspensions.ini HUB_MASS, the file's own, front and rear.
+inline constexpr auto chargerFrontHubMass = 65.0;
+inline constexpr auto chargerRearHubMass = 98.0;
+// The steering wheel's lock to lock, degrees: car.ini STEER_LOCK is 450 each way.
+inline constexpr auto chargerSteeringLockToLock = 900.0;
+
+export [[nodiscard]] CornerHardpoints chargerPoliceFrontCorner(const CornerSide side);
+export [[nodiscard]] CornerHardpoints chargerPoliceRearCorner(const CornerSide side);
+
+// The patrol car, assembled and validated the way `golfGtiMk7` is.
+export [[nodiscard]] std::expected<VehicleSetup, std::string> dodgeChargerPolice();
+
+// Its driveline: the 6.4 litre V8's curve as the file states it (no turbo, so `power.lut` is the
+// final curve), a five-speed box on one final drive, rear-wheel drive through a clutch-pack diff.
+export [[nodiscard]] DrivelineSetup dodgeChargerPoliceDriveline();
+
+// Its electronics, calibrated against the car that was just built, on `golfGtiMk7Assists`'s terms.
+// Off by default like the Golf's; the police driver switches them on.
+export [[nodiscard]] AssistSetup dodgeChargerPoliceAssists(const VehicleSetup& setup);
+
 } // namespace raceengine

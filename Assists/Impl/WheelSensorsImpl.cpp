@@ -90,6 +90,7 @@ namespace
         reading.pulses = state.pulses;
         reading.valid = state.pulses > 0;
         reading.age = state.timeSincePulse;
+        reading.period = state.measuredPeriod;
 
         if (!reading.valid || state.measuredPeriod <= 0.0)
         {
@@ -97,6 +98,7 @@ namespace
             // Either way there is no measurement, and a controller reading zero here is reading the
             // truth about what its sensor knows.
             reading.speed = 0.0;
+            reading.period = 0.0;
             continue;
         }
 

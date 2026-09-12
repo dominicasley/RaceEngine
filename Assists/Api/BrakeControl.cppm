@@ -43,7 +43,12 @@ static_assert(std::is_trivially_copyable_v<BrakeCommand>, "the actuator command 
 // back to the bad one's pressure — and buys yaw stability, because the rear axle cannot develop a
 // braking imbalance across it. On a split-mu surface it is the difference between stopping straight
 // and spinning.
-export enum class BrakeChannel : std::uint32_t { FrontLeft, FrontRight, Rear };
+export enum class BrakeChannel : std::uint32_t
+{
+    FrontLeft,
+    FrontRight,
+    Rear
+};
 
 export inline constexpr std::size_t brakeChannelCount = 3;
 
@@ -60,7 +65,14 @@ export inline constexpr std::size_t brakeChannelCount = 3;
 // condition for intervening, this controller measured a 1% improvement over locked wheels on a
 // mu 0.35 surface: the estimator collapsed, the estimated slip read near zero while the tyres were
 // at 70% real slip, and the system politely handed the pressure back.
-export enum class ModulatorPhase : std::uint32_t { Passive, Hold, Dump, Recover, Reapply };
+export enum class ModulatorPhase : std::uint32_t
+{
+    Passive,
+    Hold,
+    Dump,
+    Recover,
+    Reapply
+};
 
 // The hydraulic unit's rates, **pascals per second**.
 //
@@ -114,6 +126,153 @@ export struct BrakeModulator
     // day one is stated. (Burckhardt, *Radschlupf-Regelsysteme*, printed book only, is the one
     // place a real table may exist — on the human-fetch list.)
     double rearReapplyGradient = 3.0e7;
+};
+
+// How much authority the brake-recovery supervisor has over the five transition sites that used to
+// read `pastBand` unconditionally. Three arms, and two of them are positive controls rather than
+// options: an architecture that replaces two measured controllers has to be able to reproduce both.
+export enum class RecoveryAuthority : std::uint32_t
+{
+    // `limitSlip == pastBand`. The pre-2026-09-07 production controller, to the bit.
+    Unconditional,
+    // `limitSlip == pastBand AND the road is taking torque AND the axle's lateral reserve is worth
+    // protecting AND the caliper is not starved`. The shipped car.
+    Supervised,
+    // `limitSlip == false`. The pre-2026-08-25 acceleration-only recovery loop, to the bit.
+    Disabled,
+};
+
+// What the road-action observable says about the wheel this channel is watching.
+//
+// **UNKNOWN is not a third opinion, it is the absence of one**, and it must PERMIT recovery. A stale
+// or locked wheel holds an acceleration that reads deeply negative, so a design that let UNKNOWN
+// refuse would be reading a frozen sensor as evidence that the tyre is loaded — which is exactly the
+// artefact that made some of the diagnostic arms look better than they were. Refusal requires
+// positive evidence; permission is the default.
+export enum class RoadEvidence : std::uint32_t
+{
+    Unknown,
+    Free,
+    Loaded
+};
+
+// How many tooth crossings the road-action filter can hold. A fixed capacity because the channel
+// state is copied by value into the car's saved bytes.
+export inline constexpr std::size_t roadTorqueCapacity = 8;
+
+// The vehicle-level lateral-authority gate: **an authority arbiter and not a stability controller**.
+//
+// It commands no pressure, adds no brake torque, performs no differential braking and has no
+// actuator of any kind. Its whole output is one bounded number answering *how much of the yaw the car
+// has now did the driver not ask for*, and the only thing that number does is decide whether
+// preserving lateral tyre capacity is worth spending longitudinal capability on.
+//
+// **Why a vehicle-level signal is not optional here.** The same front-axle decision has to go two
+// different ways on two surfaces a per-wheel controller cannot tell apart. Steering on uniform low
+// grip, the front tyres must be kept near their longitudinal peak or the car goes straight on: law
+// off, lateral travel collapses from 5.24 times the locked baseline to 1.12. Braking straight on a
+// split surface, the *same* front lateral force is what sustains the rotation — the front axle's
+// moment arm is +1.13 m ahead of the centre of mass against the rear's -1.51 m behind it, so a
+// same-sign lateral force at the front holds the yaw and at the rear reverses it. Measured front
+// lateral impulse over 1.00-2.00 s: 4385 N.s on the arm that yaws 17.3 degrees, 1325 N.s on the arm
+// that yaws 2.1. The two populations do not overlap.
+//
+// The separator is driver intent and nothing else, which is why this reads steering.
+export struct StabilitySetup
+{
+    // The bicycle reference's geometry. **COMMON PUBLIC DATA** for any road car.
+    double wheelbase = 2.62;
+
+    // Steering wheel angle to road wheel angle. **COMMON PUBLIC DATA**, and derivable once from an
+    // authored rack. The reference only has to answer "is the driver asking for yaw at all", so an
+    // error here is second order.
+    double steeringRatio = 14.1;
+
+    // Understeer gradient, rad per m/s^2. **ARCHETYPE DEFAULT**, and zero is the kinematic reference
+    // rather than a missing value: it shapes how much yaw the driver asked for and not whether they
+    // asked for any.
+    double understeerGradient = 0.0;
+
+    // The lateral acceleration the vehicle-relative yaw scale is drawn against, m/s^2, and the limit
+    // above which this gate switches itself off entirely.
+    //
+    // **SOURCED, and it is already in this file**: Limpert, *Brake Design and Safety* 3rd ed. §9.3.1
+    // switches the yaw moment build-up delay off above 0.4 g for the same physical reason — above it
+    // the car is genuinely cornering, and a mechanism that exists for a straight-line split surface
+    // has no business acting. Here it does two jobs. It sets `r_scale = lateralReference / v`, which
+    // is what makes every threshold in this gate vehicle-relative and speed-relative rather than an
+    // absolute rad/s somebody measured on one car. And it is the fail-safe: above it the gate returns
+    // zero, so a car pulling real lateral acceleration keeps its front lateral protection whatever
+    // the steering channel says. 0.4 * 9.80665 = 3.92266.
+    double lateralReference = 3.92266;
+
+    // What the car can pull laterally, m/s^2, used only to saturate the reference yaw rate — a car
+    // cannot yaw faster than its grip allows however far the wheel is turned. **ARCHETYPE DEFAULT**:
+    // a road car on dry tarmac. Deliberately a different number from `lateralReference`, because
+    // clamping the reference at the scale would make "the driver is asking for yaw" unreachable at
+    // full lock.
+    //
+    // **The accelerometer raises it and never lowers it**: a car demonstrably pulling more lateral
+    // acceleration than the archetype allows is a car whose driver can be asking for more yaw than
+    // the archetype admits, and the safe direction for this gate is always toward *asking*. Lowering
+    // it on a slippery surface would be the unsafe direction — it would read a car that cannot
+    // corner as a car whose driver did not ask to. 1.0 g.
+    double lateralCapability = 9.80665;
+
+    // The dimensionless share of `r_scale` that serves as both the intent deadband and the yaw-error
+    // limit. One number rather than two, because two would be a tuning surface where the evidence
+    // supports one significance scale. **ARCHETYPE DEFAULT.**
+    //
+    // **Monotone, and it only reaches the split-mu surface.** Measured across the four ensembles it
+    // moves nothing on dry, straight low-mu or steered low-mu — none of those has yaw the driver did
+    // not ask for — and on split mu the median heading error runs 8.00 degrees at 0.25, 12.08 at
+    // 0.50, 16.29 at 1.00 and 22.33 at 2.00, against the previous controller's 17.26. A smaller share
+    // makes the gate easier to trip, which biases longitudinal utilisation forward sooner. 0.25 is a
+    // quarter of the yaw rate a 0.4 g corner implies at the car's current speed.
+    double yawShare = 0.25;
+
+    // The reference speed below which this gate is neutral, m/s. **DERIVED, not chosen**: one tooth
+    // pitch over the reference estimator's own smoothing window — below it a wheel produces fewer
+    // than one crossing per averaging interval and neither the speed nor the yaw reference means
+    // anything. Filled by the composition root from the ring and the estimator; the default is the
+    // Golf's 48-pole ring at 0.050 s smoothing, and any value at all keeps a divide bounded.
+    double speedFloor = 0.834;
+};
+
+// What one channel needs that is not per-wheel sensor data: its own actuator calibration, what the
+// driveline is doing to the wheel it watches, and the vehicle-level gate's answer.
+//
+// **A struct rather than five more parameters** because `advanceAntilockChannel` already takes nine,
+// and because these five arrive together from one place — the composition root, which is the only
+// thing that can see the whole car.
+export struct AntilockChannelInputs
+{
+    // What this channel's brake makes per pascal, N.m/Pa, and what it makes at full system pressure.
+    // The second is what `AntilockSetup::roadShare` is a fraction of.
+    double torquePerPressure = 0.0;
+    double peakBrakeTorque = 0.0;
+
+    // The radius the ECU converts a rim acceleration into an angular one with, metres.
+    double rollingRadius = 0.3186;
+
+    // The capture timer this channel's sensor is read on, seconds. Not a control parameter: it is
+    // what the quantisation floor of the road-action estimate is computed from, per sample.
+    double timerResolution = 1e-6;
+
+    // What the driveline is putting on the control wheel, N.m. **Identically zero on an undriven
+    // wheel and DIRECTLY KNOWN on a driven one** — a car whose ECU commands the driveline knows this
+    // number and does not estimate it.
+    double driveTorque = 0.0;
+
+    // Whether that number is available at all. **False makes the road evidence UNKNOWN, which
+    // PERMITS** — the alternative is an observable that silently reads a driven wheel's drive torque
+    // as zero, and with the caliper empty the drive term is not a correction to the estimate, it is
+    // the whole of it.
+    bool driveTorqueKnown = true;
+
+    // How much of the car's current yaw the driver did not ask for, 0 to 1, from
+    // `advanceStabilitySupervisor`. Zero is neutral and is what every fallback lands on.
+    double yawDisturbance = 0.0;
 };
 
 export struct AntilockSetup
@@ -181,31 +340,91 @@ export struct AntilockSetup
     // stopped going away. 2.0 * 9.80665 = 19.613.
     double recoverySurge = 19.613;
 
-    // **The recovery law reads how far the estimated slip is from the controller's own band**, and
-    // this is the switch that turns that off for an A/B. On, the law this closes over is the one
-    // `docs/braking-chain-brief.md`'s instrument convicted: every recovery decision was written as
-    // though "not departing" meant "recovered", and a lightly loaded wheel past the tyre's peak is
-    // neither — road torque nearly balances brake torque there, so the wheel neither departs nor
-    // surges, and the old law re-applied into that equilibrium and held the rear axle at three times
-    // its peak slip for an entire stop, delivering 0.74 of its capacity against the fronts' 0.85.
+    // **How much authority the recovery supervisor has**, and the field the 2026-09-07 architecture
+    // replaced `slipAwareRecovery` with (`docs/abs-architecture-design.md`).
     //
-    // Three legs, all anchored on the `slipEnter`/`slipExit` band already calibrated above — no new
-    // threshold is introduced anywhere:
+    // The old boolean armed one term, `pastBand`, which was read unconditionally in five transition
+    // sites and did three jobs at once: wheel protection, brake recovery and — without ever saying so
+    // — vehicle stability, because what it actually bought was lateral tyre capacity under steering.
+    // The forensic audit measured all three: it costs a dry stop (20 of 29 members strand the rear
+    // axle, rear utilisation 0.416 against 0.745), it costs a straight low-mu stop (worse than locked
+    // wheels on 23 of 29 members), it costs split-mu yaw (17.3 degrees against 2.1) — and it is the
+    // only thing keeping the car steerable on a slippery surface, where switching it off collapses
+    // lateral travel from 5.24 times the locked baseline to 1.12.
     //
-    //  - a dump does not end merely because the wheel stopped departing while the estimated slip is
-    //    still past the band: equilibrium past the peak is what "stopped departing at 0.42 slip" is;
-    //  - a channel in recovery whose wheel is neither departing nor genuinely re-accelerating, with
-    //    slip still past the band, is **stuck** and dumps again rather than re-applying into it;
-    //  - the re-apply gradient tapers as the estimated slip approaches the band from below, so
-    //    pressure comes back gently near the peak and at the full rate well under it.
+    // So the term survives and its gating does not. `Supervised` is the shipped car: the five sites
+    // keep their structure and the term that arms them is qualified on whether the road is taking
+    // torque, on whether the axle's lateral reserve is worth spending longitudinal capability to
+    // protect, and on whether the caliper has been empty longer than it takes to fill.
     //
-    // **Every leg is gated on the reference being valid and reading past the band**, which is what
-    // keeps the estimator-collapse case honest: on a uniformly slippery surface the estimated slip
-    // reads far *below* the truth (the reference is biased low when every wheel slips at once), the
-    // guards then never fire, and the channel behaves exactly as the previous law did. Slip reading
-    // low disables this law; only the first version of this file, which required slip to *confirm*
-    // an intervention, could be disarmed by it.
-    bool slipAwareRecovery = true;
+    // The other two arms exist because a replacement that cannot reproduce both of the things it
+    // replaces cannot be attributed. `Unconditional` is the pre-2026-09-07 production controller **to
+    // the bit**, and `Disabled` is the pre-2026-08-25 acceleration-only loop **to the bit**. Both are
+    // measured arms with published numbers, and both are the positive controls the architecture's
+    // validation is blocked on.
+    RecoveryAuthority recoveryAuthority = RecoveryAuthority::Supervised;
+
+    // --- the road-action observable ------------------------------------------------------------
+    //
+    // `T_road_hat = T_brake_commanded + I_wheel * dOmega/dt - T_drive`, in N.m of spin-up torque.
+    // With the caliper empty it degenerates to the inertial term, which is a direct measurement of
+    // what the road is doing to a wheel nothing else is touching — and that is the question the dry
+    // failure turns on, because a wheel the ECU believes is slipping and which is making no force is
+    // a wheel there is nothing to protect.
+
+    // The ECU's own figure for a wheel's rotational inertia, kg.m^2. **ARCHETYPE-ESTIMABLE and
+    // measured to be so**: swept from half to twice the plant's value the dry ensemble does not move
+    // (0 of 29 stranded at every point). It is the ECU's calibration and not the car's number, which
+    // is why it lives here beside `brakeTorquePerPressure` rather than being imported from the
+    // vehicle — this module cannot see a vehicle and must not learn to.
+    double wheelInertia = 1.45;
+
+    // The gate the estimate must clear to count as "the road is taking torque", **as a fraction of
+    // this channel's own peak brake torque**. Dimensionless on purpose: the front axle's peak is
+    // 3665.5 N.m and the rear's 729.8, a ratio of five, and a threshold in N.m does not even carry
+    // across one car's two axles let alone across a fleet. Measured plateau on the dry ensemble:
+    // 0.010 to 1.000 is 0 or 1 of 29 stranded, a factor of one hundred.
+    //
+    // **The value is bounded from both sides by physics and the two bounds are close together**,
+    // which is the most important thing to know about this number. From below it must clear what a
+    // nearly unloaded wheel offers: a rear tyre carrying 7% of its static load makes about 30 N.m,
+    // and the sensor's own quantisation floor is of order 25, which is why the gate is the larger of
+    // this share and a multiple of that floor. From above it must stay UNDER what a tyre can offer on
+    // the worst surface the car still has to be protected on: at mu 0.35 a front tyre under about
+    // 5000 N offers 0.35 * 5000 * 0.3186 = 558 N.m against a front peak brake torque of 3665, which
+    // is **0.152 of peak**. A share at or above that reads the whole front axle as making no useful
+    // force on every slippery surface, and the steered low-mu ensemble falls off a cliff there:
+    // measured on the 15-member fixture the paired lateral-travel ratio is 4.67 at 0.100, 1.19 at
+    // 0.120 and 0.26 at 0.150.
+    //
+    // 0.100 is two thirds of that upper bound and an order of magnitude above the lower one. The dry
+    // ensemble is flat across the whole range (0 of 29 stranded from 0.010 to 0.150) and the straight
+    // low-mu ensemble is the other side of the same trade, so the usable region for all four
+    // ensembles at once is narrow: **0.100 is the only point on the measured grid that satisfies
+    // every one of them**, and that narrowness is recorded rather than smoothed over.
+    double roadShare = 0.100;
+
+    // How many tooth crossings the estimate is filtered over. **Event domain and not time domain**,
+    // and that is not a preference: the sample rate is proportional to wheel speed, so a time
+    // constant averages a different number of teeth at every speed and is a different filter at
+    // 100 km/h and at 20. A fixed count of crossings averages the same amount of sensor evidence
+    // wherever it is read. Capped by `roadTorqueCapacity`.
+    std::uint32_t roadSamples = 5;
+
+    // How many of the wheel's own measured tooth intervals a sample may age before it is INVALID,
+    // dimensionless. Stated against `WheelSpeedReading::period` rather than in seconds for the same
+    // reason the filter is event-domain.
+    double staleShare = 2.0;
+
+    // How many multiples of the sensor's own quantisation floor the estimate must clear, on top of
+    // `roadShare`. The floor is computed per sample from the capture timer and the measured period —
+    // `(I/r) * (timerResolution/period) * (speed/period)` — and is of order 25 N.m at the rear at
+    // 100 km/h, which is the same order as the separation the observable is asked to make. Without
+    // this term a small `roadShare` on a coarse ring is a decision taken below the noise.
+    double noiseShare = 1.0;
+
+    // The vehicle-level lateral-authority gate. See `StabilitySetup`.
+    StabilitySetup stability;
 
     // --- yaw moment build-up delay, and it ships OFF ---------------------------------------------
     //
@@ -331,6 +550,37 @@ export struct AntilockChannelState
     // The channel that reports whether the system is working and, differenced against the time it
     // spent engaged, what frequency it is working at.
     std::uint32_t cycles = 0;
+
+    // --- the road-action observable's own state (2026-09-07) ------------------------------------
+    //
+    // A ring of the last `roadSamples` estimates, **one per tooth crossing and never one per control
+    // step**. A control step with no new crossing carries no new information about the road, and a
+    // filter fed the held value at the control rate is a filter whose length in *evidence* changes
+    // with speed.
+    std::array<double, roadTorqueCapacity> roadSamples{};
+    std::uint32_t roadCount = 0;
+    std::uint32_t roadHead = 0;
+
+    // The filtered estimate, N.m of spin-up torque, and what the supervisor made of it. Both are
+    // telemetry as well as state: a gate nobody can see in a trace is a gate nobody can report on.
+    double roadTorque = 0.0;
+    RoadEvidence evidence = RoadEvidence::Unknown;
+
+    // How long this channel's commanded pressure has been at the actuator's floor, seconds.
+    //
+    // **This is the whole answer to "the controller left the dump and the caliper is still empty".**
+    // A phase is not a delivered torque: this unit empties a rear caliper in 54 ms and fills it in
+    // 181, so a state machine that transitions in one control period can be three actuator time
+    // constants away from the pressure its phase implies. Nothing else in this file carries actuator
+    // history, and without it the dry limit cycle has no bound that does not depend on the sensor.
+    double timeAtFloor = 0.0;
+
+    // Whether the recovery supervisor is limiting slip on this channel this period — the term that
+    // replaced `pastBand` — and whether the ECU's own belief that the wheel is past the band was
+    // asserted at all. The two differ exactly where the supervisor changed a decision, which is what
+    // makes "changed decisions per stop" a directly measured number rather than a shadow run.
+    bool limited = false;
+    bool banded = false;
 };
 
 export struct AntilockState
@@ -339,6 +589,24 @@ export struct AntilockState
 
     YawMomentDelayState yawDelay;
 };
+
+// One step of the vehicle-level lateral-authority gate, answering **how much of the car's current
+// yaw the driver did not ask for**, 0 to 1.
+//
+// Pure and stateless: a reference yaw rate from the steering angle and the estimated speed, compared
+// against what the yaw sensor reports, both measured against a scale that is a property of the car
+// and its speed rather than an absolute number somebody read off one vehicle.
+//
+// **It commands nothing.** The return value gates whether the recovery supervisor's lateral-capacity
+// protection has authority at an axle, and it reaches no actuator by any other path.
+//
+// Every failure lands on **zero**, which retains the protection: a gate that withdrew lateral
+// authority because a sensor went quiet would be a gate that turns a sensor fault into a
+// straight-on. Non-finite readings, an invalid reference, a speed below the floor, and real lateral
+// acceleration all return zero.
+export [[nodiscard]] double advanceStabilitySupervisor(const StabilitySetup& setup, const double referenceSpeed,
+                                                       const bool referenceValid, const double steeringWheelAngle,
+                                                       const double yawRate, const double lateralAcceleration);
 
 // Which wheel a channel is controlling on, given what the sensors report.
 //
@@ -386,10 +654,15 @@ export [[nodiscard]] double advanceYawMomentDelay(const AntilockSetup& setup, Ya
                                                   const double lateralAcceleration, const bool braking,
                                                   const double deltaTime);
 
+// `inputs` is everything the channel needs that is not per-wheel sensor data: its own actuator
+// calibration, the driveline torque at the wheel it watches, and the vehicle-level gate's answer.
+// **A channel cannot compute any of them** — two are the composition root's and the third is the
+// whole car's — which is the same reason the yaw moment delay lives outside this function.
 export [[nodiscard]] double advanceAntilockChannel(const AntilockSetup& setup, const BrakeChannel channel,
                                                    AntilockChannelState& state, const WheelSpeedReading& wheel,
                                                    const double wheelRoadSpeed, const double referenceSpeed,
                                                    const double referenceAcceleration, const bool referenceValid,
-                                                   const double requestedPressure, const double deltaTime);
+                                                   const double requestedPressure, const AntilockChannelInputs& inputs,
+                                                   const double deltaTime);
 
 } // namespace raceengine
